@@ -1,0 +1,641 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>ospf6_lsdb.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.5.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright (C) 2003 Yasuhiro Ohara</a>
+<a name="ln3"> *</a>
+<a name="ln4"> * This file is part of GNU Zebra.</a>
+<a name="ln5"> *</a>
+<a name="ln6"> * GNU Zebra is free software; you can redistribute it and/or modify it</a>
+<a name="ln7"> * under the terms of the GNU General Public License as published by the</a>
+<a name="ln8"> * Free Software Foundation; either version 2, or (at your option) any</a>
+<a name="ln9"> * later version.</a>
+<a name="ln10"> *</a>
+<a name="ln11"> * GNU Zebra is distributed in the hope that it will be useful, but</a>
+<a name="ln12"> * WITHOUT ANY WARRANTY; without even the implied warranty of</a>
+<a name="ln13"> * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU</a>
+<a name="ln14"> * General Public License for more details.</a>
+<a name="ln15"> *</a>
+<a name="ln16"> * You should have received a copy of the GNU General Public License</a>
+<a name="ln17"> * along with GNU Zebra; see the file COPYING.  If not, write to the </a>
+<a name="ln18"> * Free Software Foundation, Inc., 59 Temple Place - Suite 330, </a>
+<a name="ln19"> * Boston, MA 02111-1307, USA.  </a>
+<a name="ln20"> */</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &lt;zebra.h&gt;</a>
+<a name="ln23"> </a>
+<a name="ln24">#include &quot;memory.h&quot;</a>
+<a name="ln25">#include &quot;log.h&quot;</a>
+<a name="ln26">#include &quot;command.h&quot;</a>
+<a name="ln27">#include &quot;prefix.h&quot;</a>
+<a name="ln28">#include &quot;table.h&quot;</a>
+<a name="ln29">#include &quot;vty.h&quot;</a>
+<a name="ln30"> </a>
+<a name="ln31">#include &quot;ospf6_proto.h&quot;</a>
+<a name="ln32">#include &quot;ospf6_lsa.h&quot;</a>
+<a name="ln33">#include &quot;ospf6_lsdb.h&quot;</a>
+<a name="ln34">#include &quot;ospf6d.h&quot;</a>
+<a name="ln35"> </a>
+<a name="ln36">struct ospf6_lsdb *</a>
+<a name="ln37">ospf6_lsdb_create (void *data)</a>
+<a name="ln38">{</a>
+<a name="ln39">  struct ospf6_lsdb *lsdb;</a>
+<a name="ln40"> </a>
+<a name="ln41">  lsdb = XCALLOC (MTYPE_OSPF6_LSDB, sizeof (struct ospf6_lsdb));</a>
+<a name="ln42">  if (lsdb == NULL)</a>
+<a name="ln43">    {</a>
+<a name="ln44">      zlog_warn (&quot;Can't malloc lsdb&quot;);</a>
+<a name="ln45">      return NULL;</a>
+<a name="ln46">    }</a>
+<a name="ln47">  memset (lsdb, 0, sizeof (struct ospf6_lsdb));</a>
+<a name="ln48"> </a>
+<a name="ln49">  lsdb-&gt;data = data;</a>
+<a name="ln50">  lsdb-&gt;table = route_table_init ();</a>
+<a name="ln51">  return lsdb;</a>
+<a name="ln52">}</a>
+<a name="ln53"> </a>
+<a name="ln54">void</a>
+<a name="ln55">ospf6_lsdb_delete (struct ospf6_lsdb *lsdb)</a>
+<a name="ln56">{</a>
+<a name="ln57">  if (lsdb != NULL)</a>
+<a name="ln58">    {</a>
+<a name="ln59">      ospf6_lsdb_remove_all (lsdb);</a>
+<a name="ln60">      route_table_finish (lsdb-&gt;table);</a>
+<a name="ln61">      XFREE (MTYPE_OSPF6_LSDB, lsdb);</a>
+<a name="ln62">    }</a>
+<a name="ln63">}</a>
+<a name="ln64"> </a>
+<a name="ln65">static void</a>
+<a name="ln66">ospf6_lsdb_set_key (struct prefix_ipv6 *key, void *value, int len)</a>
+<a name="ln67">{</a>
+<a name="ln68">  assert (key-&gt;prefixlen % 8 == 0);</a>
+<a name="ln69"> </a>
+<a name="ln70">  memcpy ((caddr_t) &amp;key-&gt;prefix + key-&gt;prefixlen / 8,</a>
+<a name="ln71">          (caddr_t) value, len);</a>
+<a name="ln72">  key-&gt;family = AF_INET6;</a>
+<a name="ln73">  key-&gt;prefixlen += len * 8;</a>
+<a name="ln74">}</a>
+<a name="ln75"> </a>
+<a name="ln76">#ifdef DEBUG</a>
+<a name="ln77">static void</a>
+<a name="ln78">_lsdb_count_assert (struct ospf6_lsdb *lsdb)</a>
+<a name="ln79">{</a>
+<a name="ln80">  struct ospf6_lsa *debug;</a>
+<a name="ln81">  unsigned int num = 0;</a>
+<a name="ln82">  for (debug = ospf6_lsdb_head (lsdb); debug;</a>
+<a name="ln83">       debug = ospf6_lsdb_next (debug))</a>
+<a name="ln84">    num++;</a>
+<a name="ln85"> </a>
+<a name="ln86">  if (num == lsdb-&gt;count)</a>
+<a name="ln87">    return;</a>
+<a name="ln88"> </a>
+<a name="ln89">  zlog_debug (&quot;PANIC !! lsdb[%p]-&gt;count = %d, real = %d&quot;,</a>
+<a name="ln90">             lsdb, lsdb-&gt;count, num);</a>
+<a name="ln91">  for (debug = ospf6_lsdb_head (lsdb); debug;</a>
+<a name="ln92">       debug = ospf6_lsdb_next (debug))</a>
+<a name="ln93">    zlog_debug (&quot;%p %p %s lsdb[%p]&quot;, debug-&gt;prev, debug-&gt;next, debug-&gt;name,</a>
+<a name="ln94">               debug-&gt;lsdb);</a>
+<a name="ln95">  zlog_debug (&quot;DUMP END&quot;);</a>
+<a name="ln96"> </a>
+<a name="ln97">  assert (num == lsdb-&gt;count);</a>
+<a name="ln98">}</a>
+<a name="ln99">#define ospf6_lsdb_count_assert(t) (_lsdb_count_assert (t))</a>
+<a name="ln100">#else /*DEBUG*/</a>
+<a name="ln101">#define ospf6_lsdb_count_assert(t) ((void) 0)</a>
+<a name="ln102">#endif /*DEBUG*/</a>
+<a name="ln103"> </a>
+<a name="ln104">void</a>
+<a name="ln105">ospf6_lsdb_add (struct ospf6_lsa *lsa, struct ospf6_lsdb *lsdb)</a>
+<a name="ln106">{</a>
+<a name="ln107">  struct prefix_ipv6 key;</a>
+<a name="ln108">  struct route_node *current;</a>
+<a name="ln109">  struct ospf6_lsa *old = NULL;</a>
+<a name="ln110"> </a>
+<a name="ln111">  memset (&amp;key, 0, sizeof (key));</a>
+<a name="ln112">  ospf6_lsdb_set_key (&amp;key, &amp;lsa-&gt;header-&gt;type, sizeof (lsa-&gt;header-&gt;type));</a>
+<a name="ln113">  ospf6_lsdb_set_key (&amp;key, &amp;lsa-&gt;header-&gt;adv_router,</a>
+<a name="ln114">                      sizeof (lsa-&gt;header-&gt;adv_router));</a>
+<a name="ln115">  ospf6_lsdb_set_key (&amp;key, &amp;lsa-&gt;header-&gt;id, sizeof (lsa-&gt;header-&gt;id));</a>
+<a name="ln116"> </a>
+<a name="ln117">  current = route_node_get (lsdb-&gt;table, (struct prefix *) &amp;key);</a>
+<a name="ln118">  old = current-&gt;info;</a>
+<a name="ln119">  current-&gt;info = lsa;</a>
+<a name="ln120">  lsa-&gt;rn = current;</a>
+<a name="ln121">  ospf6_lsa_lock (lsa);</a>
+<a name="ln122"> </a>
+<a name="ln123">  if (!old)</a>
+<a name="ln124">    {</a>
+<a name="ln125">      lsdb-&gt;count++;</a>
+<a name="ln126"> </a>
+<a name="ln127">      if (OSPF6_LSA_IS_MAXAGE (lsa))</a>
+<a name="ln128">	{</a>
+<a name="ln129">	  if (lsdb-&gt;hook_remove)</a>
+<a name="ln130">	    (*lsdb-&gt;hook_remove) (lsa);</a>
+<a name="ln131">	}</a>
+<a name="ln132">      else</a>
+<a name="ln133">	{</a>
+<a name="ln134">	  if (lsdb-&gt;hook_add)</a>
+<a name="ln135">	    (*lsdb-&gt;hook_add) (lsa);</a>
+<a name="ln136">	}</a>
+<a name="ln137">    }</a>
+<a name="ln138">  else</a>
+<a name="ln139">    {</a>
+<a name="ln140">      if (OSPF6_LSA_IS_CHANGED (old, lsa))</a>
+<a name="ln141">        {</a>
+<a name="ln142">          if (OSPF6_LSA_IS_MAXAGE (lsa))</a>
+<a name="ln143">            {</a>
+<a name="ln144">              if (lsdb-&gt;hook_remove)</a>
+<a name="ln145">                {</a>
+<a name="ln146">                  (*lsdb-&gt;hook_remove) (old);</a>
+<a name="ln147">                  (*lsdb-&gt;hook_remove) (lsa);</a>
+<a name="ln148">                }</a>
+<a name="ln149">            }</a>
+<a name="ln150">          else if (OSPF6_LSA_IS_MAXAGE (old))</a>
+<a name="ln151">            {</a>
+<a name="ln152">              if (lsdb-&gt;hook_add)</a>
+<a name="ln153">                (*lsdb-&gt;hook_add) (lsa);</a>
+<a name="ln154">            }</a>
+<a name="ln155">          else</a>
+<a name="ln156">            {</a>
+<a name="ln157">              if (lsdb-&gt;hook_remove)</a>
+<a name="ln158">                (*lsdb-&gt;hook_remove) (old);</a>
+<a name="ln159">              if (lsdb-&gt;hook_add)</a>
+<a name="ln160">                (*lsdb-&gt;hook_add) (lsa);</a>
+<a name="ln161">            }</a>
+<a name="ln162">        }</a>
+<a name="ln163">      ospf6_lsa_unlock (old);</a>
+<a name="ln164">    }</a>
+<a name="ln165"> </a>
+<a name="ln166">  ospf6_lsdb_count_assert (lsdb);</a>
+<a name="ln167">}</a>
+<a name="ln168"> </a>
+<a name="ln169">void</a>
+<a name="ln170">ospf6_lsdb_remove (struct ospf6_lsa *lsa, struct ospf6_lsdb *lsdb)</a>
+<a name="ln171">{</a>
+<a name="ln172">  struct route_node *node;</a>
+<a name="ln173">  struct prefix_ipv6 key;</a>
+<a name="ln174"> </a>
+<a name="ln175">  memset (&amp;key, 0, sizeof (key));</a>
+<a name="ln176">  ospf6_lsdb_set_key (&amp;key, &amp;lsa-&gt;header-&gt;type, sizeof (lsa-&gt;header-&gt;type));</a>
+<a name="ln177">  ospf6_lsdb_set_key (&amp;key, &amp;lsa-&gt;header-&gt;adv_router,</a>
+<a name="ln178">                      sizeof (lsa-&gt;header-&gt;adv_router));</a>
+<a name="ln179">  ospf6_lsdb_set_key (&amp;key, &amp;lsa-&gt;header-&gt;id, sizeof (lsa-&gt;header-&gt;id));</a>
+<a name="ln180"> </a>
+<a name="ln181">  node = route_node_lookup (lsdb-&gt;table, (struct prefix *) &amp;key);</a>
+<a name="ln182">  assert (node &amp;&amp; node-&gt;info == lsa);</a>
+<a name="ln183"> </a>
+<a name="ln184">  node-&gt;info = NULL;</a>
+<a name="ln185">  lsdb-&gt;count--;</a>
+<a name="ln186"> </a>
+<a name="ln187">  if (lsdb-&gt;hook_remove)</a>
+<a name="ln188">    (*lsdb-&gt;hook_remove) (lsa);</a>
+<a name="ln189"> </a>
+<a name="ln190">  route_unlock_node (node);	/* to free the lookup lock */</a>
+<a name="ln191">  route_unlock_node (node);	/* to free the original lock */</a>
+<a name="ln192">  ospf6_lsa_unlock (lsa);</a>
+<a name="ln193"> </a>
+<a name="ln194">  ospf6_lsdb_count_assert (lsdb);</a>
+<a name="ln195">}</a>
+<a name="ln196"> </a>
+<a name="ln197">struct ospf6_lsa *</a>
+<a name="ln198">ospf6_lsdb_lookup (u_int16_t type, u_int32_t id, u_int32_t adv_router,</a>
+<a name="ln199">                   struct ospf6_lsdb *lsdb)</a>
+<a name="ln200">{</a>
+<a name="ln201">  struct route_node *node;</a>
+<a name="ln202">  struct prefix_ipv6 key;</a>
+<a name="ln203"> </a>
+<a name="ln204">  if (lsdb == NULL)</a>
+<a name="ln205">    return NULL;</a>
+<a name="ln206"> </a>
+<a name="ln207">  memset (&amp;key, 0, sizeof (key));</a>
+<a name="ln208">  ospf6_lsdb_set_key (&amp;key, &amp;type, sizeof (type));</a>
+<a name="ln209">  ospf6_lsdb_set_key (&amp;key, &amp;adv_router, sizeof (adv_router));</a>
+<a name="ln210">  ospf6_lsdb_set_key (&amp;key, &amp;id, sizeof (id));</a>
+<a name="ln211"> </a>
+<a name="ln212">  node = route_node_lookup (lsdb-&gt;table, (struct prefix *) &amp;key);</a>
+<a name="ln213">  if (node == NULL || node-&gt;info == NULL)</a>
+<a name="ln214">    return NULL;</a>
+<a name="ln215"> </a>
+<a name="ln216">  route_unlock_node (node);</a>
+<a name="ln217">  return (struct ospf6_lsa *) node-&gt;info;</a>
+<a name="ln218">}</a>
+<a name="ln219"> </a>
+<a name="ln220">struct ospf6_lsa *</a>
+<a name="ln221">ospf6_lsdb_lookup_next (u_int16_t type, u_int32_t id, u_int32_t adv_router,</a>
+<a name="ln222">                        struct ospf6_lsdb *lsdb)</a>
+<a name="ln223">{</a>
+<a name="ln224">  struct route_node *node;</a>
+<a name="ln225">  struct route_node *matched = NULL;</a>
+<a name="ln226">  struct prefix_ipv6 key;</a>
+<a name="ln227">  struct prefix *p;</a>
+<a name="ln228"> </a>
+<a name="ln229">  if (lsdb == NULL)</a>
+<a name="ln230">    return NULL;</a>
+<a name="ln231"> </a>
+<a name="ln232">  memset (&amp;key, 0, sizeof (key));</a>
+<a name="ln233">  ospf6_lsdb_set_key (&amp;key, &amp;type, sizeof (type));</a>
+<a name="ln234">  ospf6_lsdb_set_key (&amp;key, &amp;adv_router, sizeof (adv_router));</a>
+<a name="ln235">  ospf6_lsdb_set_key (&amp;key, &amp;id, sizeof (id));</a>
+<a name="ln236">  p = (struct prefix *) &amp;key;</a>
+<a name="ln237"> </a>
+<a name="ln238">  {</a>
+<a name="ln239">    char buf[64];</a>
+<a name="ln240">    prefix2str (p, buf, sizeof (buf));</a>
+<a name="ln241">    zlog_debug (&quot;lsdb_lookup_next: key: %s&quot;, buf);</a>
+<a name="ln242">  }</a>
+<a name="ln243"> </a>
+<a name="ln244">  node = lsdb-&gt;table-&gt;top;</a>
+<a name="ln245">  /* walk down tree. */</a>
+<a name="ln246">  while (node &amp;&amp; node-&gt;p.prefixlen &lt;= p-&gt;prefixlen &amp;&amp;</a>
+<a name="ln247">         prefix_match (&amp;node-&gt;p, p))</a>
+<a name="ln248">    {</a>
+<a name="ln249">      matched = node;</a>
+<a name="ln250">      node = node-&gt;link[prefix_bit(&amp;p-&gt;u.prefix, node-&gt;p.prefixlen)];</a>
+<a name="ln251">    }</a>
+<a name="ln252"> </a>
+<a name="ln253">  if (matched)</a>
+<a name="ln254">    node = matched;</a>
+<a name="ln255">  else</a>
+<a name="ln256">    node = lsdb-&gt;table-&gt;top;</a>
+<a name="ln257">  route_lock_node (node);</a>
+<a name="ln258"> </a>
+<a name="ln259">  /* skip to real existing entry */</a>
+<a name="ln260">  while (node &amp;&amp; node-&gt;info == NULL)</a>
+<a name="ln261">    node = route_next (node);</a>
+<a name="ln262"> </a>
+<a name="ln263">  if (! node)</a>
+<a name="ln264">    return NULL;</a>
+<a name="ln265"> </a>
+<a name="ln266">  if (prefix_same (&amp;node-&gt;p, p))</a>
+<a name="ln267">    {</a>
+<a name="ln268">      node = route_next (node);</a>
+<a name="ln269">      while (node &amp;&amp; node-&gt;info == NULL)</a>
+<a name="ln270">        node = route_next (node);</a>
+<a name="ln271">    }</a>
+<a name="ln272"> </a>
+<a name="ln273">  if (! node)</a>
+<a name="ln274">    return NULL;</a>
+<a name="ln275"> </a>
+<a name="ln276">  route_unlock_node (node);</a>
+<a name="ln277">  return (struct ospf6_lsa *) node-&gt;info;</a>
+<a name="ln278">}</a>
+<a name="ln279"> </a>
+<a name="ln280">/* Iteration function */</a>
+<a name="ln281">struct ospf6_lsa *</a>
+<a name="ln282">ospf6_lsdb_head (struct ospf6_lsdb *lsdb)</a>
+<a name="ln283">{</a>
+<a name="ln284">  struct route_node *node;</a>
+<a name="ln285"> </a>
+<a name="ln286">  node = route_top (lsdb-&gt;table);</a>
+<a name="ln287">  if (node == NULL)</a>
+<a name="ln288">    return NULL;</a>
+<a name="ln289"> </a>
+<a name="ln290">  /* skip to the existing lsdb entry */</a>
+<a name="ln291">  while (node &amp;&amp; node-&gt;info == NULL)</a>
+<a name="ln292">    node = route_next (node);</a>
+<a name="ln293">  if (node == NULL)</a>
+<a name="ln294">    return NULL;</a>
+<a name="ln295"> </a>
+<a name="ln296">  if (node-&gt;info)</a>
+<a name="ln297">    ospf6_lsa_lock ((struct ospf6_lsa *) node-&gt;info);</a>
+<a name="ln298">  return (struct ospf6_lsa *) node-&gt;info;</a>
+<a name="ln299">}</a>
+<a name="ln300"> </a>
+<a name="ln301">struct ospf6_lsa *</a>
+<a name="ln302">ospf6_lsdb_next (struct ospf6_lsa *lsa)</a>
+<a name="ln303">{</a>
+<a name="ln304">  struct route_node *node = lsa-&gt;rn;</a>
+<a name="ln305">  struct ospf6_lsa *next = NULL;</a>
+<a name="ln306"> </a>
+<a name="ln307">  do {</a>
+<a name="ln308">    node = route_next (node);</a>
+<a name="ln309">  } while (node &amp;&amp; node-&gt;info == NULL);</a>
+<a name="ln310"> </a>
+<a name="ln311">  if ((node != NULL) &amp;&amp; (node-&gt;info != NULL))</a>
+<a name="ln312">    {</a>
+<a name="ln313">      next = node-&gt;info;</a>
+<a name="ln314">      ospf6_lsa_lock (next);</a>
+<a name="ln315">    }</a>
+<a name="ln316"> </a>
+<a name="ln317">  ospf6_lsa_unlock (lsa);</a>
+<a name="ln318">  return next;</a>
+<a name="ln319">}</a>
+<a name="ln320"> </a>
+<a name="ln321">struct ospf6_lsa *</a>
+<a name="ln322">ospf6_lsdb_type_router_head (u_int16_t type, u_int32_t adv_router,</a>
+<a name="ln323">                             struct ospf6_lsdb *lsdb)</a>
+<a name="ln324">{</a>
+<a name="ln325">  struct route_node *node;</a>
+<a name="ln326">  struct prefix_ipv6 key;</a>
+<a name="ln327">  struct ospf6_lsa *lsa;</a>
+<a name="ln328"> </a>
+<a name="ln329">  memset (&amp;key, 0, sizeof (key));</a>
+<a name="ln330">  ospf6_lsdb_set_key (&amp;key, &amp;type, sizeof (type));</a>
+<a name="ln331">  ospf6_lsdb_set_key (&amp;key, &amp;adv_router, sizeof (adv_router));</a>
+<a name="ln332"> </a>
+<a name="ln333">  node = lsdb-&gt;table-&gt;top;</a>
+<a name="ln334"> </a>
+<a name="ln335">  /* Walk down tree. */</a>
+<a name="ln336">  while (node &amp;&amp; node-&gt;p.prefixlen &lt;= key.prefixlen &amp;&amp;</a>
+<a name="ln337">	 prefix_match (&amp;node-&gt;p, (struct prefix *) &amp;key))</a>
+<a name="ln338">    node = node-&gt;link[prefix6_bit(&amp;key.prefix, node-&gt;p.prefixlen)];</a>
+<a name="ln339"> </a>
+<a name="ln340">  if (node)</a>
+<a name="ln341">    route_lock_node (node);</a>
+<a name="ln342">  while (node &amp;&amp; node-&gt;info == NULL)</a>
+<a name="ln343">    node = route_next (node);</a>
+<a name="ln344"> </a>
+<a name="ln345">  if (node == NULL)</a>
+<a name="ln346">    return NULL;</a>
+<a name="ln347"> </a>
+<a name="ln348">  if (! prefix_match ((struct prefix *) &amp;key, &amp;node-&gt;p))</a>
+<a name="ln349">    return NULL;</a>
+<a name="ln350"> </a>
+<a name="ln351">  lsa = node-&gt;info;</a>
+<a name="ln352">  ospf6_lsa_lock (lsa);</a>
+<a name="ln353"> </a>
+<a name="ln354">  return lsa;</a>
+<a name="ln355">}</a>
+<a name="ln356"> </a>
+<a name="ln357">struct ospf6_lsa *</a>
+<a name="ln358">ospf6_lsdb_type_router_next (u_int16_t type, u_int32_t adv_router,</a>
+<a name="ln359">                             struct ospf6_lsa *lsa)</a>
+<a name="ln360">{</a>
+<a name="ln361">  struct ospf6_lsa *next = ospf6_lsdb_next(lsa);</a>
+<a name="ln362"> </a>
+<a name="ln363">  if (next)</a>
+<a name="ln364">    {</a>
+<a name="ln365">      if (next-&gt;header-&gt;type != type ||</a>
+<a name="ln366">          next-&gt;header-&gt;adv_router != adv_router)</a>
+<a name="ln367">	{</a>
+<a name="ln368">	  route_unlock_node (next-&gt;rn);</a>
+<a name="ln369">	  ospf6_lsa_unlock (next);</a>
+<a name="ln370">	  next = NULL;</a>
+<a name="ln371">	}</a>
+<a name="ln372">    }</a>
+<a name="ln373"> </a>
+<a name="ln374">  return next;</a>
+<a name="ln375">}</a>
+<a name="ln376"> </a>
+<a name="ln377">struct ospf6_lsa *</a>
+<a name="ln378">ospf6_lsdb_type_head (u_int16_t type, struct ospf6_lsdb *lsdb)</a>
+<a name="ln379">{</a>
+<a name="ln380">  struct route_node *node;</a>
+<a name="ln381">  struct prefix_ipv6 key;</a>
+<a name="ln382">  struct ospf6_lsa *lsa;</a>
+<a name="ln383"> </a>
+<a name="ln384">  memset (&amp;key, 0, sizeof (key));</a>
+<a name="ln385">  ospf6_lsdb_set_key (&amp;key, &amp;type, sizeof (type));</a>
+<a name="ln386"> </a>
+<a name="ln387">  /* Walk down tree. */</a>
+<a name="ln388">  node = lsdb-&gt;table-&gt;top;</a>
+<a name="ln389">  while (node &amp;&amp; node-&gt;p.prefixlen &lt;= key.prefixlen &amp;&amp;</a>
+<a name="ln390">	 prefix_match (&amp;node-&gt;p, (struct prefix *) &amp;key))</a>
+<a name="ln391">    node = node-&gt;link[prefix6_bit(&amp;key.prefix, node-&gt;p.prefixlen)];</a>
+<a name="ln392"> </a>
+<a name="ln393">  if (node)</a>
+<a name="ln394">    route_lock_node (node);</a>
+<a name="ln395">  while (node &amp;&amp; node-&gt;info == NULL)</a>
+<a name="ln396">    node = route_next (node);</a>
+<a name="ln397"> </a>
+<a name="ln398">  if (node == NULL)</a>
+<a name="ln399">    return NULL;</a>
+<a name="ln400"> </a>
+<a name="ln401">  if (! prefix_match ((struct prefix *) &amp;key, &amp;node-&gt;p))</a>
+<a name="ln402">    return NULL;</a>
+<a name="ln403"> </a>
+<a name="ln404">  lsa = node-&gt;info;</a>
+<a name="ln405">  ospf6_lsa_lock (lsa);</a>
+<a name="ln406"> </a>
+<a name="ln407">  return lsa;</a>
+<a name="ln408">}</a>
+<a name="ln409"> </a>
+<a name="ln410">struct ospf6_lsa *</a>
+<a name="ln411">ospf6_lsdb_type_next (u_int16_t type, struct ospf6_lsa *lsa)</a>
+<a name="ln412">{</a>
+<a name="ln413">  struct ospf6_lsa *next = ospf6_lsdb_next (lsa);</a>
+<a name="ln414"> </a>
+<a name="ln415">  if (next)</a>
+<a name="ln416">    {</a>
+<a name="ln417">      if (next-&gt;header-&gt;type != type)</a>
+<a name="ln418">	{</a>
+<a name="ln419">	  route_unlock_node (next-&gt;rn);</a>
+<a name="ln420">	  ospf6_lsa_unlock (next);</a>
+<a name="ln421">	  next = NULL;</a>
+<a name="ln422">	}</a>
+<a name="ln423">    }</a>
+<a name="ln424"> </a>
+<a name="ln425">  return next;</a>
+<a name="ln426">}</a>
+<a name="ln427"> </a>
+<a name="ln428">void</a>
+<a name="ln429">ospf6_lsdb_remove_all (struct ospf6_lsdb *lsdb)</a>
+<a name="ln430">{</a>
+<a name="ln431">  struct ospf6_lsa *lsa;</a>
+<a name="ln432"> </a>
+<a name="ln433">  if (lsdb == NULL)</a>
+<a name="ln434">    return;</a>
+<a name="ln435"> </a>
+<a name="ln436">  for (lsa = ospf6_lsdb_head (lsdb); lsa; lsa = ospf6_lsdb_next (lsa))</a>
+<a name="ln437">    ospf6_lsdb_remove (lsa, lsdb);</a>
+<a name="ln438">}</a>
+<a name="ln439"> </a>
+<a name="ln440">void</a>
+<a name="ln441">ospf6_lsdb_lsa_unlock (struct ospf6_lsa *lsa)</a>
+<a name="ln442">{</a>
+<a name="ln443">  if (lsa != NULL)</a>
+<a name="ln444">    {</a>
+<a name="ln445">      if (lsa-&gt;rn != NULL)</a>
+<a name="ln446">	route_unlock_node (lsa-&gt;rn);</a>
+<a name="ln447">      ospf6_lsa_unlock (lsa);</a>
+<a name="ln448">    }</a>
+<a name="ln449">}</a>
+<a name="ln450"> </a>
+<a name="ln451">int</a>
+<a name="ln452">ospf6_lsdb_maxage_remover (struct ospf6_lsdb *lsdb)</a>
+<a name="ln453">{</a>
+<a name="ln454">  int reschedule = 0;</a>
+<a name="ln455">  struct ospf6_lsa *lsa;</a>
+<a name="ln456"> </a>
+<a name="ln457">  for (lsa = ospf6_lsdb_head (lsdb); lsa; lsa = ospf6_lsdb_next (lsa))</a>
+<a name="ln458">    {</a>
+<a name="ln459">      if (! OSPF6_LSA_IS_MAXAGE (lsa))</a>
+<a name="ln460">	continue;</a>
+<a name="ln461">      if (lsa-&gt;retrans_count != 0)</a>
+<a name="ln462">	{</a>
+<a name="ln463">	  reschedule = 1;</a>
+<a name="ln464">	  continue;</a>
+<a name="ln465">	}</a>
+<a name="ln466">      if (IS_OSPF6_DEBUG_LSA_TYPE (lsa-&gt;header-&gt;type))</a>
+<a name="ln467">	zlog_debug (&quot;Remove MaxAge %s&quot;, lsa-&gt;name);</a>
+<a name="ln468">      if (CHECK_FLAG(lsa-&gt;flag, OSPF6_LSA_SEQWRAPPED))</a>
+<a name="ln469">      {</a>
+<a name="ln470">        UNSET_FLAG(lsa-&gt;flag, OSPF6_LSA_SEQWRAPPED);</a>
+<a name="ln471">        /*</a>
+<a name="ln472">         * lsa-&gt;header-&gt;age = 0;</a>
+<a name="ln473">         */</a>
+<a name="ln474">        lsa-&gt;header-&gt;seqnum = htonl(OSPF_MAX_SEQUENCE_NUMBER + 1);</a>
+<a name="ln475">        ospf6_lsa_checksum (lsa-&gt;header);</a>
+<a name="ln476"> </a>
+<a name="ln477">	THREAD_OFF(lsa-&gt;refresh);</a>
+<a name="ln478">        thread_execute (master, ospf6_lsa_refresh, lsa, 0);</a>
+<a name="ln479">      } else {</a>
+<a name="ln480">        ospf6_lsdb_remove (lsa, lsdb);</a>
+<a name="ln481">      }</a>
+<a name="ln482">    }</a>
+<a name="ln483"> </a>
+<a name="ln484">  return (reschedule);</a>
+<a name="ln485">}</a>
+<a name="ln486"> </a>
+<a name="ln487">void</a>
+<a name="ln488">ospf6_lsdb_show (struct vty *vty, enum ospf_lsdb_show_level level,</a>
+<a name="ln489">                 u_int16_t *type, u_int32_t *id, u_int32_t *adv_router,</a>
+<a name="ln490">                 struct ospf6_lsdb *lsdb)</a>
+<a name="ln491">{</a>
+<a name="ln492">  struct ospf6_lsa *lsa;</a>
+<a name="ln493">  void (*showfunc) (struct vty *, struct ospf6_lsa *) = NULL;</a>
+<a name="ln494"> </a>
+<a name="ln495">  switch (level)</a>
+<a name="ln496">  {</a>
+<a name="ln497">    case OSPF6_LSDB_SHOW_LEVEL_DETAIL:</a>
+<a name="ln498">      showfunc = ospf6_lsa_show;</a>
+<a name="ln499">      break;</a>
+<a name="ln500">    case OSPF6_LSDB_SHOW_LEVEL_INTERNAL:</a>
+<a name="ln501">      showfunc = ospf6_lsa_show_internal;</a>
+<a name="ln502">      break;</a>
+<a name="ln503">    case OSPF6_LSDB_SHOW_LEVEL_DUMP:</a>
+<a name="ln504">      showfunc = ospf6_lsa_show_dump;</a>
+<a name="ln505">      break;</a>
+<a name="ln506">    case OSPF6_LSDB_SHOW_LEVEL_NORMAL:</a>
+<a name="ln507">    default:</a>
+<a name="ln508">      showfunc = ospf6_lsa_show_summary;</a>
+<a name="ln509">  }</a>
+<a name="ln510">  </a>
+<a name="ln511">  if (type &amp;&amp; id &amp;&amp; adv_router)</a>
+<a name="ln512">    {</a>
+<a name="ln513">      lsa = ospf6_lsdb_lookup (*type, *id, *adv_router, lsdb);</a>
+<a name="ln514">      if (lsa)</a>
+<a name="ln515">        {</a>
+<a name="ln516">          if (level == OSPF6_LSDB_SHOW_LEVEL_NORMAL)</a>
+<a name="ln517">            ospf6_lsa_show (vty, lsa);</a>
+<a name="ln518">          else</a>
+<a name="ln519">            (*showfunc) (vty, lsa);</a>
+<a name="ln520">        }</a>
+<a name="ln521">      return;</a>
+<a name="ln522">    }</a>
+<a name="ln523"> </a>
+<a name="ln524">  if (level == OSPF6_LSDB_SHOW_LEVEL_NORMAL)</a>
+<a name="ln525">    ospf6_lsa_show_summary_header (vty);</a>
+<a name="ln526"> </a>
+<a name="ln527">  if (type &amp;&amp; adv_router)</a>
+<a name="ln528">    lsa = ospf6_lsdb_type_router_head (*type, *adv_router, lsdb);</a>
+<a name="ln529">  else if (type)</a>
+<a name="ln530">    lsa = ospf6_lsdb_type_head (*type, lsdb);</a>
+<a name="ln531">  else</a>
+<a name="ln532">    lsa = ospf6_lsdb_head (lsdb);</a>
+<a name="ln533">  while (lsa)</a>
+<a name="ln534">    {</a>
+<a name="ln535">      if ((! adv_router || lsa-&gt;header-&gt;adv_router == *adv_router) &amp;&amp;</a>
+<a name="ln536">          (! id || lsa-&gt;header-&gt;id == *id))</a>
+<a name="ln537">        (*showfunc) (vty, lsa);</a>
+<a name="ln538"> </a>
+<a name="ln539">      if (type &amp;&amp; adv_router)</a>
+<a name="ln540">        lsa = ospf6_lsdb_type_router_next (*type, *adv_router, lsa);</a>
+<a name="ln541">      else if (type)</a>
+<a name="ln542">        lsa = ospf6_lsdb_type_next (*type, lsa);</a>
+<a name="ln543">      else</a>
+<a name="ln544">        lsa = ospf6_lsdb_next (lsa);</a>
+<a name="ln545">    }</a>
+<a name="ln546">}</a>
+<a name="ln547"> </a>
+<a name="ln548">/* Decide new Link State ID to originate.</a>
+<a name="ln549">   note return value is network byte order */</a>
+<a name="ln550">u_int32_t</a>
+<a name="ln551">ospf6_new_ls_id (u_int16_t type, u_int32_t adv_router,</a>
+<a name="ln552">                 struct ospf6_lsdb *lsdb)</a>
+<a name="ln553">{</a>
+<a name="ln554">  struct ospf6_lsa *lsa;</a>
+<a name="ln555">  u_int32_t id = 1;</a>
+<a name="ln556"> </a>
+<a name="ln557">  for (lsa = ospf6_lsdb_type_router_head (type, adv_router, lsdb); lsa;</a>
+<a name="ln558">       lsa = ospf6_lsdb_type_router_next (type, adv_router, lsa))</a>
+<a name="ln559">    {</a>
+<a name="ln560">      if (ntohl (lsa-&gt;header-&gt;id) &lt; id)</a>
+<a name="ln561">        continue;</a>
+<a name="ln562">      if (ntohl (lsa-&gt;header-&gt;id) &gt; id)</a>
+<a name="ln563">      {</a>
+<a name="ln564">	ospf6_lsdb_lsa_unlock (lsa);</a>
+<a name="ln565">        break;</a>
+<a name="ln566">      }</a>
+<a name="ln567">      id++;</a>
+<a name="ln568">    }</a>
+<a name="ln569"> </a>
+<a name="ln570">  return ((u_int32_t) htonl (id));</a>
+<a name="ln571">}</a>
+<a name="ln572"> </a>
+<a name="ln573">/* Decide new LS sequence number to originate.</a>
+<a name="ln574">   note return value is network byte order */</a>
+<a name="ln575">u_int32_t</a>
+<a name="ln576">ospf6_new_ls_seqnum (u_int16_t type, u_int32_t id, u_int32_t adv_router,</a>
+<a name="ln577">                     struct ospf6_lsdb *lsdb)</a>
+<a name="ln578">{</a>
+<a name="ln579">  struct ospf6_lsa *lsa;</a>
+<a name="ln580">  signed long seqnum = 0;</a>
+<a name="ln581"> </a>
+<a name="ln582">  /* if current database copy not found, return InitialSequenceNumber */</a>
+<a name="ln583">  lsa = ospf6_lsdb_lookup (type, id, adv_router, lsdb);</a>
+<a name="ln584">  if (lsa == NULL)</a>
+<a name="ln585">    seqnum = OSPF_INITIAL_SEQUENCE_NUMBER;</a>
+<a name="ln586">  else</a>
+<a name="ln587">    seqnum = (signed long) ntohl (lsa-&gt;header-&gt;seqnum) + 1;</a>
+<a name="ln588"> </a>
+<a name="ln589">  return ((u_int32_t) htonl (seqnum));</a>
+<a name="ln590">}</a>
+<a name="ln591"> </a>
+<a name="ln592"> </a>
+
+</code></pre>
+<div class="balloon" rel="7"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1042/" target="_blank">V1042</a> This file is marked with copyleft license, which requires you to open the derived source code.</p></div>
+<div class="balloon" rel="166"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1020/" target="_blank">V1020</a> The function exited without calling the 'ospf6_lsa_unlock' function. Check lines: 166, 121.</p></div>
+<div class="balloon" rel="274"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1020/" target="_blank">V1020</a> The function exited without calling the 'route_unlock_node' function. Check lines: 274, 257.</p></div>
+<div class="balloon" rel="264"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1020/" target="_blank">V1020</a> The function exited without calling the 'route_unlock_node' function. Check lines: 264, 257.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

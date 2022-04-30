@@ -1,0 +1,1103 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>log.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.5.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Logging of zebra</a>
+<a name="ln3"> * Copyright (C) 1997, 1998, 1999 Kunihiro Ishiguro</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * This file is part of GNU Zebra.</a>
+<a name="ln6"> *</a>
+<a name="ln7"> * GNU Zebra is free software; you can redistribute it and/or modify it</a>
+<a name="ln8"> * under the terms of the GNU General Public License as published by the</a>
+<a name="ln9"> * Free Software Foundation; either version 2, or (at your option) any</a>
+<a name="ln10"> * later version.</a>
+<a name="ln11"> *</a>
+<a name="ln12"> * GNU Zebra is distributed in the hope that it will be useful, but</a>
+<a name="ln13"> * WITHOUT ANY WARRANTY; without even the implied warranty of</a>
+<a name="ln14"> * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU</a>
+<a name="ln15"> * General Public License for more details.</a>
+<a name="ln16"> *</a>
+<a name="ln17"> * You should have received a copy of the GNU General Public License</a>
+<a name="ln18"> * along with GNU Zebra; see the file COPYING.  If not, write to the Free</a>
+<a name="ln19"> * Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA</a>
+<a name="ln20"> * 02111-1307, USA.  </a>
+<a name="ln21"> */</a>
+<a name="ln22"> </a>
+<a name="ln23">#define QUAGGA_DEFINE_DESC_TABLE</a>
+<a name="ln24"> </a>
+<a name="ln25">#include &lt;zebra.h&gt;</a>
+<a name="ln26"> </a>
+<a name="ln27">#include &quot;log.h&quot;</a>
+<a name="ln28">#include &quot;memory.h&quot;</a>
+<a name="ln29">#include &quot;command.h&quot;</a>
+<a name="ln30">#ifndef SUNOS_5</a>
+<a name="ln31">#include &lt;sys/un.h&gt;</a>
+<a name="ln32">#endif</a>
+<a name="ln33">/* for printstack on solaris */</a>
+<a name="ln34">#ifdef HAVE_UCONTEXT_H</a>
+<a name="ln35">#include &lt;ucontext.h&gt;</a>
+<a name="ln36">#endif</a>
+<a name="ln37"> </a>
+<a name="ln38">static int logfile_fd = -1;	/* Used in signal handler. */</a>
+<a name="ln39"> </a>
+<a name="ln40">struct zlog *zlog_default = NULL;</a>
+<a name="ln41"> </a>
+<a name="ln42">const char *zlog_proto_names[] = </a>
+<a name="ln43">{</a>
+<a name="ln44">  &quot;NONE&quot;,</a>
+<a name="ln45">  &quot;DEFAULT&quot;,</a>
+<a name="ln46">  &quot;ZEBRA&quot;,</a>
+<a name="ln47">  &quot;RIP&quot;,</a>
+<a name="ln48">  &quot;BGP&quot;,</a>
+<a name="ln49">  &quot;OSPF&quot;,</a>
+<a name="ln50">  &quot;RIPNG&quot;,</a>
+<a name="ln51">  &quot;BABEL&quot;,</a>
+<a name="ln52">  &quot;OSPF6&quot;,</a>
+<a name="ln53">  &quot;ISIS&quot;,</a>
+<a name="ln54">  &quot;PIM&quot;,</a>
+<a name="ln55">  &quot;MASC&quot;,</a>
+<a name="ln56">  &quot;NHRP&quot;,</a>
+<a name="ln57">  NULL,</a>
+<a name="ln58">};</a>
+<a name="ln59"> </a>
+<a name="ln60">const char *zlog_priority[] =</a>
+<a name="ln61">{</a>
+<a name="ln62">  &quot;emergencies&quot;,</a>
+<a name="ln63">  &quot;alerts&quot;,</a>
+<a name="ln64">  &quot;critical&quot;,</a>
+<a name="ln65">  &quot;errors&quot;,</a>
+<a name="ln66">  &quot;warnings&quot;,</a>
+<a name="ln67">  &quot;notifications&quot;,</a>
+<a name="ln68">  &quot;informational&quot;,</a>
+<a name="ln69">  &quot;debugging&quot;,</a>
+<a name="ln70">  NULL,</a>
+<a name="ln71">};</a>
+<a name="ln72">  </a>
+<a name="ln73"> </a>
+<a name="ln74"> </a>
+<a name="ln75">/* For time string format. */</a>
+<a name="ln76"> </a>
+<a name="ln77">size_t</a>
+<a name="ln78">quagga_timestamp(int timestamp_precision, char *buf, size_t buflen)</a>
+<a name="ln79">{</a>
+<a name="ln80">  static struct {</a>
+<a name="ln81">    time_t last;</a>
+<a name="ln82">    size_t len;</a>
+<a name="ln83">    char buf[28];</a>
+<a name="ln84">  } cache;</a>
+<a name="ln85">  struct timeval clock;</a>
+<a name="ln86"> </a>
+<a name="ln87">  /* would it be sufficient to use global 'recent_time' here?  I fear not... */</a>
+<a name="ln88">  gettimeofday(&amp;clock, NULL);</a>
+<a name="ln89"> </a>
+<a name="ln90">  /* first, we update the cache if the time has changed */</a>
+<a name="ln91">  if (cache.last != clock.tv_sec)</a>
+<a name="ln92">    {</a>
+<a name="ln93">      struct tm *tm;</a>
+<a name="ln94">      cache.last = clock.tv_sec;</a>
+<a name="ln95">      tm = localtime(&amp;cache.last);</a>
+<a name="ln96">      cache.len = strftime(cache.buf, sizeof(cache.buf),</a>
+<a name="ln97">      			   &quot;%Y/%m/%d %H:%M:%S&quot;, tm);</a>
+<a name="ln98">    }</a>
+<a name="ln99">  /* note: it's not worth caching the subsecond part, because</a>
+<a name="ln100">     chances are that back-to-back calls are not sufficiently close together</a>
+<a name="ln101">     for the clock not to have ticked forward */</a>
+<a name="ln102"> </a>
+<a name="ln103">  if (buflen &gt; cache.len)</a>
+<a name="ln104">    {</a>
+<a name="ln105">      memcpy(buf, cache.buf, cache.len);</a>
+<a name="ln106">      if ((timestamp_precision &gt; 0) &amp;&amp;</a>
+<a name="ln107">	  (buflen &gt; cache.len+1+timestamp_precision))</a>
+<a name="ln108">	{</a>
+<a name="ln109">	  /* should we worry about locale issues? */</a>
+<a name="ln110">	  static const int divisor[] = {0, 100000, 10000, 1000, 100, 10, 1};</a>
+<a name="ln111">	  int prec;</a>
+<a name="ln112">	  char *p = buf+cache.len+1+(prec = timestamp_precision);</a>
+<a name="ln113">	  *p-- = '\0';</a>
+<a name="ln114">	  while (prec &gt; 6)</a>
+<a name="ln115">	    /* this is unlikely to happen, but protect anyway */</a>
+<a name="ln116">	    {</a>
+<a name="ln117">	      *p-- = '0';</a>
+<a name="ln118">	      prec--;</a>
+<a name="ln119">	    }</a>
+<a name="ln120">	  clock.tv_usec /= divisor[prec];</a>
+<a name="ln121">	  do</a>
+<a name="ln122">	    {</a>
+<a name="ln123">	      *p-- = '0'+(clock.tv_usec % 10);</a>
+<a name="ln124">	      clock.tv_usec /= 10;</a>
+<a name="ln125">	    }</a>
+<a name="ln126">	  while (--prec &gt; 0);</a>
+<a name="ln127">	  *p = '.';</a>
+<a name="ln128">	  return cache.len+1+timestamp_precision;</a>
+<a name="ln129">	}</a>
+<a name="ln130">      buf[cache.len] = '\0';</a>
+<a name="ln131">      return cache.len;</a>
+<a name="ln132">    }</a>
+<a name="ln133">  if (buflen &gt; 0)</a>
+<a name="ln134">    buf[0] = '\0';</a>
+<a name="ln135">  return 0;</a>
+<a name="ln136">}</a>
+<a name="ln137"> </a>
+<a name="ln138">/* Utility routine for current time printing. */</a>
+<a name="ln139">static void</a>
+<a name="ln140">time_print(FILE *fp, struct timestamp_control *ctl)</a>
+<a name="ln141">{</a>
+<a name="ln142">  if (!ctl-&gt;already_rendered)</a>
+<a name="ln143">    {</a>
+<a name="ln144">      ctl-&gt;len = quagga_timestamp(ctl-&gt;precision, ctl-&gt;buf, sizeof(ctl-&gt;buf));</a>
+<a name="ln145">      ctl-&gt;already_rendered = 1;</a>
+<a name="ln146">    }</a>
+<a name="ln147">  fprintf(fp, &quot;%s &quot;, ctl-&gt;buf);</a>
+<a name="ln148">}</a>
+<a name="ln149">  </a>
+<a name="ln150"> </a>
+<a name="ln151">/* va_list version of zlog. */</a>
+<a name="ln152">static void</a>
+<a name="ln153">vzlog (struct zlog *zl, int priority, const char *format, va_list args)</a>
+<a name="ln154">{</a>
+<a name="ln155">  int original_errno = errno;</a>
+<a name="ln156">  struct timestamp_control tsctl;</a>
+<a name="ln157">  tsctl.already_rendered = 0;</a>
+<a name="ln158"> </a>
+<a name="ln159">  /* If zlog is not specified, use default one. */</a>
+<a name="ln160">  if (zl == NULL)</a>
+<a name="ln161">    zl = zlog_default;</a>
+<a name="ln162"> </a>
+<a name="ln163">  /* When zlog_default is also NULL, use stderr for logging. */</a>
+<a name="ln164">  if (zl == NULL)</a>
+<a name="ln165">    {</a>
+<a name="ln166">      tsctl.precision = 0;</a>
+<a name="ln167">      time_print(stderr, &amp;tsctl);</a>
+<a name="ln168">      fprintf (stderr, &quot;%s: &quot;, &quot;unknown&quot;);</a>
+<a name="ln169">      vfprintf (stderr, format, args);</a>
+<a name="ln170">      fprintf (stderr, &quot;\n&quot;);</a>
+<a name="ln171">      fflush (stderr);</a>
+<a name="ln172"> </a>
+<a name="ln173">      /* In this case we return at here. */</a>
+<a name="ln174">      errno = original_errno;</a>
+<a name="ln175">      return;</a>
+<a name="ln176">    }</a>
+<a name="ln177">  tsctl.precision = zl-&gt;timestamp_precision;</a>
+<a name="ln178"> </a>
+<a name="ln179">  /* Syslog output */</a>
+<a name="ln180">  if (priority &lt;= zl-&gt;maxlvl[ZLOG_DEST_SYSLOG])</a>
+<a name="ln181">    {</a>
+<a name="ln182">      va_list ac;</a>
+<a name="ln183">      va_copy(ac, args);</a>
+<a name="ln184">      vsyslog (priority|zlog_default-&gt;facility, format, ac);</a>
+<a name="ln185">      va_end(ac);</a>
+<a name="ln186">    }</a>
+<a name="ln187"> </a>
+<a name="ln188">  /* File output. */</a>
+<a name="ln189">  if ((priority &lt;= zl-&gt;maxlvl[ZLOG_DEST_FILE]) &amp;&amp; zl-&gt;fp)</a>
+<a name="ln190">    {</a>
+<a name="ln191">      va_list ac;</a>
+<a name="ln192">      time_print (zl-&gt;fp, &amp;tsctl);</a>
+<a name="ln193">      if (zl-&gt;record_priority)</a>
+<a name="ln194">	fprintf (zl-&gt;fp, &quot;%s: &quot;, zlog_priority[priority]);</a>
+<a name="ln195">      fprintf (zl-&gt;fp, &quot;%s: &quot;, zlog_proto_names[zl-&gt;protocol]);</a>
+<a name="ln196">      va_copy(ac, args);</a>
+<a name="ln197">      vfprintf (zl-&gt;fp, format, ac);</a>
+<a name="ln198">      va_end(ac);</a>
+<a name="ln199">      fprintf (zl-&gt;fp, &quot;\n&quot;);</a>
+<a name="ln200">      fflush (zl-&gt;fp);</a>
+<a name="ln201">    }</a>
+<a name="ln202"> </a>
+<a name="ln203">  /* stdout output. */</a>
+<a name="ln204">  if (priority &lt;= zl-&gt;maxlvl[ZLOG_DEST_STDOUT])</a>
+<a name="ln205">    {</a>
+<a name="ln206">      va_list ac;</a>
+<a name="ln207">      time_print (stdout, &amp;tsctl);</a>
+<a name="ln208">      if (zl-&gt;record_priority)</a>
+<a name="ln209">	fprintf (stdout, &quot;%s: &quot;, zlog_priority[priority]);</a>
+<a name="ln210">      fprintf (stdout, &quot;%s: &quot;, zlog_proto_names[zl-&gt;protocol]);</a>
+<a name="ln211">      va_copy(ac, args);</a>
+<a name="ln212">      vfprintf (stdout, format, ac);</a>
+<a name="ln213">      va_end(ac);</a>
+<a name="ln214">      fprintf (stdout, &quot;\n&quot;);</a>
+<a name="ln215">      fflush (stdout);</a>
+<a name="ln216">    }</a>
+<a name="ln217"> </a>
+<a name="ln218">  /* Terminal monitor. */</a>
+<a name="ln219">  if (priority &lt;= zl-&gt;maxlvl[ZLOG_DEST_MONITOR])</a>
+<a name="ln220">    vty_log ((zl-&gt;record_priority ? zlog_priority[priority] : NULL),</a>
+<a name="ln221">	     zlog_proto_names[zl-&gt;protocol], format, &amp;tsctl, args);</a>
+<a name="ln222"> </a>
+<a name="ln223">  errno = original_errno;</a>
+<a name="ln224">}</a>
+<a name="ln225"> </a>
+<a name="ln226">static char *</a>
+<a name="ln227">str_append(char *dst, int len, const char *src)</a>
+<a name="ln228">{</a>
+<a name="ln229">  while ((len-- &gt; 0) &amp;&amp; *src)</a>
+<a name="ln230">    *dst++ = *src++;</a>
+<a name="ln231">  return dst;</a>
+<a name="ln232">}</a>
+<a name="ln233"> </a>
+<a name="ln234">static char *</a>
+<a name="ln235">num_append(char *s, int len, u_long x)</a>
+<a name="ln236">{</a>
+<a name="ln237">  char buf[30];</a>
+<a name="ln238">  char *t;</a>
+<a name="ln239"> </a>
+<a name="ln240">  if (!x)</a>
+<a name="ln241">    return str_append(s,len,&quot;0&quot;);</a>
+<a name="ln242">  *(t = &amp;buf[sizeof(buf)-1]) = '\0';</a>
+<a name="ln243">  while (x &amp;&amp; (t &gt; buf))</a>
+<a name="ln244">    {</a>
+<a name="ln245">      *--t = '0'+(x % 10);</a>
+<a name="ln246">      x /= 10;</a>
+<a name="ln247">    }</a>
+<a name="ln248">  return str_append(s,len,t);</a>
+<a name="ln249">}</a>
+<a name="ln250"> </a>
+<a name="ln251">#if defined(SA_SIGINFO) || defined(HAVE_STACK_TRACE)</a>
+<a name="ln252">static char *</a>
+<a name="ln253">hex_append(char *s, int len, u_long x)</a>
+<a name="ln254">{</a>
+<a name="ln255">  char buf[30];</a>
+<a name="ln256">  char *t;</a>
+<a name="ln257"> </a>
+<a name="ln258">  if (!x)</a>
+<a name="ln259">    return str_append(s,len,&quot;0&quot;);</a>
+<a name="ln260">  *(t = &amp;buf[sizeof(buf)-1]) = '\0';</a>
+<a name="ln261">  while (x &amp;&amp; (t &gt; buf))</a>
+<a name="ln262">    {</a>
+<a name="ln263">      u_int cc = (x % 16);</a>
+<a name="ln264">      *--t = ((cc &lt; 10) ? ('0'+cc) : ('a'+cc-10));</a>
+<a name="ln265">      x /= 16;</a>
+<a name="ln266">    }</a>
+<a name="ln267">  return str_append(s,len,t);</a>
+<a name="ln268">}</a>
+<a name="ln269">#endif</a>
+<a name="ln270"> </a>
+<a name="ln271">/* Needs to be enhanced to support Solaris. */</a>
+<a name="ln272">static int</a>
+<a name="ln273">syslog_connect(void)</a>
+<a name="ln274">{</a>
+<a name="ln275">#ifdef SUNOS_5</a>
+<a name="ln276">  return -1;</a>
+<a name="ln277">#else</a>
+<a name="ln278">  int fd;</a>
+<a name="ln279">  char *s;</a>
+<a name="ln280">  struct sockaddr_un addr;</a>
+<a name="ln281"> </a>
+<a name="ln282">  if ((fd = socket(AF_UNIX,SOCK_DGRAM,0)) &lt; 0)</a>
+<a name="ln283">    return -1;</a>
+<a name="ln284">  addr.sun_family = AF_UNIX;</a>
+<a name="ln285">#ifdef _PATH_LOG</a>
+<a name="ln286">#define SYSLOG_SOCKET_PATH _PATH_LOG</a>
+<a name="ln287">#else</a>
+<a name="ln288">#define SYSLOG_SOCKET_PATH &quot;/dev/log&quot;</a>
+<a name="ln289">#endif</a>
+<a name="ln290">  s = str_append(addr.sun_path,sizeof(addr.sun_path),SYSLOG_SOCKET_PATH);</a>
+<a name="ln291">#undef SYSLOG_SOCKET_PATH</a>
+<a name="ln292">  *s = '\0';</a>
+<a name="ln293">  if (connect(fd,(struct sockaddr *)&amp;addr,sizeof(addr)) &lt; 0)</a>
+<a name="ln294">    {</a>
+<a name="ln295">      close(fd);</a>
+<a name="ln296">      return -1;</a>
+<a name="ln297">    }</a>
+<a name="ln298">  return fd;</a>
+<a name="ln299">#endif</a>
+<a name="ln300">}</a>
+<a name="ln301"> </a>
+<a name="ln302">static void</a>
+<a name="ln303">syslog_sigsafe(int priority, const char *msg, size_t msglen)</a>
+<a name="ln304">{</a>
+<a name="ln305">  static int syslog_fd = -1;</a>
+<a name="ln306">  char buf[sizeof(&quot;&lt;1234567890&gt;ripngd[1234567890]: &quot;)+msglen+50];</a>
+<a name="ln307">  char *s;</a>
+<a name="ln308"> </a>
+<a name="ln309">  if ((syslog_fd &lt; 0) &amp;&amp; ((syslog_fd = syslog_connect()) &lt; 0))</a>
+<a name="ln310">    return;</a>
+<a name="ln311"> </a>
+<a name="ln312">#define LOC s,buf+sizeof(buf)-s</a>
+<a name="ln313">  s = buf;</a>
+<a name="ln314">  s = str_append(LOC,&quot;&lt;&quot;);</a>
+<a name="ln315">  s = num_append(LOC,priority);</a>
+<a name="ln316">  s = str_append(LOC,&quot;&gt;&quot;);</a>
+<a name="ln317">  /* forget about the timestamp, too difficult in a signal handler */</a>
+<a name="ln318">  s = str_append(LOC,zlog_default-&gt;ident);</a>
+<a name="ln319">  if (zlog_default-&gt;syslog_options &amp; LOG_PID)</a>
+<a name="ln320">    {</a>
+<a name="ln321">      s = str_append(LOC,&quot;[&quot;);</a>
+<a name="ln322">      s = num_append(LOC,getpid());</a>
+<a name="ln323">      s = str_append(LOC,&quot;]&quot;);</a>
+<a name="ln324">    }</a>
+<a name="ln325">  s = str_append(LOC,&quot;: &quot;);</a>
+<a name="ln326">  s = str_append(LOC,msg);</a>
+<a name="ln327">  write(syslog_fd,buf,s-buf);</a>
+<a name="ln328">#undef LOC</a>
+<a name="ln329">}</a>
+<a name="ln330"> </a>
+<a name="ln331">static int</a>
+<a name="ln332">open_crashlog(void)</a>
+<a name="ln333">{</a>
+<a name="ln334">#define CRASHLOG_PREFIX &quot;/var/tmp/quagga.&quot;</a>
+<a name="ln335">#define CRASHLOG_SUFFIX &quot;crashlog&quot;</a>
+<a name="ln336">  if (zlog_default &amp;&amp; zlog_default-&gt;ident)</a>
+<a name="ln337">    {</a>
+<a name="ln338">      /* Avoid strlen since it is not async-signal-safe. */</a>
+<a name="ln339">      const char *p;</a>
+<a name="ln340">      size_t ilen;</a>
+<a name="ln341"> </a>
+<a name="ln342">      for (p = zlog_default-&gt;ident, ilen = 0; *p; p++)</a>
+<a name="ln343">	ilen++;</a>
+<a name="ln344">      {</a>
+<a name="ln345">	char buf[sizeof(CRASHLOG_PREFIX)+ilen+sizeof(CRASHLOG_SUFFIX)+3];</a>
+<a name="ln346">	char *s = buf;</a>
+<a name="ln347">#define LOC s,buf+sizeof(buf)-s</a>
+<a name="ln348">	s = str_append(LOC, CRASHLOG_PREFIX);</a>
+<a name="ln349">	s = str_append(LOC, zlog_default-&gt;ident);</a>
+<a name="ln350">	s = str_append(LOC, &quot;.&quot;);</a>
+<a name="ln351">	s = str_append(LOC, CRASHLOG_SUFFIX);</a>
+<a name="ln352">#undef LOC</a>
+<a name="ln353">	*s = '\0';</a>
+<a name="ln354">	return open(buf, O_WRONLY|O_CREAT|O_EXCL, LOGFILE_MASK);</a>
+<a name="ln355">      }</a>
+<a name="ln356">    }</a>
+<a name="ln357">  return open(CRASHLOG_PREFIX CRASHLOG_SUFFIX, O_WRONLY|O_CREAT|O_EXCL,</a>
+<a name="ln358">	      LOGFILE_MASK);</a>
+<a name="ln359">#undef CRASHLOG_SUFFIX</a>
+<a name="ln360">#undef CRASHLOG_PREFIX</a>
+<a name="ln361">}</a>
+<a name="ln362"> </a>
+<a name="ln363">/* Note: the goal here is to use only async-signal-safe functions. */</a>
+<a name="ln364">void</a>
+<a name="ln365">zlog_signal(int signo, const char *action</a>
+<a name="ln366">#ifdef SA_SIGINFO</a>
+<a name="ln367">	    , siginfo_t *siginfo, void *program_counter</a>
+<a name="ln368">#endif</a>
+<a name="ln369">	   )</a>
+<a name="ln370">{</a>
+<a name="ln371">  time_t now;</a>
+<a name="ln372">  char buf[sizeof(&quot;DEFAULT: Received signal S at T (si_addr 0xP, PC 0xP); aborting...&quot;)+100];</a>
+<a name="ln373">  char *s = buf;</a>
+<a name="ln374">  char *msgstart = buf;</a>
+<a name="ln375">#define LOC s,buf+sizeof(buf)-s</a>
+<a name="ln376"> </a>
+<a name="ln377">  time(&amp;now);</a>
+<a name="ln378">  if (zlog_default)</a>
+<a name="ln379">    {</a>
+<a name="ln380">      s = str_append(LOC,zlog_proto_names[zlog_default-&gt;protocol]);</a>
+<a name="ln381">      *s++ = ':';</a>
+<a name="ln382">      *s++ = ' ';</a>
+<a name="ln383">      msgstart = s;</a>
+<a name="ln384">    }</a>
+<a name="ln385">  s = str_append(LOC,&quot;Received signal &quot;);</a>
+<a name="ln386">  s = num_append(LOC,signo);</a>
+<a name="ln387">  s = str_append(LOC,&quot; at &quot;);</a>
+<a name="ln388">  s = num_append(LOC,now);</a>
+<a name="ln389">#ifdef SA_SIGINFO</a>
+<a name="ln390">  s = str_append(LOC,&quot; (si_addr 0x&quot;);</a>
+<a name="ln391">  s = hex_append(LOC,(u_long)(siginfo-&gt;si_addr));</a>
+<a name="ln392">  if (program_counter)</a>
+<a name="ln393">    {</a>
+<a name="ln394">      s = str_append(LOC,&quot;, PC 0x&quot;);</a>
+<a name="ln395">      s = hex_append(LOC,(u_long)program_counter);</a>
+<a name="ln396">    }</a>
+<a name="ln397">  s = str_append(LOC,&quot;); &quot;);</a>
+<a name="ln398">#else /* SA_SIGINFO */</a>
+<a name="ln399">  s = str_append(LOC,&quot;; &quot;);</a>
+<a name="ln400">#endif /* SA_SIGINFO */</a>
+<a name="ln401">  s = str_append(LOC,action);</a>
+<a name="ln402">  if (s &lt; buf+sizeof(buf))</a>
+<a name="ln403">    *s++ = '\n';</a>
+<a name="ln404"> </a>
+<a name="ln405">  /* N.B. implicit priority is most severe */</a>
+<a name="ln406">#define PRI LOG_CRIT</a>
+<a name="ln407"> </a>
+<a name="ln408">#define DUMP(FD) write(FD, buf, s-buf);</a>
+<a name="ln409">  /* If no file logging configured, try to write to fallback log file. */</a>
+<a name="ln410">  if ((logfile_fd &gt;= 0) || ((logfile_fd = open_crashlog()) &gt;= 0))</a>
+<a name="ln411">    DUMP(logfile_fd)</a>
+<a name="ln412">  if (!zlog_default)</a>
+<a name="ln413">    DUMP(STDERR_FILENO)</a>
+<a name="ln414">  else</a>
+<a name="ln415">    {</a>
+<a name="ln416">      if (PRI &lt;= zlog_default-&gt;maxlvl[ZLOG_DEST_STDOUT])</a>
+<a name="ln417">        DUMP(STDOUT_FILENO)</a>
+<a name="ln418">      /* Remove trailing '\n' for monitor and syslog */</a>
+<a name="ln419">      *--s = '\0';</a>
+<a name="ln420">      if (PRI &lt;= zlog_default-&gt;maxlvl[ZLOG_DEST_MONITOR])</a>
+<a name="ln421">        vty_log_fixed(buf,s-buf);</a>
+<a name="ln422">      if (PRI &lt;= zlog_default-&gt;maxlvl[ZLOG_DEST_SYSLOG])</a>
+<a name="ln423">	syslog_sigsafe(PRI|zlog_default-&gt;facility,msgstart,s-msgstart);</a>
+<a name="ln424">    }</a>
+<a name="ln425">#undef DUMP</a>
+<a name="ln426"> </a>
+<a name="ln427">  zlog_backtrace_sigsafe(PRI,</a>
+<a name="ln428">#ifdef SA_SIGINFO</a>
+<a name="ln429">  			 program_counter</a>
+<a name="ln430">#else</a>
+<a name="ln431">			 NULL</a>
+<a name="ln432">#endif</a>
+<a name="ln433">			);</a>
+<a name="ln434"> </a>
+<a name="ln435">  s = buf;</a>
+<a name="ln436">  if (!thread_current)</a>
+<a name="ln437">    s = str_append (LOC, &quot;no thread information available\n&quot;);</a>
+<a name="ln438">  else</a>
+<a name="ln439">    {</a>
+<a name="ln440">      s = str_append (LOC, &quot;in thread &quot;);</a>
+<a name="ln441">      s = str_append (LOC, thread_current-&gt;funcname);</a>
+<a name="ln442">      s = str_append (LOC, &quot; scheduled from &quot;);</a>
+<a name="ln443">      s = str_append (LOC, thread_current-&gt;schedfrom);</a>
+<a name="ln444">      s = str_append (LOC, &quot;:&quot;);</a>
+<a name="ln445">      s = num_append (LOC, thread_current-&gt;schedfrom_line);</a>
+<a name="ln446">      s = str_append (LOC, &quot;\n&quot;);</a>
+<a name="ln447">    }</a>
+<a name="ln448"> </a>
+<a name="ln449">#define DUMP(FD) write(FD, buf, s-buf);</a>
+<a name="ln450">  /* If no file logging configured, try to write to fallback log file. */</a>
+<a name="ln451">  if (logfile_fd &gt;= 0)</a>
+<a name="ln452">    DUMP(logfile_fd)</a>
+<a name="ln453">  if (!zlog_default)</a>
+<a name="ln454">    DUMP(STDERR_FILENO)</a>
+<a name="ln455">  else</a>
+<a name="ln456">    {</a>
+<a name="ln457">      if (PRI &lt;= zlog_default-&gt;maxlvl[ZLOG_DEST_STDOUT])</a>
+<a name="ln458">        DUMP(STDOUT_FILENO)</a>
+<a name="ln459">      /* Remove trailing '\n' for monitor and syslog */</a>
+<a name="ln460">      *--s = '\0';</a>
+<a name="ln461">      if (PRI &lt;= zlog_default-&gt;maxlvl[ZLOG_DEST_MONITOR])</a>
+<a name="ln462">        vty_log_fixed(buf,s-buf);</a>
+<a name="ln463">      if (PRI &lt;= zlog_default-&gt;maxlvl[ZLOG_DEST_SYSLOG])</a>
+<a name="ln464">	syslog_sigsafe(PRI|zlog_default-&gt;facility,msgstart,s-msgstart);</a>
+<a name="ln465">    }</a>
+<a name="ln466">#undef DUMP</a>
+<a name="ln467"> </a>
+<a name="ln468">#undef PRI</a>
+<a name="ln469">#undef LOC</a>
+<a name="ln470">}</a>
+<a name="ln471"> </a>
+<a name="ln472">/* Log a backtrace using only async-signal-safe functions.</a>
+<a name="ln473">   Needs to be enhanced to support syslog logging. */</a>
+<a name="ln474">void</a>
+<a name="ln475">zlog_backtrace_sigsafe(int priority, void *program_counter)</a>
+<a name="ln476">{</a>
+<a name="ln477">#ifdef HAVE_STACK_TRACE</a>
+<a name="ln478">  static const char pclabel[] = &quot;Program counter: &quot;;</a>
+<a name="ln479">  void *array[64];</a>
+<a name="ln480">  int size;</a>
+<a name="ln481">  char buf[100];</a>
+<a name="ln482">  char *s, **bt = NULL;</a>
+<a name="ln483">#define LOC s,buf+sizeof(buf)-s</a>
+<a name="ln484"> </a>
+<a name="ln485">#ifdef HAVE_GLIBC_BACKTRACE</a>
+<a name="ln486">  size = backtrace(array, array_size(array));</a>
+<a name="ln487">  if (size &lt;= 0 || (size_t)size &gt; array_size(array))</a>
+<a name="ln488">    return;</a>
+<a name="ln489"> </a>
+<a name="ln490">#define DUMP(FD) { \</a>
+<a name="ln491">  if (program_counter) \</a>
+<a name="ln492">    { \</a>
+<a name="ln493">      write(FD, pclabel, sizeof(pclabel)-1); \</a>
+<a name="ln494">      backtrace_symbols_fd(&amp;program_counter, 1, FD); \</a>
+<a name="ln495">    } \</a>
+<a name="ln496">  write(FD, buf, s-buf);	\</a>
+<a name="ln497">  backtrace_symbols_fd(array, size, FD); \</a>
+<a name="ln498">}</a>
+<a name="ln499">#elif defined(HAVE_PRINTSTACK)</a>
+<a name="ln500">#define DUMP(FD) { \</a>
+<a name="ln501">  if (program_counter) \</a>
+<a name="ln502">    write((FD), pclabel, sizeof(pclabel)-1); \</a>
+<a name="ln503">  write((FD), buf, s-buf); \</a>
+<a name="ln504">  printstack((FD)); \</a>
+<a name="ln505">}</a>
+<a name="ln506">#endif /* HAVE_GLIBC_BACKTRACE, HAVE_PRINTSTACK */</a>
+<a name="ln507"> </a>
+<a name="ln508">  s = buf;</a>
+<a name="ln509">  s = str_append(LOC,&quot;Backtrace for &quot;);</a>
+<a name="ln510">  s = num_append(LOC,size);</a>
+<a name="ln511">  s = str_append(LOC,&quot; stack frames:\n&quot;);</a>
+<a name="ln512"> </a>
+<a name="ln513">  if ((logfile_fd &gt;= 0) || ((logfile_fd = open_crashlog()) &gt;= 0))</a>
+<a name="ln514">    DUMP(logfile_fd)</a>
+<a name="ln515">  if (!zlog_default)</a>
+<a name="ln516">    DUMP(STDERR_FILENO)</a>
+<a name="ln517">  else</a>
+<a name="ln518">    {</a>
+<a name="ln519">      if (priority &lt;= zlog_default-&gt;maxlvl[ZLOG_DEST_STDOUT])</a>
+<a name="ln520">	DUMP(STDOUT_FILENO)</a>
+<a name="ln521">      /* Remove trailing '\n' for monitor and syslog */</a>
+<a name="ln522">      *--s = '\0';</a>
+<a name="ln523">      if (priority &lt;= zlog_default-&gt;maxlvl[ZLOG_DEST_MONITOR])</a>
+<a name="ln524">	vty_log_fixed(buf,s-buf);</a>
+<a name="ln525">      if (priority &lt;= zlog_default-&gt;maxlvl[ZLOG_DEST_SYSLOG])</a>
+<a name="ln526">	syslog_sigsafe(priority|zlog_default-&gt;facility,buf,s-buf);</a>
+<a name="ln527">      {</a>
+<a name="ln528">	int i;</a>
+<a name="ln529">#ifdef HAVE_GLIBC_BACKTRACE</a>
+<a name="ln530">        bt = backtrace_symbols(array, size);</a>
+<a name="ln531">#endif</a>
+<a name="ln532">	/* Just print the function addresses. */</a>
+<a name="ln533">	for (i = 0; i &lt; size; i++)</a>
+<a name="ln534">	  {</a>
+<a name="ln535">	    s = buf;</a>
+<a name="ln536">	    if (bt) </a>
+<a name="ln537">	      s = str_append(LOC, bt[i]);</a>
+<a name="ln538">	    else {</a>
+<a name="ln539">	      s = str_append(LOC,&quot;[bt &quot;);</a>
+<a name="ln540">	      s = num_append(LOC,i);</a>
+<a name="ln541">	      s = str_append(LOC,&quot;] 0x&quot;);</a>
+<a name="ln542">	      s = hex_append(LOC,(u_long)(array[i]));</a>
+<a name="ln543">	    }</a>
+<a name="ln544">	    *s = '\0';</a>
+<a name="ln545">	    if (priority &lt;= zlog_default-&gt;maxlvl[ZLOG_DEST_MONITOR])</a>
+<a name="ln546">	      vty_log_fixed(buf,s-buf);</a>
+<a name="ln547">	    if (priority &lt;= zlog_default-&gt;maxlvl[ZLOG_DEST_SYSLOG])</a>
+<a name="ln548">	      syslog_sigsafe(priority|zlog_default-&gt;facility,buf,s-buf);</a>
+<a name="ln549">	  }</a>
+<a name="ln550">	  if (bt)</a>
+<a name="ln551">	    free(bt);</a>
+<a name="ln552">      }</a>
+<a name="ln553">    }</a>
+<a name="ln554">#undef DUMP</a>
+<a name="ln555">#undef LOC</a>
+<a name="ln556">#endif /* HAVE_STRACK_TRACE */</a>
+<a name="ln557">}</a>
+<a name="ln558"> </a>
+<a name="ln559">void</a>
+<a name="ln560">zlog_backtrace(int priority)</a>
+<a name="ln561">{</a>
+<a name="ln562">#ifndef HAVE_GLIBC_BACKTRACE</a>
+<a name="ln563">  zlog(NULL, priority, &quot;No backtrace available on this platform.&quot;);</a>
+<a name="ln564">#else</a>
+<a name="ln565">  void *array[20];</a>
+<a name="ln566">  int size, i;</a>
+<a name="ln567">  char **strings;</a>
+<a name="ln568"> </a>
+<a name="ln569">  size = backtrace(array, array_size(array));</a>
+<a name="ln570">  if (size &lt;= 0 || (size_t)size &gt; array_size(array))</a>
+<a name="ln571">    {</a>
+<a name="ln572">      zlog_err(&quot;Cannot get backtrace, returned invalid # of frames %d &quot;</a>
+<a name="ln573">	       &quot;(valid range is between 1 and %lu)&quot;,</a>
+<a name="ln574">	       size, (unsigned long)(array_size(array)));</a>
+<a name="ln575">      return;</a>
+<a name="ln576">    }</a>
+<a name="ln577">  zlog(NULL, priority, &quot;Backtrace for %d stack frames:&quot;, size);</a>
+<a name="ln578">  if (!(strings = backtrace_symbols(array, size)))</a>
+<a name="ln579">    {</a>
+<a name="ln580">      zlog_err(&quot;Cannot get backtrace symbols (out of memory?)&quot;);</a>
+<a name="ln581">      for (i = 0; i &lt; size; i++)</a>
+<a name="ln582">	zlog(NULL, priority, &quot;[bt %d] %p&quot;,i,array[i]);</a>
+<a name="ln583">    }</a>
+<a name="ln584">  else</a>
+<a name="ln585">    {</a>
+<a name="ln586">      for (i = 0; i &lt; size; i++)</a>
+<a name="ln587">	zlog(NULL, priority, &quot;[bt %d] %s&quot;,i,strings[i]);</a>
+<a name="ln588">      free(strings);</a>
+<a name="ln589">    }</a>
+<a name="ln590">#endif /* HAVE_GLIBC_BACKTRACE */</a>
+<a name="ln591">}</a>
+<a name="ln592"> </a>
+<a name="ln593">void</a>
+<a name="ln594">zlog (struct zlog *zl, int priority, const char *format, ...)</a>
+<a name="ln595">{</a>
+<a name="ln596">  va_list args;</a>
+<a name="ln597"> </a>
+<a name="ln598">  va_start(args, format);</a>
+<a name="ln599">  vzlog (zl, priority, format, args);</a>
+<a name="ln600">  va_end (args);</a>
+<a name="ln601">}</a>
+<a name="ln602"> </a>
+<a name="ln603">#define ZLOG_FUNC(FUNCNAME,PRIORITY) \</a>
+<a name="ln604">void \</a>
+<a name="ln605">FUNCNAME(const char *format, ...) \</a>
+<a name="ln606">{ \</a>
+<a name="ln607">  va_list args; \</a>
+<a name="ln608">  va_start(args, format); \</a>
+<a name="ln609">  vzlog (NULL, PRIORITY, format, args); \</a>
+<a name="ln610">  va_end(args); \</a>
+<a name="ln611">}</a>
+<a name="ln612"> </a>
+<a name="ln613">ZLOG_FUNC(zlog_err, LOG_ERR)</a>
+<a name="ln614"> </a>
+<a name="ln615">ZLOG_FUNC(zlog_warn, LOG_WARNING)</a>
+<a name="ln616"> </a>
+<a name="ln617">ZLOG_FUNC(zlog_info, LOG_INFO)</a>
+<a name="ln618"> </a>
+<a name="ln619">ZLOG_FUNC(zlog_notice, LOG_NOTICE)</a>
+<a name="ln620"> </a>
+<a name="ln621">ZLOG_FUNC(zlog_debug, LOG_DEBUG)</a>
+<a name="ln622"> </a>
+<a name="ln623">#undef ZLOG_FUNC</a>
+<a name="ln624"> </a>
+<a name="ln625">#define PLOG_FUNC(FUNCNAME,PRIORITY) \</a>
+<a name="ln626">void \</a>
+<a name="ln627">FUNCNAME(struct zlog *zl, const char *format, ...) \</a>
+<a name="ln628">{ \</a>
+<a name="ln629">  va_list args; \</a>
+<a name="ln630">  va_start(args, format); \</a>
+<a name="ln631">  vzlog (zl, PRIORITY, format, args); \</a>
+<a name="ln632">  va_end(args); \</a>
+<a name="ln633">}</a>
+<a name="ln634"> </a>
+<a name="ln635">PLOG_FUNC(plog_err, LOG_ERR)</a>
+<a name="ln636"> </a>
+<a name="ln637">PLOG_FUNC(plog_warn, LOG_WARNING)</a>
+<a name="ln638"> </a>
+<a name="ln639">PLOG_FUNC(plog_info, LOG_INFO)</a>
+<a name="ln640"> </a>
+<a name="ln641">PLOG_FUNC(plog_notice, LOG_NOTICE)</a>
+<a name="ln642"> </a>
+<a name="ln643">PLOG_FUNC(plog_debug, LOG_DEBUG)</a>
+<a name="ln644"> </a>
+<a name="ln645">#undef PLOG_FUNC</a>
+<a name="ln646"> </a>
+<a name="ln647">void zlog_thread_info (int log_level)</a>
+<a name="ln648">{</a>
+<a name="ln649">  if (thread_current)</a>
+<a name="ln650">    zlog(NULL, log_level, &quot;Current thread function %s, scheduled from &quot;</a>
+<a name="ln651">	 &quot;file %s, line %u&quot;, thread_current-&gt;funcname,</a>
+<a name="ln652">	 thread_current-&gt;schedfrom, thread_current-&gt;schedfrom_line);</a>
+<a name="ln653">  else</a>
+<a name="ln654">    zlog(NULL, log_level, &quot;Current thread not known/applicable&quot;);</a>
+<a name="ln655">}</a>
+<a name="ln656"> </a>
+<a name="ln657">void</a>
+<a name="ln658">_zlog_assert_failed (const char *assertion, const char *file,</a>
+<a name="ln659">		     unsigned int line, const char *function)</a>
+<a name="ln660">{</a>
+<a name="ln661">  /* Force fallback file logging? */</a>
+<a name="ln662">  if (zlog_default &amp;&amp; !zlog_default-&gt;fp &amp;&amp;</a>
+<a name="ln663">      ((logfile_fd = open_crashlog()) &gt;= 0) &amp;&amp;</a>
+<a name="ln664">      ((zlog_default-&gt;fp = fdopen(logfile_fd, &quot;w&quot;)) != NULL))</a>
+<a name="ln665">    zlog_default-&gt;maxlvl[ZLOG_DEST_FILE] = LOG_ERR;</a>
+<a name="ln666">  zlog(NULL, LOG_CRIT, &quot;Assertion `%s' failed in file %s, line %u, function %s&quot;,</a>
+<a name="ln667">       assertion,file,line,(function ? function : &quot;?&quot;));</a>
+<a name="ln668">  zlog_backtrace(LOG_CRIT);</a>
+<a name="ln669">  zlog_thread_info(LOG_CRIT);</a>
+<a name="ln670">  abort();</a>
+<a name="ln671">}</a>
+<a name="ln672"> </a>
+<a name="ln673"> </a>
+<a name="ln674">/* Open log stream */</a>
+<a name="ln675">struct zlog *</a>
+<a name="ln676">openzlog (const char *progname, zlog_proto_t protocol,</a>
+<a name="ln677">	  int syslog_flags, int syslog_facility)</a>
+<a name="ln678">{</a>
+<a name="ln679">  struct zlog *zl;</a>
+<a name="ln680">  u_int i;</a>
+<a name="ln681"> </a>
+<a name="ln682">  zl = XCALLOC(MTYPE_ZLOG, sizeof (struct zlog));</a>
+<a name="ln683"> </a>
+<a name="ln684">  zl-&gt;ident = progname;</a>
+<a name="ln685">  zl-&gt;protocol = protocol;</a>
+<a name="ln686">  zl-&gt;facility = syslog_facility;</a>
+<a name="ln687">  zl-&gt;syslog_options = syslog_flags;</a>
+<a name="ln688"> </a>
+<a name="ln689">  /* Set default logging levels. */</a>
+<a name="ln690">  for (i = 0; i &lt; array_size(zl-&gt;maxlvl); i++)</a>
+<a name="ln691">    zl-&gt;maxlvl[i] = ZLOG_DISABLED;</a>
+<a name="ln692">  zl-&gt;maxlvl[ZLOG_DEST_MONITOR] = LOG_DEBUG;</a>
+<a name="ln693">  zl-&gt;default_lvl = LOG_DEBUG;</a>
+<a name="ln694"> </a>
+<a name="ln695">  openlog (progname, syslog_flags, zl-&gt;facility);</a>
+<a name="ln696">  </a>
+<a name="ln697">  return zl;</a>
+<a name="ln698">}</a>
+<a name="ln699"> </a>
+<a name="ln700">void</a>
+<a name="ln701">closezlog (struct zlog *zl)</a>
+<a name="ln702">{</a>
+<a name="ln703">  closelog();</a>
+<a name="ln704"> </a>
+<a name="ln705">  if (zl-&gt;fp != NULL)</a>
+<a name="ln706">    fclose (zl-&gt;fp);</a>
+<a name="ln707"> </a>
+<a name="ln708">  if (zl-&gt;filename != NULL)</a>
+<a name="ln709">    free (zl-&gt;filename);</a>
+<a name="ln710"> </a>
+<a name="ln711">  XFREE (MTYPE_ZLOG, zl);</a>
+<a name="ln712">}</a>
+<a name="ln713"> </a>
+<a name="ln714">/* Called from command.c. */</a>
+<a name="ln715">void</a>
+<a name="ln716">zlog_set_level (struct zlog *zl, zlog_dest_t dest, int log_level)</a>
+<a name="ln717">{</a>
+<a name="ln718">  if (zl == NULL)</a>
+<a name="ln719">    zl = zlog_default;</a>
+<a name="ln720"> </a>
+<a name="ln721">  zl-&gt;maxlvl[dest] = log_level;</a>
+<a name="ln722">}</a>
+<a name="ln723"> </a>
+<a name="ln724">int</a>
+<a name="ln725">zlog_set_file (struct zlog *zl, const char *filename, int log_level)</a>
+<a name="ln726">{</a>
+<a name="ln727">  FILE *fp;</a>
+<a name="ln728">  mode_t oldumask;</a>
+<a name="ln729"> </a>
+<a name="ln730">  /* There is opend file.  */</a>
+<a name="ln731">  zlog_reset_file (zl);</a>
+<a name="ln732"> </a>
+<a name="ln733">  /* Set default zl. */</a>
+<a name="ln734">  if (zl == NULL)</a>
+<a name="ln735">    zl = zlog_default;</a>
+<a name="ln736"> </a>
+<a name="ln737">  /* Open file. */</a>
+<a name="ln738">  oldumask = umask (0777 &amp; ~LOGFILE_MASK);</a>
+<a name="ln739">  fp = fopen (filename, &quot;a&quot;);</a>
+<a name="ln740">  umask(oldumask);</a>
+<a name="ln741">  if (fp == NULL)</a>
+<a name="ln742">    return 0;</a>
+<a name="ln743"> </a>
+<a name="ln744">  /* Set flags. */</a>
+<a name="ln745">  zl-&gt;filename = strdup (filename);</a>
+<a name="ln746">  zl-&gt;maxlvl[ZLOG_DEST_FILE] = log_level;</a>
+<a name="ln747">  zl-&gt;fp = fp;</a>
+<a name="ln748">  logfile_fd = fileno(fp);</a>
+<a name="ln749"> </a>
+<a name="ln750">  return 1;</a>
+<a name="ln751">}</a>
+<a name="ln752"> </a>
+<a name="ln753">/* Reset opend file. */</a>
+<a name="ln754">int</a>
+<a name="ln755">zlog_reset_file (struct zlog *zl)</a>
+<a name="ln756">{</a>
+<a name="ln757">  if (zl == NULL)</a>
+<a name="ln758">    zl = zlog_default;</a>
+<a name="ln759"> </a>
+<a name="ln760">  if (zl-&gt;fp)</a>
+<a name="ln761">    fclose (zl-&gt;fp);</a>
+<a name="ln762">  zl-&gt;fp = NULL;</a>
+<a name="ln763">  logfile_fd = -1;</a>
+<a name="ln764">  zl-&gt;maxlvl[ZLOG_DEST_FILE] = ZLOG_DISABLED;</a>
+<a name="ln765"> </a>
+<a name="ln766">  if (zl-&gt;filename)</a>
+<a name="ln767">    free (zl-&gt;filename);</a>
+<a name="ln768">  zl-&gt;filename = NULL;</a>
+<a name="ln769"> </a>
+<a name="ln770">  return 1;</a>
+<a name="ln771">}</a>
+<a name="ln772"> </a>
+<a name="ln773">/* Reopen log file. */</a>
+<a name="ln774">int</a>
+<a name="ln775">zlog_rotate (struct zlog *zl)</a>
+<a name="ln776">{</a>
+<a name="ln777">  int level;</a>
+<a name="ln778"> </a>
+<a name="ln779">  if (zl == NULL)</a>
+<a name="ln780">    zl = zlog_default;</a>
+<a name="ln781"> </a>
+<a name="ln782">  if (zl-&gt;fp)</a>
+<a name="ln783">    fclose (zl-&gt;fp);</a>
+<a name="ln784">  zl-&gt;fp = NULL;</a>
+<a name="ln785">  logfile_fd = -1;</a>
+<a name="ln786">  level = zl-&gt;maxlvl[ZLOG_DEST_FILE];</a>
+<a name="ln787">  zl-&gt;maxlvl[ZLOG_DEST_FILE] = ZLOG_DISABLED;</a>
+<a name="ln788"> </a>
+<a name="ln789">  if (zl-&gt;filename)</a>
+<a name="ln790">    {</a>
+<a name="ln791">      mode_t oldumask;</a>
+<a name="ln792">      int save_errno;</a>
+<a name="ln793"> </a>
+<a name="ln794">      oldumask = umask (0777 &amp; ~LOGFILE_MASK);</a>
+<a name="ln795">      zl-&gt;fp = fopen (zl-&gt;filename, &quot;a&quot;);</a>
+<a name="ln796">      save_errno = errno;</a>
+<a name="ln797">      umask(oldumask);</a>
+<a name="ln798">      if (zl-&gt;fp == NULL)</a>
+<a name="ln799">        {</a>
+<a name="ln800">	  zlog_err(&quot;Log rotate failed: cannot open file %s for append: %s&quot;,</a>
+<a name="ln801">	  	   zl-&gt;filename, safe_strerror(save_errno));</a>
+<a name="ln802">	  return -1;</a>
+<a name="ln803">        }	</a>
+<a name="ln804">      logfile_fd = fileno(zl-&gt;fp);</a>
+<a name="ln805">      zl-&gt;maxlvl[ZLOG_DEST_FILE] = level;</a>
+<a name="ln806">    }</a>
+<a name="ln807"> </a>
+<a name="ln808">  return 1;</a>
+<a name="ln809">}</a>
+<a name="ln810"> </a>
+<a name="ln811">/* Message lookup function. */</a>
+<a name="ln812">const char *</a>
+<a name="ln813">lookup (const struct message *mes, int key)</a>
+<a name="ln814">{</a>
+<a name="ln815">  const struct message *pnt;</a>
+<a name="ln816"> </a>
+<a name="ln817">  for (pnt = mes; pnt-&gt;key != 0; pnt++) </a>
+<a name="ln818">    if (pnt-&gt;key == key) </a>
+<a name="ln819">      return pnt-&gt;str;</a>
+<a name="ln820"> </a>
+<a name="ln821">  return &quot;&quot;;</a>
+<a name="ln822">}</a>
+<a name="ln823"> </a>
+<a name="ln824">/* Older/faster version of message lookup function, but requires caller to pass</a>
+<a name="ln825"> * in the array size (instead of relying on a 0 key to terminate the search). </a>
+<a name="ln826"> *</a>
+<a name="ln827"> * The return value is the message string if found, or the 'none' pointer</a>
+<a name="ln828"> * provided otherwise.</a>
+<a name="ln829"> */</a>
+<a name="ln830">const char *</a>
+<a name="ln831">mes_lookup (const struct message *meslist, int max, int index,</a>
+<a name="ln832">  const char *none, const char *mesname)</a>
+<a name="ln833">{</a>
+<a name="ln834">  int pos = index - meslist[0].key;</a>
+<a name="ln835">  </a>
+<a name="ln836">  /* first check for best case: index is in range and matches the key</a>
+<a name="ln837">   * value in that slot.</a>
+<a name="ln838">   * NB: key numbering might be offset from 0. E.g. protocol constants</a>
+<a name="ln839">   * often start at 1.</a>
+<a name="ln840">   */</a>
+<a name="ln841">  if ((pos &gt;= 0) &amp;&amp; (pos &lt; max)</a>
+<a name="ln842">      &amp;&amp; (meslist[pos].key == index))</a>
+<a name="ln843">    return meslist[pos].str;</a>
+<a name="ln844"> </a>
+<a name="ln845">  /* fall back to linear search */</a>
+<a name="ln846">  {</a>
+<a name="ln847">    int i;</a>
+<a name="ln848"> </a>
+<a name="ln849">    for (i = 0; i &lt; max; i++, meslist++)</a>
+<a name="ln850">      {</a>
+<a name="ln851">	if (meslist-&gt;key == index)</a>
+<a name="ln852">	  {</a>
+<a name="ln853">	    const char *str = (meslist-&gt;str ? meslist-&gt;str : none);</a>
+<a name="ln854">	    </a>
+<a name="ln855">	    zlog_debug (&quot;message index %d [%s] found in %s at position %d (max is %d)&quot;,</a>
+<a name="ln856">		      index, str, mesname, i, max);</a>
+<a name="ln857">	    return str;</a>
+<a name="ln858">	  }</a>
+<a name="ln859">      }</a>
+<a name="ln860">  }</a>
+<a name="ln861">  zlog_err(&quot;message index %d not found in %s (max is %d)&quot;, index, mesname, max);</a>
+<a name="ln862">  assert (none);</a>
+<a name="ln863">  return none;</a>
+<a name="ln864">}</a>
+<a name="ln865"> </a>
+<a name="ln866">/* Wrapper around strerror to handle case where it returns NULL. */</a>
+<a name="ln867">const char *</a>
+<a name="ln868">safe_strerror(int errnum)</a>
+<a name="ln869">{</a>
+<a name="ln870">  const char *s = strerror(errnum);</a>
+<a name="ln871">  return (s != NULL) ? s : &quot;Unknown error&quot;;</a>
+<a name="ln872">}</a>
+<a name="ln873"> </a>
+<a name="ln874">#define DESC_ENTRY(T) [(T)] = { (T), (#T), '\0' }</a>
+<a name="ln875">static const struct zebra_desc_table command_types[] = {</a>
+<a name="ln876">  DESC_ENTRY	(ZEBRA_INTERFACE_ADD),</a>
+<a name="ln877">  DESC_ENTRY	(ZEBRA_INTERFACE_DELETE),</a>
+<a name="ln878">  DESC_ENTRY	(ZEBRA_INTERFACE_ADDRESS_ADD),</a>
+<a name="ln879">  DESC_ENTRY	(ZEBRA_INTERFACE_ADDRESS_DELETE),</a>
+<a name="ln880">  DESC_ENTRY	(ZEBRA_INTERFACE_UP),</a>
+<a name="ln881">  DESC_ENTRY	(ZEBRA_INTERFACE_DOWN),</a>
+<a name="ln882">  DESC_ENTRY	(ZEBRA_IPV4_ROUTE_ADD),</a>
+<a name="ln883">  DESC_ENTRY	(ZEBRA_IPV4_ROUTE_DELETE),</a>
+<a name="ln884">  DESC_ENTRY	(ZEBRA_IPV6_ROUTE_ADD),</a>
+<a name="ln885">  DESC_ENTRY	(ZEBRA_IPV6_ROUTE_DELETE),</a>
+<a name="ln886">  DESC_ENTRY	(ZEBRA_REDISTRIBUTE_ADD),</a>
+<a name="ln887">  DESC_ENTRY	(ZEBRA_REDISTRIBUTE_DELETE),</a>
+<a name="ln888">  DESC_ENTRY	(ZEBRA_REDISTRIBUTE_DEFAULT_ADD),</a>
+<a name="ln889">  DESC_ENTRY	(ZEBRA_REDISTRIBUTE_DEFAULT_DELETE),</a>
+<a name="ln890">  DESC_ENTRY	(ZEBRA_IPV4_NEXTHOP_LOOKUP),</a>
+<a name="ln891">  DESC_ENTRY	(ZEBRA_IPV6_NEXTHOP_LOOKUP),</a>
+<a name="ln892">  DESC_ENTRY	(ZEBRA_IPV4_IMPORT_LOOKUP),</a>
+<a name="ln893">  DESC_ENTRY	(ZEBRA_IPV6_IMPORT_LOOKUP),</a>
+<a name="ln894">  DESC_ENTRY	(ZEBRA_INTERFACE_RENAME),</a>
+<a name="ln895">  DESC_ENTRY	(ZEBRA_ROUTER_ID_ADD),</a>
+<a name="ln896">  DESC_ENTRY	(ZEBRA_ROUTER_ID_DELETE),</a>
+<a name="ln897">  DESC_ENTRY	(ZEBRA_ROUTER_ID_UPDATE),</a>
+<a name="ln898">  DESC_ENTRY	(ZEBRA_HELLO),</a>
+<a name="ln899">  DESC_ENTRY	(ZEBRA_NEXTHOP_REGISTER),</a>
+<a name="ln900">  DESC_ENTRY	(ZEBRA_NEXTHOP_UNREGISTER),</a>
+<a name="ln901">  DESC_ENTRY	(ZEBRA_NEXTHOP_UPDATE),</a>
+<a name="ln902">};</a>
+<a name="ln903">#undef DESC_ENTRY</a>
+<a name="ln904"> </a>
+<a name="ln905">static const struct zebra_desc_table unknown = { 0, &quot;unknown&quot;, '?' };</a>
+<a name="ln906"> </a>
+<a name="ln907">static const struct zebra_desc_table *</a>
+<a name="ln908">zroute_lookup(u_int zroute)</a>
+<a name="ln909">{</a>
+<a name="ln910">  u_int i;</a>
+<a name="ln911"> </a>
+<a name="ln912">  if (zroute &gt;= array_size(route_types))</a>
+<a name="ln913">    {</a>
+<a name="ln914">      zlog_err(&quot;unknown zebra route type: %u&quot;, zroute);</a>
+<a name="ln915">      return &amp;unknown;</a>
+<a name="ln916">    }</a>
+<a name="ln917">  if (zroute == route_types[zroute].type)</a>
+<a name="ln918">    return &amp;route_types[zroute];</a>
+<a name="ln919">  for (i = 0; i &lt; array_size(route_types); i++)</a>
+<a name="ln920">    {</a>
+<a name="ln921">      if (zroute == route_types[i].type)</a>
+<a name="ln922">        {</a>
+<a name="ln923">	  zlog_warn(&quot;internal error: route type table out of order &quot;</a>
+<a name="ln924">		    &quot;while searching for %u, please notify developers&quot;, zroute);</a>
+<a name="ln925">	  return &amp;route_types[i];</a>
+<a name="ln926">        }</a>
+<a name="ln927">    }</a>
+<a name="ln928">  zlog_err(&quot;internal error: cannot find route type %u in table!&quot;, zroute);</a>
+<a name="ln929">  return &amp;unknown;</a>
+<a name="ln930">}</a>
+<a name="ln931"> </a>
+<a name="ln932">const char *</a>
+<a name="ln933">zebra_route_string(u_int zroute)</a>
+<a name="ln934">{</a>
+<a name="ln935">  return zroute_lookup(zroute)-&gt;string;</a>
+<a name="ln936">}</a>
+<a name="ln937"> </a>
+<a name="ln938">char</a>
+<a name="ln939">zebra_route_char(u_int zroute)</a>
+<a name="ln940">{</a>
+<a name="ln941">  return zroute_lookup(zroute)-&gt;chr;</a>
+<a name="ln942">}</a>
+<a name="ln943"> </a>
+<a name="ln944">const char *</a>
+<a name="ln945">zserv_command_string (unsigned int command)</a>
+<a name="ln946">{</a>
+<a name="ln947">  if (command &gt;= array_size(command_types))</a>
+<a name="ln948">    {</a>
+<a name="ln949">      zlog_err (&quot;unknown zserv command type: %u&quot;, command);</a>
+<a name="ln950">      return unknown.string;</a>
+<a name="ln951">    }</a>
+<a name="ln952">  return command_types[command].string;</a>
+<a name="ln953">}</a>
+<a name="ln954"> </a>
+<a name="ln955">int</a>
+<a name="ln956">proto_name2num(const char *s)</a>
+<a name="ln957">{</a>
+<a name="ln958">   unsigned i;</a>
+<a name="ln959"> </a>
+<a name="ln960">   for (i=0; i&lt;array_size(route_types); ++i)</a>
+<a name="ln961">     if (strcasecmp(s, route_types[i].string) == 0)</a>
+<a name="ln962">       return route_types[i].type;</a>
+<a name="ln963">   return -1;</a>
+<a name="ln964">}</a>
+<a name="ln965"> </a>
+<a name="ln966">int</a>
+<a name="ln967">proto_redistnum(int afi, const char *s)</a>
+<a name="ln968">{</a>
+<a name="ln969">  if (! s)</a>
+<a name="ln970">    return -1;</a>
+<a name="ln971"> </a>
+<a name="ln972">  if (afi == AFI_IP)</a>
+<a name="ln973">    {</a>
+<a name="ln974">      if (strncmp (s, &quot;k&quot;, 1) == 0)</a>
+<a name="ln975">	return ZEBRA_ROUTE_KERNEL;</a>
+<a name="ln976">      else if (strncmp (s, &quot;c&quot;, 1) == 0)</a>
+<a name="ln977">	return ZEBRA_ROUTE_CONNECT;</a>
+<a name="ln978">      else if (strncmp (s, &quot;s&quot;, 1) == 0)</a>
+<a name="ln979">	return ZEBRA_ROUTE_STATIC;</a>
+<a name="ln980">      else if (strncmp (s, &quot;r&quot;, 1) == 0)</a>
+<a name="ln981">	return ZEBRA_ROUTE_RIP;</a>
+<a name="ln982">      else if (strncmp (s, &quot;o&quot;, 1) == 0)</a>
+<a name="ln983">	return ZEBRA_ROUTE_OSPF;</a>
+<a name="ln984">      else if (strncmp (s, &quot;i&quot;, 1) == 0)</a>
+<a name="ln985">	return ZEBRA_ROUTE_ISIS;</a>
+<a name="ln986">      else if (strncmp (s, &quot;bg&quot;, 2) == 0)</a>
+<a name="ln987">	return ZEBRA_ROUTE_BGP;</a>
+<a name="ln988">      else if (strncmp (s, &quot;ba&quot;, 2) == 0)</a>
+<a name="ln989">	return ZEBRA_ROUTE_BABEL;</a>
+<a name="ln990">      else if (strncmp (s, &quot;n&quot;, 1) == 0)</a>
+<a name="ln991">	return ZEBRA_ROUTE_NHRP;</a>
+<a name="ln992">    }</a>
+<a name="ln993">  if (afi == AFI_IP6)</a>
+<a name="ln994">    {</a>
+<a name="ln995">      if (strncmp (s, &quot;k&quot;, 1) == 0)</a>
+<a name="ln996">	return ZEBRA_ROUTE_KERNEL;</a>
+<a name="ln997">      else if (strncmp (s, &quot;c&quot;, 1) == 0)</a>
+<a name="ln998">	return ZEBRA_ROUTE_CONNECT;</a>
+<a name="ln999">      else if (strncmp (s, &quot;s&quot;, 1) == 0)</a>
+<a name="ln1000">	return ZEBRA_ROUTE_STATIC;</a>
+<a name="ln1001">      else if (strncmp (s, &quot;r&quot;, 1) == 0)</a>
+<a name="ln1002">	return ZEBRA_ROUTE_RIPNG;</a>
+<a name="ln1003">      else if (strncmp (s, &quot;o&quot;, 1) == 0)</a>
+<a name="ln1004">	return ZEBRA_ROUTE_OSPF6;</a>
+<a name="ln1005">      else if (strncmp (s, &quot;i&quot;, 1) == 0)</a>
+<a name="ln1006">	return ZEBRA_ROUTE_ISIS;</a>
+<a name="ln1007">      else if (strncmp (s, &quot;bg&quot;, 2) == 0)</a>
+<a name="ln1008">	return ZEBRA_ROUTE_BGP;</a>
+<a name="ln1009">      else if (strncmp (s, &quot;ba&quot;, 2) == 0)</a>
+<a name="ln1010">	return ZEBRA_ROUTE_BABEL;</a>
+<a name="ln1011">      else if (strncmp (s, &quot;n&quot;, 1) == 0)</a>
+<a name="ln1012">	return ZEBRA_ROUTE_NHRP;</a>
+<a name="ln1013">    }</a>
+<a name="ln1014">  return -1;</a>
+<a name="ln1015">}</a>
+<a name="ln1016"> </a>
+<a name="ln1017">void</a>
+<a name="ln1018">zlog_hexdump (void *mem, unsigned int len) {</a>
+<a name="ln1019">  unsigned long i = 0;</a>
+<a name="ln1020">  unsigned int j = 0;</a>
+<a name="ln1021">  unsigned int columns = 8;</a>
+<a name="ln1022">  char buf[(len * 4) + ((len/4) * 20) + 30];</a>
+<a name="ln1023">  char *s = buf;</a>
+<a name="ln1024"> </a>
+<a name="ln1025">  for (i = 0; i &lt; len + ((len % columns) ? (columns - len % columns) : 0); i++)</a>
+<a name="ln1026">    {</a>
+<a name="ln1027">      /* print offset */</a>
+<a name="ln1028">      if (i % columns == 0)</a>
+<a name="ln1029">        s += sprintf(s, &quot;0x%016lx: &quot;, (unsigned long)mem + i);</a>
+<a name="ln1030"> </a>
+<a name="ln1031">      /* print hex data */</a>
+<a name="ln1032">      if (i &lt; len)</a>
+<a name="ln1033">        s += sprintf(s, &quot;%02x &quot;, 0xFF &amp; ((char*)mem)[i]);</a>
+<a name="ln1034"> </a>
+<a name="ln1035">      /* end of block, just aligning for ASCII dump */</a>
+<a name="ln1036">      else</a>
+<a name="ln1037">        s += sprintf(s, &quot;   &quot;);</a>
+<a name="ln1038"> </a>
+<a name="ln1039">      /* print ASCII dump */</a>
+<a name="ln1040">      if (i % columns == (columns - 1))</a>
+<a name="ln1041">        {</a>
+<a name="ln1042">          for (j = i - (columns - 1); j &lt;= i; j++)</a>
+<a name="ln1043">            {</a>
+<a name="ln1044">              if (j &gt;= len) /* end of block, not really printing */</a>
+<a name="ln1045">                s += sprintf(s, &quot; &quot;);</a>
+<a name="ln1046"> </a>
+<a name="ln1047">              else if(isprint((int)((char*)mem)[j])) /* printable char */</a>
+<a name="ln1048">                s += sprintf(s, &quot;%c&quot;, 0xFF &amp; ((char*)mem)[j]);</a>
+<a name="ln1049"> </a>
+<a name="ln1050">              else /* other char */</a>
+<a name="ln1051">                s += sprintf(s, &quot;.&quot;);</a>
+<a name="ln1052">            }</a>
+<a name="ln1053">          s += sprintf(s, &quot;\n&quot;);</a>
+<a name="ln1054">        }</a>
+<a name="ln1055">    }</a>
+<a name="ln1056">    zlog_debug(&quot;\n%s&quot;, buf);</a>
+<a name="ln1057">}</a>
+
+</code></pre>
+<div class="balloon" rel="8"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1042/" target="_blank">V1042</a> This file is marked with copyleft license, which requires you to open the derived source code.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

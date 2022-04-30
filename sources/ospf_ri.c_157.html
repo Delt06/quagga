@@ -1,0 +1,1687 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>ospf_ri.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.5.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * This is an implementation of RFC4970 Router Information</a>
+<a name="ln3"> * with support of RFC5088 PCE Capabilites announcement</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * Module name: Router Information</a>
+<a name="ln6"> * Version:     0.99.22</a>
+<a name="ln7"> * Created:     2012-02-01 by Olivier Dugeon</a>
+<a name="ln8"> * Copyright (C) 2012 Orange Labs http://www.orange.com/</a>
+<a name="ln9"> *</a>
+<a name="ln10"> * This file is part of GNU Quagga.</a>
+<a name="ln11"> *</a>
+<a name="ln12"> * GNU Zebra is free software; you can redistribute it and/or modify it</a>
+<a name="ln13"> * under the terms of the GNU General Public License as published by the</a>
+<a name="ln14"> * Free Software Foundation; either version 2, or (at your option) any</a>
+<a name="ln15"> * later version.</a>
+<a name="ln16"> * </a>
+<a name="ln17"> * GNU Quagga is distributed in the hope that it will be useful, but</a>
+<a name="ln18"> * WITHOUT ANY WARRANTY; without even the implied warranty of</a>
+<a name="ln19"> * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU</a>
+<a name="ln20"> * General Public License for more details.</a>
+<a name="ln21"> *</a>
+<a name="ln22"> * You should have received a copy of the GNU General Public License</a>
+<a name="ln23"> * along with GNU Quagga; see the file COPYING.  If not, write to the Free</a>
+<a name="ln24"> * Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA</a>
+<a name="ln25"> * 02111-1307, USA.</a>
+<a name="ln26"> */</a>
+<a name="ln27"> </a>
+<a name="ln28">#include &lt;zebra.h&gt;</a>
+<a name="ln29">#include &lt;math.h&gt;</a>
+<a name="ln30"> </a>
+<a name="ln31">#include &quot;linklist.h&quot;</a>
+<a name="ln32">#include &quot;prefix.h&quot;</a>
+<a name="ln33">#include &quot;if.h&quot;</a>
+<a name="ln34">#include &quot;table.h&quot;</a>
+<a name="ln35">#include &quot;memory.h&quot;</a>
+<a name="ln36">#include &quot;command.h&quot;</a>
+<a name="ln37">#include &quot;vty.h&quot;</a>
+<a name="ln38">#include &quot;stream.h&quot;</a>
+<a name="ln39">#include &quot;log.h&quot;</a>
+<a name="ln40">#include &quot;thread.h&quot;</a>
+<a name="ln41">#include &quot;hash.h&quot;</a>
+<a name="ln42">#include &quot;sockunion.h&quot;          /* for inet_aton() */</a>
+<a name="ln43"> </a>
+<a name="ln44">#include &quot;ospfd/ospfd.h&quot;</a>
+<a name="ln45">#include &quot;ospfd/ospf_interface.h&quot;</a>
+<a name="ln46">#include &quot;ospfd/ospf_ism.h&quot;</a>
+<a name="ln47">#include &quot;ospfd/ospf_asbr.h&quot;</a>
+<a name="ln48">#include &quot;ospfd/ospf_lsa.h&quot;</a>
+<a name="ln49">#include &quot;ospfd/ospf_lsdb.h&quot;</a>
+<a name="ln50">#include &quot;ospfd/ospf_neighbor.h&quot;</a>
+<a name="ln51">#include &quot;ospfd/ospf_nsm.h&quot;</a>
+<a name="ln52">#include &quot;ospfd/ospf_flood.h&quot;</a>
+<a name="ln53">#include &quot;ospfd/ospf_packet.h&quot;</a>
+<a name="ln54">#include &quot;ospfd/ospf_spf.h&quot;</a>
+<a name="ln55">#include &quot;ospfd/ospf_dump.h&quot;</a>
+<a name="ln56">#include &quot;ospfd/ospf_route.h&quot;</a>
+<a name="ln57">#include &quot;ospfd/ospf_ase.h&quot;</a>
+<a name="ln58">#include &quot;ospfd/ospf_zebra.h&quot;</a>
+<a name="ln59">#include &quot;ospfd/ospf_ri.h&quot;</a>
+<a name="ln60">#include &quot;ospfd/ospf_te.h&quot;</a>
+<a name="ln61"> </a>
+<a name="ln62">struct ospf_pce_info</a>
+<a name="ln63">{</a>
+<a name="ln64"> </a>
+<a name="ln65">  /* Store Router Information PCE TLV and SubTLV in network byte order. */</a>
+<a name="ln66">  struct ri_tlv_pce pce_header;</a>
+<a name="ln67">  struct ri_pce_subtlv_address pce_address;</a>
+<a name="ln68">  struct ri_pce_subtlv_path_scope pce_scope;</a>
+<a name="ln69">  struct list *pce_domain;</a>
+<a name="ln70">  struct list *pce_neighbor;</a>
+<a name="ln71">  struct ri_pce_subtlv_cap_flag pce_cap_flag;</a>
+<a name="ln72">};</a>
+<a name="ln73"> </a>
+<a name="ln74">/* Following structure are internal use only. */</a>
+<a name="ln75">struct ospf_router_info</a>
+<a name="ln76">{</a>
+<a name="ln77">  status_t status;</a>
+<a name="ln78"> </a>
+<a name="ln79">  u_int8_t registered;</a>
+<a name="ln80">  u_int8_t scope;</a>
+<a name="ln81"> </a>
+<a name="ln82">  /* Flags to manage this router information. */</a>
+<a name="ln83">#define RIFLG_LOOKUP_DONE			0x1</a>
+<a name="ln84">#define RIFLG_LSA_ENGAGED			0x2</a>
+<a name="ln85">#define RIFLG_LSA_FORCED_REFRESH	0x4</a>
+<a name="ln86">  u_int32_t flags;</a>
+<a name="ln87"> </a>
+<a name="ln88">  /* area pointer if flooding is Type 10 Null if flooding is AS scope */</a>
+<a name="ln89">  struct ospf_area *area;</a>
+<a name="ln90">  struct in_addr area_id;</a>
+<a name="ln91"> </a>
+<a name="ln92">  /* Store Router Information Capabilities LSA */</a>
+<a name="ln93">  struct ri_tlv_router_cap router_cap;</a>
+<a name="ln94"> </a>
+<a name="ln95">  /* Store PCE capability LSA */</a>
+<a name="ln96">  struct ospf_pce_info pce_info;</a>
+<a name="ln97">};</a>
+<a name="ln98"> </a>
+<a name="ln99">/*</a>
+<a name="ln100"> * Global variable to manage Opaque-LSA/Router Information on this node.</a>
+<a name="ln101"> * Note that all parameter values are stored in network byte order.</a>
+<a name="ln102"> */</a>
+<a name="ln103">static struct ospf_router_info OspfRI;</a>
+<a name="ln104"> </a>
+<a name="ln105">/*------------------------------------------------------------------------------*</a>
+<a name="ln106"> * Followings are initialize/terminate functions for Router Information handling.</a>
+<a name="ln107"> *------------------------------------------------------------------------------*/</a>
+<a name="ln108"> </a>
+<a name="ln109">static void ospf_router_info_ism_change (struct ospf_interface *oi,</a>
+<a name="ln110">                                         int old_status);</a>
+<a name="ln111">static void ospf_router_info_nsm_change (struct ospf_neighbor *nbr,</a>
+<a name="ln112">                                         int old_status);</a>
+<a name="ln113">static void ospf_router_info_config_write_router (struct vty *vty);</a>
+<a name="ln114">static void ospf_router_info_show_info (struct vty *vty,</a>
+<a name="ln115">                                        struct ospf_lsa *lsa);</a>
+<a name="ln116">static int ospf_router_info_lsa_originate (void *arg);</a>
+<a name="ln117">static struct ospf_lsa *ospf_router_info_lsa_refresh (struct ospf_lsa *lsa);</a>
+<a name="ln118">static void ospf_router_info_lsa_schedule (opcode_t opcode);</a>
+<a name="ln119">static void ospf_router_info_register_vty (void);</a>
+<a name="ln120">static void del_pce_info (void *val);</a>
+<a name="ln121"> </a>
+<a name="ln122">int</a>
+<a name="ln123">ospf_router_info_init (void)</a>
+<a name="ln124">{</a>
+<a name="ln125"> </a>
+<a name="ln126">  memset (&amp;OspfRI, 0, sizeof (struct ospf_router_info));</a>
+<a name="ln127">  OspfRI.status = disabled;</a>
+<a name="ln128">  OspfRI.registered = 0;</a>
+<a name="ln129">  OspfRI.scope = OSPF_OPAQUE_AS_LSA;</a>
+<a name="ln130">  OspfRI.flags = 0;</a>
+<a name="ln131"> </a>
+<a name="ln132">  /* Initialize pce domain and neighbor list */</a>
+<a name="ln133">  OspfRI.pce_info.pce_domain = list_new ();</a>
+<a name="ln134">  OspfRI.pce_info.pce_domain-&gt;del = del_pce_info;</a>
+<a name="ln135">  OspfRI.pce_info.pce_neighbor = list_new ();</a>
+<a name="ln136">  OspfRI.pce_info.pce_neighbor-&gt;del = del_pce_info;</a>
+<a name="ln137"> </a>
+<a name="ln138">  ospf_router_info_register_vty ();</a>
+<a name="ln139"> </a>
+<a name="ln140">  return 0;</a>
+<a name="ln141">}</a>
+<a name="ln142"> </a>
+<a name="ln143">static int</a>
+<a name="ln144">ospf_router_info_register (u_int8_t scope)</a>
+<a name="ln145">{</a>
+<a name="ln146">  int rc = 0;</a>
+<a name="ln147"> </a>
+<a name="ln148">  if (OspfRI.registered)</a>
+<a name="ln149">    return 0;</a>
+<a name="ln150"> </a>
+<a name="ln151">  zlog_info (&quot;Register Router Information with scope %s(%d)&quot;,</a>
+<a name="ln152">             scope == OSPF_OPAQUE_AREA_LSA ? &quot;Area&quot; : &quot;AS&quot;, scope);</a>
+<a name="ln153">  rc = ospf_register_opaque_functab (scope,</a>
+<a name="ln154">                                     OPAQUE_TYPE_ROUTER_INFORMATION_LSA,</a>
+<a name="ln155">                                     NULL,    /* new interface */</a>
+<a name="ln156">                                     NULL,    /* del interface */</a>
+<a name="ln157">                                     ospf_router_info_ism_change,</a>
+<a name="ln158">                                     ospf_router_info_nsm_change,</a>
+<a name="ln159">                                     ospf_router_info_config_write_router,</a>
+<a name="ln160">                                     NULL,    /* Config. write interface */</a>
+<a name="ln161">                                     NULL,    /* Config. write debug */</a>
+<a name="ln162">                                     ospf_router_info_show_info,</a>
+<a name="ln163">                                     ospf_router_info_lsa_originate,</a>
+<a name="ln164">                                     ospf_router_info_lsa_refresh,</a>
+<a name="ln165">                                     NULL,    /* new_lsa_hook */</a>
+<a name="ln166">                                     NULL);   /* del_lsa_hook */</a>
+<a name="ln167"> </a>
+<a name="ln168">  if (rc != 0)</a>
+<a name="ln169">    {</a>
+<a name="ln170">      zlog_warn (&quot;ospf_router_info_init: Failed to register functions&quot;);</a>
+<a name="ln171">      return rc;</a>
+<a name="ln172">    }</a>
+<a name="ln173"> </a>
+<a name="ln174">  OspfRI.registered = 1;</a>
+<a name="ln175">  OspfRI.scope = scope;</a>
+<a name="ln176">  return 0;</a>
+<a name="ln177">}</a>
+<a name="ln178"> </a>
+<a name="ln179">static int</a>
+<a name="ln180">ospf_router_info_unregister ()</a>
+<a name="ln181">{</a>
+<a name="ln182"> </a>
+<a name="ln183">  if ((OspfRI.scope != OSPF_OPAQUE_AS_LSA)</a>
+<a name="ln184">      &amp;&amp; (OspfRI.scope != OSPF_OPAQUE_AREA_LSA))</a>
+<a name="ln185">    {</a>
+<a name="ln186">      zlog_warn (&quot;Unable to unregister Router Info functions: Wrong scope!&quot;);</a>
+<a name="ln187">      return -1;</a>
+<a name="ln188">    }</a>
+<a name="ln189"> </a>
+<a name="ln190">  ospf_delete_opaque_functab (OspfRI.scope,</a>
+<a name="ln191">                              OPAQUE_TYPE_ROUTER_INFORMATION_LSA);</a>
+<a name="ln192"> </a>
+<a name="ln193">  OspfRI.registered = 0;</a>
+<a name="ln194">  return 0;</a>
+<a name="ln195"> </a>
+<a name="ln196">}</a>
+<a name="ln197"> </a>
+<a name="ln198">void</a>
+<a name="ln199">ospf_router_info_term (void)</a>
+<a name="ln200">{</a>
+<a name="ln201"> </a>
+<a name="ln202">  list_delete (OspfRI.pce_info.pce_domain);</a>
+<a name="ln203">  list_delete (OspfRI.pce_info.pce_neighbor);</a>
+<a name="ln204"> </a>
+<a name="ln205">  OspfRI.pce_info.pce_domain = NULL;</a>
+<a name="ln206">  OspfRI.pce_info.pce_neighbor = NULL;</a>
+<a name="ln207">  OspfRI.status = disabled;</a>
+<a name="ln208"> </a>
+<a name="ln209">  ospf_router_info_unregister (OspfRI.scope);</a>
+<a name="ln210"> </a>
+<a name="ln211">  return;</a>
+<a name="ln212">}</a>
+<a name="ln213"> </a>
+<a name="ln214">static void</a>
+<a name="ln215">del_pce_info (void *val)</a>
+<a name="ln216">{</a>
+<a name="ln217">  XFREE (MTYPE_OSPF_PCE_PARAMS, val);</a>
+<a name="ln218">  return;</a>
+<a name="ln219">}</a>
+<a name="ln220"> </a>
+<a name="ln221">/*------------------------------------------------------------------------*</a>
+<a name="ln222"> * Followings are control functions for ROUTER INFORMATION parameters management.</a>
+<a name="ln223"> *------------------------------------------------------------------------*/</a>
+<a name="ln224"> </a>
+<a name="ln225">static void</a>
+<a name="ln226">set_router_info_capabilities (struct ri_tlv_router_cap *ric, u_int32_t cap)</a>
+<a name="ln227">{</a>
+<a name="ln228">  ric-&gt;header.type = htons (RI_TLV_CAPABILITIES);</a>
+<a name="ln229">  ric-&gt;header.length = htons (RI_TLV_LENGTH);</a>
+<a name="ln230">  ric-&gt;value = htonl (cap);</a>
+<a name="ln231">  return;</a>
+<a name="ln232">}</a>
+<a name="ln233"> </a>
+<a name="ln234">static int</a>
+<a name="ln235">set_pce_header (struct ospf_pce_info *pce)</a>
+<a name="ln236">{</a>
+<a name="ln237">  u_int16_t length = 0;</a>
+<a name="ln238">  struct listnode *node;</a>
+<a name="ln239">  struct ri_pce_subtlv_domain *domain;</a>
+<a name="ln240">  struct ri_pce_subtlv_neighbor *neighbor;</a>
+<a name="ln241"> </a>
+<a name="ln242">  /* PCE Address */</a>
+<a name="ln243">  if (ntohs (pce-&gt;pce_address.header.type) != 0)</a>
+<a name="ln244">    length += RI_TLV_SIZE (&amp;pce-&gt;pce_address.header);</a>
+<a name="ln245"> </a>
+<a name="ln246">  /* PCE Path Scope */</a>
+<a name="ln247">  if (ntohs (pce-&gt;pce_scope.header.type) != 0)</a>
+<a name="ln248">    length += RI_TLV_SIZE (&amp;pce-&gt;pce_scope.header);</a>
+<a name="ln249"> </a>
+<a name="ln250">  /* PCE Domain */</a>
+<a name="ln251">  for (ALL_LIST_ELEMENTS_RO (pce-&gt;pce_domain, node, domain))</a>
+<a name="ln252">    {</a>
+<a name="ln253">      if (ntohs (domain-&gt;header.type) != 0)</a>
+<a name="ln254">        length += RI_TLV_SIZE (&amp;domain-&gt;header);</a>
+<a name="ln255">    }</a>
+<a name="ln256"> </a>
+<a name="ln257">  /* PCE Neighbor */</a>
+<a name="ln258">  for (ALL_LIST_ELEMENTS_RO (pce-&gt;pce_neighbor, node, neighbor))</a>
+<a name="ln259">    {</a>
+<a name="ln260">      if (ntohs (neighbor-&gt;header.type) != 0)</a>
+<a name="ln261">        length += RI_TLV_SIZE (&amp;neighbor-&gt;header);</a>
+<a name="ln262">    }</a>
+<a name="ln263"> </a>
+<a name="ln264">  /* PCE Capabilities */</a>
+<a name="ln265">  if (ntohs (pce-&gt;pce_cap_flag.header.type) != 0)</a>
+<a name="ln266">    length += RI_TLV_SIZE (&amp;pce-&gt;pce_cap_flag.header);</a>
+<a name="ln267"> </a>
+<a name="ln268">  if (length != 0)</a>
+<a name="ln269">    {</a>
+<a name="ln270">      pce-&gt;pce_header.header.type = htons (RI_TLV_PCE);</a>
+<a name="ln271">      pce-&gt;pce_header.header.length = htons (length);</a>
+<a name="ln272">    }</a>
+<a name="ln273">  else</a>
+<a name="ln274">    {</a>
+<a name="ln275">      pce-&gt;pce_header.header.type = 0;</a>
+<a name="ln276">      pce-&gt;pce_header.header.length = 0;</a>
+<a name="ln277">    }</a>
+<a name="ln278"> </a>
+<a name="ln279">  return length;</a>
+<a name="ln280">}</a>
+<a name="ln281"> </a>
+<a name="ln282">static void</a>
+<a name="ln283">set_pce_address (struct in_addr ipv4, struct ospf_pce_info *pce)</a>
+<a name="ln284">{</a>
+<a name="ln285"> </a>
+<a name="ln286">  /* Enable PCE Info */</a>
+<a name="ln287">  pce-&gt;pce_header.header.type = htons (RI_TLV_PCE);</a>
+<a name="ln288">  /* Set PCE Address */</a>
+<a name="ln289">  pce-&gt;pce_address.header.type = htons (RI_PCE_SUBTLV_ADDRESS);</a>
+<a name="ln290">  pce-&gt;pce_address.header.length = htons (PCE_ADDRESS_LENGTH_IPV4);</a>
+<a name="ln291">  pce-&gt;pce_address.address.type = htons (PCE_ADDRESS_TYPE_IPV4);</a>
+<a name="ln292">  pce-&gt;pce_address.address.value = ipv4;</a>
+<a name="ln293"> </a>
+<a name="ln294">  return;</a>
+<a name="ln295">}</a>
+<a name="ln296"> </a>
+<a name="ln297">static void</a>
+<a name="ln298">set_pce_path_scope (u_int32_t scope, struct ospf_pce_info *pce)</a>
+<a name="ln299">{</a>
+<a name="ln300"> </a>
+<a name="ln301">  /* Enable PCE Info */</a>
+<a name="ln302">  pce-&gt;pce_header.header.type = htons (RI_TLV_PCE);</a>
+<a name="ln303">  /* Set PCE Scope */</a>
+<a name="ln304">  pce-&gt;pce_scope.header.type = htons (RI_PCE_SUBTLV_PATH_SCOPE);</a>
+<a name="ln305">  pce-&gt;pce_scope.header.length = htons (RI_TLV_LENGTH);</a>
+<a name="ln306">  pce-&gt;pce_scope.value = htonl (scope);</a>
+<a name="ln307"> </a>
+<a name="ln308">  return;</a>
+<a name="ln309">}</a>
+<a name="ln310"> </a>
+<a name="ln311">static void</a>
+<a name="ln312">set_pce_domain (u_int16_t type, u_int32_t domain, struct ospf_pce_info *pce)</a>
+<a name="ln313">{</a>
+<a name="ln314"> </a>
+<a name="ln315">  struct ri_pce_subtlv_domain *new;</a>
+<a name="ln316"> </a>
+<a name="ln317">  /* Enable PCE Info */</a>
+<a name="ln318">  pce-&gt;pce_header.header.type = htons (RI_TLV_PCE);</a>
+<a name="ln319"> </a>
+<a name="ln320">  /* Create new domain info */</a>
+<a name="ln321">  new =</a>
+<a name="ln322">    XCALLOC (MTYPE_OSPF_PCE_PARAMS,</a>
+<a name="ln323">             sizeof (struct ri_pce_subtlv_domain));</a>
+<a name="ln324"> </a>
+<a name="ln325">  new-&gt;header.type = htons (RI_PCE_SUBTLV_DOMAIN);</a>
+<a name="ln326">  new-&gt;header.length = htons (PCE_ADDRESS_LENGTH_IPV4);</a>
+<a name="ln327">  new-&gt;type = htons (type);</a>
+<a name="ln328">  new-&gt;value = htonl (domain);</a>
+<a name="ln329"> </a>
+<a name="ln330">  /* Add new domain to the list */</a>
+<a name="ln331">  listnode_add (pce-&gt;pce_domain, new);</a>
+<a name="ln332"> </a>
+<a name="ln333">  return;</a>
+<a name="ln334">}</a>
+<a name="ln335"> </a>
+<a name="ln336">static void</a>
+<a name="ln337">unset_pce_domain (u_int16_t type, u_int32_t domain, struct ospf_pce_info *pce)</a>
+<a name="ln338">{</a>
+<a name="ln339">  struct listnode *node;</a>
+<a name="ln340">  struct ri_pce_subtlv_domain *old = NULL;</a>
+<a name="ln341">  int found = 0;</a>
+<a name="ln342"> </a>
+<a name="ln343">  /* Search the corresponding node */</a>
+<a name="ln344">  for (ALL_LIST_ELEMENTS_RO (pce-&gt;pce_domain, node, old))</a>
+<a name="ln345">    {</a>
+<a name="ln346">      if ((old-&gt;type == htons (type)) &amp;&amp; (old-&gt;value == htonl (domain)))</a>
+<a name="ln347">        {</a>
+<a name="ln348">          found = 1;</a>
+<a name="ln349">          break;</a>
+<a name="ln350">        }</a>
+<a name="ln351">    }</a>
+<a name="ln352"> </a>
+<a name="ln353">  /* if found remove it */</a>
+<a name="ln354">  if (found)</a>
+<a name="ln355">    {</a>
+<a name="ln356">      listnode_delete (pce-&gt;pce_domain, old);</a>
+<a name="ln357"> </a>
+<a name="ln358">      /* Avoid misjudgement in the next lookup. */</a>
+<a name="ln359">      if (listcount (pce-&gt;pce_domain) == 0)</a>
+<a name="ln360">        pce-&gt;pce_domain-&gt;head = pce-&gt;pce_domain-&gt;tail = NULL;</a>
+<a name="ln361"> </a>
+<a name="ln362">      /* Finally free the old domain */</a>
+<a name="ln363">      XFREE (MTYPE_OSPF_PCE_PARAMS, old);</a>
+<a name="ln364">    }</a>
+<a name="ln365">}</a>
+<a name="ln366"> </a>
+<a name="ln367">static void</a>
+<a name="ln368">set_pce_neighbor (u_int16_t type, u_int32_t domain, struct ospf_pce_info *pce)</a>
+<a name="ln369">{</a>
+<a name="ln370"> </a>
+<a name="ln371">  struct ri_pce_subtlv_neighbor *new;</a>
+<a name="ln372"> </a>
+<a name="ln373">  /* Enable PCE Info */</a>
+<a name="ln374">  pce-&gt;pce_header.header.type = htons (RI_TLV_PCE);</a>
+<a name="ln375"> </a>
+<a name="ln376">  /* Create new neighbor info */</a>
+<a name="ln377">  new =</a>
+<a name="ln378">    XCALLOC (MTYPE_OSPF_PCE_PARAMS,</a>
+<a name="ln379">             sizeof (struct ri_pce_subtlv_neighbor));</a>
+<a name="ln380"> </a>
+<a name="ln381">  new-&gt;header.type = htons (RI_PCE_SUBTLV_NEIGHBOR);</a>
+<a name="ln382">  new-&gt;header.length = htons (PCE_ADDRESS_LENGTH_IPV4);</a>
+<a name="ln383">  new-&gt;type = htons (type);</a>
+<a name="ln384">  new-&gt;value = htonl (domain);</a>
+<a name="ln385"> </a>
+<a name="ln386">  /* Add new domain to the list */</a>
+<a name="ln387">  listnode_add (pce-&gt;pce_neighbor, new);</a>
+<a name="ln388"> </a>
+<a name="ln389">  return;</a>
+<a name="ln390">}</a>
+<a name="ln391"> </a>
+<a name="ln392">static void</a>
+<a name="ln393">unset_pce_neighbor (u_int16_t type, u_int32_t domain,</a>
+<a name="ln394">                    struct ospf_pce_info *pce)</a>
+<a name="ln395">{</a>
+<a name="ln396">  struct listnode *node;</a>
+<a name="ln397">  struct ri_pce_subtlv_neighbor *old = NULL;</a>
+<a name="ln398">  int found = 0;</a>
+<a name="ln399"> </a>
+<a name="ln400">  /* Search the corresponding node */</a>
+<a name="ln401">  for (ALL_LIST_ELEMENTS_RO (pce-&gt;pce_neighbor, node, old))</a>
+<a name="ln402">    {</a>
+<a name="ln403">      if ((old-&gt;type == htons (type)) &amp;&amp; (old-&gt;value == htonl (domain)))</a>
+<a name="ln404">        {</a>
+<a name="ln405">          found = 1;</a>
+<a name="ln406">          break;</a>
+<a name="ln407">        }</a>
+<a name="ln408">    }</a>
+<a name="ln409"> </a>
+<a name="ln410">  /* if found remove it */</a>
+<a name="ln411">  if (found)</a>
+<a name="ln412">    {</a>
+<a name="ln413">      listnode_delete (pce-&gt;pce_neighbor, old);</a>
+<a name="ln414"> </a>
+<a name="ln415">      /* Avoid misjudgement in the next lookup. */</a>
+<a name="ln416">      if (listcount (pce-&gt;pce_neighbor) == 0)</a>
+<a name="ln417">        pce-&gt;pce_neighbor-&gt;head = pce-&gt;pce_neighbor-&gt;tail = NULL;</a>
+<a name="ln418"> </a>
+<a name="ln419">      /* Finally free the old domain */</a>
+<a name="ln420">      XFREE (MTYPE_OSPF_PCE_PARAMS, old);</a>
+<a name="ln421">    }</a>
+<a name="ln422">}</a>
+<a name="ln423"> </a>
+<a name="ln424">static void</a>
+<a name="ln425">set_pce_cap_flag (u_int32_t cap, struct ospf_pce_info *pce)</a>
+<a name="ln426">{</a>
+<a name="ln427"> </a>
+<a name="ln428">  /* Enable PCE Info */</a>
+<a name="ln429">  pce-&gt;pce_header.header.type = htons (RI_TLV_PCE);</a>
+<a name="ln430">  /* Set PCE Capabilities flag */</a>
+<a name="ln431">  pce-&gt;pce_cap_flag.header.type = htons (RI_PCE_SUBTLV_CAP_FLAG);</a>
+<a name="ln432">  pce-&gt;pce_cap_flag.header.length = htons (RI_TLV_LENGTH);</a>
+<a name="ln433">  pce-&gt;pce_cap_flag.value = htonl (cap);</a>
+<a name="ln434"> </a>
+<a name="ln435">  return;</a>
+<a name="ln436">}</a>
+<a name="ln437"> </a>
+<a name="ln438"> </a>
+<a name="ln439">static void</a>
+<a name="ln440">unset_param (struct ri_tlv_header *tlv)</a>
+<a name="ln441">{</a>
+<a name="ln442"> </a>
+<a name="ln443">  tlv-&gt;type = 0;</a>
+<a name="ln444">  /* Fill the Value to 0 */</a>
+<a name="ln445">  memset ((tlv + RI_TLV_HDR_SIZE), 0, RI_TLV_BODY_SIZE (tlv));</a>
+<a name="ln446">  tlv-&gt;length = 0;</a>
+<a name="ln447"> </a>
+<a name="ln448">  return;</a>
+<a name="ln449">}</a>
+<a name="ln450"> </a>
+<a name="ln451">static void</a>
+<a name="ln452">initialize_params (struct ospf_router_info *ori)</a>
+<a name="ln453">{</a>
+<a name="ln454">  u_int32_t cap;</a>
+<a name="ln455">  struct ospf *top;</a>
+<a name="ln456"> </a>
+<a name="ln457">  /*</a>
+<a name="ln458">   * Initialize default Router Information Capabilities.</a>
+<a name="ln459">   */</a>
+<a name="ln460">  cap = 0;</a>
+<a name="ln461">  cap = cap | RI_TE_SUPPORT;</a>
+<a name="ln462"> </a>
+<a name="ln463">  set_router_info_capabilities (&amp;ori-&gt;router_cap, cap);</a>
+<a name="ln464"> </a>
+<a name="ln465">  /* If Area address is not null and exist, retrieve corresponding structure */</a>
+<a name="ln466">  top = ospf_lookup ();</a>
+<a name="ln467">  zlog_info (&quot;RI-&gt; Initialize Router Info for %s scope within area %s&quot;,</a>
+<a name="ln468">             OspfRI.scope == OSPF_OPAQUE_AREA_LSA ? &quot;Area&quot; : &quot;AS&quot;,</a>
+<a name="ln469">             inet_ntoa (OspfRI.area_id));</a>
+<a name="ln470"> </a>
+<a name="ln471">  /* Try to get the Area context at this step. Do it latter if not available */</a>
+<a name="ln472">  if ((OspfRI.scope == OSPF_OPAQUE_AREA_LSA) &amp;&amp; (OspfRI.area == NULL))</a>
+<a name="ln473">    OspfRI.area = ospf_area_lookup_by_area_id (top, OspfRI.area_id);</a>
+<a name="ln474"> </a>
+<a name="ln475">  /*</a>
+<a name="ln476">   * Initialize default PCE Information values</a>
+<a name="ln477">   */</a>
+<a name="ln478">  /* PCE address == OSPF Router ID */</a>
+<a name="ln479">  set_pce_address (top-&gt;router_id, &amp;ori-&gt;pce_info);</a>
+<a name="ln480"> </a>
+<a name="ln481">  /* PCE scope */</a>
+<a name="ln482">  cap = 7;                      /* Set L, R and Rd bits to one = intra &amp; inter-area path computation */</a>
+<a name="ln483">  set_pce_path_scope (cap, &amp;ori-&gt;pce_info);</a>
+<a name="ln484"> </a>
+<a name="ln485">  /* PCE Capabilities */</a>
+<a name="ln486">  cap =</a>
+<a name="ln487">    PCE_CAP_BIDIRECTIONAL | PCE_CAP_DIVERSE_PATH | PCE_CAP_OBJECTIVES |</a>
+<a name="ln488">    PCE_CAP_ADDITIVE | PCE_CAP_MULTIPLE_REQ;</a>
+<a name="ln489">  set_pce_cap_flag (cap, &amp;ori-&gt;pce_info);</a>
+<a name="ln490"> </a>
+<a name="ln491">  /* Finally compute PCE header */</a>
+<a name="ln492">  set_pce_header (&amp;ori-&gt;pce_info);</a>
+<a name="ln493"> </a>
+<a name="ln494">  return;</a>
+<a name="ln495">}</a>
+<a name="ln496"> </a>
+<a name="ln497">static int</a>
+<a name="ln498">is_mandated_params_set (struct ospf_router_info ori)</a>
+<a name="ln499">{</a>
+<a name="ln500">  int rc = 0;</a>
+<a name="ln501"> </a>
+<a name="ln502">  if (ntohs (ori.router_cap.header.type) == 0)</a>
+<a name="ln503">    goto out;</a>
+<a name="ln504"> </a>
+<a name="ln505">  if ((ntohs (ori.pce_info.pce_header.header.type) == RI_TLV_PCE)</a>
+<a name="ln506">      &amp;&amp; (ntohs (ori.pce_info.pce_address.header.type) == 0)</a>
+<a name="ln507">      &amp;&amp; (ntohs (ori.pce_info.pce_cap_flag.header.type) == 0))</a>
+<a name="ln508">    goto out;</a>
+<a name="ln509"> </a>
+<a name="ln510">  rc = 1;</a>
+<a name="ln511"> </a>
+<a name="ln512">out:</a>
+<a name="ln513">  return rc;</a>
+<a name="ln514">}</a>
+<a name="ln515"> </a>
+<a name="ln516">/*------------------------------------------------------------------------*</a>
+<a name="ln517"> * Followings are callback functions against generic Opaque-LSAs handling.</a>
+<a name="ln518"> *------------------------------------------------------------------------*/</a>
+<a name="ln519">static void</a>
+<a name="ln520">ospf_router_info_ism_change (struct ospf_interface *oi, int old_state)</a>
+<a name="ln521">{</a>
+<a name="ln522">  /* So far, nothing to do here. */</a>
+<a name="ln523">  return;</a>
+<a name="ln524"> </a>
+<a name="ln525">}</a>
+<a name="ln526"> </a>
+<a name="ln527">static void</a>
+<a name="ln528">ospf_router_info_nsm_change (struct ospf_neighbor *nbr, int old_state)</a>
+<a name="ln529">{</a>
+<a name="ln530"> </a>
+<a name="ln531">  /* So far, nothing to do here. */</a>
+<a name="ln532">  return;</a>
+<a name="ln533">}</a>
+<a name="ln534"> </a>
+<a name="ln535">/*------------------------------------------------------------------------*</a>
+<a name="ln536"> * Followings are OSPF protocol processing functions for ROUTER INFORMATION</a>
+<a name="ln537"> *------------------------------------------------------------------------*/</a>
+<a name="ln538"> </a>
+<a name="ln539">static void</a>
+<a name="ln540">build_tlv_header (struct stream *s, struct ri_tlv_header *tlvh)</a>
+<a name="ln541">{</a>
+<a name="ln542"> </a>
+<a name="ln543">  stream_put (s, tlvh, sizeof (struct ri_tlv_header));</a>
+<a name="ln544">  return;</a>
+<a name="ln545">}</a>
+<a name="ln546"> </a>
+<a name="ln547">static void</a>
+<a name="ln548">build_tlv (struct stream *s, struct ri_tlv_header *tlvh)</a>
+<a name="ln549">{</a>
+<a name="ln550"> </a>
+<a name="ln551">  if (ntohs (tlvh-&gt;type) != 0)</a>
+<a name="ln552">    {</a>
+<a name="ln553">      build_tlv_header (s, tlvh);</a>
+<a name="ln554">      stream_put (s, tlvh + 1, RI_TLV_BODY_SIZE (tlvh));</a>
+<a name="ln555">    }</a>
+<a name="ln556">  return;</a>
+<a name="ln557">}</a>
+<a name="ln558"> </a>
+<a name="ln559">static void</a>
+<a name="ln560">ospf_router_info_lsa_body_set (struct stream *s)</a>
+<a name="ln561">{</a>
+<a name="ln562"> </a>
+<a name="ln563">  struct listnode *node;</a>
+<a name="ln564">  struct ri_pce_subtlv_domain *domain;</a>
+<a name="ln565">  struct ri_pce_subtlv_neighbor *neighbor;</a>
+<a name="ln566"> </a>
+<a name="ln567">  /* Build Router Information TLV */</a>
+<a name="ln568">  build_tlv (s, &amp;OspfRI.router_cap.header);</a>
+<a name="ln569"> </a>
+<a name="ln570">  /* Add RI PCE TLV if it is set */</a>
+<a name="ln571">  /* Compute PCE Info header first */</a>
+<a name="ln572">  if ((set_pce_header (&amp;OspfRI.pce_info)) != 0)</a>
+<a name="ln573">    {</a>
+<a name="ln574"> </a>
+<a name="ln575">      /* Build PCE TLV */</a>
+<a name="ln576">      build_tlv_header (s, &amp;OspfRI.pce_info.pce_header.header);</a>
+<a name="ln577"> </a>
+<a name="ln578">      /* Build PCE address sub-tlv */</a>
+<a name="ln579">      build_tlv (s, &amp;OspfRI.pce_info.pce_address.header);</a>
+<a name="ln580"> </a>
+<a name="ln581">      /* Build PCE path scope sub-tlv */</a>
+<a name="ln582">      build_tlv (s, &amp;OspfRI.pce_info.pce_scope.header);</a>
+<a name="ln583"> </a>
+<a name="ln584">      /* Build PCE domain sub-tlv */</a>
+<a name="ln585">      for (ALL_LIST_ELEMENTS_RO (OspfRI.pce_info.pce_domain, node, domain))</a>
+<a name="ln586">        build_tlv (s, &amp;domain-&gt;header);</a>
+<a name="ln587"> </a>
+<a name="ln588">      /* Build PCE neighbor sub-tlv */</a>
+<a name="ln589">      for (ALL_LIST_ELEMENTS_RO</a>
+<a name="ln590">           (OspfRI.pce_info.pce_neighbor, node, neighbor))</a>
+<a name="ln591">        build_tlv (s, &amp;neighbor-&gt;header);</a>
+<a name="ln592"> </a>
+<a name="ln593">      /* Build PCE cap flag sub-tlv */</a>
+<a name="ln594">      build_tlv (s, &amp;OspfRI.pce_info.pce_cap_flag.header);</a>
+<a name="ln595">    }</a>
+<a name="ln596"> </a>
+<a name="ln597">  return;</a>
+<a name="ln598">}</a>
+<a name="ln599"> </a>
+<a name="ln600">/* Create new opaque-LSA. */</a>
+<a name="ln601">static struct ospf_lsa *</a>
+<a name="ln602">ospf_router_info_lsa_new ()</a>
+<a name="ln603">{</a>
+<a name="ln604">  struct ospf *top;</a>
+<a name="ln605">  struct stream *s;</a>
+<a name="ln606">  struct lsa_header *lsah;</a>
+<a name="ln607">  struct ospf_lsa *new = NULL;</a>
+<a name="ln608">  u_char options, lsa_type;</a>
+<a name="ln609">  struct in_addr lsa_id;</a>
+<a name="ln610">  u_int32_t tmp;</a>
+<a name="ln611">  u_int16_t length;</a>
+<a name="ln612"> </a>
+<a name="ln613">  /* Create a stream for LSA. */</a>
+<a name="ln614">  if ((s = stream_new (OSPF_MAX_LSA_SIZE)) == NULL)</a>
+<a name="ln615">    {</a>
+<a name="ln616">      zlog_warn (&quot;ospf_router_info_lsa_new: stream_new() ?&quot;);</a>
+<a name="ln617">      goto out;</a>
+<a name="ln618">    }</a>
+<a name="ln619">  lsah = (struct lsa_header *) STREAM_DATA (s);</a>
+<a name="ln620"> </a>
+<a name="ln621">  options = OSPF_OPTION_E;      /* Enable AS external as we flood RI with Opaque Type 11 */</a>
+<a name="ln622">  options |= OSPF_OPTION_O;     /* Don't forget this :-) */</a>
+<a name="ln623"> </a>
+<a name="ln624">  lsa_type = OspfRI.scope;</a>
+<a name="ln625">  /* LSA ID == 0 for Router Information see RFC 4970 */</a>
+<a name="ln626">  tmp = SET_OPAQUE_LSID (OPAQUE_TYPE_ROUTER_INFORMATION_LSA, 0);</a>
+<a name="ln627">  lsa_id.s_addr = htonl (tmp);</a>
+<a name="ln628"> </a>
+<a name="ln629">  if (IS_DEBUG_OSPF (lsa, LSA_GENERATE))</a>
+<a name="ln630">    zlog_debug</a>
+<a name="ln631">      (&quot;LSA[Type%d:%s]: Create an Opaque-LSA/ROUTER INFORMATION instance&quot;,</a>
+<a name="ln632">       lsa_type, inet_ntoa (lsa_id));</a>
+<a name="ln633"> </a>
+<a name="ln634">  top = ospf_lookup ();</a>
+<a name="ln635"> </a>
+<a name="ln636">  /* Set opaque-LSA header fields. */</a>
+<a name="ln637">  lsa_header_set (s, options, lsa_type, lsa_id, top-&gt;router_id);</a>
+<a name="ln638"> </a>
+<a name="ln639">  /* Set opaque-LSA body fields. */</a>
+<a name="ln640">  ospf_router_info_lsa_body_set (s);</a>
+<a name="ln641"> </a>
+<a name="ln642">  /* Set length. */</a>
+<a name="ln643">  length = stream_get_endp (s);</a>
+<a name="ln644">  lsah-&gt;length = htons (length);</a>
+<a name="ln645"> </a>
+<a name="ln646">  /* Now, create an OSPF LSA instance. */</a>
+<a name="ln647">  if ((new = ospf_lsa_new ()) == NULL)</a>
+<a name="ln648">    {</a>
+<a name="ln649">      zlog_warn (&quot;ospf_router_info_lsa_new: ospf_lsa_new() ?&quot;);</a>
+<a name="ln650">      stream_free (s);</a>
+<a name="ln651">      goto out;</a>
+<a name="ln652">    }</a>
+<a name="ln653">  if ((new-&gt;data = ospf_lsa_data_new (length)) == NULL)</a>
+<a name="ln654">    {</a>
+<a name="ln655">      zlog_warn (&quot;ospf_router_info_lsa_new: ospf_lsa_data_new() ?&quot;);</a>
+<a name="ln656">      ospf_lsa_unlock (&amp;new);</a>
+<a name="ln657">      new = NULL;</a>
+<a name="ln658">      stream_free (s);</a>
+<a name="ln659">      goto out;</a>
+<a name="ln660">    }</a>
+<a name="ln661"> </a>
+<a name="ln662">  new-&gt;area = OspfRI.area;      /* Area must be null if the Opaque type is AS scope, fulfill otherwise */</a>
+<a name="ln663"> </a>
+<a name="ln664">  SET_FLAG (new-&gt;flags, OSPF_LSA_SELF);</a>
+<a name="ln665">  memcpy (new-&gt;data, lsah, length);</a>
+<a name="ln666">  stream_free (s);</a>
+<a name="ln667"> </a>
+<a name="ln668">out:return new;</a>
+<a name="ln669">}</a>
+<a name="ln670"> </a>
+<a name="ln671">static int</a>
+<a name="ln672">ospf_router_info_lsa_originate1 (void *arg)</a>
+<a name="ln673">{</a>
+<a name="ln674">  struct ospf_lsa *new;</a>
+<a name="ln675">  struct ospf *top;</a>
+<a name="ln676">  struct ospf_area *area;</a>
+<a name="ln677">  int rc = -1;</a>
+<a name="ln678"> </a>
+<a name="ln679">  /* First check if the area is known if flooding scope is Area */</a>
+<a name="ln680">  if (OspfRI.scope == OSPF_OPAQUE_AREA_LSA)</a>
+<a name="ln681">    {</a>
+<a name="ln682">      area = (struct ospf_area *) arg;</a>
+<a name="ln683">      if (area-&gt;area_id.s_addr != OspfRI.area_id.s_addr)</a>
+<a name="ln684">        {</a>
+<a name="ln685">          zlog_debug</a>
+<a name="ln686">            (&quot;RI -&gt; This is not the Router Information Area. Stop processing&quot;);</a>
+<a name="ln687">          goto out;</a>
+<a name="ln688">        }</a>
+<a name="ln689">      OspfRI.area = area;</a>
+<a name="ln690">    }</a>
+<a name="ln691"> </a>
+<a name="ln692">  /* Create new Opaque-LSA/ROUTER INFORMATION instance. */</a>
+<a name="ln693">  if ((new = ospf_router_info_lsa_new ()) == NULL)</a>
+<a name="ln694">    {</a>
+<a name="ln695">      zlog_warn</a>
+<a name="ln696">        (&quot;ospf_router_info_lsa_originate1: ospf_router_info_lsa_new() ?&quot;);</a>
+<a name="ln697">      goto out;</a>
+<a name="ln698">    }</a>
+<a name="ln699"> </a>
+<a name="ln700">  /* Get ospf info */</a>
+<a name="ln701">  top = ospf_lookup ();</a>
+<a name="ln702"> </a>
+<a name="ln703">  /* Install this LSA into LSDB. */</a>
+<a name="ln704">  if (ospf_lsa_install (top, NULL /*oi */ , new) == NULL)</a>
+<a name="ln705">    {</a>
+<a name="ln706">      zlog_warn (&quot;ospf_router_info_lsa_originate1: ospf_lsa_install() ?&quot;);</a>
+<a name="ln707">      ospf_lsa_unlock (&amp;new);</a>
+<a name="ln708">      goto out;</a>
+<a name="ln709">    }</a>
+<a name="ln710"> </a>
+<a name="ln711">  /* Now this Router Info parameter entry has associated LSA. */</a>
+<a name="ln712">  SET_FLAG (OspfRI.flags, RIFLG_LSA_ENGAGED);</a>
+<a name="ln713"> </a>
+<a name="ln714">  /* Update new LSA origination count. */</a>
+<a name="ln715">  top-&gt;lsa_originate_count++;</a>
+<a name="ln716"> </a>
+<a name="ln717">  /* Flood new LSA through AS. */</a>
+<a name="ln718">  if (OspfRI.scope == OSPF_OPAQUE_AS_LSA)</a>
+<a name="ln719">    ospf_flood_through_as (top, NULL /*nbr */ , new);</a>
+<a name="ln720">  else</a>
+<a name="ln721">    ospf_flood_through_area (OspfRI.area, NULL /*nbr */ , new);</a>
+<a name="ln722"> </a>
+<a name="ln723">  if (IS_DEBUG_OSPF (lsa, LSA_GENERATE))</a>
+<a name="ln724">    {</a>
+<a name="ln725">      zlog_debug (&quot;LSA[Type%d:%s]: Originate Opaque-LSA/ROUTER INFORMATION&quot;,</a>
+<a name="ln726">                  new-&gt;data-&gt;type, inet_ntoa (new-&gt;data-&gt;id));</a>
+<a name="ln727">      ospf_lsa_header_dump (new-&gt;data);</a>
+<a name="ln728">    }</a>
+<a name="ln729"> </a>
+<a name="ln730">  rc = 0;</a>
+<a name="ln731">out:return rc;</a>
+<a name="ln732">}</a>
+<a name="ln733"> </a>
+<a name="ln734">static int</a>
+<a name="ln735">ospf_router_info_lsa_originate (void *arg)</a>
+<a name="ln736">{</a>
+<a name="ln737"> </a>
+<a name="ln738">  int rc = -1;</a>
+<a name="ln739"> </a>
+<a name="ln740">  if (OspfRI.status == disabled)</a>
+<a name="ln741">    {</a>
+<a name="ln742">      zlog_info</a>
+<a name="ln743">        (&quot;ospf_router_info_lsa_originate: ROUTER INFORMATION is disabled now.&quot;);</a>
+<a name="ln744">      rc = 0;                   /* This is not an error case. */</a>
+<a name="ln745">      goto out;</a>
+<a name="ln746">    }</a>
+<a name="ln747"> </a>
+<a name="ln748">  /* Check if Router Information LSA is already engaged */</a>
+<a name="ln749">  if (OspfRI.flags &amp; RIFLG_LSA_ENGAGED)</a>
+<a name="ln750">    {</a>
+<a name="ln751">      if (OspfRI.flags &amp; RIFLG_LSA_FORCED_REFRESH)</a>
+<a name="ln752">        {</a>
+<a name="ln753">          OspfRI.flags &amp;= ~RIFLG_LSA_FORCED_REFRESH;</a>
+<a name="ln754">          ospf_router_info_lsa_schedule (REFRESH_THIS_LSA);</a>
+<a name="ln755">        }</a>
+<a name="ln756">    }</a>
+<a name="ln757">  else</a>
+<a name="ln758">    {</a>
+<a name="ln759">      if (!is_mandated_params_set (OspfRI))</a>
+<a name="ln760">        zlog_warn</a>
+<a name="ln761">          (&quot;ospf_router_info_lsa_originate: lacks mandated ROUTER INFORMATION parameters&quot;);</a>
+<a name="ln762"> </a>
+<a name="ln763">      /* Ok, let's try to originate an LSA */</a>
+<a name="ln764">      if (ospf_router_info_lsa_originate1 (arg) != 0)</a>
+<a name="ln765">        goto out;</a>
+<a name="ln766">    }</a>
+<a name="ln767"> </a>
+<a name="ln768">  rc = 0;</a>
+<a name="ln769">out:return rc;</a>
+<a name="ln770">}</a>
+<a name="ln771"> </a>
+<a name="ln772">static struct ospf_lsa *</a>
+<a name="ln773">ospf_router_info_lsa_refresh (struct ospf_lsa *lsa)</a>
+<a name="ln774">{</a>
+<a name="ln775">  struct ospf_lsa *new = NULL;</a>
+<a name="ln776">  struct ospf *top;</a>
+<a name="ln777"> </a>
+<a name="ln778">  if (OspfRI.status == disabled)</a>
+<a name="ln779">    {</a>
+<a name="ln780">      /*</a>
+<a name="ln781">       * This LSA must have flushed before due to ROUTER INFORMATION status change.</a>
+<a name="ln782">       * It seems a slip among routers in the routing domain.</a>
+<a name="ln783">       */</a>
+<a name="ln784">      zlog_info</a>
+<a name="ln785">        (&quot;ospf_router_info_lsa_refresh: ROUTER INFORMATION is disabled now.&quot;);</a>
+<a name="ln786">      lsa-&gt;data-&gt;ls_age = htons (OSPF_LSA_MAXAGE);      /* Flush it anyway. */</a>
+<a name="ln787">    }</a>
+<a name="ln788"> </a>
+<a name="ln789">  /* Verify that the Router Information ID is supported */</a>
+<a name="ln790">  if (GET_OPAQUE_ID (ntohl (lsa-&gt;data-&gt;id.s_addr)) != 0)</a>
+<a name="ln791">    {</a>
+<a name="ln792">      zlog_warn</a>
+<a name="ln793">        (&quot;ospf_router_info_lsa_refresh: Unsupported Router Information ID&quot;);</a>
+<a name="ln794">      goto out;</a>
+<a name="ln795">    }</a>
+<a name="ln796"> </a>
+<a name="ln797">  /* If the lsa's age reached to MaxAge, start flushing procedure. */</a>
+<a name="ln798">  if (IS_LSA_MAXAGE (lsa))</a>
+<a name="ln799">    {</a>
+<a name="ln800">      OspfRI.flags &amp;= ~RIFLG_LSA_ENGAGED;</a>
+<a name="ln801">      ospf_opaque_lsa_flush_schedule (lsa);</a>
+<a name="ln802">      goto out;</a>
+<a name="ln803">    }</a>
+<a name="ln804"> </a>
+<a name="ln805">  /* Create new Opaque-LSA/ROUTER INFORMATION instance. */</a>
+<a name="ln806">  if ((new = ospf_router_info_lsa_new ()) == NULL)</a>
+<a name="ln807">    {</a>
+<a name="ln808">      zlog_warn</a>
+<a name="ln809">        (&quot;ospf_router_info_lsa_refresh: ospf_router_info_lsa_new() ?&quot;);</a>
+<a name="ln810">      goto out;</a>
+<a name="ln811">    }</a>
+<a name="ln812">  new-&gt;data-&gt;ls_seqnum = lsa_seqnum_increment (lsa);</a>
+<a name="ln813"> </a>
+<a name="ln814">  /* Install this LSA into LSDB. */</a>
+<a name="ln815">  /* Given &quot;lsa&quot; will be freed in the next function. */</a>
+<a name="ln816">  top = ospf_lookup ();</a>
+<a name="ln817">  if (ospf_lsa_install (top, NULL /*oi */ , new) == NULL)</a>
+<a name="ln818">    {</a>
+<a name="ln819">      zlog_warn (&quot;ospf_router_info_lsa_refresh: ospf_lsa_install() ?&quot;);</a>
+<a name="ln820">      ospf_lsa_unlock (&amp;new);</a>
+<a name="ln821">      goto out;</a>
+<a name="ln822">    }</a>
+<a name="ln823"> </a>
+<a name="ln824">  /* Flood updated LSA through AS or AREA depending of OspfRI.scope. */</a>
+<a name="ln825">  if (OspfRI.scope == OSPF_OPAQUE_AS_LSA)</a>
+<a name="ln826">    ospf_flood_through_as (top, NULL /*nbr */ , new);</a>
+<a name="ln827">  else</a>
+<a name="ln828">    ospf_flood_through_area (OspfRI.area, NULL /*nbr */ , new);</a>
+<a name="ln829"> </a>
+<a name="ln830">  /* Debug logging. */</a>
+<a name="ln831">  if (IS_DEBUG_OSPF (lsa, LSA_GENERATE))</a>
+<a name="ln832">    {</a>
+<a name="ln833">      zlog_debug (&quot;LSA[Type%d:%s]: Refresh Opaque-LSA/ROUTER INFORMATION&quot;,</a>
+<a name="ln834">                  new-&gt;data-&gt;type, inet_ntoa (new-&gt;data-&gt;id));</a>
+<a name="ln835">      ospf_lsa_header_dump (new-&gt;data);</a>
+<a name="ln836">    }</a>
+<a name="ln837"> </a>
+<a name="ln838">out:return new;</a>
+<a name="ln839">}</a>
+<a name="ln840"> </a>
+<a name="ln841">static void</a>
+<a name="ln842">ospf_router_info_lsa_schedule (opcode_t opcode)</a>
+<a name="ln843">{</a>
+<a name="ln844">  struct ospf_lsa lsa;</a>
+<a name="ln845">  struct lsa_header lsah;</a>
+<a name="ln846">  struct ospf *top;</a>
+<a name="ln847">  u_int32_t tmp;</a>
+<a name="ln848"> </a>
+<a name="ln849">  memset (&amp;lsa, 0, sizeof (lsa));</a>
+<a name="ln850">  memset (&amp;lsah, 0, sizeof (lsah));</a>
+<a name="ln851"> </a>
+<a name="ln852">  zlog_debug (&quot;RI-&gt; LSA schedule %s%s%s&quot;,</a>
+<a name="ln853">              opcode == REORIGINATE_THIS_LSA ? &quot;Re-Originate&quot; : &quot;&quot;,</a>
+<a name="ln854">              opcode == REFRESH_THIS_LSA ? &quot;Refresh&quot; : &quot;&quot;,</a>
+<a name="ln855">              opcode == FLUSH_THIS_LSA ? &quot;Flush&quot; : &quot;&quot;);</a>
+<a name="ln856"> </a>
+<a name="ln857">  top = ospf_lookup ();</a>
+<a name="ln858">  if ((OspfRI.scope == OSPF_OPAQUE_AREA_LSA) &amp;&amp; (OspfRI.area == NULL))</a>
+<a name="ln859">    {</a>
+<a name="ln860">      zlog_warn</a>
+<a name="ln861">        (&quot;ospf_router_info_lsa_schedule(): Router Info is Area scope flooding but area is not set&quot;);</a>
+<a name="ln862">      OspfRI.area = ospf_area_lookup_by_area_id (top, OspfRI.area_id);</a>
+<a name="ln863">    }</a>
+<a name="ln864">  lsa.area = OspfRI.area;</a>
+<a name="ln865">  lsa.data = &amp;lsah;</a>
+<a name="ln866">  lsah.type = OspfRI.scope;</a>
+<a name="ln867"> </a>
+<a name="ln868">  /* LSA ID is set to 0 for the Router Information. See RFC 4970 */</a>
+<a name="ln869">  tmp = SET_OPAQUE_LSID (OPAQUE_TYPE_ROUTER_INFORMATION_LSA, 0);</a>
+<a name="ln870">  lsah.id.s_addr = htonl (tmp);</a>
+<a name="ln871"> </a>
+<a name="ln872">  switch (opcode)</a>
+<a name="ln873">    {</a>
+<a name="ln874">    case REORIGINATE_THIS_LSA:</a>
+<a name="ln875">      if (OspfRI.scope == OSPF_OPAQUE_AREA_LSA)</a>
+<a name="ln876">        ospf_opaque_lsa_reoriginate_schedule ((void *) OspfRI.area,</a>
+<a name="ln877">                                              OSPF_OPAQUE_AREA_LSA,</a>
+<a name="ln878">                                              OPAQUE_TYPE_ROUTER_INFORMATION_LSA);</a>
+<a name="ln879">      else</a>
+<a name="ln880">        ospf_opaque_lsa_reoriginate_schedule ((void *) top,</a>
+<a name="ln881">                                              OSPF_OPAQUE_AS_LSA,</a>
+<a name="ln882">                                              OPAQUE_TYPE_ROUTER_INFORMATION_LSA);</a>
+<a name="ln883">      break;</a>
+<a name="ln884">    case REFRESH_THIS_LSA:</a>
+<a name="ln885">      ospf_opaque_lsa_refresh_schedule (&amp;lsa);</a>
+<a name="ln886">      break;</a>
+<a name="ln887">    case FLUSH_THIS_LSA:</a>
+<a name="ln888">      OspfRI.flags &amp;= ~RIFLG_LSA_ENGAGED;</a>
+<a name="ln889">      ospf_opaque_lsa_flush_schedule (&amp;lsa);</a>
+<a name="ln890">      break;</a>
+<a name="ln891">    default:</a>
+<a name="ln892">      zlog_warn (&quot;ospf_router_info_lsa_schedule: Unknown opcode (%u)&quot;,</a>
+<a name="ln893">                 opcode);</a>
+<a name="ln894">      break;</a>
+<a name="ln895">    }</a>
+<a name="ln896"> </a>
+<a name="ln897">  return;</a>
+<a name="ln898">}</a>
+<a name="ln899"> </a>
+<a name="ln900">/*------------------------------------------------------------------------*</a>
+<a name="ln901"> * Followings are vty session control functions.</a>
+<a name="ln902"> *------------------------------------------------------------------------*/</a>
+<a name="ln903"> </a>
+<a name="ln904">static u_int16_t</a>
+<a name="ln905">show_vty_router_cap (struct vty *vty, struct ri_tlv_header *tlvh)</a>
+<a name="ln906">{</a>
+<a name="ln907">  struct ri_tlv_router_cap *top = (struct ri_tlv_router_cap *) tlvh;</a>
+<a name="ln908"> </a>
+<a name="ln909">  if (vty != NULL)</a>
+<a name="ln910">    vty_out (vty, &quot;  Router Capabilities: 0x%x%s&quot;, ntohl (top-&gt;value),</a>
+<a name="ln911">             VTY_NEWLINE);</a>
+<a name="ln912">  else</a>
+<a name="ln913">    zlog_debug (&quot;    Router Capabilities: 0x%x&quot;, ntohl (top-&gt;value));</a>
+<a name="ln914"> </a>
+<a name="ln915">  return RI_TLV_SIZE (tlvh);</a>
+<a name="ln916">}</a>
+<a name="ln917"> </a>
+<a name="ln918">static u_int16_t</a>
+<a name="ln919">show_vty_pce_subtlv_address (struct vty *vty, struct ri_tlv_header *tlvh)</a>
+<a name="ln920">{</a>
+<a name="ln921">  struct ri_pce_subtlv_address *top = (struct ri_pce_subtlv_address *) tlvh;</a>
+<a name="ln922"> </a>
+<a name="ln923">  if (ntohs (top-&gt;address.type) == PCE_ADDRESS_TYPE_IPV4)</a>
+<a name="ln924">    {</a>
+<a name="ln925">      if (vty != NULL)</a>
+<a name="ln926">        vty_out (vty, &quot;  PCE Address: %s%s&quot;, inet_ntoa (top-&gt;address.value),</a>
+<a name="ln927">                 VTY_NEWLINE);</a>
+<a name="ln928">      else</a>
+<a name="ln929">        zlog_debug (&quot;    PCE Address: %s&quot;, inet_ntoa (top-&gt;address.value));</a>
+<a name="ln930">    }</a>
+<a name="ln931">  else</a>
+<a name="ln932">    {</a>
+<a name="ln933">      /* TODO: Add support to IPv6 with inet_ntop() */</a>
+<a name="ln934">      if (vty != NULL)</a>
+<a name="ln935">        vty_out (vty, &quot;  PCE Address: 0x%x%s&quot;,</a>
+<a name="ln936">                 ntohl (top-&gt;address.value.s_addr), VTY_NEWLINE);</a>
+<a name="ln937">      else</a>
+<a name="ln938">        zlog_debug (&quot;    PCE Address: 0x%x&quot;,</a>
+<a name="ln939">                    ntohl (top-&gt;address.value.s_addr));</a>
+<a name="ln940">    }</a>
+<a name="ln941"> </a>
+<a name="ln942">  return RI_TLV_SIZE (tlvh);</a>
+<a name="ln943">}</a>
+<a name="ln944"> </a>
+<a name="ln945">static u_int16_t</a>
+<a name="ln946">show_vty_pce_subtlv_path_scope (struct vty *vty, struct ri_tlv_header *tlvh)</a>
+<a name="ln947">{</a>
+<a name="ln948">  struct ri_pce_subtlv_path_scope *top =</a>
+<a name="ln949">    (struct ri_pce_subtlv_path_scope *) tlvh;</a>
+<a name="ln950"> </a>
+<a name="ln951">  if (vty != NULL)</a>
+<a name="ln952">    vty_out (vty, &quot;  PCE Path Scope: 0x%x%s&quot;, ntohl (top-&gt;value),</a>
+<a name="ln953">             VTY_NEWLINE);</a>
+<a name="ln954">  else</a>
+<a name="ln955">    zlog_debug (&quot;    PCE Path Scope: 0x%x&quot;, ntohl (top-&gt;value));</a>
+<a name="ln956"> </a>
+<a name="ln957">  return RI_TLV_SIZE (tlvh);</a>
+<a name="ln958">}</a>
+<a name="ln959"> </a>
+<a name="ln960">static u_int16_t</a>
+<a name="ln961">show_vty_pce_subtlv_domain (struct vty *vty, struct ri_tlv_header *tlvh)</a>
+<a name="ln962">{</a>
+<a name="ln963">  struct ri_pce_subtlv_domain *top = (struct ri_pce_subtlv_domain *) tlvh;</a>
+<a name="ln964">  struct in_addr tmp;</a>
+<a name="ln965"> </a>
+<a name="ln966">  if (ntohs (top-&gt;type) == PCE_DOMAIN_TYPE_AREA)</a>
+<a name="ln967">    {</a>
+<a name="ln968">      tmp.s_addr = top-&gt;value;</a>
+<a name="ln969">      if (vty != NULL)</a>
+<a name="ln970">        vty_out (vty, &quot;  PCE domain Area: %s%s&quot;, inet_ntoa (tmp),</a>
+<a name="ln971">                 VTY_NEWLINE);</a>
+<a name="ln972">      else</a>
+<a name="ln973">        zlog_debug (&quot;    PCE domain Area: %s&quot;, inet_ntoa (tmp));</a>
+<a name="ln974">    }</a>
+<a name="ln975">  else</a>
+<a name="ln976">    {</a>
+<a name="ln977">      if (vty != NULL)</a>
+<a name="ln978">        vty_out (vty, &quot;  PCE domain AS: %d%s&quot;, ntohl (top-&gt;value),</a>
+<a name="ln979">                 VTY_NEWLINE);</a>
+<a name="ln980">      else</a>
+<a name="ln981">        zlog_debug (&quot;    PCE domain AS: %d&quot;, ntohl (top-&gt;value));</a>
+<a name="ln982">    }</a>
+<a name="ln983">  return RI_TLV_SIZE (tlvh);</a>
+<a name="ln984">}</a>
+<a name="ln985"> </a>
+<a name="ln986">static u_int16_t</a>
+<a name="ln987">show_vty_pce_subtlv_neighbor (struct vty *vty, struct ri_tlv_header *tlvh)</a>
+<a name="ln988">{</a>
+<a name="ln989"> </a>
+<a name="ln990">  struct ri_pce_subtlv_neighbor *top = (struct ri_pce_subtlv_neighbor *) tlvh;</a>
+<a name="ln991">  struct in_addr tmp;</a>
+<a name="ln992"> </a>
+<a name="ln993">  if (ntohs (top-&gt;type) == PCE_DOMAIN_TYPE_AREA)</a>
+<a name="ln994">    {</a>
+<a name="ln995">      tmp.s_addr = top-&gt;value;</a>
+<a name="ln996">      if (vty != NULL)</a>
+<a name="ln997">        vty_out (vty, &quot;  PCE neighbor Area: %s%s&quot;, inet_ntoa (tmp),</a>
+<a name="ln998">                 VTY_NEWLINE);</a>
+<a name="ln999">      else</a>
+<a name="ln1000">        zlog_debug (&quot;    PCE neighbor Area: %s&quot;, inet_ntoa (tmp));</a>
+<a name="ln1001">    }</a>
+<a name="ln1002">  else</a>
+<a name="ln1003">    {</a>
+<a name="ln1004">      if (vty != NULL)</a>
+<a name="ln1005">        vty_out (vty, &quot;  PCE neighbor AS: %d%s&quot;, ntohl (top-&gt;value),</a>
+<a name="ln1006">                 VTY_NEWLINE);</a>
+<a name="ln1007">      else</a>
+<a name="ln1008">        zlog_debug (&quot;    PCE neighbor AS: %d&quot;, ntohl (top-&gt;value));</a>
+<a name="ln1009">    }</a>
+<a name="ln1010">  return RI_TLV_SIZE (tlvh);</a>
+<a name="ln1011">}</a>
+<a name="ln1012"> </a>
+<a name="ln1013">static u_int16_t</a>
+<a name="ln1014">show_vty_pce_subtlv_cap_flag (struct vty *vty, struct ri_tlv_header *tlvh)</a>
+<a name="ln1015">{</a>
+<a name="ln1016">  struct ri_pce_subtlv_cap_flag *top = (struct ri_pce_subtlv_cap_flag *) tlvh;</a>
+<a name="ln1017"> </a>
+<a name="ln1018">  if (vty != NULL)</a>
+<a name="ln1019">    vty_out (vty, &quot;  PCE Capabilities Flag: 0x%x%s&quot;, ntohl (top-&gt;value),</a>
+<a name="ln1020">             VTY_NEWLINE);</a>
+<a name="ln1021">  else</a>
+<a name="ln1022">    zlog_debug (&quot;    PCE Capabilities Flag: 0x%x&quot;, ntohl (top-&gt;value));</a>
+<a name="ln1023"> </a>
+<a name="ln1024">  return RI_TLV_SIZE (tlvh);</a>
+<a name="ln1025">}</a>
+<a name="ln1026"> </a>
+<a name="ln1027">static u_int16_t</a>
+<a name="ln1028">show_vty_unknown_tlv (struct vty *vty, struct ri_tlv_header *tlvh)</a>
+<a name="ln1029">{</a>
+<a name="ln1030">  if (vty != NULL)</a>
+<a name="ln1031">    vty_out (vty, &quot;  Unknown TLV: [type(0x%x), length(0x%x)]%s&quot;,</a>
+<a name="ln1032">             ntohs (tlvh-&gt;type), ntohs (tlvh-&gt;length), VTY_NEWLINE);</a>
+<a name="ln1033">  else</a>
+<a name="ln1034">    zlog_debug (&quot;    Unknown TLV: [type(0x%x), length(0x%x)]&quot;,</a>
+<a name="ln1035">                ntohs (tlvh-&gt;type), ntohs (tlvh-&gt;length));</a>
+<a name="ln1036"> </a>
+<a name="ln1037">  return RI_TLV_SIZE (tlvh);</a>
+<a name="ln1038">}</a>
+<a name="ln1039"> </a>
+<a name="ln1040">static u_int16_t</a>
+<a name="ln1041">show_vty_pce_info (struct vty *vty, struct ri_tlv_header *ri, uint32_t total)</a>
+<a name="ln1042">{</a>
+<a name="ln1043">  struct ri_tlv_header *tlvh;</a>
+<a name="ln1044">  u_int16_t sum = 0;</a>
+<a name="ln1045"> </a>
+<a name="ln1046">  for (tlvh = ri; sum &lt; total; tlvh = RI_TLV_HDR_NEXT (tlvh))</a>
+<a name="ln1047">    {</a>
+<a name="ln1048">      switch (ntohs (tlvh-&gt;type))</a>
+<a name="ln1049">        {</a>
+<a name="ln1050">        case RI_PCE_SUBTLV_ADDRESS:</a>
+<a name="ln1051">          sum += show_vty_pce_subtlv_address (vty, tlvh);</a>
+<a name="ln1052">          break;</a>
+<a name="ln1053">        case RI_PCE_SUBTLV_PATH_SCOPE:</a>
+<a name="ln1054">          sum += show_vty_pce_subtlv_path_scope (vty, tlvh);</a>
+<a name="ln1055">          break;</a>
+<a name="ln1056">        case RI_PCE_SUBTLV_DOMAIN:</a>
+<a name="ln1057">          sum += show_vty_pce_subtlv_domain (vty, tlvh);</a>
+<a name="ln1058">          break;</a>
+<a name="ln1059">        case RI_PCE_SUBTLV_NEIGHBOR:</a>
+<a name="ln1060">          sum += show_vty_pce_subtlv_neighbor (vty, tlvh);</a>
+<a name="ln1061">          break;</a>
+<a name="ln1062">        case RI_PCE_SUBTLV_CAP_FLAG:</a>
+<a name="ln1063">          sum += show_vty_pce_subtlv_cap_flag (vty, tlvh);</a>
+<a name="ln1064">          break;</a>
+<a name="ln1065">        default:</a>
+<a name="ln1066">          sum += show_vty_unknown_tlv (vty, tlvh);</a>
+<a name="ln1067">          break;</a>
+<a name="ln1068">        }</a>
+<a name="ln1069">    }</a>
+<a name="ln1070">  return sum;</a>
+<a name="ln1071">}</a>
+<a name="ln1072"> </a>
+<a name="ln1073">static void</a>
+<a name="ln1074">ospf_router_info_show_info (struct vty *vty, struct ospf_lsa *lsa)</a>
+<a name="ln1075">{</a>
+<a name="ln1076">  struct lsa_header *lsah = (struct lsa_header *) lsa-&gt;data;</a>
+<a name="ln1077">  struct ri_tlv_header *tlvh;</a>
+<a name="ln1078">  u_int16_t length = 0, sum = 0;</a>
+<a name="ln1079"> </a>
+<a name="ln1080">  /* Initialize TLV browsing */</a>
+<a name="ln1081">  length = ntohs (lsah-&gt;length) - OSPF_LSA_HEADER_SIZE;</a>
+<a name="ln1082"> </a>
+<a name="ln1083">  for (tlvh = RI_TLV_HDR_TOP (lsah); sum &lt; length;</a>
+<a name="ln1084">       tlvh = RI_TLV_HDR_NEXT (tlvh))</a>
+<a name="ln1085">    {</a>
+<a name="ln1086">      switch (ntohs (tlvh-&gt;type))</a>
+<a name="ln1087">        {</a>
+<a name="ln1088">        case RI_TLV_CAPABILITIES:</a>
+<a name="ln1089">          sum += show_vty_router_cap (vty, tlvh);</a>
+<a name="ln1090">          break;</a>
+<a name="ln1091">        case RI_TLV_PCE:</a>
+<a name="ln1092">          tlvh++;</a>
+<a name="ln1093">          sum += RI_TLV_HDR_SIZE;</a>
+<a name="ln1094">          sum += show_vty_pce_info (vty, tlvh, length - sum);</a>
+<a name="ln1095">          break;</a>
+<a name="ln1096">        default:</a>
+<a name="ln1097">          sum += show_vty_unknown_tlv (vty, tlvh);</a>
+<a name="ln1098">          break;</a>
+<a name="ln1099">        }</a>
+<a name="ln1100">    }</a>
+<a name="ln1101"> </a>
+<a name="ln1102">  return;</a>
+<a name="ln1103">}</a>
+<a name="ln1104"> </a>
+<a name="ln1105">static void</a>
+<a name="ln1106">ospf_router_info_config_write_router (struct vty *vty)</a>
+<a name="ln1107">{</a>
+<a name="ln1108">  struct ospf_pce_info *pce = &amp;OspfRI.pce_info;</a>
+<a name="ln1109">  struct listnode *node;</a>
+<a name="ln1110">  struct ri_pce_subtlv_domain *domain;</a>
+<a name="ln1111">  struct ri_pce_subtlv_neighbor *neighbor;</a>
+<a name="ln1112">  struct in_addr tmp;</a>
+<a name="ln1113"> </a>
+<a name="ln1114">  if (OspfRI.status == enabled)</a>
+<a name="ln1115">    {</a>
+<a name="ln1116">      if (OspfRI.scope == OSPF_OPAQUE_AS_LSA)</a>
+<a name="ln1117">        vty_out (vty, &quot; router-info as%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1118">      else</a>
+<a name="ln1119">        vty_out (vty, &quot; router-info area %s%s&quot;, inet_ntoa (OspfRI.area_id),</a>
+<a name="ln1120">                 VTY_NEWLINE);</a>
+<a name="ln1121"> </a>
+<a name="ln1122">      if (pce-&gt;pce_address.header.type != 0)</a>
+<a name="ln1123">        vty_out (vty, &quot;  pce address %s%s&quot;,</a>
+<a name="ln1124">                 inet_ntoa (pce-&gt;pce_address.address.value), VTY_NEWLINE);</a>
+<a name="ln1125"> </a>
+<a name="ln1126">      if (pce-&gt;pce_cap_flag.header.type != 0)</a>
+<a name="ln1127">        vty_out (vty, &quot;  pce flag 0x%x%s&quot;, ntohl (pce-&gt;pce_cap_flag.value),</a>
+<a name="ln1128">                 VTY_NEWLINE);</a>
+<a name="ln1129"> </a>
+<a name="ln1130">      for (ALL_LIST_ELEMENTS_RO (pce-&gt;pce_domain, node, domain))</a>
+<a name="ln1131">        {</a>
+<a name="ln1132">          if (domain-&gt;header.type != 0)</a>
+<a name="ln1133">            {</a>
+<a name="ln1134">              if (domain-&gt;type == PCE_DOMAIN_TYPE_AREA)</a>
+<a name="ln1135">                {</a>
+<a name="ln1136">                  tmp.s_addr = domain-&gt;value;</a>
+<a name="ln1137">                  vty_out (vty, &quot;  pce domain area %s%s&quot;, inet_ntoa (tmp),</a>
+<a name="ln1138">                           VTY_NEWLINE);</a>
+<a name="ln1139">                }</a>
+<a name="ln1140">              else</a>
+<a name="ln1141">                {</a>
+<a name="ln1142">                  vty_out (vty, &quot;  pce domain as %d%s&quot;, ntohl (domain-&gt;value),</a>
+<a name="ln1143">                           VTY_NEWLINE);</a>
+<a name="ln1144">                }</a>
+<a name="ln1145">            }</a>
+<a name="ln1146">        }</a>
+<a name="ln1147"> </a>
+<a name="ln1148">      for (ALL_LIST_ELEMENTS_RO (pce-&gt;pce_neighbor, node, neighbor))</a>
+<a name="ln1149">        {</a>
+<a name="ln1150">          if (neighbor-&gt;header.type != 0)</a>
+<a name="ln1151">            {</a>
+<a name="ln1152">              if (neighbor-&gt;type == PCE_DOMAIN_TYPE_AREA)</a>
+<a name="ln1153">                {</a>
+<a name="ln1154">                  tmp.s_addr = neighbor-&gt;value;</a>
+<a name="ln1155">                  vty_out (vty, &quot;  pce neighbor area %s%s&quot;, inet_ntoa (tmp),</a>
+<a name="ln1156">                           VTY_NEWLINE);</a>
+<a name="ln1157">                }</a>
+<a name="ln1158">              else</a>
+<a name="ln1159">                {</a>
+<a name="ln1160">                  vty_out (vty, &quot;  pce neighbor as %d%s&quot;,</a>
+<a name="ln1161">                           ntohl (neighbor-&gt;value), VTY_NEWLINE);</a>
+<a name="ln1162">                }</a>
+<a name="ln1163">            }</a>
+<a name="ln1164">        }</a>
+<a name="ln1165"> </a>
+<a name="ln1166">      if (pce-&gt;pce_scope.header.type != 0)</a>
+<a name="ln1167">        vty_out (vty, &quot;  pce scope 0x%x%s&quot;,</a>
+<a name="ln1168">                 ntohl (OspfRI.pce_info.pce_scope.value), VTY_NEWLINE);</a>
+<a name="ln1169">    }</a>
+<a name="ln1170">  return;</a>
+<a name="ln1171">}</a>
+<a name="ln1172"> </a>
+<a name="ln1173">/*------------------------------------------------------------------------*</a>
+<a name="ln1174"> * Followings are vty command functions.</a>
+<a name="ln1175"> *------------------------------------------------------------------------*/</a>
+<a name="ln1176"> </a>
+<a name="ln1177">DEFUN (router_info,</a>
+<a name="ln1178">       router_info_area_cmd,</a>
+<a name="ln1179">       &quot;router-info area A.B.C.D&quot;,</a>
+<a name="ln1180">       OSPF_RI_STR</a>
+<a name="ln1181">       &quot;Enable the Router Information functionality with Area flooding scope\n&quot;</a>
+<a name="ln1182">       &quot;OSPF area ID in IP format&quot;)</a>
+<a name="ln1183">{</a>
+<a name="ln1184"> </a>
+<a name="ln1185">  u_int8_t scope;</a>
+<a name="ln1186"> </a>
+<a name="ln1187">  if (OspfRI.status == enabled)</a>
+<a name="ln1188">    return CMD_SUCCESS;</a>
+<a name="ln1189"> </a>
+<a name="ln1190">  /* Check and get Area value if present */</a>
+<a name="ln1191">  if (argc == 1)</a>
+<a name="ln1192">    {</a>
+<a name="ln1193">      if (!inet_aton (argv[0], &amp;OspfRI.area_id))</a>
+<a name="ln1194">        {</a>
+<a name="ln1195">          vty_out (vty, &quot;Please specify Router Info Area by A.B.C.D%s&quot;,</a>
+<a name="ln1196">                   VTY_NEWLINE);</a>
+<a name="ln1197">          return CMD_WARNING;</a>
+<a name="ln1198">        }</a>
+<a name="ln1199">      scope = OSPF_OPAQUE_AREA_LSA;</a>
+<a name="ln1200">    }</a>
+<a name="ln1201">  else</a>
+<a name="ln1202">    {</a>
+<a name="ln1203">      OspfRI.area_id.s_addr = 0;</a>
+<a name="ln1204">      scope = OSPF_OPAQUE_AS_LSA;</a>
+<a name="ln1205">    }</a>
+<a name="ln1206"> </a>
+<a name="ln1207">  /* First start to register Router Information callbacks */</a>
+<a name="ln1208">  if ((ospf_router_info_register (scope)) != 0)</a>
+<a name="ln1209">    {</a>
+<a name="ln1210">      zlog_warn (&quot;Enable to register Router Information callbacks. Abort!&quot;);</a>
+<a name="ln1211">      return CMD_WARNING;</a>
+<a name="ln1212">    }</a>
+<a name="ln1213"> </a>
+<a name="ln1214">  OspfRI.status = enabled;</a>
+<a name="ln1215"> </a>
+<a name="ln1216">  if (IS_DEBUG_OSPF_EVENT)</a>
+<a name="ln1217">    zlog_debug (&quot;RI-&gt; Router Information (%s flooding): OFF -&gt; ON&quot;,</a>
+<a name="ln1218">                 OspfRI.scope == OSPF_OPAQUE_AREA_LSA ? &quot;Area&quot; : &quot;AS&quot;);</a>
+<a name="ln1219"> </a>
+<a name="ln1220">  /*</a>
+<a name="ln1221">   * Following code is intended to handle two cases;</a>
+<a name="ln1222">   *</a>
+<a name="ln1223">   * 1) Router Information was disabled at startup time, but now become enabled.</a>
+<a name="ln1224">   * 2) Router Information was once enabled then disabled, and now enabled again.</a>
+<a name="ln1225">   */</a>
+<a name="ln1226"> </a>
+<a name="ln1227">  initialize_params (&amp;OspfRI);</a>
+<a name="ln1228"> </a>
+<a name="ln1229">  /* Refresh RI LSA if already engaged */</a>
+<a name="ln1230">  if (OspfRI.flags &amp; RIFLG_LSA_ENGAGED)</a>
+<a name="ln1231">    {</a>
+<a name="ln1232">      zlog_debug (&quot;RI-&gt; Initial origination following configuration&quot;);</a>
+<a name="ln1233">      ospf_router_info_lsa_schedule (REORIGINATE_THIS_LSA);</a>
+<a name="ln1234">    }</a>
+<a name="ln1235">  return CMD_SUCCESS;</a>
+<a name="ln1236"> </a>
+<a name="ln1237">}</a>
+<a name="ln1238"> </a>
+<a name="ln1239">ALIAS (router_info,</a>
+<a name="ln1240">       router_info_as_cmd,</a>
+<a name="ln1241">       &quot;router-info as&quot;,</a>
+<a name="ln1242">       OSPF_RI_STR</a>
+<a name="ln1243">       &quot;Enable the Router Information functionality with AS flooding scope\n&quot;)</a>
+<a name="ln1244"> </a>
+<a name="ln1245">DEFUN (no_router_info,</a>
+<a name="ln1246">       no_router_info_cmd,</a>
+<a name="ln1247">       &quot;no router-info&quot;,</a>
+<a name="ln1248">       NO_STR</a>
+<a name="ln1249">       &quot;Disable the Router Information functionality\n&quot;)</a>
+<a name="ln1250">{</a>
+<a name="ln1251"> </a>
+<a name="ln1252">  if (OspfRI.status == disabled)</a>
+<a name="ln1253">    return CMD_SUCCESS;</a>
+<a name="ln1254"> </a>
+<a name="ln1255">  if (IS_DEBUG_OSPF_EVENT)</a>
+<a name="ln1256">    zlog_debug (&quot;RI-&gt; Router Information: ON -&gt; OFF&quot;);</a>
+<a name="ln1257"> </a>
+<a name="ln1258">  if (OspfRI.flags &amp; RIFLG_LSA_ENGAGED)</a>
+<a name="ln1259">    ospf_router_info_lsa_schedule (FLUSH_THIS_LSA);</a>
+<a name="ln1260"> </a>
+<a name="ln1261">  /* Unregister the callbacks */</a>
+<a name="ln1262">  ospf_router_info_unregister ();</a>
+<a name="ln1263"> </a>
+<a name="ln1264">  OspfRI.status = disabled;</a>
+<a name="ln1265"> </a>
+<a name="ln1266">  return CMD_SUCCESS;</a>
+<a name="ln1267">}</a>
+<a name="ln1268"> </a>
+<a name="ln1269">DEFUN (pce_address,</a>
+<a name="ln1270">       pce_address_cmd,</a>
+<a name="ln1271">       &quot;pce address A.B.C.D&quot;,</a>
+<a name="ln1272">       PCE_STR</a>
+<a name="ln1273">       &quot;Stable IP address of the PCE\n&quot;</a>
+<a name="ln1274">       &quot;PCE address in IPv4 address format\n&quot;)</a>
+<a name="ln1275">{</a>
+<a name="ln1276">  struct in_addr value;</a>
+<a name="ln1277">  struct ospf_pce_info *pi = &amp;OspfRI.pce_info;</a>
+<a name="ln1278"> </a>
+<a name="ln1279">  if (!inet_aton (argv[0], &amp;value))</a>
+<a name="ln1280">    {</a>
+<a name="ln1281">      vty_out (vty, &quot;Please specify PCE Address by A.B.C.D%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1282">      return CMD_WARNING;</a>
+<a name="ln1283">    }</a>
+<a name="ln1284"> </a>
+<a name="ln1285">  if (ntohs (pi-&gt;pce_address.header.type) == 0</a>
+<a name="ln1286">      || ntohl (pi-&gt;pce_address.address.value.s_addr) != ntohl (value.s_addr))</a>
+<a name="ln1287">    {</a>
+<a name="ln1288"> </a>
+<a name="ln1289">      set_pce_address (value, pi);</a>
+<a name="ln1290"> </a>
+<a name="ln1291">      /* Refresh RI LSA if already engaged */</a>
+<a name="ln1292">      if ((OspfRI.status == enabled) &amp;&amp; (OspfRI.flags &amp; RIFLG_LSA_ENGAGED))</a>
+<a name="ln1293">        ospf_router_info_lsa_schedule (REFRESH_THIS_LSA);</a>
+<a name="ln1294">    }</a>
+<a name="ln1295"> </a>
+<a name="ln1296">  return CMD_SUCCESS;</a>
+<a name="ln1297">}</a>
+<a name="ln1298"> </a>
+<a name="ln1299">DEFUN (no_pce_address,</a>
+<a name="ln1300">       no_pce_address_cmd,</a>
+<a name="ln1301">       &quot;no pce address&quot;,</a>
+<a name="ln1302">       NO_STR</a>
+<a name="ln1303">       PCE_STR</a>
+<a name="ln1304">       &quot;Disable PCE address\n&quot;)</a>
+<a name="ln1305">{</a>
+<a name="ln1306"> </a>
+<a name="ln1307">  unset_param (&amp;OspfRI.pce_info.pce_address.header);</a>
+<a name="ln1308"> </a>
+<a name="ln1309">  /* Refresh RI LSA if already engaged */</a>
+<a name="ln1310">  if ((OspfRI.status == enabled) &amp;&amp; (OspfRI.flags &amp; RIFLG_LSA_ENGAGED))</a>
+<a name="ln1311">    ospf_router_info_lsa_schedule (REFRESH_THIS_LSA);</a>
+<a name="ln1312"> </a>
+<a name="ln1313">  return CMD_SUCCESS;</a>
+<a name="ln1314">}</a>
+<a name="ln1315"> </a>
+<a name="ln1316">DEFUN (pce_path_scope,</a>
+<a name="ln1317">       pce_path_scope_cmd,</a>
+<a name="ln1318">       &quot;pce scope BITPATTERN&quot;,</a>
+<a name="ln1319">       PCE_STR</a>
+<a name="ln1320">       &quot;Path scope visibilities of the PCE for path computation\n&quot;</a>
+<a name="ln1321">       &quot;32-bit Hexadecimal value\n&quot;)</a>
+<a name="ln1322">{</a>
+<a name="ln1323">  uint32_t scope;</a>
+<a name="ln1324">  struct ospf_pce_info *pi = &amp;OspfRI.pce_info;</a>
+<a name="ln1325"> </a>
+<a name="ln1326">  if (sscanf (argv[0], &quot;0x%x&quot;, &amp;scope) != 1)</a>
+<a name="ln1327">    {</a>
+<a name="ln1328">      vty_out (vty, &quot;pce_path_scope: fscanf: %s%s&quot;, safe_strerror (errno),</a>
+<a name="ln1329">               VTY_NEWLINE);</a>
+<a name="ln1330">      return CMD_WARNING;</a>
+<a name="ln1331">    }</a>
+<a name="ln1332"> </a>
+<a name="ln1333">  if (ntohl (pi-&gt;pce_scope.header.type) == 0 || scope != pi-&gt;pce_scope.value)</a>
+<a name="ln1334">    {</a>
+<a name="ln1335">      set_pce_path_scope (scope, pi);</a>
+<a name="ln1336"> </a>
+<a name="ln1337">      /* Refresh RI LSA if already engaged */</a>
+<a name="ln1338">      if ((OspfRI.status == enabled) &amp;&amp; (OspfRI.flags &amp; RIFLG_LSA_ENGAGED))</a>
+<a name="ln1339">        ospf_router_info_lsa_schedule (REFRESH_THIS_LSA);</a>
+<a name="ln1340">    }</a>
+<a name="ln1341"> </a>
+<a name="ln1342">  return CMD_SUCCESS;</a>
+<a name="ln1343">}</a>
+<a name="ln1344"> </a>
+<a name="ln1345">DEFUN (no_pce_path_scope,</a>
+<a name="ln1346">       no_pce_path_scope_cmd,</a>
+<a name="ln1347">       &quot;no pce scope&quot;,</a>
+<a name="ln1348">       NO_STR</a>
+<a name="ln1349">       PCE_STR</a>
+<a name="ln1350">       &quot;Disable PCE path scope\n&quot;)</a>
+<a name="ln1351">{</a>
+<a name="ln1352"> </a>
+<a name="ln1353">  unset_param (&amp;OspfRI.pce_info.pce_address.header);</a>
+<a name="ln1354"> </a>
+<a name="ln1355">  /* Refresh RI LSA if already engaged */</a>
+<a name="ln1356">  if ((OspfRI.status == enabled) &amp;&amp; (OspfRI.flags &amp; RIFLG_LSA_ENGAGED))</a>
+<a name="ln1357">    ospf_router_info_lsa_schedule (REFRESH_THIS_LSA);</a>
+<a name="ln1358"> </a>
+<a name="ln1359">  return CMD_SUCCESS;</a>
+<a name="ln1360">}</a>
+<a name="ln1361"> </a>
+<a name="ln1362">DEFUN (pce_domain,</a>
+<a name="ln1363">       pce_domain_cmd,</a>
+<a name="ln1364">       &quot;pce domain as &lt;0-65535&gt;&quot;,</a>
+<a name="ln1365">       PCE_STR</a>
+<a name="ln1366">       &quot;Configure PCE domain AS number\n&quot;</a>
+<a name="ln1367">       &quot;AS number where the PCE as visibilities for path computation\n&quot;</a>
+<a name="ln1368">       &quot;AS number in decimal &lt;0-65535&gt;\n&quot;)</a>
+<a name="ln1369">{</a>
+<a name="ln1370"> </a>
+<a name="ln1371">  uint32_t as;</a>
+<a name="ln1372">  struct ospf_pce_info *pce = &amp;OspfRI.pce_info;</a>
+<a name="ln1373">  struct listnode *node;</a>
+<a name="ln1374">  struct ri_pce_subtlv_domain *domain;</a>
+<a name="ln1375"> </a>
+<a name="ln1376">  if (sscanf (argv[0], &quot;%d&quot;, &amp;as) != 1)</a>
+<a name="ln1377">    {</a>
+<a name="ln1378">      vty_out (vty, &quot;pce_domain: fscanf: %s%s&quot;, safe_strerror (errno),</a>
+<a name="ln1379">               VTY_NEWLINE);</a>
+<a name="ln1380">      return CMD_WARNING;</a>
+<a name="ln1381">    }</a>
+<a name="ln1382"> </a>
+<a name="ln1383">  /* Check if the domain is not already in the domain list */</a>
+<a name="ln1384">  for (ALL_LIST_ELEMENTS_RO (pce-&gt;pce_domain, node, domain))</a>
+<a name="ln1385">    {</a>
+<a name="ln1386">      if (ntohl (domain-&gt;header.type) == 0 &amp;&amp; as == domain-&gt;value)</a>
+<a name="ln1387">        goto out;</a>
+<a name="ln1388">    }</a>
+<a name="ln1389"> </a>
+<a name="ln1390">  /* Create new domain if not found */</a>
+<a name="ln1391">  set_pce_domain (PCE_DOMAIN_TYPE_AS, as, pce);</a>
+<a name="ln1392"> </a>
+<a name="ln1393">  /* Refresh RI LSA if already engaged */</a>
+<a name="ln1394">  if ((OspfRI.status == enabled) &amp;&amp; (OspfRI.flags &amp; RIFLG_LSA_ENGAGED))</a>
+<a name="ln1395">    ospf_router_info_lsa_schedule (REFRESH_THIS_LSA);</a>
+<a name="ln1396"> </a>
+<a name="ln1397">out:return CMD_SUCCESS;</a>
+<a name="ln1398">}</a>
+<a name="ln1399"> </a>
+<a name="ln1400">DEFUN (no_pce_domain,</a>
+<a name="ln1401">       no_pce_domain_cmd,</a>
+<a name="ln1402">       &quot;no pce domain as &lt;0-65535&gt;&quot;,</a>
+<a name="ln1403">       NO_STR</a>
+<a name="ln1404">       PCE_STR</a>
+<a name="ln1405">       &quot;Disable PCE domain AS number\n&quot;</a>
+<a name="ln1406">       &quot;AS number where the PCE as visibilities for path computation\n&quot;</a>
+<a name="ln1407">       &quot;AS number in decimal &lt;0-65535&gt;\n&quot;)</a>
+<a name="ln1408">{</a>
+<a name="ln1409"> </a>
+<a name="ln1410">  uint32_t as;</a>
+<a name="ln1411">  struct ospf_pce_info *pce = &amp;OspfRI.pce_info;</a>
+<a name="ln1412"> </a>
+<a name="ln1413">  if (sscanf (argv[0], &quot;%d&quot;, &amp;as) != 1)</a>
+<a name="ln1414">    {</a>
+<a name="ln1415">      vty_out (vty, &quot;no_pce_domain: fscanf: %s%s&quot;, safe_strerror (errno),</a>
+<a name="ln1416">               VTY_NEWLINE);</a>
+<a name="ln1417">      return CMD_WARNING;</a>
+<a name="ln1418">    }</a>
+<a name="ln1419"> </a>
+<a name="ln1420">  /* Unset corresponding PCE domain */</a>
+<a name="ln1421">  unset_pce_domain (PCE_DOMAIN_TYPE_AS, as, pce);</a>
+<a name="ln1422"> </a>
+<a name="ln1423">  /* Refresh RI LSA if already engaged */</a>
+<a name="ln1424">  if ((OspfRI.status == enabled) &amp;&amp; (OspfRI.flags &amp; RIFLG_LSA_ENGAGED))</a>
+<a name="ln1425">    ospf_router_info_lsa_schedule (REFRESH_THIS_LSA);</a>
+<a name="ln1426"> </a>
+<a name="ln1427">  return CMD_SUCCESS;</a>
+<a name="ln1428">}</a>
+<a name="ln1429"> </a>
+<a name="ln1430">DEFUN (pce_neigbhor,</a>
+<a name="ln1431">       pce_neighbor_cmd,</a>
+<a name="ln1432">       &quot;pce neighbor as &lt;0-65535&gt;&quot;,</a>
+<a name="ln1433">       PCE_STR</a>
+<a name="ln1434">       &quot;Configure PCE neighbor domain AS number\n&quot;</a>
+<a name="ln1435">       &quot;AS number of PCE neighbors\n&quot;</a>
+<a name="ln1436">       &quot;AS number in decimal &lt;0-65535&gt;\n&quot;)</a>
+<a name="ln1437">{</a>
+<a name="ln1438"> </a>
+<a name="ln1439">  uint32_t as;</a>
+<a name="ln1440">  struct ospf_pce_info *pce = &amp;OspfRI.pce_info;</a>
+<a name="ln1441">  struct listnode *node;</a>
+<a name="ln1442">  struct ri_pce_subtlv_neighbor *neighbor;</a>
+<a name="ln1443"> </a>
+<a name="ln1444">  if (sscanf (argv[0], &quot;%d&quot;, &amp;as) != 1)</a>
+<a name="ln1445">    {</a>
+<a name="ln1446">      vty_out (vty, &quot;pce_neighbor: fscanf: %s%s&quot;, safe_strerror (errno),</a>
+<a name="ln1447">               VTY_NEWLINE);</a>
+<a name="ln1448">      return CMD_WARNING;</a>
+<a name="ln1449">    }</a>
+<a name="ln1450"> </a>
+<a name="ln1451">  /* Check if the domain is not already in the domain list */</a>
+<a name="ln1452">  for (ALL_LIST_ELEMENTS_RO (pce-&gt;pce_neighbor, node, neighbor))</a>
+<a name="ln1453">    {</a>
+<a name="ln1454">      if (ntohl (neighbor-&gt;header.type) == 0 &amp;&amp; as == neighbor-&gt;value)</a>
+<a name="ln1455">        goto out;</a>
+<a name="ln1456">    }</a>
+<a name="ln1457"> </a>
+<a name="ln1458">  /* Create new domain if not found */</a>
+<a name="ln1459">  set_pce_neighbor (PCE_DOMAIN_TYPE_AS, as, pce);</a>
+<a name="ln1460"> </a>
+<a name="ln1461">  /* Refresh RI LSA if already engaged */</a>
+<a name="ln1462">  if ((OspfRI.status == enabled) &amp;&amp; (OspfRI.flags &amp; RIFLG_LSA_ENGAGED))</a>
+<a name="ln1463">    ospf_router_info_lsa_schedule (REFRESH_THIS_LSA);</a>
+<a name="ln1464"> </a>
+<a name="ln1465">out:return CMD_SUCCESS;</a>
+<a name="ln1466">}</a>
+<a name="ln1467"> </a>
+<a name="ln1468">DEFUN (no_pce_neighbor,</a>
+<a name="ln1469">       no_pce_neighbor_cmd,</a>
+<a name="ln1470">       &quot;no pce neighbor as &lt;0-65535&gt;&quot;,</a>
+<a name="ln1471">       NO_STR</a>
+<a name="ln1472">       PCE_STR</a>
+<a name="ln1473">       &quot;Disable PCE neighbor AS number\n&quot;</a>
+<a name="ln1474">       &quot;AS number of PCE neighbor\n&quot;</a>
+<a name="ln1475">       &quot;AS number in decimal &lt;0-65535&gt;\n&quot;)</a>
+<a name="ln1476">{</a>
+<a name="ln1477"> </a>
+<a name="ln1478">  uint32_t as;</a>
+<a name="ln1479">  struct ospf_pce_info *pce = &amp;OspfRI.pce_info;</a>
+<a name="ln1480"> </a>
+<a name="ln1481">  if (sscanf (argv[0], &quot;%d&quot;, &amp;as) != 1)</a>
+<a name="ln1482">    {</a>
+<a name="ln1483">      vty_out (vty, &quot;no_pce_neighbor: fscanf: %s%s&quot;, safe_strerror (errno),</a>
+<a name="ln1484">               VTY_NEWLINE);</a>
+<a name="ln1485">      return CMD_WARNING;</a>
+<a name="ln1486">    }</a>
+<a name="ln1487"> </a>
+<a name="ln1488">  /* Unset corresponding PCE domain */</a>
+<a name="ln1489">  unset_pce_neighbor (PCE_DOMAIN_TYPE_AS, as, pce);</a>
+<a name="ln1490"> </a>
+<a name="ln1491">  /* Refresh RI LSA if already engaged */</a>
+<a name="ln1492">  if ((OspfRI.status == enabled) &amp;&amp; (OspfRI.flags &amp; RIFLG_LSA_ENGAGED))</a>
+<a name="ln1493">    ospf_router_info_lsa_schedule (REFRESH_THIS_LSA);</a>
+<a name="ln1494"> </a>
+<a name="ln1495">  return CMD_SUCCESS;</a>
+<a name="ln1496">}</a>
+<a name="ln1497"> </a>
+<a name="ln1498">DEFUN (pce_cap_flag,</a>
+<a name="ln1499">       pce_cap_flag_cmd,</a>
+<a name="ln1500">       &quot;pce flag BITPATTERN&quot;,</a>
+<a name="ln1501">       PCE_STR</a>
+<a name="ln1502">       &quot;Capabilities of the PCE for path computation\n&quot;</a>
+<a name="ln1503">       &quot;32-bit Hexadecimal value\n&quot;)</a>
+<a name="ln1504">{</a>
+<a name="ln1505"> </a>
+<a name="ln1506">  uint32_t cap;</a>
+<a name="ln1507">  struct ospf_pce_info *pce = &amp;OspfRI.pce_info;</a>
+<a name="ln1508"> </a>
+<a name="ln1509">  if (sscanf (argv[0], &quot;0x%x&quot;, &amp;cap) != 1)</a>
+<a name="ln1510">    {</a>
+<a name="ln1511">      vty_out (vty, &quot;pce_cap_flag: fscanf: %s%s&quot;, safe_strerror (errno),</a>
+<a name="ln1512">               VTY_NEWLINE);</a>
+<a name="ln1513">      return CMD_WARNING;</a>
+<a name="ln1514">    }</a>
+<a name="ln1515"> </a>
+<a name="ln1516">  if (ntohl (pce-&gt;pce_cap_flag.header.type) == 0</a>
+<a name="ln1517">      || cap != pce-&gt;pce_cap_flag.value)</a>
+<a name="ln1518">    {</a>
+<a name="ln1519">      set_pce_cap_flag (cap, pce);</a>
+<a name="ln1520"> </a>
+<a name="ln1521">      /* Refresh RI LSA if already engaged */</a>
+<a name="ln1522">      if ((OspfRI.status == enabled) &amp;&amp; (OspfRI.flags &amp; RIFLG_LSA_ENGAGED))</a>
+<a name="ln1523">        ospf_router_info_lsa_schedule (REFRESH_THIS_LSA);</a>
+<a name="ln1524">    }</a>
+<a name="ln1525"> </a>
+<a name="ln1526">  return CMD_SUCCESS;</a>
+<a name="ln1527">}</a>
+<a name="ln1528"> </a>
+<a name="ln1529">DEFUN (no_pce_cap_flag,</a>
+<a name="ln1530">       no_pce_cap_flag_cmd,</a>
+<a name="ln1531">       &quot;no pce flag&quot;,</a>
+<a name="ln1532">       NO_STR</a>
+<a name="ln1533">       PCE_STR</a>
+<a name="ln1534">       &quot;Disable PCE capabilities\n&quot;)</a>
+<a name="ln1535">{</a>
+<a name="ln1536"> </a>
+<a name="ln1537">  unset_param (&amp;OspfRI.pce_info.pce_cap_flag.header);</a>
+<a name="ln1538"> </a>
+<a name="ln1539">  /* Refresh RI LSA if already engaged */</a>
+<a name="ln1540">  if ((OspfRI.status == enabled) &amp;&amp; (OspfRI.flags &amp; RIFLG_LSA_ENGAGED))</a>
+<a name="ln1541">    ospf_router_info_lsa_schedule (REFRESH_THIS_LSA);</a>
+<a name="ln1542"> </a>
+<a name="ln1543">  return CMD_SUCCESS;</a>
+<a name="ln1544">}</a>
+<a name="ln1545"> </a>
+<a name="ln1546">DEFUN (show_ip_ospf_router_info,</a>
+<a name="ln1547">       show_ip_ospf_router_info_cmd,</a>
+<a name="ln1548">       &quot;show ip ospf router-info&quot;,</a>
+<a name="ln1549">       SHOW_STR</a>
+<a name="ln1550">       IP_STR</a>
+<a name="ln1551">       OSPF_STR</a>
+<a name="ln1552">       &quot;Router Information\n&quot;)</a>
+<a name="ln1553">{</a>
+<a name="ln1554"> </a>
+<a name="ln1555">  if (OspfRI.status == enabled)</a>
+<a name="ln1556">    {</a>
+<a name="ln1557">      vty_out (vty, &quot;--- Router Information parameters ---%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1558">      show_vty_router_cap (vty, &amp;OspfRI.router_cap.header);</a>
+<a name="ln1559">    }</a>
+<a name="ln1560">  else</a>
+<a name="ln1561">    {</a>
+<a name="ln1562">      if (vty != NULL)</a>
+<a name="ln1563">        vty_out (vty, &quot;  Router Information is disabled on this router%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1564">    }</a>
+<a name="ln1565">  return CMD_SUCCESS;</a>
+<a name="ln1566">}</a>
+<a name="ln1567"> </a>
+<a name="ln1568">DEFUN (show_ip_opsf_router_info_pce,</a>
+<a name="ln1569">       show_ip_ospf_router_info_pce_cmd,</a>
+<a name="ln1570">       &quot;show ip ospf router-info pce&quot;,</a>
+<a name="ln1571">       SHOW_STR</a>
+<a name="ln1572">       IP_STR</a>
+<a name="ln1573">       OSPF_STR</a>
+<a name="ln1574">       &quot;Router Information\n&quot;</a>
+<a name="ln1575">       &quot;PCE information\n&quot;)</a>
+<a name="ln1576">{</a>
+<a name="ln1577"> </a>
+<a name="ln1578">  struct ospf_pce_info *pce = &amp;OspfRI.pce_info;</a>
+<a name="ln1579">  struct listnode *node;</a>
+<a name="ln1580">  struct ri_pce_subtlv_domain *domain;</a>
+<a name="ln1581">  struct ri_pce_subtlv_neighbor *neighbor;</a>
+<a name="ln1582"> </a>
+<a name="ln1583">  if (OspfRI.status == enabled)</a>
+<a name="ln1584">    {</a>
+<a name="ln1585">      vty_out (vty, &quot;--- PCE parameters ---%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1586"> </a>
+<a name="ln1587">      if (pce-&gt;pce_address.header.type != 0)</a>
+<a name="ln1588">        show_vty_pce_subtlv_address (vty, &amp;pce-&gt;pce_address.header);</a>
+<a name="ln1589"> </a>
+<a name="ln1590">      if (pce-&gt;pce_scope.header.type != 0)</a>
+<a name="ln1591">        show_vty_pce_subtlv_path_scope (vty, &amp;pce-&gt;pce_scope.header);</a>
+<a name="ln1592"> </a>
+<a name="ln1593">      for (ALL_LIST_ELEMENTS_RO (pce-&gt;pce_domain, node, domain))</a>
+<a name="ln1594">        {</a>
+<a name="ln1595">          if (domain-&gt;header.type != 0)</a>
+<a name="ln1596">            show_vty_pce_subtlv_domain (vty, &amp;domain-&gt;header);</a>
+<a name="ln1597">        }</a>
+<a name="ln1598"> </a>
+<a name="ln1599">      for (ALL_LIST_ELEMENTS_RO (pce-&gt;pce_neighbor, node, neighbor))</a>
+<a name="ln1600">        {</a>
+<a name="ln1601">          if (neighbor-&gt;header.type != 0)</a>
+<a name="ln1602">            show_vty_pce_subtlv_neighbor (vty, &amp;neighbor-&gt;header);</a>
+<a name="ln1603">        }</a>
+<a name="ln1604"> </a>
+<a name="ln1605">      if (pce-&gt;pce_cap_flag.header.type != 0)</a>
+<a name="ln1606">        show_vty_pce_subtlv_cap_flag (vty, &amp;pce-&gt;pce_cap_flag.header);</a>
+<a name="ln1607"> </a>
+<a name="ln1608">    }</a>
+<a name="ln1609">  else</a>
+<a name="ln1610">    {</a>
+<a name="ln1611">      vty_out (vty, &quot;  Router Information is disabled on this router%s&quot;,</a>
+<a name="ln1612">               VTY_NEWLINE);</a>
+<a name="ln1613">    }</a>
+<a name="ln1614"> </a>
+<a name="ln1615">  return CMD_SUCCESS;</a>
+<a name="ln1616">}</a>
+<a name="ln1617"> </a>
+<a name="ln1618">/* Install new CLI commands */</a>
+<a name="ln1619">static void</a>
+<a name="ln1620">ospf_router_info_register_vty (void)</a>
+<a name="ln1621">{</a>
+<a name="ln1622">  install_element (VIEW_NODE, &amp;show_ip_ospf_router_info_cmd);</a>
+<a name="ln1623">  install_element (VIEW_NODE, &amp;show_ip_ospf_router_info_pce_cmd);</a>
+<a name="ln1624"> </a>
+<a name="ln1625">  install_element (OSPF_NODE, &amp;router_info_area_cmd);</a>
+<a name="ln1626">  install_element (OSPF_NODE, &amp;router_info_as_cmd);</a>
+<a name="ln1627">  install_element (OSPF_NODE, &amp;no_router_info_cmd);</a>
+<a name="ln1628">  install_element (OSPF_NODE, &amp;pce_address_cmd);</a>
+<a name="ln1629">  install_element (OSPF_NODE, &amp;pce_path_scope_cmd);</a>
+<a name="ln1630">  install_element (OSPF_NODE, &amp;pce_domain_cmd);</a>
+<a name="ln1631">  install_element (OSPF_NODE, &amp;no_pce_domain_cmd);</a>
+<a name="ln1632">  install_element (OSPF_NODE, &amp;pce_neighbor_cmd);</a>
+<a name="ln1633">  install_element (OSPF_NODE, &amp;no_pce_neighbor_cmd);</a>
+<a name="ln1634">  install_element (OSPF_NODE, &amp;pce_cap_flag_cmd);</a>
+<a name="ln1635"> </a>
+<a name="ln1636">  return;</a>
+<a name="ln1637">}</a>
+
+</code></pre>
+<div class="balloon" rel="13"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1042/" target="_blank">V1042</a> This file is marked with copyleft license, which requires you to open the derived source code.</p></div>
+<div class="balloon" rel="1376"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'sscanf' function. A pointer to the signed int type is expected.</p></div>
+<div class="balloon" rel="1413"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'sscanf' function. A pointer to the signed int type is expected.</p></div>
+<div class="balloon" rel="1444"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'sscanf' function. A pointer to the signed int type is expected.</p></div>
+<div class="balloon" rel="1481"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'sscanf' function. A pointer to the signed int type is expected.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

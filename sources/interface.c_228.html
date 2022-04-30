@@ -1,0 +1,2867 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>interface.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.5.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Interface function.</a>
+<a name="ln3"> * Copyright (C) 1997, 1999 Kunihiro Ishiguro</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * This file is part of GNU Zebra.</a>
+<a name="ln6"> *</a>
+<a name="ln7"> * GNU Zebra is free software; you can redistribute it and/or modify it</a>
+<a name="ln8"> * under the terms of the GNU General Public License as published by the</a>
+<a name="ln9"> * Free Software Foundation; either version 2, or (at your option) any</a>
+<a name="ln10"> * later version.</a>
+<a name="ln11"> *</a>
+<a name="ln12"> * GNU Zebra is distributed in the hope that it will be useful, but</a>
+<a name="ln13"> * WITHOUT ANY WARRANTY; without even the implied warranty of</a>
+<a name="ln14"> * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU</a>
+<a name="ln15"> * General Public License for more details.</a>
+<a name="ln16"> *</a>
+<a name="ln17"> * You should have received a copy of the GNU General Public License</a>
+<a name="ln18"> * along with GNU Zebra; see the file COPYING.  If not, write to the Free</a>
+<a name="ln19"> * Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA</a>
+<a name="ln20"> * 02111-1307, USA.  </a>
+<a name="ln21"> */</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &lt;zebra.h&gt;</a>
+<a name="ln24"> </a>
+<a name="ln25">#include &quot;if.h&quot;</a>
+<a name="ln26">#include &quot;vty.h&quot;</a>
+<a name="ln27">#include &quot;sockunion.h&quot;</a>
+<a name="ln28">#include &quot;prefix.h&quot;</a>
+<a name="ln29">#include &quot;command.h&quot;</a>
+<a name="ln30">#include &quot;memory.h&quot;</a>
+<a name="ln31">#include &quot;ioctl.h&quot;</a>
+<a name="ln32">#include &quot;connected.h&quot;</a>
+<a name="ln33">#include &quot;log.h&quot;</a>
+<a name="ln34">#include &quot;zclient.h&quot;</a>
+<a name="ln35">#include &quot;vrf.h&quot;</a>
+<a name="ln36">#include &quot;command.h&quot;</a>
+<a name="ln37"> </a>
+<a name="ln38">#include &quot;zebra/interface.h&quot;</a>
+<a name="ln39">#include &quot;zebra/rtadv.h&quot;</a>
+<a name="ln40">#include &quot;zebra/rib.h&quot;</a>
+<a name="ln41">#include &quot;zebra/zserv.h&quot;</a>
+<a name="ln42">#include &quot;zebra/redistribute.h&quot;</a>
+<a name="ln43">#include &quot;zebra/debug.h&quot;</a>
+<a name="ln44">#include &quot;zebra/irdp.h&quot;</a>
+<a name="ln45"> </a>
+<a name="ln46">#if defined (HAVE_RTADV)</a>
+<a name="ln47">/* Order is intentional.  Matches RFC4191.  This array is also used for</a>
+<a name="ln48">   command matching, so only modify with care. */</a>
+<a name="ln49">const char *rtadv_pref_strs[] = { &quot;medium&quot;, &quot;high&quot;, &quot;INVALID&quot;, &quot;low&quot;, 0 };</a>
+<a name="ln50">#endif /* HAVE_RTADV */</a>
+<a name="ln51"> </a>
+<a name="ln52">/* We don't have a tidy top-level instance object for zebra, or interfaces */</a>
+<a name="ln53">static struct zebra_if_defaults zif_defaults = {</a>
+<a name="ln54">  .linkdetect = IF_LINKDETECT_UNSPEC,</a>
+<a name="ln55">};</a>
+<a name="ln56"> </a>
+<a name="ln57">/* helper only for if_zebra_linkdetect */</a>
+<a name="ln58">static void</a>
+<a name="ln59">if_zebra_linkdetect_set_val (struct interface *ifp, zebra_if_linkdetect val)</a>
+<a name="ln60">{</a>
+<a name="ln61">  switch (val)</a>
+<a name="ln62">    {</a>
+<a name="ln63">      case IF_LINKDETECT_ON:</a>
+<a name="ln64">        SET_FLAG(ifp-&gt;status, ZEBRA_INTERFACE_LINKDETECTION);</a>
+<a name="ln65">        break;</a>
+<a name="ln66">      case IF_LINKDETECT_OFF:</a>
+<a name="ln67">        UNSET_FLAG(ifp-&gt;status, ZEBRA_INTERFACE_LINKDETECTION);</a>
+<a name="ln68">        break;</a>
+<a name="ln69">      default: break;</a>
+<a name="ln70">    }</a>
+<a name="ln71">}</a>
+<a name="ln72"> </a>
+<a name="ln73">static void</a>
+<a name="ln74">if_zebra_linkdetect_set (struct interface *ifp)</a>
+<a name="ln75">{</a>
+<a name="ln76">  struct zebra_if *zif = ifp-&gt;info;</a>
+<a name="ln77">  assert (zif != NULL);</a>
+<a name="ln78">  int if_was_operative = if_is_operative(ifp);</a>
+<a name="ln79">  </a>
+<a name="ln80">  /* If user has explicitly configured for the interface, let that set */</a>
+<a name="ln81">  if (zif-&gt;linkdetect != IF_LINKDETECT_UNSPEC)</a>
+<a name="ln82">    if_zebra_linkdetect_set_val (ifp, zif-&gt;linkdetect);</a>
+<a name="ln83">  else </a>
+<a name="ln84">    {</a>
+<a name="ln85">      /* general compiled in default is to set */</a>
+<a name="ln86">      SET_FLAG(ifp-&gt;status, ZEBRA_INTERFACE_LINKDETECTION);</a>
+<a name="ln87">      /* but user can specify a default too */</a>
+<a name="ln88">      if_zebra_linkdetect_set_val (ifp, zif_defaults.linkdetect);</a>
+<a name="ln89">    }</a>
+<a name="ln90">  /* When linkdetection is enabled, interface might come down */</a>
+<a name="ln91">  if (!if_is_operative(ifp) &amp;&amp; if_was_operative) if_down(ifp);</a>
+<a name="ln92">  /* Alternatively, it may come up after disabling link detection */</a>
+<a name="ln93">  if (if_is_operative(ifp) &amp;&amp; !if_was_operative) if_up(ifp);</a>
+<a name="ln94">}</a>
+<a name="ln95"> </a>
+<a name="ln96">/* Called when new interface is added. */</a>
+<a name="ln97">static int</a>
+<a name="ln98">if_zebra_new_hook (struct interface *ifp)</a>
+<a name="ln99">{</a>
+<a name="ln100">  struct zebra_if *zebra_if;</a>
+<a name="ln101"> </a>
+<a name="ln102">  zebra_if = XCALLOC (MTYPE_TMP, sizeof (struct zebra_if));</a>
+<a name="ln103"> </a>
+<a name="ln104">  zebra_if-&gt;multicast = IF_ZEBRA_MULTICAST_UNSPEC;</a>
+<a name="ln105">  zebra_if-&gt;shutdown = IF_ZEBRA_SHUTDOWN_OFF;</a>
+<a name="ln106"> </a>
+<a name="ln107">  switch (zif_defaults.linkdetect)</a>
+<a name="ln108">    {</a>
+<a name="ln109">      case IF_LINKDETECT_OFF:</a>
+<a name="ln110">        UNSET_FLAG(ifp-&gt;status, ZEBRA_INTERFACE_LINKDETECTION);</a>
+<a name="ln111">        break;</a>
+<a name="ln112">      case IF_LINKDETECT_UNSPEC:</a>
+<a name="ln113">      case IF_LINKDETECT_ON:</a>
+<a name="ln114">      default:</a>
+<a name="ln115">        SET_FLAG(ifp-&gt;status, ZEBRA_INTERFACE_LINKDETECTION);</a>
+<a name="ln116">        break;</a>
+<a name="ln117">    }</a>
+<a name="ln118">  </a>
+<a name="ln119">#if defined (HAVE_RTADV)</a>
+<a name="ln120">  {</a>
+<a name="ln121">    /* Set default router advertise values. */</a>
+<a name="ln122">    struct rtadvconf *rtadv;</a>
+<a name="ln123"> </a>
+<a name="ln124">    rtadv = &amp;zebra_if-&gt;rtadv;</a>
+<a name="ln125"> </a>
+<a name="ln126">    rtadv-&gt;AdvSendAdvertisements = 0;</a>
+<a name="ln127">    rtadv-&gt;MaxRtrAdvInterval = RTADV_MAX_RTR_ADV_INTERVAL;</a>
+<a name="ln128">    rtadv-&gt;MinRtrAdvInterval = RTADV_MIN_RTR_ADV_INTERVAL;</a>
+<a name="ln129">    rtadv-&gt;AdvIntervalTimer = 0;</a>
+<a name="ln130">    rtadv-&gt;AdvManagedFlag = 0;</a>
+<a name="ln131">    rtadv-&gt;AdvOtherConfigFlag = 0;</a>
+<a name="ln132">    rtadv-&gt;AdvHomeAgentFlag = 0;</a>
+<a name="ln133">    rtadv-&gt;AdvLinkMTU = 0;</a>
+<a name="ln134">    rtadv-&gt;AdvReachableTime = 0;</a>
+<a name="ln135">    rtadv-&gt;AdvRetransTimer = 0;</a>
+<a name="ln136">    rtadv-&gt;AdvCurHopLimit = 0;</a>
+<a name="ln137">    rtadv-&gt;AdvDefaultLifetime = -1; /* derive from MaxRtrAdvInterval */</a>
+<a name="ln138">    rtadv-&gt;HomeAgentPreference = 0;</a>
+<a name="ln139">    rtadv-&gt;HomeAgentLifetime = -1; /* derive from AdvDefaultLifetime */</a>
+<a name="ln140">    rtadv-&gt;AdvIntervalOption = 0;</a>
+<a name="ln141">    rtadv-&gt;DefaultPreference = RTADV_PREF_MEDIUM;</a>
+<a name="ln142"> </a>
+<a name="ln143">    rtadv-&gt;AdvPrefixList = list_new ();</a>
+<a name="ln144">  }    </a>
+<a name="ln145">#endif /* HAVE_RTADV */</a>
+<a name="ln146"> </a>
+<a name="ln147">  /* Initialize installed address chains tree. */</a>
+<a name="ln148">  zebra_if-&gt;ipv4_subnets = route_table_init ();</a>
+<a name="ln149"> </a>
+<a name="ln150">  ifp-&gt;info = zebra_if;</a>
+<a name="ln151">  return 0;</a>
+<a name="ln152">}</a>
+<a name="ln153"> </a>
+<a name="ln154">/* Called when interface is deleted. */</a>
+<a name="ln155">static int</a>
+<a name="ln156">if_zebra_delete_hook (struct interface *ifp)</a>
+<a name="ln157">{</a>
+<a name="ln158">  struct zebra_if *zebra_if;</a>
+<a name="ln159">  </a>
+<a name="ln160">  if (ifp-&gt;info)</a>
+<a name="ln161">    {</a>
+<a name="ln162">      zebra_if = ifp-&gt;info;</a>
+<a name="ln163"> </a>
+<a name="ln164">      /* Free installed address chains tree. */</a>
+<a name="ln165">      if (zebra_if-&gt;ipv4_subnets)</a>
+<a name="ln166">	route_table_finish (zebra_if-&gt;ipv4_subnets);</a>
+<a name="ln167"> </a>
+<a name="ln168">      XFREE (MTYPE_TMP, zebra_if);</a>
+<a name="ln169">    }</a>
+<a name="ln170"> </a>
+<a name="ln171">  return 0;</a>
+<a name="ln172">}</a>
+<a name="ln173"> </a>
+<a name="ln174">/* Tie an interface address to its derived subnet list of addresses. */</a>
+<a name="ln175">int</a>
+<a name="ln176">if_subnet_add (struct interface *ifp, struct connected *ifc)</a>
+<a name="ln177">{</a>
+<a name="ln178">  struct route_node *rn;</a>
+<a name="ln179">  struct zebra_if *zebra_if;</a>
+<a name="ln180">  struct prefix cp;</a>
+<a name="ln181">  struct list *addr_list;</a>
+<a name="ln182"> </a>
+<a name="ln183">  assert (ifp &amp;&amp; ifp-&gt;info &amp;&amp; ifc);</a>
+<a name="ln184">  zebra_if = ifp-&gt;info;</a>
+<a name="ln185"> </a>
+<a name="ln186">  /* Get address derived subnet node and associated address list, while marking</a>
+<a name="ln187">     address secondary attribute appropriately. */</a>
+<a name="ln188">  cp = *ifc-&gt;address;</a>
+<a name="ln189">  apply_mask (&amp;cp);</a>
+<a name="ln190">  rn = route_node_get (zebra_if-&gt;ipv4_subnets, &amp;cp);</a>
+<a name="ln191"> </a>
+<a name="ln192">  if ((addr_list = rn-&gt;info))</a>
+<a name="ln193">    SET_FLAG (ifc-&gt;flags, ZEBRA_IFA_SECONDARY);</a>
+<a name="ln194">  else</a>
+<a name="ln195">    {</a>
+<a name="ln196">      UNSET_FLAG (ifc-&gt;flags, ZEBRA_IFA_SECONDARY);</a>
+<a name="ln197">      rn-&gt;info = addr_list = list_new ();</a>
+<a name="ln198">      route_lock_node (rn);</a>
+<a name="ln199">    }</a>
+<a name="ln200"> </a>
+<a name="ln201">  /* Tie address at the tail of address list. */</a>
+<a name="ln202">  listnode_add (addr_list, ifc);</a>
+<a name="ln203">  </a>
+<a name="ln204">  /* Return list element count. */</a>
+<a name="ln205">  return (addr_list-&gt;count);</a>
+<a name="ln206">}</a>
+<a name="ln207"> </a>
+<a name="ln208">/* Untie an interface address from its derived subnet list of addresses. */</a>
+<a name="ln209">int</a>
+<a name="ln210">if_subnet_delete (struct interface *ifp, struct connected *ifc)</a>
+<a name="ln211">{</a>
+<a name="ln212">  struct route_node *rn;</a>
+<a name="ln213">  struct zebra_if *zebra_if;</a>
+<a name="ln214">  struct list *addr_list;</a>
+<a name="ln215"> </a>
+<a name="ln216">  assert (ifp &amp;&amp; ifp-&gt;info &amp;&amp; ifc);</a>
+<a name="ln217">  zebra_if = ifp-&gt;info;</a>
+<a name="ln218"> </a>
+<a name="ln219">  /* Get address derived subnet node. */</a>
+<a name="ln220">  rn = route_node_lookup (zebra_if-&gt;ipv4_subnets, ifc-&gt;address);</a>
+<a name="ln221">  if (! (rn &amp;&amp; rn-&gt;info))</a>
+<a name="ln222">    {</a>
+<a name="ln223">      zlog_warn(&quot;Trying to remove an address from an unknown subnet.&quot;</a>
+<a name="ln224">                &quot; (please report this bug)&quot;);</a>
+<a name="ln225">      return -1;</a>
+<a name="ln226">    }</a>
+<a name="ln227">  route_unlock_node (rn);</a>
+<a name="ln228">  </a>
+<a name="ln229">  /* Untie address from subnet's address list. */</a>
+<a name="ln230">  addr_list = rn-&gt;info;</a>
+<a name="ln231"> </a>
+<a name="ln232">  /* Deleting an address that is not registered is a bug.</a>
+<a name="ln233">   * In any case, we shouldn't decrement the lock counter if the address</a>
+<a name="ln234">   * is unknown. */</a>
+<a name="ln235">  if (!listnode_lookup(addr_list, ifc))</a>
+<a name="ln236">    {</a>
+<a name="ln237">      zlog_warn(&quot;Trying to remove an address from a subnet where it is not&quot;</a>
+<a name="ln238">                &quot; currently registered. (please report this bug)&quot;);</a>
+<a name="ln239">      return -1;</a>
+<a name="ln240">    }</a>
+<a name="ln241"> </a>
+<a name="ln242">  listnode_delete (addr_list, ifc);</a>
+<a name="ln243">  route_unlock_node (rn);</a>
+<a name="ln244"> </a>
+<a name="ln245">  /* Return list element count, if not empty. */</a>
+<a name="ln246">  if (addr_list-&gt;count)</a>
+<a name="ln247">    {</a>
+<a name="ln248">      /* If deleted address is primary, mark subsequent one as such and distribute. */</a>
+<a name="ln249">      if (! CHECK_FLAG (ifc-&gt;flags, ZEBRA_IFA_SECONDARY))</a>
+<a name="ln250">	{</a>
+<a name="ln251">	  ifc = listgetdata ((struct listnode *)listhead (addr_list));</a>
+<a name="ln252">	  zebra_interface_address_delete_update (ifp, ifc);</a>
+<a name="ln253">	  UNSET_FLAG (ifc-&gt;flags, ZEBRA_IFA_SECONDARY);</a>
+<a name="ln254">	  /* XXX: Linux kernel removes all the secondary addresses when the primary</a>
+<a name="ln255">	   * address is removed. We could try to work around that, though this is</a>
+<a name="ln256">	   * non-trivial. */</a>
+<a name="ln257">	  zebra_interface_address_add_update (ifp, ifc);</a>
+<a name="ln258">	}</a>
+<a name="ln259">      </a>
+<a name="ln260">      return addr_list-&gt;count;</a>
+<a name="ln261">    }</a>
+<a name="ln262">  </a>
+<a name="ln263">  /* Otherwise, free list and route node. */</a>
+<a name="ln264">  list_free (addr_list);</a>
+<a name="ln265">  rn-&gt;info = NULL;</a>
+<a name="ln266">  route_unlock_node (rn);</a>
+<a name="ln267"> </a>
+<a name="ln268">  return 0;</a>
+<a name="ln269">}</a>
+<a name="ln270"> </a>
+<a name="ln271">/* if_flags_mangle: A place for hacks that require mangling</a>
+<a name="ln272"> * or tweaking the interface flags.</a>
+<a name="ln273"> *</a>
+<a name="ln274"> * ******************** Solaris flags hacks **************************</a>
+<a name="ln275"> *</a>
+<a name="ln276"> * Solaris IFF_UP flag reflects only the primary interface as the</a>
+<a name="ln277"> * routing socket only sends IFINFO for the primary interface.  Hence  </a>
+<a name="ln278"> * ~IFF_UP does not per se imply all the logical interfaces are also   </a>
+<a name="ln279"> * down - which we only know of as addresses. Instead we must determine</a>
+<a name="ln280"> * whether the interface really is up or not according to how many   </a>
+<a name="ln281"> * addresses are still attached. (Solaris always sends RTM_DELADDR if</a>
+<a name="ln282"> * an interface, logical or not, goes ~IFF_UP).</a>
+<a name="ln283"> *</a>
+<a name="ln284"> * Ie, we mangle IFF_UP to *additionally* reflect whether or not there</a>
+<a name="ln285"> * are addresses left in struct connected, not just the actual underlying</a>
+<a name="ln286"> * IFF_UP flag.</a>
+<a name="ln287"> *</a>
+<a name="ln288"> * We must hence remember the real state of IFF_UP, which we do in</a>
+<a name="ln289"> * struct zebra_if.primary_state.</a>
+<a name="ln290"> *</a>
+<a name="ln291"> * Setting IFF_UP within zebra to administratively shutdown the</a>
+<a name="ln292"> * interface will affect only the primary interface/address on Solaris.</a>
+<a name="ln293"> ************************End Solaris flags hacks ***********************</a>
+<a name="ln294"> */</a>
+<a name="ln295">static void</a>
+<a name="ln296">if_flags_mangle (struct interface *ifp, uint64_t *newflags)</a>
+<a name="ln297">{</a>
+<a name="ln298">#ifdef SUNOS_5</a>
+<a name="ln299">  struct zebra_if *zif = ifp-&gt;info;</a>
+<a name="ln300">  </a>
+<a name="ln301">  zif-&gt;primary_state = *newflags &amp; (IFF_UP &amp; 0xff);</a>
+<a name="ln302">  </a>
+<a name="ln303">  if (CHECK_FLAG (zif-&gt;primary_state, IFF_UP)</a>
+<a name="ln304">      || listcount(ifp-&gt;connected) &gt; 0)</a>
+<a name="ln305">    SET_FLAG (*newflags, IFF_UP);</a>
+<a name="ln306">  else</a>
+<a name="ln307">    UNSET_FLAG (*newflags, IFF_UP);</a>
+<a name="ln308">#endif /* SUNOS_5 */</a>
+<a name="ln309">}</a>
+<a name="ln310"> </a>
+<a name="ln311">/* Update the flags field of the ifp with the new flag set provided.</a>
+<a name="ln312"> * Take whatever actions are required for any changes in flags we care</a>
+<a name="ln313"> * about.</a>
+<a name="ln314"> *</a>
+<a name="ln315"> * newflags should be the raw value, as obtained from the OS.</a>
+<a name="ln316"> */</a>
+<a name="ln317">void</a>
+<a name="ln318">if_flags_update (struct interface *ifp, uint64_t newflags)</a>
+<a name="ln319">{</a>
+<a name="ln320">  if_flags_mangle (ifp, &amp;newflags);</a>
+<a name="ln321">    </a>
+<a name="ln322">  if (if_is_operative (ifp))</a>
+<a name="ln323">    {</a>
+<a name="ln324">      /* operative -&gt; inoperative? */</a>
+<a name="ln325">      ifp-&gt;flags = newflags;</a>
+<a name="ln326">      if (!if_is_operative (ifp))</a>
+<a name="ln327">        if_down (ifp);</a>
+<a name="ln328">    }</a>
+<a name="ln329">  else</a>
+<a name="ln330">    {</a>
+<a name="ln331">      /* inoperative -&gt; operative? */</a>
+<a name="ln332">      ifp-&gt;flags = newflags;</a>
+<a name="ln333">      if (if_is_operative (ifp))</a>
+<a name="ln334">        if_up (ifp);</a>
+<a name="ln335">    }</a>
+<a name="ln336">}</a>
+<a name="ln337"> </a>
+<a name="ln338">/* Wake up configured address if it is not in current kernel</a>
+<a name="ln339">   address. */</a>
+<a name="ln340">static void</a>
+<a name="ln341">if_addr_wakeup (struct interface *ifp)</a>
+<a name="ln342">{</a>
+<a name="ln343">  struct listnode *node, *nnode;</a>
+<a name="ln344">  struct connected *ifc;</a>
+<a name="ln345">  struct prefix *p;</a>
+<a name="ln346">  int ret;</a>
+<a name="ln347"> </a>
+<a name="ln348">  for (ALL_LIST_ELEMENTS (ifp-&gt;connected, node, nnode, ifc))</a>
+<a name="ln349">    {</a>
+<a name="ln350">      p = ifc-&gt;address;</a>
+<a name="ln351">	</a>
+<a name="ln352">      if (CHECK_FLAG (ifc-&gt;conf, ZEBRA_IFC_CONFIGURED)</a>
+<a name="ln353">	  &amp;&amp; ! CHECK_FLAG (ifc-&gt;conf, ZEBRA_IFC_QUEUED))</a>
+<a name="ln354">	{</a>
+<a name="ln355">	  /* Address check. */</a>
+<a name="ln356">	  if (p-&gt;family == AF_INET)</a>
+<a name="ln357">	    {</a>
+<a name="ln358">	      if (! if_is_up (ifp))</a>
+<a name="ln359">		{</a>
+<a name="ln360">		  /* Assume zebra is configured like following:</a>
+<a name="ln361">		   *</a>
+<a name="ln362">		   *   interface gre0</a>
+<a name="ln363">		   *    ip addr 192.0.2.1/24</a>
+<a name="ln364">		   *   !</a>
+<a name="ln365">		   *</a>
+<a name="ln366">		   * As soon as zebra becomes first aware that gre0 exists in the</a>
+<a name="ln367">		   * kernel, it will set gre0 up and configure its addresses.</a>
+<a name="ln368">		   *</a>
+<a name="ln369">		   * (This may happen at startup when the interface already exists</a>
+<a name="ln370">		   * or during runtime when the interface is added to the kernel)</a>
+<a name="ln371">		   *</a>
+<a name="ln372">		   * XXX: IRDP code is calling here via if_add_update - this seems</a>
+<a name="ln373">		   * somewhat weird.</a>
+<a name="ln374">		   * XXX: RUNNING is not a settable flag on any system</a>
+<a name="ln375">		   * I (paulj) am aware of.</a>
+<a name="ln376">		  */</a>
+<a name="ln377">		  if_set_flags (ifp, IFF_UP | IFF_RUNNING);</a>
+<a name="ln378">		  if_refresh (ifp);</a>
+<a name="ln379">		}</a>
+<a name="ln380"> </a>
+<a name="ln381">	      ret = if_set_prefix (ifp, ifc);</a>
+<a name="ln382">	      if (ret &lt; 0)</a>
+<a name="ln383">		{</a>
+<a name="ln384">		  zlog_warn (&quot;Can't set interface's address: %s&quot;, </a>
+<a name="ln385">			     safe_strerror(errno));</a>
+<a name="ln386">		  continue;</a>
+<a name="ln387">		}</a>
+<a name="ln388"> </a>
+<a name="ln389">	      SET_FLAG (ifc-&gt;conf, ZEBRA_IFC_QUEUED);</a>
+<a name="ln390">	      /* The address will be advertised to zebra clients when the notification</a>
+<a name="ln391">	       * from the kernel has been received.</a>
+<a name="ln392">	       * It will also be added to the interface's subnet list then. */</a>
+<a name="ln393">	    }</a>
+<a name="ln394">#ifdef HAVE_IPV6</a>
+<a name="ln395">	  if (p-&gt;family == AF_INET6)</a>
+<a name="ln396">	    {</a>
+<a name="ln397">	      if (! if_is_up (ifp))</a>
+<a name="ln398">		{</a>
+<a name="ln399">		  /* See long comment above */</a>
+<a name="ln400">		  if_set_flags (ifp, IFF_UP | IFF_RUNNING);</a>
+<a name="ln401">		  if_refresh (ifp);</a>
+<a name="ln402">		}</a>
+<a name="ln403"> </a>
+<a name="ln404">	      ret = if_prefix_add_ipv6 (ifp, ifc);</a>
+<a name="ln405">	      if (ret &lt; 0)</a>
+<a name="ln406">		{</a>
+<a name="ln407">		  zlog_warn (&quot;Can't set interface's address: %s&quot;, </a>
+<a name="ln408">			     safe_strerror(errno));</a>
+<a name="ln409">		  continue;</a>
+<a name="ln410">		}</a>
+<a name="ln411"> </a>
+<a name="ln412">	      SET_FLAG (ifc-&gt;conf, ZEBRA_IFC_QUEUED);</a>
+<a name="ln413">	      /* The address will be advertised to zebra clients when the notification</a>
+<a name="ln414">	       * from the kernel has been received. */</a>
+<a name="ln415">	    }</a>
+<a name="ln416">#endif /* HAVE_IPV6 */</a>
+<a name="ln417">	}</a>
+<a name="ln418">    }</a>
+<a name="ln419">}</a>
+<a name="ln420"> </a>
+<a name="ln421">static void if_count_up(struct zebra_if *zif)</a>
+<a name="ln422">{</a>
+<a name="ln423">  event_counter_inc(&amp;zif-&gt;up_events);</a>
+<a name="ln424">}</a>
+<a name="ln425"> </a>
+<a name="ln426">static void if_count_down(struct zebra_if *zif)</a>
+<a name="ln427">{</a>
+<a name="ln428">  event_counter_inc(&amp;zif-&gt;down_events);</a>
+<a name="ln429">}</a>
+<a name="ln430"> </a>
+<a name="ln431">void</a>
+<a name="ln432">if_startup_count_up (void)</a>
+<a name="ln433">{</a>
+<a name="ln434">  vrf_iter_t iter;</a>
+<a name="ln435">  struct interface *ifp;</a>
+<a name="ln436">  struct zebra_if *zif;</a>
+<a name="ln437">  struct listnode *node;</a>
+<a name="ln438"> </a>
+<a name="ln439">  for (iter = vrf_first(); iter != VRF_ITER_INVALID; iter = vrf_next(iter))</a>
+<a name="ln440">    {</a>
+<a name="ln441">      for (ALL_LIST_ELEMENTS_RO (vrf_iter2iflist(iter), node, ifp))</a>
+<a name="ln442">        {</a>
+<a name="ln443">          zif = ifp-&gt;info;</a>
+<a name="ln444">          if (!zif-&gt;up_events.count &amp;&amp; if_is_operative(ifp))</a>
+<a name="ln445">            if_count_up(zif);</a>
+<a name="ln446">        }</a>
+<a name="ln447">    }</a>
+<a name="ln448">}</a>
+<a name="ln449"> </a>
+<a name="ln450">/* Handle interface addition */</a>
+<a name="ln451">void</a>
+<a name="ln452">if_add_update (struct interface *ifp)</a>
+<a name="ln453">{</a>
+<a name="ln454">  struct zebra_if *if_data;</a>
+<a name="ln455"> </a>
+<a name="ln456">  if_data = ifp-&gt;info;</a>
+<a name="ln457">  assert(if_data);</a>
+<a name="ln458"> </a>
+<a name="ln459">  if (if_data-&gt;multicast == IF_ZEBRA_MULTICAST_ON)</a>
+<a name="ln460">    if_set_flags (ifp, IFF_MULTICAST);</a>
+<a name="ln461">  else if (if_data-&gt;multicast == IF_ZEBRA_MULTICAST_OFF)</a>
+<a name="ln462">    if_unset_flags (ifp, IFF_MULTICAST);</a>
+<a name="ln463"> </a>
+<a name="ln464">  zebra_interface_add_update (ifp);</a>
+<a name="ln465"> </a>
+<a name="ln466">  if (! CHECK_FLAG (ifp-&gt;status, ZEBRA_INTERFACE_ACTIVE))</a>
+<a name="ln467">    {</a>
+<a name="ln468">      SET_FLAG (ifp-&gt;status, ZEBRA_INTERFACE_ACTIVE);</a>
+<a name="ln469"> </a>
+<a name="ln470">      if (if_data &amp;&amp; if_data-&gt;shutdown == IF_ZEBRA_SHUTDOWN_ON)</a>
+<a name="ln471">	{</a>
+<a name="ln472">	  if (IS_ZEBRA_DEBUG_KERNEL)</a>
+<a name="ln473">	    zlog_debug (&quot;interface %s vrf %u index %d is shutdown. &quot;</a>
+<a name="ln474">			&quot;Won't wake it up.&quot;,</a>
+<a name="ln475">			ifp-&gt;name, ifp-&gt;vrf_id, ifp-&gt;ifindex);</a>
+<a name="ln476">	  return;</a>
+<a name="ln477">	}</a>
+<a name="ln478"> </a>
+<a name="ln479">      if_addr_wakeup (ifp);</a>
+<a name="ln480"> </a>
+<a name="ln481">      if (IS_ZEBRA_DEBUG_KERNEL)</a>
+<a name="ln482">	zlog_debug (&quot;interface %s vrf %u index %d becomes active.&quot;,</a>
+<a name="ln483">		    ifp-&gt;name, ifp-&gt;vrf_id, ifp-&gt;ifindex);</a>
+<a name="ln484">    }</a>
+<a name="ln485">  else</a>
+<a name="ln486">    {</a>
+<a name="ln487">      if (IS_ZEBRA_DEBUG_KERNEL)</a>
+<a name="ln488">	zlog_debug (&quot;interface %s vrf %u index %d is added.&quot;,</a>
+<a name="ln489">		    ifp-&gt;name, ifp-&gt;vrf_id, ifp-&gt;ifindex);</a>
+<a name="ln490">    }</a>
+<a name="ln491"> </a>
+<a name="ln492">  if (host_config_get())</a>
+<a name="ln493">    {</a>
+<a name="ln494">      /* If configuration and therefore link-detect have already been</a>
+<a name="ln495">       * loaded, count an initial up event when new interfaces are added</a>
+<a name="ln496">       * in up state.</a>
+<a name="ln497">       * If configuration has not been loaded yet, this is handled by</a>
+<a name="ln498">       * if_startup_count_up which is called after reading the config. */</a>
+<a name="ln499">      if (!if_data-&gt;up_events.count &amp;&amp; if_is_operative(ifp))</a>
+<a name="ln500">        if_count_up(if_data);</a>
+<a name="ln501">    }</a>
+<a name="ln502">}</a>
+<a name="ln503"> </a>
+<a name="ln504">/* Handle an interface delete event */</a>
+<a name="ln505">void </a>
+<a name="ln506">if_delete_update (struct interface *ifp)</a>
+<a name="ln507">{</a>
+<a name="ln508">  struct connected *ifc;</a>
+<a name="ln509">  struct prefix *p;</a>
+<a name="ln510">  struct route_node *rn;</a>
+<a name="ln511">  struct zebra_if *zebra_if;</a>
+<a name="ln512"> </a>
+<a name="ln513">  zebra_if = ifp-&gt;info;</a>
+<a name="ln514"> </a>
+<a name="ln515">  if (if_is_up(ifp))</a>
+<a name="ln516">    {</a>
+<a name="ln517">      zlog_err (&quot;interface %s vrf %u index %d is still up while being deleted.&quot;,</a>
+<a name="ln518">                ifp-&gt;name, ifp-&gt;vrf_id, ifp-&gt;ifindex);</a>
+<a name="ln519">      return;</a>
+<a name="ln520">    }</a>
+<a name="ln521"> </a>
+<a name="ln522">  /* Mark interface as inactive */</a>
+<a name="ln523">  UNSET_FLAG (ifp-&gt;status, ZEBRA_INTERFACE_ACTIVE);</a>
+<a name="ln524">  </a>
+<a name="ln525">  if (IS_ZEBRA_DEBUG_KERNEL)</a>
+<a name="ln526">    zlog_debug (&quot;interface %s vrf %u index %d is now inactive.&quot;,</a>
+<a name="ln527">                ifp-&gt;name, ifp-&gt;vrf_id, ifp-&gt;ifindex);</a>
+<a name="ln528"> </a>
+<a name="ln529">  /* Delete connected routes from the kernel. */</a>
+<a name="ln530">  if (ifp-&gt;connected)</a>
+<a name="ln531">    {</a>
+<a name="ln532">      struct listnode *node;</a>
+<a name="ln533">      struct listnode *last = NULL;</a>
+<a name="ln534"> </a>
+<a name="ln535">      while ((node = (last ? last-&gt;next : listhead (ifp-&gt;connected))))</a>
+<a name="ln536">	{</a>
+<a name="ln537">	  ifc = listgetdata (node);</a>
+<a name="ln538">	  p = ifc-&gt;address;</a>
+<a name="ln539">	  </a>
+<a name="ln540">	  if (p-&gt;family == AF_INET</a>
+<a name="ln541">	      &amp;&amp; (rn = route_node_lookup (zebra_if-&gt;ipv4_subnets, p)))</a>
+<a name="ln542">	    {</a>
+<a name="ln543">	      struct listnode *anode;</a>
+<a name="ln544">	      struct listnode *next;</a>
+<a name="ln545">	      struct listnode *first;</a>
+<a name="ln546">	      struct list *addr_list;</a>
+<a name="ln547">	      </a>
+<a name="ln548">	      route_unlock_node (rn);</a>
+<a name="ln549">	      addr_list = (struct list *) rn-&gt;info;</a>
+<a name="ln550">	      </a>
+<a name="ln551">	      /* Remove addresses, secondaries first. */</a>
+<a name="ln552">	      first = listhead (addr_list);</a>
+<a name="ln553">	      for (anode = first-&gt;next; anode || first; anode = next)</a>
+<a name="ln554">		{</a>
+<a name="ln555">		  if (!anode)</a>
+<a name="ln556">		    {</a>
+<a name="ln557">		      anode = first;</a>
+<a name="ln558">		      first = NULL;</a>
+<a name="ln559">		    }</a>
+<a name="ln560">		  next = anode-&gt;next;</a>
+<a name="ln561"> </a>
+<a name="ln562">		  ifc = listgetdata (anode);</a>
+<a name="ln563">		  p = ifc-&gt;address;</a>
+<a name="ln564">		  connected_down_ipv4 (ifp, ifc);</a>
+<a name="ln565"> </a>
+<a name="ln566">		  /* XXX: We have to send notifications here explicitly, because we destroy</a>
+<a name="ln567">		   * the ifc before receiving the notification about the address being deleted.</a>
+<a name="ln568">		   */</a>
+<a name="ln569">		  zebra_interface_address_delete_update (ifp, ifc);</a>
+<a name="ln570"> </a>
+<a name="ln571">		  UNSET_FLAG (ifc-&gt;conf, ZEBRA_IFC_REAL);</a>
+<a name="ln572">		  UNSET_FLAG (ifc-&gt;conf, ZEBRA_IFC_QUEUED);</a>
+<a name="ln573"> </a>
+<a name="ln574">		  /* Remove from subnet chain. */</a>
+<a name="ln575">		  list_delete_node (addr_list, anode);</a>
+<a name="ln576">		  route_unlock_node (rn);</a>
+<a name="ln577">		  </a>
+<a name="ln578">		  /* Remove from interface address list (unconditionally). */</a>
+<a name="ln579">		  if (!CHECK_FLAG (ifc-&gt;conf, ZEBRA_IFC_CONFIGURED))</a>
+<a name="ln580">		    {</a>
+<a name="ln581">		      listnode_delete (ifp-&gt;connected, ifc);</a>
+<a name="ln582">		      connected_free (ifc);</a>
+<a name="ln583">                    }</a>
+<a name="ln584">                  else</a>
+<a name="ln585">                    last = node;</a>
+<a name="ln586">		}</a>
+<a name="ln587"> </a>
+<a name="ln588">	      /* Free chain list and respective route node. */</a>
+<a name="ln589">	      list_delete (addr_list);</a>
+<a name="ln590">	      rn-&gt;info = NULL;</a>
+<a name="ln591">	      route_unlock_node (rn);</a>
+<a name="ln592">	    }</a>
+<a name="ln593">#ifdef HAVE_IPV6</a>
+<a name="ln594">	  else if (p-&gt;family == AF_INET6)</a>
+<a name="ln595">	    {</a>
+<a name="ln596">	      connected_down_ipv6 (ifp, ifc);</a>
+<a name="ln597"> </a>
+<a name="ln598">	      zebra_interface_address_delete_update (ifp, ifc);</a>
+<a name="ln599"> </a>
+<a name="ln600">	      UNSET_FLAG (ifc-&gt;conf, ZEBRA_IFC_REAL);</a>
+<a name="ln601">	      UNSET_FLAG (ifc-&gt;conf, ZEBRA_IFC_QUEUED);</a>
+<a name="ln602"> </a>
+<a name="ln603">	      if (CHECK_FLAG (ifc-&gt;conf, ZEBRA_IFC_CONFIGURED))</a>
+<a name="ln604">		last = node;</a>
+<a name="ln605">	      else</a>
+<a name="ln606">		{</a>
+<a name="ln607">		  listnode_delete (ifp-&gt;connected, ifc);</a>
+<a name="ln608">		  connected_free (ifc);</a>
+<a name="ln609">		}</a>
+<a name="ln610">	    }</a>
+<a name="ln611">#endif /* HAVE_IPV6 */</a>
+<a name="ln612">	  else</a>
+<a name="ln613">	    {</a>
+<a name="ln614">	      last = node;</a>
+<a name="ln615">	    }</a>
+<a name="ln616">	}</a>
+<a name="ln617">    }</a>
+<a name="ln618">  zebra_interface_delete_update (ifp);</a>
+<a name="ln619"> </a>
+<a name="ln620">  /* Update ifindex after distributing the delete message.  This is in</a>
+<a name="ln621">     case any client needs to have the old value of ifindex available</a>
+<a name="ln622">     while processing the deletion.  Each client daemon is responsible</a>
+<a name="ln623">     for setting ifindex to IFINDEX_INTERNAL after processing the</a>
+<a name="ln624">     interface deletion message. */</a>
+<a name="ln625">  ifp-&gt;ifindex = IFINDEX_INTERNAL;</a>
+<a name="ln626">}</a>
+<a name="ln627"> </a>
+<a name="ln628">/* Interface is up. */</a>
+<a name="ln629">void</a>
+<a name="ln630">if_up (struct interface *ifp)</a>
+<a name="ln631">{</a>
+<a name="ln632">  struct listnode *node;</a>
+<a name="ln633">  struct listnode *next;</a>
+<a name="ln634">  struct connected *ifc;</a>
+<a name="ln635">  struct prefix *p;</a>
+<a name="ln636"> </a>
+<a name="ln637">  if_count_up(ifp-&gt;info);</a>
+<a name="ln638"> </a>
+<a name="ln639">  /* Notify the protocol daemons. */</a>
+<a name="ln640">  zebra_interface_up_update (ifp);</a>
+<a name="ln641"> </a>
+<a name="ln642">  /* Install connected routes to the kernel. */</a>
+<a name="ln643">  if (ifp-&gt;connected)</a>
+<a name="ln644">    {</a>
+<a name="ln645">      for (ALL_LIST_ELEMENTS (ifp-&gt;connected, node, next, ifc))</a>
+<a name="ln646">	{</a>
+<a name="ln647">	  p = ifc-&gt;address;</a>
+<a name="ln648"> </a>
+<a name="ln649">	  if (p-&gt;family == AF_INET)</a>
+<a name="ln650">	    connected_up_ipv4 (ifp, ifc);</a>
+<a name="ln651">#ifdef HAVE_IPV6</a>
+<a name="ln652">	  else if (p-&gt;family == AF_INET6)</a>
+<a name="ln653">	    connected_up_ipv6 (ifp, ifc);</a>
+<a name="ln654">#endif /* HAVE_IPV6 */</a>
+<a name="ln655">	}</a>
+<a name="ln656">    }</a>
+<a name="ln657"> </a>
+<a name="ln658">  /* Examine all static routes. */</a>
+<a name="ln659">  rib_update (ifp-&gt;vrf_id);</a>
+<a name="ln660">}</a>
+<a name="ln661"> </a>
+<a name="ln662">/* Interface goes down.  We have to manage different behavior of based</a>
+<a name="ln663">   OS. */</a>
+<a name="ln664">void</a>
+<a name="ln665">if_down (struct interface *ifp)</a>
+<a name="ln666">{</a>
+<a name="ln667">  struct listnode *node;</a>
+<a name="ln668">  struct listnode *next;</a>
+<a name="ln669">  struct connected *ifc;</a>
+<a name="ln670">  struct prefix *p;</a>
+<a name="ln671">  struct zebra_if *zif;</a>
+<a name="ln672"> </a>
+<a name="ln673">  zif = ifp-&gt;info;</a>
+<a name="ln674">  if (zif-&gt;up_events.count)</a>
+<a name="ln675">    if_count_down(zif);</a>
+<a name="ln676"> </a>
+<a name="ln677">  /* Notify to the protocol daemons. */</a>
+<a name="ln678">  zebra_interface_down_update (ifp);</a>
+<a name="ln679"> </a>
+<a name="ln680">  /* Delete connected routes from the kernel. */</a>
+<a name="ln681">  if (ifp-&gt;connected)</a>
+<a name="ln682">    {</a>
+<a name="ln683">      for (ALL_LIST_ELEMENTS (ifp-&gt;connected, node, next, ifc))</a>
+<a name="ln684">	{</a>
+<a name="ln685">	  p = ifc-&gt;address;</a>
+<a name="ln686"> </a>
+<a name="ln687">	  if (p-&gt;family == AF_INET)</a>
+<a name="ln688">	    connected_down_ipv4 (ifp, ifc);</a>
+<a name="ln689">#ifdef HAVE_IPV6</a>
+<a name="ln690">	  else if (p-&gt;family == AF_INET6)</a>
+<a name="ln691">	    connected_down_ipv6 (ifp, ifc);</a>
+<a name="ln692">#endif /* HAVE_IPV6 */</a>
+<a name="ln693">	}</a>
+<a name="ln694">    }</a>
+<a name="ln695"> </a>
+<a name="ln696">  /* Examine all static routes which direct to the interface. */</a>
+<a name="ln697">  rib_update (ifp-&gt;vrf_id);</a>
+<a name="ln698">}</a>
+<a name="ln699"> </a>
+<a name="ln700">void</a>
+<a name="ln701">if_refresh (struct interface *ifp)</a>
+<a name="ln702">{</a>
+<a name="ln703">  if_get_flags (ifp);</a>
+<a name="ln704">}</a>
+<a name="ln705"> </a>
+<a name="ln706">/* Output prefix string to vty. */</a>
+<a name="ln707">static int</a>
+<a name="ln708">prefix_vty_out (struct vty *vty, struct prefix *p)</a>
+<a name="ln709">{</a>
+<a name="ln710">  char str[INET6_ADDRSTRLEN];</a>
+<a name="ln711"> </a>
+<a name="ln712">  inet_ntop (p-&gt;family, &amp;p-&gt;u.prefix, str, sizeof (str));</a>
+<a name="ln713">  vty_out (vty, &quot;%s&quot;, str);</a>
+<a name="ln714">  return strlen (str);</a>
+<a name="ln715">}</a>
+<a name="ln716"> </a>
+<a name="ln717">/* Dump if address information to vty. */</a>
+<a name="ln718">static void</a>
+<a name="ln719">connected_dump_vty (struct vty *vty, struct connected *connected)</a>
+<a name="ln720">{</a>
+<a name="ln721">  struct prefix *p;</a>
+<a name="ln722"> </a>
+<a name="ln723">  /* Print interface address. */</a>
+<a name="ln724">  p = connected-&gt;address;</a>
+<a name="ln725">  vty_out (vty, &quot;  %s &quot;, prefix_family_str (p));</a>
+<a name="ln726">  prefix_vty_out (vty, p);</a>
+<a name="ln727">  vty_out (vty, &quot;/%d&quot;, p-&gt;prefixlen);</a>
+<a name="ln728"> </a>
+<a name="ln729">  /* If there is destination address, print it. */</a>
+<a name="ln730">  if (connected-&gt;destination)</a>
+<a name="ln731">    {</a>
+<a name="ln732">      vty_out (vty, (CONNECTED_PEER(connected) ? &quot; peer &quot; : &quot; broadcast &quot;));</a>
+<a name="ln733">      prefix_vty_out (vty, connected-&gt;destination);</a>
+<a name="ln734">    }</a>
+<a name="ln735"> </a>
+<a name="ln736">  if (CHECK_FLAG (connected-&gt;flags, ZEBRA_IFA_SECONDARY))</a>
+<a name="ln737">    vty_out (vty, &quot; secondary&quot;);</a>
+<a name="ln738"> </a>
+<a name="ln739">  if (CHECK_FLAG (connected-&gt;flags, ZEBRA_IFA_UNNUMBERED))</a>
+<a name="ln740">    vty_out (vty, &quot; unnumbered&quot;);</a>
+<a name="ln741"> </a>
+<a name="ln742">  if (connected-&gt;label)</a>
+<a name="ln743">    vty_out (vty, &quot; %s&quot;, connected-&gt;label);</a>
+<a name="ln744"> </a>
+<a name="ln745">  vty_out (vty, &quot;%s&quot;, VTY_NEWLINE);</a>
+<a name="ln746">}</a>
+<a name="ln747"> </a>
+<a name="ln748">#if defined (HAVE_RTADV)</a>
+<a name="ln749">/* Dump interface ND information to vty. */</a>
+<a name="ln750">static void</a>
+<a name="ln751">nd_dump_vty (struct vty *vty, struct interface *ifp)</a>
+<a name="ln752">{</a>
+<a name="ln753">  struct zebra_if *zif;</a>
+<a name="ln754">  struct rtadvconf *rtadv;</a>
+<a name="ln755">  int interval;</a>
+<a name="ln756"> </a>
+<a name="ln757">  zif = (struct zebra_if *) ifp-&gt;info;</a>
+<a name="ln758">  rtadv = &amp;zif-&gt;rtadv;</a>
+<a name="ln759"> </a>
+<a name="ln760">  if (rtadv-&gt;AdvSendAdvertisements)</a>
+<a name="ln761">    {</a>
+<a name="ln762">      vty_out (vty, &quot;  ND advertised reachable time is %d milliseconds%s&quot;,</a>
+<a name="ln763">	       rtadv-&gt;AdvReachableTime, VTY_NEWLINE);</a>
+<a name="ln764">      vty_out (vty, &quot;  ND advertised retransmit interval is %d milliseconds%s&quot;,</a>
+<a name="ln765">	       rtadv-&gt;AdvRetransTimer, VTY_NEWLINE);</a>
+<a name="ln766">      interval = rtadv-&gt;MaxRtrAdvInterval;</a>
+<a name="ln767">      if (interval % 1000)</a>
+<a name="ln768">        vty_out (vty, &quot;  ND router advertisements are sent every &quot;</a>
+<a name="ln769">			&quot;%d milliseconds%s&quot;, interval,</a>
+<a name="ln770">		 VTY_NEWLINE);</a>
+<a name="ln771">      else</a>
+<a name="ln772">        vty_out (vty, &quot;  ND router advertisements are sent every &quot;</a>
+<a name="ln773">			&quot;%d seconds%s&quot;, interval / 1000,</a>
+<a name="ln774">		 VTY_NEWLINE);</a>
+<a name="ln775">      if (rtadv-&gt;AdvDefaultLifetime != -1)</a>
+<a name="ln776">	vty_out (vty, &quot;  ND router advertisements live for %d seconds%s&quot;,</a>
+<a name="ln777">		 rtadv-&gt;AdvDefaultLifetime, VTY_NEWLINE);</a>
+<a name="ln778">      else</a>
+<a name="ln779">	vty_out (vty, &quot;  ND router advertisements lifetime tracks ra-interval%s&quot;,</a>
+<a name="ln780">		 VTY_NEWLINE);</a>
+<a name="ln781">      vty_out (vty, &quot;  ND router advertisement default router preference is &quot;</a>
+<a name="ln782">			&quot;%s%s&quot;, rtadv_pref_strs[rtadv-&gt;DefaultPreference],</a>
+<a name="ln783">		 VTY_NEWLINE);</a>
+<a name="ln784">      if (rtadv-&gt;AdvManagedFlag)</a>
+<a name="ln785">	vty_out (vty, &quot;  Hosts use DHCP to obtain routable addresses.%s&quot;,</a>
+<a name="ln786">		 VTY_NEWLINE);</a>
+<a name="ln787">      else</a>
+<a name="ln788">	vty_out (vty, &quot;  Hosts use stateless autoconfig for addresses.%s&quot;,</a>
+<a name="ln789">		 VTY_NEWLINE);</a>
+<a name="ln790">      if (rtadv-&gt;AdvHomeAgentFlag)</a>
+<a name="ln791">      {</a>
+<a name="ln792">      	vty_out (vty, &quot;  ND router advertisements with &quot;</a>
+<a name="ln793">				&quot;Home Agent flag bit set.%s&quot;,</a>
+<a name="ln794">		 VTY_NEWLINE);</a>
+<a name="ln795">	if (rtadv-&gt;HomeAgentLifetime != -1)</a>
+<a name="ln796">	  vty_out (vty, &quot;  Home Agent lifetime is %u seconds%s&quot;,</a>
+<a name="ln797">	           rtadv-&gt;HomeAgentLifetime, VTY_NEWLINE);</a>
+<a name="ln798">	else</a>
+<a name="ln799">	  vty_out (vty, &quot;  Home Agent lifetime tracks ra-lifetime%s&quot;,</a>
+<a name="ln800">	           VTY_NEWLINE);</a>
+<a name="ln801">	vty_out (vty, &quot;  Home Agent preference is %u%s&quot;,</a>
+<a name="ln802">	         rtadv-&gt;HomeAgentPreference, VTY_NEWLINE);</a>
+<a name="ln803">      }</a>
+<a name="ln804">      if (rtadv-&gt;AdvIntervalOption)</a>
+<a name="ln805">      	vty_out (vty, &quot;  ND router advertisements with Adv. Interval option.%s&quot;,</a>
+<a name="ln806">		 VTY_NEWLINE);</a>
+<a name="ln807">    }</a>
+<a name="ln808">}</a>
+<a name="ln809">#endif /* HAVE_RTADV */</a>
+<a name="ln810"> </a>
+<a name="ln811">/* Interface's information print out to vty interface. */</a>
+<a name="ln812">static void</a>
+<a name="ln813">if_dump_vty (struct vty *vty, struct interface *ifp)</a>
+<a name="ln814">{</a>
+<a name="ln815">  struct connected *connected;</a>
+<a name="ln816">  struct listnode *node;</a>
+<a name="ln817">  struct route_node *rn;</a>
+<a name="ln818">  struct zebra_if *zebra_if;</a>
+<a name="ln819"> </a>
+<a name="ln820">  zebra_if = ifp-&gt;info;</a>
+<a name="ln821"> </a>
+<a name="ln822">  vty_out (vty, &quot;Interface %s is &quot;, ifp-&gt;name);</a>
+<a name="ln823">  if (if_is_up(ifp)) {</a>
+<a name="ln824">    vty_out (vty, &quot;up, line protocol &quot;);</a>
+<a name="ln825">    </a>
+<a name="ln826">    if (CHECK_FLAG(ifp-&gt;status, ZEBRA_INTERFACE_LINKDETECTION)) {</a>
+<a name="ln827">      if (if_is_running(ifp))</a>
+<a name="ln828">       vty_out (vty, &quot;is up%s&quot;, VTY_NEWLINE);</a>
+<a name="ln829">      else</a>
+<a name="ln830">	vty_out (vty, &quot;is down%s&quot;, VTY_NEWLINE);</a>
+<a name="ln831">    } else {</a>
+<a name="ln832">      vty_out (vty, &quot;detection is disabled%s&quot;, VTY_NEWLINE);</a>
+<a name="ln833">    }</a>
+<a name="ln834">  } else {</a>
+<a name="ln835">    vty_out (vty, &quot;down%s&quot;, VTY_NEWLINE);</a>
+<a name="ln836">  }</a>
+<a name="ln837"> </a>
+<a name="ln838">  vty_out (vty, &quot;  Link ups:   %s%s&quot;,</a>
+<a name="ln839">           event_counter_format(&amp;zebra_if-&gt;up_events), VTY_NEWLINE);</a>
+<a name="ln840">  vty_out (vty, &quot;  Link downs: %s%s&quot;,</a>
+<a name="ln841">           event_counter_format(&amp;zebra_if-&gt;down_events), VTY_NEWLINE);</a>
+<a name="ln842"> </a>
+<a name="ln843">  vty_out (vty, &quot;  vrf: %u%s&quot;, ifp-&gt;vrf_id, VTY_NEWLINE);</a>
+<a name="ln844"> </a>
+<a name="ln845">  if (ifp-&gt;desc)</a>
+<a name="ln846">    vty_out (vty, &quot;  Description: %s%s&quot;, ifp-&gt;desc,</a>
+<a name="ln847">	     VTY_NEWLINE);</a>
+<a name="ln848">  if (ifp-&gt;ifindex == IFINDEX_INTERNAL)</a>
+<a name="ln849">    {</a>
+<a name="ln850">      vty_out(vty, &quot;  pseudo interface%s&quot;, VTY_NEWLINE);</a>
+<a name="ln851">      return;</a>
+<a name="ln852">    }</a>
+<a name="ln853">  else if (! CHECK_FLAG (ifp-&gt;status, ZEBRA_INTERFACE_ACTIVE))</a>
+<a name="ln854">    {</a>
+<a name="ln855">      vty_out(vty, &quot;  index %d inactive interface%s&quot;, </a>
+<a name="ln856">	      ifp-&gt;ifindex, </a>
+<a name="ln857">	      VTY_NEWLINE);</a>
+<a name="ln858">      return;</a>
+<a name="ln859">    }</a>
+<a name="ln860"> </a>
+<a name="ln861">  vty_out (vty, &quot;  index %d metric %d mtu %d &quot;,</a>
+<a name="ln862">	   ifp-&gt;ifindex, ifp-&gt;metric, ifp-&gt;mtu);</a>
+<a name="ln863">#ifdef HAVE_IPV6</a>
+<a name="ln864">  if (ifp-&gt;mtu6 != ifp-&gt;mtu)</a>
+<a name="ln865">    vty_out (vty, &quot;mtu6 %d &quot;, ifp-&gt;mtu6);</a>
+<a name="ln866">#endif </a>
+<a name="ln867">  vty_out (vty, &quot;%s  flags: %s%s&quot;, VTY_NEWLINE,</a>
+<a name="ln868">           if_flag_dump (ifp-&gt;flags), VTY_NEWLINE);</a>
+<a name="ln869">  </a>
+<a name="ln870">  /* Hardware address. */</a>
+<a name="ln871">  vty_out (vty, &quot;  Type: %s%s&quot;, if_link_type_str (ifp-&gt;ll_type), VTY_NEWLINE);</a>
+<a name="ln872">  if (ifp-&gt;hw_addr_len != 0)</a>
+<a name="ln873">    {</a>
+<a name="ln874">      int i;</a>
+<a name="ln875"> </a>
+<a name="ln876">      vty_out (vty, &quot;  HWaddr: &quot;);</a>
+<a name="ln877">      for (i = 0; i &lt; ifp-&gt;hw_addr_len; i++)</a>
+<a name="ln878">	vty_out (vty, &quot;%s%02x&quot;, i == 0 ? &quot;&quot; : &quot;:&quot;, ifp-&gt;hw_addr[i]);</a>
+<a name="ln879">      vty_out (vty, &quot;%s&quot;, VTY_NEWLINE);</a>
+<a name="ln880">    }</a>
+<a name="ln881">  </a>
+<a name="ln882">  /* Bandwidth in kbps */</a>
+<a name="ln883">  if (ifp-&gt;bandwidth != 0)</a>
+<a name="ln884">    {</a>
+<a name="ln885">      vty_out(vty, &quot;  bandwidth %u kbps&quot;, ifp-&gt;bandwidth);</a>
+<a name="ln886">      vty_out(vty, &quot;%s&quot;, VTY_NEWLINE);</a>
+<a name="ln887">    }</a>
+<a name="ln888"> </a>
+<a name="ln889">  for (rn = route_top (zebra_if-&gt;ipv4_subnets); rn; rn = route_next (rn))</a>
+<a name="ln890">    {</a>
+<a name="ln891">      if (! rn-&gt;info)</a>
+<a name="ln892">	continue;</a>
+<a name="ln893"> </a>
+<a name="ln894">      for (ALL_LIST_ELEMENTS_RO ((struct list *)rn-&gt;info, node, connected))</a>
+<a name="ln895">        connected_dump_vty (vty, connected);</a>
+<a name="ln896">    }</a>
+<a name="ln897"> </a>
+<a name="ln898">  for (ALL_LIST_ELEMENTS_RO (ifp-&gt;connected, node, connected))</a>
+<a name="ln899">    {</a>
+<a name="ln900">      if (CHECK_FLAG (connected-&gt;conf, ZEBRA_IFC_REAL) &amp;&amp;</a>
+<a name="ln901">	  (connected-&gt;address-&gt;family == AF_INET6))</a>
+<a name="ln902">	connected_dump_vty (vty, connected);</a>
+<a name="ln903">    }</a>
+<a name="ln904"> </a>
+<a name="ln905">  if (HAS_LINK_PARAMS(ifp))</a>
+<a name="ln906">    {</a>
+<a name="ln907">      int i;</a>
+<a name="ln908">      struct if_link_params *iflp = ifp-&gt;link_params;</a>
+<a name="ln909">      vty_out(vty, &quot;  Traffic Engineering Link Parameters:%s&quot;, VTY_NEWLINE);</a>
+<a name="ln910">      if (IS_PARAM_SET(iflp, LP_TE))</a>
+<a name="ln911">        vty_out(vty, &quot;    TE metric %u%s&quot;,iflp-&gt;te_metric, VTY_NEWLINE);</a>
+<a name="ln912">      if (IS_PARAM_SET(iflp, LP_MAX_BW))</a>
+<a name="ln913">        vty_out(vty, &quot;    Maximum Bandwidth %g (Byte/s)%s&quot;, iflp-&gt;max_bw, VTY_NEWLINE);</a>
+<a name="ln914">      if (IS_PARAM_SET(iflp, LP_MAX_RSV_BW))</a>
+<a name="ln915">        vty_out(vty, &quot;    Maximum Reservable Bandwidth %g (Byte/s)%s&quot;, iflp-&gt;max_rsv_bw, VTY_NEWLINE);</a>
+<a name="ln916">      if (IS_PARAM_SET(iflp, LP_UNRSV_BW)) {</a>
+<a name="ln917">        vty_out(vty, &quot;    Unreserved Bandwidth per Class Type in Byte/s:%s&quot;, VTY_NEWLINE);</a>
+<a name="ln918">        for (i = 0; i &lt; MAX_CLASS_TYPE; i+=2)</a>
+<a name="ln919">          vty_out(vty, &quot;      [%d]: %g (Bytes/sec),\t[%d]: %g (Bytes/sec)%s&quot;,</a>
+<a name="ln920">                  i, iflp-&gt;unrsv_bw[i], i+1, iflp-&gt;unrsv_bw[i+1], VTY_NEWLINE);</a>
+<a name="ln921">      }</a>
+<a name="ln922"> </a>
+<a name="ln923">      if (IS_PARAM_SET(iflp, LP_ADM_GRP))</a>
+<a name="ln924">        vty_out(vty, &quot;    Administrative Group:%u%s&quot;, iflp-&gt;admin_grp, VTY_NEWLINE);</a>
+<a name="ln925">      if (IS_PARAM_SET(iflp, LP_DELAY))</a>
+<a name="ln926">        {</a>
+<a name="ln927">          vty_out(vty, &quot;    Link Delay Average: %u (micro-sec.)&quot;, iflp-&gt;av_delay);</a>
+<a name="ln928">          if (IS_PARAM_SET(iflp, LP_MM_DELAY))</a>
+<a name="ln929">            {</a>
+<a name="ln930">              vty_out(vty, &quot; Min:  %u (micro-sec.)&quot;, iflp-&gt;min_delay);</a>
+<a name="ln931">              vty_out(vty, &quot; Max:  %u (micro-sec.)&quot;, iflp-&gt;max_delay);</a>
+<a name="ln932">            }</a>
+<a name="ln933">          vty_out(vty, &quot;%s&quot;, VTY_NEWLINE);</a>
+<a name="ln934">        }</a>
+<a name="ln935">      if (IS_PARAM_SET(iflp, LP_DELAY_VAR))</a>
+<a name="ln936">        vty_out(vty, &quot;    Link Delay Variation %u (micro-sec.)%s&quot;, iflp-&gt;delay_var, VTY_NEWLINE);</a>
+<a name="ln937">      if (IS_PARAM_SET(iflp, LP_PKT_LOSS))</a>
+<a name="ln938">        vty_out(vty, &quot;    Link Packet Loss %g (in %%)%s&quot;, iflp-&gt;pkt_loss, VTY_NEWLINE);</a>
+<a name="ln939">      if (IS_PARAM_SET(iflp, LP_AVA_BW))</a>
+<a name="ln940">        vty_out(vty, &quot;    Available Bandwidth %g (Byte/s)%s&quot;, iflp-&gt;ava_bw, VTY_NEWLINE);</a>
+<a name="ln941">      if (IS_PARAM_SET(iflp, LP_RES_BW))</a>
+<a name="ln942">        vty_out(vty, &quot;    Residual Bandwidth %g (Byte/s)%s&quot;, iflp-&gt;res_bw, VTY_NEWLINE);</a>
+<a name="ln943">      if (IS_PARAM_SET(iflp, LP_USE_BW))</a>
+<a name="ln944">        vty_out(vty, &quot;    Utilized Bandwidth %g (Byte/s)%s&quot;, iflp-&gt;use_bw, VTY_NEWLINE);</a>
+<a name="ln945">      if (IS_PARAM_SET(iflp, LP_RMT_AS))</a>
+<a name="ln946">        vty_out(vty, &quot;    Neighbor ASBR IP: %s AS: %u %s&quot;, inet_ntoa(iflp-&gt;rmt_ip), iflp-&gt;rmt_as, VTY_NEWLINE);</a>
+<a name="ln947">    }</a>
+<a name="ln948"> </a>
+<a name="ln949"> #ifdef RTADV</a>
+<a name="ln950">   nd_dump_vty (vty, ifp);</a>
+<a name="ln951"> #endif /* RTADV */</a>
+<a name="ln952">#if defined (HAVE_RTADV)</a>
+<a name="ln953">  nd_dump_vty (vty, ifp);</a>
+<a name="ln954">#endif /* HAVE_RTADV */</a>
+<a name="ln955"> </a>
+<a name="ln956">#ifdef HAVE_PROC_NET_DEV</a>
+<a name="ln957">  /* Statistics print out using proc file system. */</a>
+<a name="ln958">  vty_out (vty, &quot;    %lu input packets (%lu multicast), %lu bytes, &quot;</a>
+<a name="ln959">	   &quot;%lu dropped%s&quot;,</a>
+<a name="ln960">	   ifp-&gt;stats.rx_packets, ifp-&gt;stats.rx_multicast,</a>
+<a name="ln961">	   ifp-&gt;stats.rx_bytes, ifp-&gt;stats.rx_dropped, VTY_NEWLINE);</a>
+<a name="ln962"> </a>
+<a name="ln963">  vty_out (vty, &quot;    %lu input errors, %lu length, %lu overrun,&quot;</a>
+<a name="ln964">	   &quot; %lu CRC, %lu frame%s&quot;,</a>
+<a name="ln965">	   ifp-&gt;stats.rx_errors, ifp-&gt;stats.rx_length_errors,</a>
+<a name="ln966">	   ifp-&gt;stats.rx_over_errors, ifp-&gt;stats.rx_crc_errors,</a>
+<a name="ln967">	   ifp-&gt;stats.rx_frame_errors, VTY_NEWLINE);</a>
+<a name="ln968"> </a>
+<a name="ln969">  vty_out (vty, &quot;    %lu fifo, %lu missed%s&quot;, ifp-&gt;stats.rx_fifo_errors,</a>
+<a name="ln970">	   ifp-&gt;stats.rx_missed_errors, VTY_NEWLINE);</a>
+<a name="ln971"> </a>
+<a name="ln972">  vty_out (vty, &quot;    %lu output packets, %lu bytes, %lu dropped%s&quot;,</a>
+<a name="ln973">	   ifp-&gt;stats.tx_packets, ifp-&gt;stats.tx_bytes,</a>
+<a name="ln974">	   ifp-&gt;stats.tx_dropped, VTY_NEWLINE);</a>
+<a name="ln975"> </a>
+<a name="ln976">  vty_out (vty, &quot;    %lu output errors, %lu aborted, %lu carrier,&quot;</a>
+<a name="ln977">	   &quot; %lu fifo, %lu heartbeat%s&quot;,</a>
+<a name="ln978">	   ifp-&gt;stats.tx_errors, ifp-&gt;stats.tx_aborted_errors,</a>
+<a name="ln979">	   ifp-&gt;stats.tx_carrier_errors, ifp-&gt;stats.tx_fifo_errors,</a>
+<a name="ln980">	   ifp-&gt;stats.tx_heartbeat_errors, VTY_NEWLINE);</a>
+<a name="ln981"> </a>
+<a name="ln982">  vty_out (vty, &quot;    %lu window, %lu collisions%s&quot;,</a>
+<a name="ln983">	   ifp-&gt;stats.tx_window_errors, ifp-&gt;stats.collisions, VTY_NEWLINE);</a>
+<a name="ln984">#endif /* HAVE_PROC_NET_DEV */</a>
+<a name="ln985"> </a>
+<a name="ln986">#ifdef HAVE_NET_RT_IFLIST</a>
+<a name="ln987">#if defined (__bsdi__) || defined (__NetBSD__)</a>
+<a name="ln988">  /* Statistics print out using sysctl (). */</a>
+<a name="ln989">  vty_out (vty, &quot;    input packets %llu, bytes %llu, dropped %llu,&quot;</a>
+<a name="ln990">           &quot; multicast packets %llu%s&quot;,</a>
+<a name="ln991">           (unsigned long long)ifp-&gt;stats.ifi_ipackets,</a>
+<a name="ln992">           (unsigned long long)ifp-&gt;stats.ifi_ibytes,</a>
+<a name="ln993">           (unsigned long long)ifp-&gt;stats.ifi_iqdrops,</a>
+<a name="ln994">           (unsigned long long)ifp-&gt;stats.ifi_imcasts,</a>
+<a name="ln995">           VTY_NEWLINE);</a>
+<a name="ln996"> </a>
+<a name="ln997">  vty_out (vty, &quot;    input errors %llu%s&quot;,</a>
+<a name="ln998">           (unsigned long long)ifp-&gt;stats.ifi_ierrors, VTY_NEWLINE);</a>
+<a name="ln999"> </a>
+<a name="ln1000">  vty_out (vty, &quot;    output packets %llu, bytes %llu,&quot;</a>
+<a name="ln1001">           &quot; multicast packets %llu%s&quot;,</a>
+<a name="ln1002">           (unsigned long long)ifp-&gt;stats.ifi_opackets,</a>
+<a name="ln1003">           (unsigned long long)ifp-&gt;stats.ifi_obytes,</a>
+<a name="ln1004">           (unsigned long long)ifp-&gt;stats.ifi_omcasts,</a>
+<a name="ln1005">           VTY_NEWLINE);</a>
+<a name="ln1006"> </a>
+<a name="ln1007">  vty_out (vty, &quot;    output errors %llu%s&quot;,</a>
+<a name="ln1008">           (unsigned long long)ifp-&gt;stats.ifi_oerrors, VTY_NEWLINE);</a>
+<a name="ln1009"> </a>
+<a name="ln1010">  vty_out (vty, &quot;    collisions %llu%s&quot;,</a>
+<a name="ln1011">           (unsigned long long)ifp-&gt;stats.ifi_collisions, VTY_NEWLINE);</a>
+<a name="ln1012">#else</a>
+<a name="ln1013">  /* Statistics print out using sysctl (). */</a>
+<a name="ln1014">  vty_out (vty, &quot;    input packets %lu, bytes %lu, dropped %lu,&quot;</a>
+<a name="ln1015">	   &quot; multicast packets %lu%s&quot;,</a>
+<a name="ln1016">	   ifp-&gt;stats.ifi_ipackets, ifp-&gt;stats.ifi_ibytes,</a>
+<a name="ln1017">	   ifp-&gt;stats.ifi_iqdrops, ifp-&gt;stats.ifi_imcasts,</a>
+<a name="ln1018">	   VTY_NEWLINE);</a>
+<a name="ln1019"> </a>
+<a name="ln1020">  vty_out (vty, &quot;    input errors %lu%s&quot;,</a>
+<a name="ln1021">	   ifp-&gt;stats.ifi_ierrors, VTY_NEWLINE);</a>
+<a name="ln1022"> </a>
+<a name="ln1023">  vty_out (vty, &quot;    output packets %lu, bytes %lu, multicast packets %lu%s&quot;,</a>
+<a name="ln1024">	   ifp-&gt;stats.ifi_opackets, ifp-&gt;stats.ifi_obytes,</a>
+<a name="ln1025">	   ifp-&gt;stats.ifi_omcasts, VTY_NEWLINE);</a>
+<a name="ln1026"> </a>
+<a name="ln1027">  vty_out (vty, &quot;    output errors %lu%s&quot;,</a>
+<a name="ln1028">	   ifp-&gt;stats.ifi_oerrors, VTY_NEWLINE);</a>
+<a name="ln1029"> </a>
+<a name="ln1030">  vty_out (vty, &quot;    collisions %lu%s&quot;,</a>
+<a name="ln1031">	   ifp-&gt;stats.ifi_collisions, VTY_NEWLINE);</a>
+<a name="ln1032">#endif /* __bsdi__ || __NetBSD__ */</a>
+<a name="ln1033">#endif /* HAVE_NET_RT_IFLIST */</a>
+<a name="ln1034">}</a>
+<a name="ln1035"> </a>
+<a name="ln1036">/* Wrapper hook point for zebra daemon so that ifindex can be set </a>
+<a name="ln1037"> * DEFUN macro not used as extract.pl HAS to ignore this</a>
+<a name="ln1038"> * See also interface_cmd in lib/if.c</a>
+<a name="ln1039"> */ </a>
+<a name="ln1040">DEFUN_NOSH (zebra_interface,</a>
+<a name="ln1041">	    zebra_interface_cmd,</a>
+<a name="ln1042">	    &quot;interface IFNAME&quot;,</a>
+<a name="ln1043">	    &quot;Select an interface to configure\n&quot;</a>
+<a name="ln1044">	    &quot;Interface's name\n&quot;)</a>
+<a name="ln1045">{</a>
+<a name="ln1046">  int ret;</a>
+<a name="ln1047">  struct interface *ifp;</a>
+<a name="ln1048">  </a>
+<a name="ln1049">  /* Call lib interface() */</a>
+<a name="ln1050">  if ((ret = interface_cmd.func (self, vty, argc, argv)) != CMD_SUCCESS)</a>
+<a name="ln1051">    return ret;</a>
+<a name="ln1052"> </a>
+<a name="ln1053">  ifp = vty-&gt;index;</a>
+<a name="ln1054"> </a>
+<a name="ln1055">  if (ifp-&gt;ifindex == IFINDEX_INTERNAL)</a>
+<a name="ln1056">    /* Is this really necessary?  Shouldn't status be initialized to 0</a>
+<a name="ln1057">       in that case? */</a>
+<a name="ln1058">    UNSET_FLAG (ifp-&gt;status, ZEBRA_INTERFACE_ACTIVE);</a>
+<a name="ln1059"> </a>
+<a name="ln1060">  return ret;</a>
+<a name="ln1061">}</a>
+<a name="ln1062"> </a>
+<a name="ln1063">ALIAS (zebra_interface,</a>
+<a name="ln1064">       zebra_interface_vrf_cmd,</a>
+<a name="ln1065">       &quot;interface IFNAME &quot; VRF_CMD_STR,</a>
+<a name="ln1066">       &quot;Select an interface to configure\n&quot;</a>
+<a name="ln1067">       &quot;Interface's name\n&quot;</a>
+<a name="ln1068">       VRF_CMD_HELP_STR)</a>
+<a name="ln1069"> </a>
+<a name="ln1070">struct cmd_node interface_node =</a>
+<a name="ln1071">{</a>
+<a name="ln1072">  INTERFACE_NODE,</a>
+<a name="ln1073">  &quot;%s(config-if)# &quot;,</a>
+<a name="ln1074">  1</a>
+<a name="ln1075">};</a>
+<a name="ln1076"> </a>
+<a name="ln1077">/* Show all interfaces to vty. */</a>
+<a name="ln1078">DEFUN (show_interface, show_interface_cmd,</a>
+<a name="ln1079">       &quot;show interface&quot;,</a>
+<a name="ln1080">       SHOW_STR</a>
+<a name="ln1081">       &quot;Interface status and configuration\n&quot;)</a>
+<a name="ln1082">{</a>
+<a name="ln1083">  struct listnode *node;</a>
+<a name="ln1084">  struct interface *ifp;</a>
+<a name="ln1085">  vrf_id_t vrf_id = VRF_DEFAULT;</a>
+<a name="ln1086"> </a>
+<a name="ln1087">#ifdef HAVE_PROC_NET_DEV</a>
+<a name="ln1088">  /* If system has interface statistics via proc file system, update</a>
+<a name="ln1089">     statistics. */</a>
+<a name="ln1090">  ifstat_update_proc ();</a>
+<a name="ln1091">#endif /* HAVE_PROC_NET_DEV */</a>
+<a name="ln1092">#ifdef HAVE_NET_RT_IFLIST</a>
+<a name="ln1093">  ifstat_update_sysctl ();</a>
+<a name="ln1094">#endif /* HAVE_NET_RT_IFLIST */</a>
+<a name="ln1095"> </a>
+<a name="ln1096">  if (argc &gt; 0)</a>
+<a name="ln1097">    VTY_GET_INTEGER (&quot;VRF ID&quot;, vrf_id, argv[0]);</a>
+<a name="ln1098"> </a>
+<a name="ln1099">  /* All interface print. */</a>
+<a name="ln1100">  for (ALL_LIST_ELEMENTS_RO (vrf_iflist (vrf_id), node, ifp))</a>
+<a name="ln1101">    if_dump_vty (vty, ifp);</a>
+<a name="ln1102"> </a>
+<a name="ln1103">  return CMD_SUCCESS;</a>
+<a name="ln1104">}</a>
+<a name="ln1105"> </a>
+<a name="ln1106">ALIAS (show_interface,</a>
+<a name="ln1107">       show_interface_vrf_cmd,</a>
+<a name="ln1108">       &quot;show interface &quot; VRF_CMD_STR,</a>
+<a name="ln1109">       SHOW_STR</a>
+<a name="ln1110">       &quot;Interface status and configuration\n&quot;</a>
+<a name="ln1111">       VRF_CMD_HELP_STR)</a>
+<a name="ln1112"> </a>
+<a name="ln1113">/* Show all interfaces to vty. */</a>
+<a name="ln1114">DEFUN (show_interface_vrf_all, show_interface_vrf_all_cmd,</a>
+<a name="ln1115">       &quot;show interface &quot; VRF_ALL_CMD_STR,</a>
+<a name="ln1116">       SHOW_STR</a>
+<a name="ln1117">       &quot;Interface status and configuration\n&quot;</a>
+<a name="ln1118">       VRF_ALL_CMD_HELP_STR)</a>
+<a name="ln1119">{</a>
+<a name="ln1120">  struct listnode *node;</a>
+<a name="ln1121">  struct interface *ifp;</a>
+<a name="ln1122">  vrf_iter_t iter;</a>
+<a name="ln1123"> </a>
+<a name="ln1124">#ifdef HAVE_PROC_NET_DEV</a>
+<a name="ln1125">  /* If system has interface statistics via proc file system, update</a>
+<a name="ln1126">     statistics. */</a>
+<a name="ln1127">  ifstat_update_proc ();</a>
+<a name="ln1128">#endif /* HAVE_PROC_NET_DEV */</a>
+<a name="ln1129">#ifdef HAVE_NET_RT_IFLIST</a>
+<a name="ln1130">  ifstat_update_sysctl ();</a>
+<a name="ln1131">#endif /* HAVE_NET_RT_IFLIST */</a>
+<a name="ln1132"> </a>
+<a name="ln1133">  /* All interface print. */</a>
+<a name="ln1134">  for (iter = vrf_first (); iter != VRF_ITER_INVALID; iter = vrf_next (iter))</a>
+<a name="ln1135">    for (ALL_LIST_ELEMENTS_RO (vrf_iter2iflist (iter), node, ifp))</a>
+<a name="ln1136">      if_dump_vty (vty, ifp);</a>
+<a name="ln1137"> </a>
+<a name="ln1138">  return CMD_SUCCESS;</a>
+<a name="ln1139">}</a>
+<a name="ln1140"> </a>
+<a name="ln1141">/* Show specified interface to vty. */</a>
+<a name="ln1142">DEFUN (show_interface_name, show_interface_name_cmd,</a>
+<a name="ln1143">       &quot;show interface IFNAME&quot;,</a>
+<a name="ln1144">       SHOW_STR</a>
+<a name="ln1145">       &quot;Interface status and configuration\n&quot;</a>
+<a name="ln1146">       &quot;Interface name\n&quot;)</a>
+<a name="ln1147">{</a>
+<a name="ln1148">  struct interface *ifp;</a>
+<a name="ln1149">  vrf_id_t vrf_id = VRF_DEFAULT;</a>
+<a name="ln1150"> </a>
+<a name="ln1151">#ifdef HAVE_PROC_NET_DEV</a>
+<a name="ln1152">  /* If system has interface statistics via proc file system, update</a>
+<a name="ln1153">     statistics. */</a>
+<a name="ln1154">  ifstat_update_proc ();</a>
+<a name="ln1155">#endif /* HAVE_PROC_NET_DEV */</a>
+<a name="ln1156">#ifdef HAVE_NET_RT_IFLIST</a>
+<a name="ln1157">  ifstat_update_sysctl ();</a>
+<a name="ln1158">#endif /* HAVE_NET_RT_IFLIST */</a>
+<a name="ln1159"> </a>
+<a name="ln1160">  if (argc &gt; 1)</a>
+<a name="ln1161">    VTY_GET_INTEGER (&quot;VRF ID&quot;, vrf_id, argv[1]);</a>
+<a name="ln1162"> </a>
+<a name="ln1163">  /* Specified interface print. */</a>
+<a name="ln1164">  ifp = if_lookup_by_name_vrf (argv[0], vrf_id);</a>
+<a name="ln1165">  if (ifp == NULL)</a>
+<a name="ln1166">    {</a>
+<a name="ln1167">      vty_out (vty, &quot;%% Can't find interface %s%s&quot;, argv[0],</a>
+<a name="ln1168">               VTY_NEWLINE);</a>
+<a name="ln1169">      return CMD_WARNING;</a>
+<a name="ln1170">    }</a>
+<a name="ln1171">  if_dump_vty (vty, ifp);</a>
+<a name="ln1172"> </a>
+<a name="ln1173">  return CMD_SUCCESS;</a>
+<a name="ln1174">}</a>
+<a name="ln1175"> </a>
+<a name="ln1176">ALIAS (show_interface_name,</a>
+<a name="ln1177">       show_interface_name_vrf_cmd,</a>
+<a name="ln1178">       &quot;show interface IFNAME &quot; VRF_CMD_STR,</a>
+<a name="ln1179">       SHOW_STR</a>
+<a name="ln1180">       &quot;Interface status and configuration\n&quot;</a>
+<a name="ln1181">       &quot;Interface name\n&quot;</a>
+<a name="ln1182">       VRF_CMD_HELP_STR)</a>
+<a name="ln1183"> </a>
+<a name="ln1184">/* Show specified interface to vty. */</a>
+<a name="ln1185">DEFUN (show_interface_name_vrf_all, show_interface_name_vrf_all_cmd,</a>
+<a name="ln1186">       &quot;show interface IFNAME &quot; VRF_ALL_CMD_STR,</a>
+<a name="ln1187">       SHOW_STR</a>
+<a name="ln1188">       &quot;Interface status and configuration\n&quot;</a>
+<a name="ln1189">       &quot;Interface name\n&quot;</a>
+<a name="ln1190">       VRF_ALL_CMD_HELP_STR)</a>
+<a name="ln1191">{</a>
+<a name="ln1192">  struct interface *ifp;</a>
+<a name="ln1193">  vrf_iter_t iter;</a>
+<a name="ln1194">  int found = 0;</a>
+<a name="ln1195"> </a>
+<a name="ln1196">#ifdef HAVE_PROC_NET_DEV</a>
+<a name="ln1197">  /* If system has interface statistics via proc file system, update</a>
+<a name="ln1198">     statistics. */</a>
+<a name="ln1199">  ifstat_update_proc ();</a>
+<a name="ln1200">#endif /* HAVE_PROC_NET_DEV */</a>
+<a name="ln1201">#ifdef HAVE_NET_RT_IFLIST</a>
+<a name="ln1202">  ifstat_update_sysctl ();</a>
+<a name="ln1203">#endif /* HAVE_NET_RT_IFLIST */</a>
+<a name="ln1204"> </a>
+<a name="ln1205">  /* All interface print. */</a>
+<a name="ln1206">  for (iter = vrf_first (); iter != VRF_ITER_INVALID; iter = vrf_next (iter))</a>
+<a name="ln1207">    {</a>
+<a name="ln1208">      /* Specified interface print. */</a>
+<a name="ln1209">      ifp = if_lookup_by_name_vrf (argv[0], vrf_iter2id (iter));</a>
+<a name="ln1210">      if (ifp)</a>
+<a name="ln1211">        {</a>
+<a name="ln1212">          if_dump_vty (vty, ifp);</a>
+<a name="ln1213">          found++;</a>
+<a name="ln1214">        }</a>
+<a name="ln1215">    }</a>
+<a name="ln1216"> </a>
+<a name="ln1217">  if (!found)</a>
+<a name="ln1218">    {</a>
+<a name="ln1219">      vty_out (vty, &quot;%% Can't find interface %s%s&quot;, argv[0], VTY_NEWLINE);</a>
+<a name="ln1220">      return CMD_WARNING;</a>
+<a name="ln1221">    }</a>
+<a name="ln1222"> </a>
+<a name="ln1223">  return CMD_SUCCESS;</a>
+<a name="ln1224">}</a>
+<a name="ln1225"> </a>
+<a name="ln1226">static void</a>
+<a name="ln1227">if_show_description (struct vty *vty, vrf_id_t vrf_id)</a>
+<a name="ln1228">{</a>
+<a name="ln1229">  struct listnode *node;</a>
+<a name="ln1230">  struct interface *ifp;</a>
+<a name="ln1231"> </a>
+<a name="ln1232">  vty_out (vty, &quot;Interface       Status  Protocol  Description%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1233">  for (ALL_LIST_ELEMENTS_RO (vrf_iflist (vrf_id), node, ifp))</a>
+<a name="ln1234">    {</a>
+<a name="ln1235">      int len;</a>
+<a name="ln1236"> </a>
+<a name="ln1237">      len = vty_out (vty, &quot;%s&quot;, ifp-&gt;name);</a>
+<a name="ln1238">      vty_out (vty, &quot;%*s&quot;, (16 - len), &quot; &quot;);</a>
+<a name="ln1239">      </a>
+<a name="ln1240">      if (if_is_up(ifp))</a>
+<a name="ln1241">	{</a>
+<a name="ln1242">	  vty_out (vty, &quot;up      &quot;);</a>
+<a name="ln1243">	  if (CHECK_FLAG(ifp-&gt;status, ZEBRA_INTERFACE_LINKDETECTION))</a>
+<a name="ln1244">	    {</a>
+<a name="ln1245">	      if (if_is_running(ifp))</a>
+<a name="ln1246">		vty_out (vty, &quot;up        &quot;);</a>
+<a name="ln1247">	      else</a>
+<a name="ln1248">		vty_out (vty, &quot;down      &quot;);</a>
+<a name="ln1249">	    }</a>
+<a name="ln1250">	  else</a>
+<a name="ln1251">	    {</a>
+<a name="ln1252">	      vty_out (vty, &quot;unknown   &quot;);</a>
+<a name="ln1253">	    }</a>
+<a name="ln1254">	}</a>
+<a name="ln1255">      else</a>
+<a name="ln1256">	{</a>
+<a name="ln1257">	  vty_out (vty, &quot;down    down      &quot;);</a>
+<a name="ln1258">	}</a>
+<a name="ln1259"> </a>
+<a name="ln1260">      if (ifp-&gt;desc)</a>
+<a name="ln1261">	vty_out (vty, &quot;%s&quot;, ifp-&gt;desc);</a>
+<a name="ln1262">      vty_out (vty, &quot;%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1263">    }</a>
+<a name="ln1264">}</a>
+<a name="ln1265"> </a>
+<a name="ln1266">DEFUN (show_interface_desc,</a>
+<a name="ln1267">       show_interface_desc_cmd,</a>
+<a name="ln1268">       &quot;show interface description&quot;,</a>
+<a name="ln1269">       SHOW_STR</a>
+<a name="ln1270">       &quot;Interface status and configuration\n&quot;</a>
+<a name="ln1271">       &quot;Interface description\n&quot;)</a>
+<a name="ln1272">{</a>
+<a name="ln1273">  vrf_id_t vrf_id = VRF_DEFAULT;</a>
+<a name="ln1274"> </a>
+<a name="ln1275">  if (argc &gt; 0)</a>
+<a name="ln1276">    VTY_GET_INTEGER (&quot;VRF ID&quot;, vrf_id, argv[0]);</a>
+<a name="ln1277"> </a>
+<a name="ln1278">  if_show_description (vty, vrf_id);</a>
+<a name="ln1279"> </a>
+<a name="ln1280">  return CMD_SUCCESS;</a>
+<a name="ln1281">}</a>
+<a name="ln1282"> </a>
+<a name="ln1283">ALIAS (show_interface_desc,</a>
+<a name="ln1284">       show_interface_desc_vrf_cmd,</a>
+<a name="ln1285">       &quot;show interface description &quot; VRF_CMD_STR,</a>
+<a name="ln1286">       SHOW_STR</a>
+<a name="ln1287">       &quot;Interface status and configuration\n&quot;</a>
+<a name="ln1288">       &quot;Interface description\n&quot;</a>
+<a name="ln1289">       VRF_CMD_HELP_STR)</a>
+<a name="ln1290"> </a>
+<a name="ln1291">DEFUN (show_interface_desc_vrf_all,</a>
+<a name="ln1292">       show_interface_desc_vrf_all_cmd,</a>
+<a name="ln1293">       &quot;show interface description &quot; VRF_ALL_CMD_STR,</a>
+<a name="ln1294">       SHOW_STR</a>
+<a name="ln1295">       &quot;Interface status and configuration\n&quot;</a>
+<a name="ln1296">       &quot;Interface description\n&quot;</a>
+<a name="ln1297">       VRF_ALL_CMD_HELP_STR)</a>
+<a name="ln1298">{</a>
+<a name="ln1299">  vrf_iter_t iter;</a>
+<a name="ln1300"> </a>
+<a name="ln1301">  for (iter = vrf_first (); iter != VRF_ITER_INVALID; iter = vrf_next (iter))</a>
+<a name="ln1302">    if (!list_isempty (vrf_iter2iflist (iter)))</a>
+<a name="ln1303">      {</a>
+<a name="ln1304">        vty_out (vty, &quot;%s\tVRF %u%s%s&quot;, VTY_NEWLINE,</a>
+<a name="ln1305">                 vrf_iter2id (iter),</a>
+<a name="ln1306">                 VTY_NEWLINE, VTY_NEWLINE);</a>
+<a name="ln1307">        if_show_description (vty, vrf_iter2id (iter));</a>
+<a name="ln1308">      }</a>
+<a name="ln1309"> </a>
+<a name="ln1310">  return CMD_SUCCESS;</a>
+<a name="ln1311">}</a>
+<a name="ln1312"> </a>
+<a name="ln1313">DEFUN (multicast,</a>
+<a name="ln1314">       multicast_cmd,</a>
+<a name="ln1315">       &quot;multicast&quot;,</a>
+<a name="ln1316">       &quot;Set multicast flag to interface\n&quot;)</a>
+<a name="ln1317">{</a>
+<a name="ln1318">  int ret;</a>
+<a name="ln1319">  struct interface *ifp;</a>
+<a name="ln1320">  struct zebra_if *if_data;</a>
+<a name="ln1321"> </a>
+<a name="ln1322">  ifp = (struct interface *) vty-&gt;index;</a>
+<a name="ln1323">  if (CHECK_FLAG (ifp-&gt;status, ZEBRA_INTERFACE_ACTIVE))</a>
+<a name="ln1324">    {</a>
+<a name="ln1325">      ret = if_set_flags (ifp, IFF_MULTICAST);</a>
+<a name="ln1326">      if (ret &lt; 0)</a>
+<a name="ln1327">	{</a>
+<a name="ln1328">	  vty_out (vty, &quot;Can't set multicast flag%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1329">	  return CMD_WARNING;</a>
+<a name="ln1330">	}</a>
+<a name="ln1331">      if_refresh (ifp);</a>
+<a name="ln1332">    }</a>
+<a name="ln1333">  if_data = ifp-&gt;info;</a>
+<a name="ln1334">  if_data-&gt;multicast = IF_ZEBRA_MULTICAST_ON;</a>
+<a name="ln1335"> </a>
+<a name="ln1336">  return CMD_SUCCESS;</a>
+<a name="ln1337">}</a>
+<a name="ln1338"> </a>
+<a name="ln1339">DEFUN (no_multicast,</a>
+<a name="ln1340">       no_multicast_cmd,</a>
+<a name="ln1341">       &quot;no multicast&quot;,</a>
+<a name="ln1342">       NO_STR</a>
+<a name="ln1343">       &quot;Unset multicast flag to interface\n&quot;)</a>
+<a name="ln1344">{</a>
+<a name="ln1345">  int ret;</a>
+<a name="ln1346">  struct interface *ifp;</a>
+<a name="ln1347">  struct zebra_if *if_data;</a>
+<a name="ln1348"> </a>
+<a name="ln1349">  ifp = (struct interface *) vty-&gt;index;</a>
+<a name="ln1350">  if (CHECK_FLAG (ifp-&gt;status, ZEBRA_INTERFACE_ACTIVE))</a>
+<a name="ln1351">    {</a>
+<a name="ln1352">      ret = if_unset_flags (ifp, IFF_MULTICAST);</a>
+<a name="ln1353">      if (ret &lt; 0)</a>
+<a name="ln1354">	{</a>
+<a name="ln1355">	  vty_out (vty, &quot;Can't unset multicast flag%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1356">	  return CMD_WARNING;</a>
+<a name="ln1357">	}</a>
+<a name="ln1358">      if_refresh (ifp);</a>
+<a name="ln1359">    }</a>
+<a name="ln1360">  if_data = ifp-&gt;info;</a>
+<a name="ln1361">  if_data-&gt;multicast = IF_ZEBRA_MULTICAST_OFF;</a>
+<a name="ln1362"> </a>
+<a name="ln1363">  return CMD_SUCCESS;</a>
+<a name="ln1364">}</a>
+<a name="ln1365"> </a>
+<a name="ln1366">/* Hacky: create a dummy node just to hang a config-writer callback off it */</a>
+<a name="ln1367">static struct cmd_node zebra_if_defaults_node = {</a>
+<a name="ln1368">  ZEBRA_IF_DEFAULTS_NODE,</a>
+<a name="ln1369">  &quot;&quot;,</a>
+<a name="ln1370">  1,</a>
+<a name="ln1371">};</a>
+<a name="ln1372"> </a>
+<a name="ln1373">static int</a>
+<a name="ln1374">config_write_zebra_if_defaults (struct vty *vty)</a>
+<a name="ln1375">{</a>
+<a name="ln1376">  if (zif_defaults.linkdetect != IF_LINKDETECT_UNSPEC)</a>
+<a name="ln1377">    vty_out (vty, &quot;default link-detect %s%s&quot;,</a>
+<a name="ln1378">             zif_defaults.linkdetect == IF_LINKDETECT_ON ? &quot;on&quot; : &quot;off&quot;,</a>
+<a name="ln1379">             VTY_NEWLINE);</a>
+<a name="ln1380">  return 0;</a>
+<a name="ln1381">}</a>
+<a name="ln1382"> </a>
+<a name="ln1383">DEFUN(default_linkdetect,</a>
+<a name="ln1384">      default_linkdetect_cmd,</a>
+<a name="ln1385">      &quot;default link-detect (on|off)&quot;,</a>
+<a name="ln1386">      &quot;Configure defaults of settings\n&quot;</a>
+<a name="ln1387">      &quot;Interface link detection\n&quot;</a>
+<a name="ln1388">      &quot;Interface link-detect defaults to enabled\n&quot;</a>
+<a name="ln1389">      &quot;Interface link-detect defaults to disabled\n&quot;)</a>
+<a name="ln1390">{</a>
+<a name="ln1391">  zebra_if_linkdetect prev = zif_defaults.linkdetect;</a>
+<a name="ln1392">  struct listnode *node;</a>
+<a name="ln1393">  struct interface *ifp;</a>
+<a name="ln1394">  vrf_iter_t iter;</a>
+<a name="ln1395">  </a>
+<a name="ln1396">  if (strcmp (argv[1], &quot;on&quot;) == 0)</a>
+<a name="ln1397">    zif_defaults.linkdetect = IF_LINKDETECT_ON;</a>
+<a name="ln1398">  else</a>
+<a name="ln1399">    zif_defaults.linkdetect = IF_LINKDETECT_OFF;</a>
+<a name="ln1400">    </a>
+<a name="ln1401">  if (zif_defaults.linkdetect != prev)</a>
+<a name="ln1402">    for (iter = vrf_first (); iter != VRF_ITER_INVALID; iter = vrf_next (iter))</a>
+<a name="ln1403">      for (ALL_LIST_ELEMENTS_RO (vrf_iter2iflist (iter), node, ifp))</a>
+<a name="ln1404">        if_zebra_linkdetect_set (ifp);</a>
+<a name="ln1405">  </a>
+<a name="ln1406">  return CMD_SUCCESS;</a>
+<a name="ln1407">}</a>
+<a name="ln1408"> </a>
+<a name="ln1409">DEFUN (linkdetect,</a>
+<a name="ln1410">       linkdetect_cmd,</a>
+<a name="ln1411">       &quot;link-detect [default]&quot;,</a>
+<a name="ln1412">       &quot;Enable link detection on interface\n&quot;</a>
+<a name="ln1413">       &quot;Leave link-detect to the default\n&quot;)</a>
+<a name="ln1414">{</a>
+<a name="ln1415">  struct interface *ifp;</a>
+<a name="ln1416">  struct zebra_if *zif;</a>
+<a name="ln1417">  </a>
+<a name="ln1418">  ifp = (struct interface *) vty-&gt;index;</a>
+<a name="ln1419">  zif = ifp-&gt;info;</a>
+<a name="ln1420">  assert (zif != NULL);</a>
+<a name="ln1421">  </a>
+<a name="ln1422">  zif-&gt;linkdetect = IF_LINKDETECT_ON;</a>
+<a name="ln1423">  if_zebra_linkdetect_set (ifp);</a>
+<a name="ln1424">  </a>
+<a name="ln1425">  /* FIXME: Will defer status change forwarding if interface</a>
+<a name="ln1426">     does not come down! */</a>
+<a name="ln1427"> </a>
+<a name="ln1428">  return CMD_SUCCESS;</a>
+<a name="ln1429">}</a>
+<a name="ln1430"> </a>
+<a name="ln1431"> </a>
+<a name="ln1432">DEFUN (no_linkdetect,</a>
+<a name="ln1433">       no_linkdetect_cmd,</a>
+<a name="ln1434">       &quot;no link-detect&quot;,</a>
+<a name="ln1435">       NO_STR</a>
+<a name="ln1436">       &quot;Disable link detection on interface\n&quot;)</a>
+<a name="ln1437">{</a>
+<a name="ln1438">  struct interface *ifp;</a>
+<a name="ln1439">  struct zebra_if *zif;</a>
+<a name="ln1440">  </a>
+<a name="ln1441">  ifp = (struct interface *) vty-&gt;index;</a>
+<a name="ln1442">  zif = ifp-&gt;info;</a>
+<a name="ln1443">  assert (zif != NULL);</a>
+<a name="ln1444">  </a>
+<a name="ln1445">  zif-&gt;linkdetect = IF_LINKDETECT_OFF;</a>
+<a name="ln1446">  if_zebra_linkdetect_set (ifp);</a>
+<a name="ln1447">  </a>
+<a name="ln1448">  /* FIXME: see linkdetect_cmd */</a>
+<a name="ln1449"> </a>
+<a name="ln1450">  return CMD_SUCCESS;</a>
+<a name="ln1451">}</a>
+<a name="ln1452"> </a>
+<a name="ln1453">DEFUN (shutdown_if,</a>
+<a name="ln1454">       shutdown_if_cmd,</a>
+<a name="ln1455">       &quot;shutdown&quot;,</a>
+<a name="ln1456">       &quot;Shutdown the selected interface\n&quot;)</a>
+<a name="ln1457">{</a>
+<a name="ln1458">  int ret;</a>
+<a name="ln1459">  struct interface *ifp;</a>
+<a name="ln1460">  struct zebra_if *if_data;</a>
+<a name="ln1461"> </a>
+<a name="ln1462">  ifp = (struct interface *) vty-&gt;index;</a>
+<a name="ln1463">  if (ifp-&gt;ifindex != IFINDEX_INTERNAL)</a>
+<a name="ln1464">    {</a>
+<a name="ln1465">        ret = if_unset_flags (ifp, IFF_UP);</a>
+<a name="ln1466">        if (ret &lt; 0)</a>
+<a name="ln1467">          {</a>
+<a name="ln1468">            vty_out (vty, &quot;Can't shutdown interface%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1469">            return CMD_WARNING;</a>
+<a name="ln1470">          }</a>
+<a name="ln1471">        if_refresh (ifp);</a>
+<a name="ln1472">    }</a>
+<a name="ln1473">  if_data = ifp-&gt;info;</a>
+<a name="ln1474">  if_data-&gt;shutdown = IF_ZEBRA_SHUTDOWN_ON;</a>
+<a name="ln1475"> </a>
+<a name="ln1476">  return CMD_SUCCESS;</a>
+<a name="ln1477">}</a>
+<a name="ln1478"> </a>
+<a name="ln1479">DEFUN (no_shutdown_if,</a>
+<a name="ln1480">       no_shutdown_if_cmd,</a>
+<a name="ln1481">       &quot;no shutdown&quot;,</a>
+<a name="ln1482">       NO_STR</a>
+<a name="ln1483">       &quot;Shutdown the selected interface\n&quot;)</a>
+<a name="ln1484">{</a>
+<a name="ln1485">  int ret;</a>
+<a name="ln1486">  struct interface *ifp;</a>
+<a name="ln1487">  struct zebra_if *if_data;</a>
+<a name="ln1488"> </a>
+<a name="ln1489">  ifp = (struct interface *) vty-&gt;index;</a>
+<a name="ln1490"> </a>
+<a name="ln1491">  if (ifp-&gt;ifindex != IFINDEX_INTERNAL)</a>
+<a name="ln1492">    {</a>
+<a name="ln1493">      ret = if_set_flags (ifp, IFF_UP | IFF_RUNNING);</a>
+<a name="ln1494">      if (ret &lt; 0)</a>
+<a name="ln1495">	{</a>
+<a name="ln1496">	  vty_out (vty, &quot;Can't up interface%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1497">	  return CMD_WARNING;</a>
+<a name="ln1498">	}</a>
+<a name="ln1499">      if_refresh (ifp);</a>
+<a name="ln1500"> </a>
+<a name="ln1501">      /* Some addresses (in particular, IPv6 addresses on Linux) get</a>
+<a name="ln1502">       * removed when the interface goes down. They need to be readded.</a>
+<a name="ln1503">       */</a>
+<a name="ln1504">      if_addr_wakeup(ifp);</a>
+<a name="ln1505">    }</a>
+<a name="ln1506"> </a>
+<a name="ln1507">  if_data = ifp-&gt;info;</a>
+<a name="ln1508">  if_data-&gt;shutdown = IF_ZEBRA_SHUTDOWN_OFF;</a>
+<a name="ln1509"> </a>
+<a name="ln1510">  return CMD_SUCCESS;</a>
+<a name="ln1511">}</a>
+<a name="ln1512"> </a>
+<a name="ln1513">DEFUN (bandwidth_if,</a>
+<a name="ln1514">       bandwidth_if_cmd,</a>
+<a name="ln1515">       &quot;bandwidth &lt;1-10000000&gt;&quot;,</a>
+<a name="ln1516">       &quot;Set bandwidth informational parameter\n&quot;</a>
+<a name="ln1517">       &quot;Bandwidth in kilobits\n&quot;)</a>
+<a name="ln1518">{</a>
+<a name="ln1519">  struct interface *ifp;   </a>
+<a name="ln1520">  unsigned int bandwidth;</a>
+<a name="ln1521">  </a>
+<a name="ln1522">  ifp = (struct interface *) vty-&gt;index;</a>
+<a name="ln1523">  bandwidth = strtol(argv[0], NULL, 10);</a>
+<a name="ln1524"> </a>
+<a name="ln1525">  /* bandwidth range is &lt;1-10000000&gt; */</a>
+<a name="ln1526">  if (bandwidth &lt; 1 || bandwidth &gt; 10000000)</a>
+<a name="ln1527">    {</a>
+<a name="ln1528">      vty_out (vty, &quot;Bandwidth is invalid%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1529">      return CMD_WARNING;</a>
+<a name="ln1530">    }</a>
+<a name="ln1531">  </a>
+<a name="ln1532">  ifp-&gt;bandwidth = bandwidth;</a>
+<a name="ln1533"> </a>
+<a name="ln1534">  /* force protocols to recalculate routes due to cost change */</a>
+<a name="ln1535">  if (if_is_operative (ifp))</a>
+<a name="ln1536">    zebra_interface_up_update (ifp);</a>
+<a name="ln1537">  </a>
+<a name="ln1538">  return CMD_SUCCESS;</a>
+<a name="ln1539">}</a>
+<a name="ln1540"> </a>
+<a name="ln1541">DEFUN (no_bandwidth_if,</a>
+<a name="ln1542">       no_bandwidth_if_cmd,</a>
+<a name="ln1543">       &quot;no bandwidth&quot;,</a>
+<a name="ln1544">       NO_STR</a>
+<a name="ln1545">       &quot;Set bandwidth informational parameter\n&quot;)</a>
+<a name="ln1546">{</a>
+<a name="ln1547">  struct interface *ifp;   </a>
+<a name="ln1548">  </a>
+<a name="ln1549">  ifp = (struct interface *) vty-&gt;index;</a>
+<a name="ln1550"> </a>
+<a name="ln1551">  ifp-&gt;bandwidth = 0;</a>
+<a name="ln1552">  </a>
+<a name="ln1553">  /* force protocols to recalculate routes due to cost change */</a>
+<a name="ln1554">  if (if_is_operative (ifp))</a>
+<a name="ln1555">    zebra_interface_up_update (ifp);</a>
+<a name="ln1556"> </a>
+<a name="ln1557">  return CMD_SUCCESS;</a>
+<a name="ln1558">}</a>
+<a name="ln1559"> </a>
+<a name="ln1560">ALIAS (no_bandwidth_if,</a>
+<a name="ln1561">       no_bandwidth_if_val_cmd,</a>
+<a name="ln1562">       &quot;no bandwidth &lt;1-10000000&gt;&quot;,</a>
+<a name="ln1563">       NO_STR</a>
+<a name="ln1564">       &quot;Set bandwidth informational parameter\n&quot;</a>
+<a name="ln1565">       &quot;Bandwidth in kilobits\n&quot;)</a>
+<a name="ln1566"> </a>
+<a name="ln1567">struct cmd_node link_params_node =</a>
+<a name="ln1568">{</a>
+<a name="ln1569">  LINK_PARAMS_NODE,</a>
+<a name="ln1570">  &quot;%s(config-link-params)# &quot;,</a>
+<a name="ln1571">  1,</a>
+<a name="ln1572">};</a>
+<a name="ln1573"> </a>
+<a name="ln1574">static void</a>
+<a name="ln1575">link_param_cmd_set_uint32 (struct interface *ifp, uint32_t *field, </a>
+<a name="ln1576">                           uint32_t type, uint32_t value)</a>
+<a name="ln1577">{</a>
+<a name="ln1578">  /* Update field as needed */</a>
+<a name="ln1579">  if (IS_PARAM_UNSET(ifp-&gt;link_params, type) || *field != value)</a>
+<a name="ln1580">    {</a>
+<a name="ln1581">      *field = value;</a>
+<a name="ln1582">      SET_PARAM(ifp-&gt;link_params, type);</a>
+<a name="ln1583"> </a>
+<a name="ln1584">      /* force protocols to update LINK STATE due to parameters change */</a>
+<a name="ln1585">      if (if_is_operative (ifp))</a>
+<a name="ln1586">        zebra_interface_parameters_update (ifp);</a>
+<a name="ln1587">    }</a>
+<a name="ln1588">}</a>
+<a name="ln1589">static void</a>
+<a name="ln1590">link_param_cmd_set_float (struct interface *ifp, float *field,</a>
+<a name="ln1591">                          uint32_t type, float value)</a>
+<a name="ln1592">{</a>
+<a name="ln1593"> </a>
+<a name="ln1594">  /* Update field as needed */</a>
+<a name="ln1595">  if (IS_PARAM_UNSET(ifp-&gt;link_params, type) || *field != value)</a>
+<a name="ln1596">    {</a>
+<a name="ln1597">      *field = value;</a>
+<a name="ln1598">      SET_PARAM(ifp-&gt;link_params, type);</a>
+<a name="ln1599"> </a>
+<a name="ln1600">      /* force protocols to update LINK STATE due to parameters change */</a>
+<a name="ln1601">      if (if_is_operative (ifp))</a>
+<a name="ln1602">        zebra_interface_parameters_update (ifp);</a>
+<a name="ln1603">    }</a>
+<a name="ln1604">}</a>
+<a name="ln1605"> </a>
+<a name="ln1606">static void</a>
+<a name="ln1607">link_param_cmd_unset (struct interface *ifp, uint32_t type)</a>
+<a name="ln1608">{</a>
+<a name="ln1609"> </a>
+<a name="ln1610">  /* Unset field */</a>
+<a name="ln1611">  UNSET_PARAM(ifp-&gt;link_params, type);</a>
+<a name="ln1612"> </a>
+<a name="ln1613">  /* force protocols to update LINK STATE due to parameters change */</a>
+<a name="ln1614">  if (if_is_operative (ifp))</a>
+<a name="ln1615">    zebra_interface_parameters_update (ifp);</a>
+<a name="ln1616">}</a>
+<a name="ln1617"> </a>
+<a name="ln1618">DEFUN (link_params,</a>
+<a name="ln1619">       link_params_cmd,</a>
+<a name="ln1620">       &quot;link-params&quot;,</a>
+<a name="ln1621">       LINK_PARAMS_STR)</a>
+<a name="ln1622">{</a>
+<a name="ln1623">  vty-&gt;node = LINK_PARAMS_NODE;</a>
+<a name="ln1624">  </a>
+<a name="ln1625">  return CMD_SUCCESS;</a>
+<a name="ln1626">}</a>
+<a name="ln1627"> </a>
+<a name="ln1628">DEFUN (exit_link_params,</a>
+<a name="ln1629">       exit_link_params_cmd,</a>
+<a name="ln1630">       &quot;exit-link-params&quot;,</a>
+<a name="ln1631">       &quot;Exit from Link Params configuration mode\n&quot;)</a>
+<a name="ln1632">{</a>
+<a name="ln1633">  if (vty-&gt;node == LINK_PARAMS_NODE)</a>
+<a name="ln1634">    vty-&gt;node = INTERFACE_NODE;</a>
+<a name="ln1635">  return CMD_SUCCESS;</a>
+<a name="ln1636">}</a>
+<a name="ln1637"> </a>
+<a name="ln1638">/* Specific Traffic Engineering parameters commands */</a>
+<a name="ln1639">DEFUN (link_params_enable,</a>
+<a name="ln1640">       link_params_enable_cmd,</a>
+<a name="ln1641">       &quot;enable&quot;,</a>
+<a name="ln1642">       &quot;Activate link parameters on this interface\n&quot;)</a>
+<a name="ln1643">{</a>
+<a name="ln1644">  struct interface *ifp = (struct interface *) vty-&gt;index;</a>
+<a name="ln1645">    </a>
+<a name="ln1646">  /* This command could be issue at startup, when activate MPLS TE */</a>
+<a name="ln1647">  /* on a new interface or after a ON / OFF / ON toggle */</a>
+<a name="ln1648">  /* In all case, TE parameters are reset to their default factory */</a>
+<a name="ln1649">  if (IS_ZEBRA_DEBUG_EVENT)</a>
+<a name="ln1650">    zlog_debug (&quot;Link-params: enable TE link parameters on interface %s&quot;, ifp-&gt;name);</a>
+<a name="ln1651">  </a>
+<a name="ln1652">  if (!if_link_params_get (ifp)) </a>
+<a name="ln1653">    {</a>
+<a name="ln1654">      if (IS_ZEBRA_DEBUG_EVENT)</a>
+<a name="ln1655">        zlog_debug (&quot;Link-params: failed to init TE link parameters  %s&quot;, ifp-&gt;name);</a>
+<a name="ln1656">      </a>
+<a name="ln1657">      return CMD_WARNING;</a>
+<a name="ln1658">    }</a>
+<a name="ln1659">  </a>
+<a name="ln1660">  /* force protocols to update LINK STATE due to parameters change */</a>
+<a name="ln1661">  if (if_is_operative (ifp))</a>
+<a name="ln1662">    zebra_interface_parameters_update (ifp);</a>
+<a name="ln1663"> </a>
+<a name="ln1664">  return CMD_SUCCESS;</a>
+<a name="ln1665">}</a>
+<a name="ln1666"> </a>
+<a name="ln1667">DEFUN (no_link_params_enable,</a>
+<a name="ln1668">       no_link_params_enable_cmd,</a>
+<a name="ln1669">       &quot;no enable&quot;,</a>
+<a name="ln1670">       NO_STR</a>
+<a name="ln1671">       &quot;Disable link parameters on this interface\n&quot;)</a>
+<a name="ln1672">{</a>
+<a name="ln1673">  struct interface *ifp = (struct interface *) vty-&gt;index;</a>
+<a name="ln1674"> </a>
+<a name="ln1675">  zlog_debug (&quot;MPLS-TE: disable TE link parameters on interface %s&quot;, ifp-&gt;name);</a>
+<a name="ln1676">  </a>
+<a name="ln1677">  if_link_params_free (ifp);</a>
+<a name="ln1678">  </a>
+<a name="ln1679">  /* force protocols to update LINK STATE due to parameters change */</a>
+<a name="ln1680">  if (if_is_operative (ifp))</a>
+<a name="ln1681">    zebra_interface_parameters_update (ifp);</a>
+<a name="ln1682"> </a>
+<a name="ln1683">  return CMD_SUCCESS;</a>
+<a name="ln1684">}</a>
+<a name="ln1685"> </a>
+<a name="ln1686">/* STANDARD TE metrics */</a>
+<a name="ln1687">DEFUN (link_params_metric,</a>
+<a name="ln1688">       link_params_metric_cmd,</a>
+<a name="ln1689">       &quot;metric &lt;0-4294967295&gt;&quot;,</a>
+<a name="ln1690">       &quot;Link metric for MPLS-TE purpose\n&quot;</a>
+<a name="ln1691">       &quot;Metric value in decimal\n&quot;)</a>
+<a name="ln1692">{</a>
+<a name="ln1693">  struct interface *ifp = (struct interface *) vty-&gt;index;</a>
+<a name="ln1694">  struct if_link_params *iflp = if_link_params_get (ifp);</a>
+<a name="ln1695">  u_int32_t metric;</a>
+<a name="ln1696"> </a>
+<a name="ln1697">  VTY_GET_ULONG(&quot;metric&quot;, metric, argv[0]);</a>
+<a name="ln1698"> </a>
+<a name="ln1699">  /* Update TE metric if needed */</a>
+<a name="ln1700">  link_param_cmd_set_uint32 (ifp, &amp;iflp-&gt;te_metric, LP_TE, metric);</a>
+<a name="ln1701">  </a>
+<a name="ln1702">  return CMD_SUCCESS;</a>
+<a name="ln1703">}</a>
+<a name="ln1704"> </a>
+<a name="ln1705">DEFUN (no_link_params_metric,</a>
+<a name="ln1706">       no_link_params_metric_cmd,</a>
+<a name="ln1707">       &quot;no metric&quot;,</a>
+<a name="ln1708">       NO_STR</a>
+<a name="ln1709">       &quot;Disable Link Metric on this interface\n&quot;)</a>
+<a name="ln1710">{</a>
+<a name="ln1711">  struct interface *ifp = (struct interface *) vty-&gt;index;</a>
+<a name="ln1712">  </a>
+<a name="ln1713">  /* Unset TE Metric */</a>
+<a name="ln1714">  link_param_cmd_unset(ifp, LP_TE);</a>
+<a name="ln1715">  </a>
+<a name="ln1716">  return CMD_SUCCESS;</a>
+<a name="ln1717">}</a>
+<a name="ln1718"> </a>
+<a name="ln1719">DEFUN (link_params_maxbw,</a>
+<a name="ln1720">       link_params_maxbw_cmd,</a>
+<a name="ln1721">       &quot;max-bw BANDWIDTH&quot;,</a>
+<a name="ln1722">       &quot;Maximum bandwidth that can be used\n&quot;</a>
+<a name="ln1723">       &quot;Bytes/second (IEEE floating point format)\n&quot;)</a>
+<a name="ln1724">{</a>
+<a name="ln1725">  struct interface *ifp = (struct interface *) vty-&gt;index;</a>
+<a name="ln1726">  struct if_link_params *iflp = if_link_params_get (ifp);</a>
+<a name="ln1727">  </a>
+<a name="ln1728">  float bw;</a>
+<a name="ln1729"> </a>
+<a name="ln1730">  if (sscanf (argv[0], &quot;%g&quot;, &amp;bw) != 1)</a>
+<a name="ln1731">    {</a>
+<a name="ln1732">      vty_out (vty, &quot;link_params_maxbw: fscanf: %s%s&quot;, safe_strerror (errno),</a>
+<a name="ln1733">               VTY_NEWLINE);</a>
+<a name="ln1734">      return CMD_WARNING;</a>
+<a name="ln1735">    }</a>
+<a name="ln1736"> </a>
+<a name="ln1737">  /* Check that Maximum bandwidth is not lower than other bandwidth parameters */</a>
+<a name="ln1738">  if ((bw &lt;= iflp-&gt;max_rsv_bw)</a>
+<a name="ln1739">      || (bw &lt;= iflp-&gt;unrsv_bw[0])</a>
+<a name="ln1740">      || (bw &lt;= iflp-&gt;unrsv_bw[1])</a>
+<a name="ln1741">      || (bw &lt;= iflp-&gt;unrsv_bw[2])</a>
+<a name="ln1742">      || (bw &lt;= iflp-&gt;unrsv_bw[3])</a>
+<a name="ln1743">      || (bw &lt;= iflp-&gt;unrsv_bw[4])</a>
+<a name="ln1744">      || (bw &lt;= iflp-&gt;unrsv_bw[5])</a>
+<a name="ln1745">      || (bw &lt;= iflp-&gt;unrsv_bw[6])</a>
+<a name="ln1746">      || (bw &lt;= iflp-&gt;unrsv_bw[7])</a>
+<a name="ln1747">      || (bw &lt;= iflp-&gt;ava_bw)</a>
+<a name="ln1748">      || (bw &lt;= iflp-&gt;res_bw)</a>
+<a name="ln1749">      || (bw &lt;= iflp-&gt;use_bw))</a>
+<a name="ln1750">    {</a>
+<a name="ln1751">      vty_out (vty,</a>
+<a name="ln1752">               &quot;Maximum Bandwidth could not be lower than others bandwidth%s&quot;,</a>
+<a name="ln1753">               VTY_NEWLINE);</a>
+<a name="ln1754">      return CMD_WARNING;</a>
+<a name="ln1755">    }</a>
+<a name="ln1756"> </a>
+<a name="ln1757">  /* Update Maximum Bandwidth if needed */</a>
+<a name="ln1758">  link_param_cmd_set_float (ifp, &amp;iflp-&gt;max_bw, LP_MAX_BW, bw);</a>
+<a name="ln1759">    </a>
+<a name="ln1760">  return CMD_SUCCESS;</a>
+<a name="ln1761">}</a>
+<a name="ln1762"> </a>
+<a name="ln1763">DEFUN (link_params_max_rsv_bw,</a>
+<a name="ln1764">       link_params_max_rsv_bw_cmd,</a>
+<a name="ln1765">       &quot;max-rsv-bw BANDWIDTH&quot;,</a>
+<a name="ln1766">       &quot;Maximum bandwidth that may be reserved\n&quot;</a>
+<a name="ln1767">       &quot;Bytes/second (IEEE floating point format)\n&quot;)</a>
+<a name="ln1768">{</a>
+<a name="ln1769">  struct interface *ifp = (struct interface *) vty-&gt;index;</a>
+<a name="ln1770">  struct if_link_params *iflp = if_link_params_get (ifp);</a>
+<a name="ln1771">  float bw;</a>
+<a name="ln1772"> </a>
+<a name="ln1773">  if (sscanf (argv[0], &quot;%g&quot;, &amp;bw) != 1)</a>
+<a name="ln1774">    {</a>
+<a name="ln1775">      vty_out (vty, &quot;link_params_max_rsv_bw: fscanf: %s%s&quot;, safe_strerror (errno),</a>
+<a name="ln1776">               VTY_NEWLINE);</a>
+<a name="ln1777">      return CMD_WARNING;</a>
+<a name="ln1778">    }</a>
+<a name="ln1779"> </a>
+<a name="ln1780">  /* Check that bandwidth is not greater than maximum bandwidth parameter */</a>
+<a name="ln1781">  if (bw &gt; iflp-&gt;max_bw)</a>
+<a name="ln1782">    {</a>
+<a name="ln1783">      vty_out (vty,</a>
+<a name="ln1784">               &quot;Maximum Reservable Bandwidth could not be greater than Maximum Bandwidth (%g)%s&quot;,</a>
+<a name="ln1785">               iflp-&gt;max_bw, VTY_NEWLINE);</a>
+<a name="ln1786">      return CMD_WARNING;</a>
+<a name="ln1787">    }</a>
+<a name="ln1788"> </a>
+<a name="ln1789">  /* Update Maximum Reservable Bandwidth if needed */</a>
+<a name="ln1790">  link_param_cmd_set_float (ifp, &amp;iflp-&gt;max_rsv_bw, LP_MAX_RSV_BW, bw);</a>
+<a name="ln1791">  </a>
+<a name="ln1792">  return CMD_SUCCESS;</a>
+<a name="ln1793">}</a>
+<a name="ln1794"> </a>
+<a name="ln1795">DEFUN (link_params_unrsv_bw,</a>
+<a name="ln1796">       link_params_unrsv_bw_cmd,</a>
+<a name="ln1797">       &quot;unrsv-bw &lt;0-7&gt; BANDWIDTH&quot;,</a>
+<a name="ln1798">       &quot;Unreserved bandwidth at each priority level\n&quot;</a>
+<a name="ln1799">       &quot;Priority\n&quot;</a>
+<a name="ln1800">       &quot;Bytes/second (IEEE floating point format)\n&quot;)</a>
+<a name="ln1801">{</a>
+<a name="ln1802">  struct interface *ifp = (struct interface *) vty-&gt;index;</a>
+<a name="ln1803">  struct if_link_params *iflp = if_link_params_get (ifp);</a>
+<a name="ln1804">  int priority;</a>
+<a name="ln1805">  float bw;</a>
+<a name="ln1806"> </a>
+<a name="ln1807">  /* We don't have to consider about range check here. */</a>
+<a name="ln1808">  if (sscanf (argv[0], &quot;%d&quot;, &amp;priority) != 1)</a>
+<a name="ln1809">    {</a>
+<a name="ln1810">      vty_out (vty, &quot;link_params_unrsv_bw: fscanf: %s%s&quot;, safe_strerror (errno),</a>
+<a name="ln1811">               VTY_NEWLINE);</a>
+<a name="ln1812">      return CMD_WARNING;</a>
+<a name="ln1813">    }</a>
+<a name="ln1814"> </a>
+<a name="ln1815">  if (sscanf (argv[1], &quot;%g&quot;, &amp;bw) != 1)</a>
+<a name="ln1816">    {</a>
+<a name="ln1817">      vty_out (vty, &quot;link_params_unrsv_bw: fscanf: %s%s&quot;, safe_strerror (errno),</a>
+<a name="ln1818">               VTY_NEWLINE);</a>
+<a name="ln1819">      return CMD_WARNING;</a>
+<a name="ln1820">    }</a>
+<a name="ln1821"> </a>
+<a name="ln1822">  /* Check that bandwidth is not greater than maximum bandwidth parameter */</a>
+<a name="ln1823">  if (bw &gt; iflp-&gt;max_bw)</a>
+<a name="ln1824">    {</a>
+<a name="ln1825">      vty_out (vty,</a>
+<a name="ln1826">               &quot;UnReserved Bandwidth could not be greater than Maximum Bandwidth (%g)%s&quot;,</a>
+<a name="ln1827">               iflp-&gt;max_bw, VTY_NEWLINE);</a>
+<a name="ln1828">      return CMD_WARNING;</a>
+<a name="ln1829">    }</a>
+<a name="ln1830"> </a>
+<a name="ln1831">  /* Update Unreserved Bandwidth if needed */</a>
+<a name="ln1832">  link_param_cmd_set_float (ifp, &amp;iflp-&gt;unrsv_bw[priority], LP_UNRSV_BW, bw);</a>
+<a name="ln1833">  </a>
+<a name="ln1834">  return CMD_SUCCESS;</a>
+<a name="ln1835">}</a>
+<a name="ln1836"> </a>
+<a name="ln1837">DEFUN (link_params_admin_grp,</a>
+<a name="ln1838">       link_params_admin_grp_cmd,</a>
+<a name="ln1839">       &quot;admin-grp BITPATTERN&quot;,</a>
+<a name="ln1840">       &quot;Administrative group membership\n&quot;</a>
+<a name="ln1841">       &quot;32-bit Hexadecimal value (e.g. 0xa1)\n&quot;)</a>
+<a name="ln1842">{</a>
+<a name="ln1843">  struct interface *ifp = (struct interface *) vty-&gt;index;</a>
+<a name="ln1844">  struct if_link_params *iflp = if_link_params_get (ifp);</a>
+<a name="ln1845">  unsigned long value;</a>
+<a name="ln1846"> </a>
+<a name="ln1847">  if (sscanf (argv[0], &quot;0x%lx&quot;, &amp;value) != 1)</a>
+<a name="ln1848">    {</a>
+<a name="ln1849">      vty_out (vty, &quot;link_params_admin_grp: fscanf: %s%s&quot;,</a>
+<a name="ln1850">               safe_strerror (errno), VTY_NEWLINE);</a>
+<a name="ln1851">      return CMD_WARNING;</a>
+<a name="ln1852">    }</a>
+<a name="ln1853"> </a>
+<a name="ln1854">  /* Update Administrative Group if needed */</a>
+<a name="ln1855">  link_param_cmd_set_uint32 (ifp, &amp;iflp-&gt;admin_grp, LP_ADM_GRP, value);</a>
+<a name="ln1856">  </a>
+<a name="ln1857">  return CMD_SUCCESS;</a>
+<a name="ln1858">}</a>
+<a name="ln1859"> </a>
+<a name="ln1860">DEFUN (no_link_params_admin_grp,</a>
+<a name="ln1861">       no_link_params_admin_grp_cmd,</a>
+<a name="ln1862">       &quot;no admin-grp&quot;,</a>
+<a name="ln1863">       NO_STR</a>
+<a name="ln1864">       &quot;Disable Administrative group membership on this interface\n&quot;)</a>
+<a name="ln1865">{</a>
+<a name="ln1866">  struct interface *ifp = (struct interface *) vty-&gt;index;</a>
+<a name="ln1867">  </a>
+<a name="ln1868">  /* Unset Admin Group */</a>
+<a name="ln1869">  link_param_cmd_unset(ifp, LP_ADM_GRP);</a>
+<a name="ln1870">  </a>
+<a name="ln1871">  return CMD_SUCCESS;</a>
+<a name="ln1872">}</a>
+<a name="ln1873"> </a>
+<a name="ln1874">/* RFC5392 &amp; RFC5316: INTER-AS */</a>
+<a name="ln1875">DEFUN (link_params_inter_as,</a>
+<a name="ln1876">       link_params_inter_as_cmd,</a>
+<a name="ln1877">       &quot;neighbor A.B.C.D as &lt;1-4294967295&gt;&quot;,</a>
+<a name="ln1878">       &quot;Configure remote ASBR information (Neighbor IP address and AS number)\n&quot;</a>
+<a name="ln1879">       &quot;Remote IP address in dot decimal A.B.C.D\n&quot;</a>
+<a name="ln1880">       &quot;Remote AS number\n&quot;</a>
+<a name="ln1881">       &quot;AS number in the range &lt;1-4294967295&gt;\n&quot;)</a>
+<a name="ln1882">{</a>
+<a name="ln1883"> </a>
+<a name="ln1884">  struct interface *ifp = (struct interface *) vty-&gt;index;</a>
+<a name="ln1885">  struct if_link_params *iflp = if_link_params_get (ifp);</a>
+<a name="ln1886">  struct in_addr addr;</a>
+<a name="ln1887">  u_int32_t as;</a>
+<a name="ln1888"> </a>
+<a name="ln1889">  if (!inet_aton (argv[0], &amp;addr))</a>
+<a name="ln1890">    {</a>
+<a name="ln1891">      vty_out (vty, &quot;Please specify Router-Addr by A.B.C.D%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1892">      return CMD_WARNING;</a>
+<a name="ln1893">    }</a>
+<a name="ln1894">    </a>
+<a name="ln1895">  VTY_GET_ULONG(&quot;AS number&quot;, as, argv[1]);</a>
+<a name="ln1896">  </a>
+<a name="ln1897">  /* Update Remote IP and Remote AS fields if needed */</a>
+<a name="ln1898">  if (IS_PARAM_UNSET(iflp, LP_RMT_AS)</a>
+<a name="ln1899">      || iflp-&gt;rmt_as != as</a>
+<a name="ln1900">      || iflp-&gt;rmt_ip.s_addr != addr.s_addr)</a>
+<a name="ln1901">    {</a>
+<a name="ln1902"> </a>
+<a name="ln1903">      iflp-&gt;rmt_as = as;</a>
+<a name="ln1904">      iflp-&gt;rmt_ip.s_addr = addr.s_addr;</a>
+<a name="ln1905">      SET_PARAM(iflp, LP_RMT_AS);</a>
+<a name="ln1906"> </a>
+<a name="ln1907">      /* force protocols to update LINK STATE due to parameters change */</a>
+<a name="ln1908">      if (if_is_operative (ifp))</a>
+<a name="ln1909">        zebra_interface_parameters_update (ifp);</a>
+<a name="ln1910">    }</a>
+<a name="ln1911">  return CMD_SUCCESS;</a>
+<a name="ln1912">}</a>
+<a name="ln1913"> </a>
+<a name="ln1914">DEFUN (no_link_params_inter_as,</a>
+<a name="ln1915">       no_link_params_inter_as_cmd,</a>
+<a name="ln1916">       &quot;no neighbor&quot;,</a>
+<a name="ln1917">       NO_STR</a>
+<a name="ln1918">       &quot;Remove Neighbor IP address and AS number for Inter-AS TE\n&quot;)</a>
+<a name="ln1919">{</a>
+<a name="ln1920"> </a>
+<a name="ln1921">  struct interface *ifp = (struct interface *) vty-&gt;index;</a>
+<a name="ln1922">  struct if_link_params *iflp = if_link_params_get (ifp);</a>
+<a name="ln1923"> </a>
+<a name="ln1924">  /* Reset Remote IP and AS neighbor */</a>
+<a name="ln1925">  iflp-&gt;rmt_as = 0;</a>
+<a name="ln1926">  iflp-&gt;rmt_ip.s_addr = 0;</a>
+<a name="ln1927">  UNSET_PARAM(iflp, LP_RMT_AS);</a>
+<a name="ln1928"> </a>
+<a name="ln1929">  /* force protocols to update LINK STATE due to parameters change */</a>
+<a name="ln1930">  if (if_is_operative (ifp))</a>
+<a name="ln1931">    zebra_interface_parameters_update (ifp);</a>
+<a name="ln1932"> </a>
+<a name="ln1933">  return CMD_SUCCESS;</a>
+<a name="ln1934">}</a>
+<a name="ln1935"> </a>
+<a name="ln1936">/* RFC7471: OSPF Traffic Engineering (TE) Metric extensions &amp; draft-ietf-isis-metric-extensions-07.txt */</a>
+<a name="ln1937">DEFUN (link_params_delay,</a>
+<a name="ln1938">       link_params_delay_cmd,</a>
+<a name="ln1939">       &quot;delay &lt;0-16777215&gt;&quot;,</a>
+<a name="ln1940">       &quot;Unidirectional Average Link Delay\n&quot;</a>
+<a name="ln1941">       &quot;Average delay in micro-second as decimal (0...16777215)\n&quot;)</a>
+<a name="ln1942">{</a>
+<a name="ln1943"> </a>
+<a name="ln1944">  struct interface *ifp = (struct interface *) vty-&gt;index;</a>
+<a name="ln1945">  struct if_link_params *iflp = if_link_params_get (ifp);</a>
+<a name="ln1946">  u_int32_t delay = 0, low = 0, high = 0;</a>
+<a name="ln1947">  u_int8_t update = 0;</a>
+<a name="ln1948"> </a>
+<a name="ln1949">  /* Get and Check new delay values */</a>
+<a name="ln1950">  VTY_GET_ULONG(&quot;delay&quot;, delay, argv[0]);</a>
+<a name="ln1951">  switch (argc)</a>
+<a name="ln1952">    {</a>
+<a name="ln1953">    case 1:</a>
+<a name="ln1954">      /* Check new delay value against old Min and Max delays if set */</a>
+<a name="ln1955">      if (IS_PARAM_SET(iflp, LP_MM_DELAY)</a>
+<a name="ln1956">          &amp;&amp; (delay &lt;= iflp-&gt;min_delay || delay &gt;= iflp-&gt;max_delay))</a>
+<a name="ln1957">        {</a>
+<a name="ln1958">          vty_out (vty, &quot;Average delay should be comprise between Min (%d) and Max (%d) delay%s&quot;,</a>
+<a name="ln1959">                   iflp-&gt;min_delay, iflp-&gt;max_delay, VTY_NEWLINE);</a>
+<a name="ln1960">          return CMD_WARNING;</a>
+<a name="ln1961">        }</a>
+<a name="ln1962">      /* Update delay if value is not set or change */</a>
+<a name="ln1963">      if (IS_PARAM_UNSET(iflp, LP_DELAY)|| iflp-&gt;av_delay != delay)</a>
+<a name="ln1964">        {</a>
+<a name="ln1965">          iflp-&gt;av_delay = delay;</a>
+<a name="ln1966">          SET_PARAM(iflp, LP_DELAY);</a>
+<a name="ln1967">          update = 1;</a>
+<a name="ln1968">        }</a>
+<a name="ln1969">      /* Unset Min and Max delays if already set */</a>
+<a name="ln1970">      if (IS_PARAM_SET(iflp, LP_MM_DELAY))</a>
+<a name="ln1971">        {</a>
+<a name="ln1972">          iflp-&gt;min_delay = 0;</a>
+<a name="ln1973">          iflp-&gt;max_delay = 0;</a>
+<a name="ln1974">          UNSET_PARAM(iflp, LP_MM_DELAY);</a>
+<a name="ln1975">          update = 1;</a>
+<a name="ln1976">        }</a>
+<a name="ln1977">      break;</a>
+<a name="ln1978">    case 2:</a>
+<a name="ln1979">      vty_out (vty, &quot;You should specify both Minimum and Maximum delay with Average delay%s&quot;,</a>
+<a name="ln1980">               VTY_NEWLINE);</a>
+<a name="ln1981">      return CMD_WARNING;</a>
+<a name="ln1982">    break;</a>
+<a name="ln1983">    case 3:</a>
+<a name="ln1984">      VTY_GET_ULONG(&quot;minimum delay&quot;, low, argv[1]);</a>
+<a name="ln1985">      VTY_GET_ULONG(&quot;maximum delay&quot;, high, argv[2]);</a>
+<a name="ln1986">      /* Check new delays value coherency */</a>
+<a name="ln1987">      if (delay &lt;= low || delay &gt;= high)</a>
+<a name="ln1988">        {</a>
+<a name="ln1989">          vty_out (vty, &quot;Average delay should be comprise between Min (%d) and Max (%d) delay%s&quot;,</a>
+<a name="ln1990">                   low, high, VTY_NEWLINE);</a>
+<a name="ln1991">          return CMD_WARNING;</a>
+<a name="ln1992">        }</a>
+<a name="ln1993">      /* Update Delays if needed */</a>
+<a name="ln1994">      if (IS_PARAM_UNSET(iflp, LP_DELAY)</a>
+<a name="ln1995">          || IS_PARAM_UNSET(iflp, LP_MM_DELAY)</a>
+<a name="ln1996">          || iflp-&gt;av_delay != delay</a>
+<a name="ln1997">          || iflp-&gt;min_delay != low</a>
+<a name="ln1998">          || iflp-&gt;max_delay != high)</a>
+<a name="ln1999">        {</a>
+<a name="ln2000">          iflp-&gt;av_delay = delay;</a>
+<a name="ln2001">          SET_PARAM(iflp, LP_DELAY);</a>
+<a name="ln2002">          iflp-&gt;min_delay = low;</a>
+<a name="ln2003">          iflp-&gt;max_delay = high;</a>
+<a name="ln2004">          SET_PARAM(iflp, LP_MM_DELAY);</a>
+<a name="ln2005">          update = 1;</a>
+<a name="ln2006">        }</a>
+<a name="ln2007">      break;</a>
+<a name="ln2008">    default:</a>
+<a name="ln2009">      return CMD_WARNING;</a>
+<a name="ln2010">      break;</a>
+<a name="ln2011">    }</a>
+<a name="ln2012"> </a>
+<a name="ln2013">  /* force protocols to update LINK STATE due to parameters change */</a>
+<a name="ln2014">  if (update == 1 &amp;&amp; if_is_operative (ifp))</a>
+<a name="ln2015">    zebra_interface_parameters_update (ifp);</a>
+<a name="ln2016"> </a>
+<a name="ln2017">  return CMD_SUCCESS;</a>
+<a name="ln2018">}</a>
+<a name="ln2019"> </a>
+<a name="ln2020">ALIAS (link_params_delay,</a>
+<a name="ln2021">       link_params_delay_mm_cmd,</a>
+<a name="ln2022">       &quot;delay &lt;0-16777215&gt; min &lt;0-16777215&gt; max &lt;0-16777215&gt;&quot;,</a>
+<a name="ln2023">       &quot;Unidirectional Average Link Delay (optionally Minimum and Maximum delays)\n&quot;</a>
+<a name="ln2024">       &quot;Average delay in micro-second as decimal (0...16777215)\n&quot;</a>
+<a name="ln2025">       &quot;Minimum delay\n&quot;</a>
+<a name="ln2026">       &quot;Minimum delay in micro-second as decimal (0...16777215)\n&quot;</a>
+<a name="ln2027">       &quot;Maximum delay\n&quot;</a>
+<a name="ln2028">       &quot;Maximum delay in micro-second as decimal (0...16777215)\n&quot;)</a>
+<a name="ln2029"> </a>
+<a name="ln2030">DEFUN (no_link_params_delay,</a>
+<a name="ln2031">       no_link_params_delay_cmd,</a>
+<a name="ln2032">       &quot;no delay&quot;,</a>
+<a name="ln2033">       NO_STR</a>
+<a name="ln2034">       &quot;Disable Unidirectional Average, Min &amp; Max Link Delay on this interface\n&quot;)</a>
+<a name="ln2035">{</a>
+<a name="ln2036">  struct interface *ifp = (struct interface *) vty-&gt;index;</a>
+<a name="ln2037">  struct if_link_params *iflp = if_link_params_get (ifp);</a>
+<a name="ln2038">  </a>
+<a name="ln2039">  /* Unset Delays */</a>
+<a name="ln2040">  iflp-&gt;av_delay = 0;</a>
+<a name="ln2041">  UNSET_PARAM(iflp, LP_DELAY);</a>
+<a name="ln2042">  iflp-&gt;min_delay = 0;</a>
+<a name="ln2043">  iflp-&gt;max_delay = 0;</a>
+<a name="ln2044">  UNSET_PARAM(iflp, LP_MM_DELAY);</a>
+<a name="ln2045">  </a>
+<a name="ln2046">  /* force protocols to update LINK STATE due to parameters change */</a>
+<a name="ln2047">  if (if_is_operative (ifp))</a>
+<a name="ln2048">    zebra_interface_parameters_update (ifp);</a>
+<a name="ln2049">  </a>
+<a name="ln2050">  return CMD_SUCCESS;</a>
+<a name="ln2051">}</a>
+<a name="ln2052"> </a>
+<a name="ln2053">DEFUN (link_params_delay_var,</a>
+<a name="ln2054">       link_params_delay_var_cmd,</a>
+<a name="ln2055">       &quot;delay-variation &lt;0-16777215&gt;&quot;,</a>
+<a name="ln2056">       &quot;Unidirectional Link Delay Variation\n&quot;</a>
+<a name="ln2057">       &quot;delay variation in micro-second as decimal (0...16777215)\n&quot;)</a>
+<a name="ln2058">{</a>
+<a name="ln2059">  struct interface *ifp = (struct interface *) vty-&gt;index;</a>
+<a name="ln2060">  struct if_link_params *iflp = if_link_params_get (ifp);</a>
+<a name="ln2061">  u_int32_t value;</a>
+<a name="ln2062">  </a>
+<a name="ln2063">  VTY_GET_ULONG(&quot;delay variation&quot;, value, argv[0]);</a>
+<a name="ln2064">  </a>
+<a name="ln2065">  /* Update Delay Variation if needed */</a>
+<a name="ln2066">  link_param_cmd_set_uint32 (ifp, &amp;iflp-&gt;delay_var, LP_DELAY_VAR, value);</a>
+<a name="ln2067">  </a>
+<a name="ln2068">  return CMD_SUCCESS;</a>
+<a name="ln2069">}</a>
+<a name="ln2070"> </a>
+<a name="ln2071">DEFUN (no_link_params_delay_var,</a>
+<a name="ln2072">       no_link_params_delay_var_cmd,</a>
+<a name="ln2073">       &quot;no delay-variation&quot;,</a>
+<a name="ln2074">       NO_STR</a>
+<a name="ln2075">       &quot;Disable Unidirectional Delay Variation on this interface\n&quot;)</a>
+<a name="ln2076">{</a>
+<a name="ln2077">  struct interface *ifp = (struct interface *) vty-&gt;index;</a>
+<a name="ln2078">  </a>
+<a name="ln2079">  /* Unset Delay Variation */</a>
+<a name="ln2080">  link_param_cmd_unset(ifp, LP_DELAY_VAR);</a>
+<a name="ln2081">  </a>
+<a name="ln2082">  return CMD_SUCCESS;</a>
+<a name="ln2083">}</a>
+<a name="ln2084"> </a>
+<a name="ln2085">DEFUN (link_params_pkt_loss,</a>
+<a name="ln2086">       link_params_pkt_loss_cmd,</a>
+<a name="ln2087">       &quot;packet-loss PERCENTAGE&quot;,</a>
+<a name="ln2088">       &quot;Unidirectional Link Packet Loss\n&quot;</a>
+<a name="ln2089">       &quot;percentage of total traffic by 0.000003% step and less than 50.331642%\n&quot;)</a>
+<a name="ln2090">{</a>
+<a name="ln2091">  struct interface *ifp = (struct interface *) vty-&gt;index;</a>
+<a name="ln2092">  struct if_link_params *iflp = if_link_params_get (ifp);</a>
+<a name="ln2093">  float fval;</a>
+<a name="ln2094"> </a>
+<a name="ln2095">  if (sscanf (argv[0], &quot;%g&quot;, &amp;fval) != 1)</a>
+<a name="ln2096">    {</a>
+<a name="ln2097">      vty_out (vty, &quot;link_params_pkt_loss: fscanf: %s%s&quot;, safe_strerror (errno),</a>
+<a name="ln2098">               VTY_NEWLINE);</a>
+<a name="ln2099">      return CMD_WARNING;</a>
+<a name="ln2100">    }</a>
+<a name="ln2101"> </a>
+<a name="ln2102">  if (fval &gt; MAX_PKT_LOSS)</a>
+<a name="ln2103">    fval = MAX_PKT_LOSS;</a>
+<a name="ln2104"> </a>
+<a name="ln2105">  /* Update Packet Loss if needed */</a>
+<a name="ln2106">  link_param_cmd_set_float (ifp, &amp;iflp-&gt;pkt_loss, LP_PKT_LOSS, fval);</a>
+<a name="ln2107">  </a>
+<a name="ln2108">  return CMD_SUCCESS;</a>
+<a name="ln2109">}</a>
+<a name="ln2110"> </a>
+<a name="ln2111">DEFUN (no_link_params_pkt_loss,</a>
+<a name="ln2112">       no_link_params_pkt_loss_cmd,</a>
+<a name="ln2113">       &quot;no packet-loss&quot;,</a>
+<a name="ln2114">       NO_STR</a>
+<a name="ln2115">       &quot;Disable Unidirectional Link Packet Loss on this interface\n&quot;)</a>
+<a name="ln2116">{</a>
+<a name="ln2117">  struct interface *ifp = (struct interface *) vty-&gt;index;</a>
+<a name="ln2118">  </a>
+<a name="ln2119">  /* Unset Packet Loss */</a>
+<a name="ln2120">  link_param_cmd_unset(ifp, LP_PKT_LOSS);</a>
+<a name="ln2121">  </a>
+<a name="ln2122">  return CMD_SUCCESS;</a>
+<a name="ln2123">}</a>
+<a name="ln2124"> </a>
+<a name="ln2125">DEFUN (link_params_res_bw,</a>
+<a name="ln2126">       link_params_res_bw_cmd,</a>
+<a name="ln2127">       &quot;res-bw BANDWIDTH&quot;,</a>
+<a name="ln2128">       &quot;Unidirectional Residual Bandwidth\n&quot;</a>
+<a name="ln2129">       &quot;Bytes/second (IEEE floating point format)\n&quot;)</a>
+<a name="ln2130">{</a>
+<a name="ln2131">  struct interface *ifp = (struct interface *) vty-&gt;index;</a>
+<a name="ln2132">  struct if_link_params *iflp = if_link_params_get (ifp);</a>
+<a name="ln2133">  float bw;</a>
+<a name="ln2134"> </a>
+<a name="ln2135">  if (sscanf (argv[0], &quot;%g&quot;, &amp;bw) != 1)</a>
+<a name="ln2136">    {</a>
+<a name="ln2137">      vty_out (vty, &quot;link_params_res_bw: fscanf: %s%s&quot;, safe_strerror (errno),</a>
+<a name="ln2138">               VTY_NEWLINE);</a>
+<a name="ln2139">      return CMD_WARNING;</a>
+<a name="ln2140">    }</a>
+<a name="ln2141"> </a>
+<a name="ln2142">  /* Check that bandwidth is not greater than maximum bandwidth parameter */</a>
+<a name="ln2143">  if (bw &gt; iflp-&gt;max_bw)</a>
+<a name="ln2144">    {</a>
+<a name="ln2145">      vty_out (vty,</a>
+<a name="ln2146">               &quot;Residual Bandwidth could not be greater than Maximum Bandwidth (%g)%s&quot;,</a>
+<a name="ln2147">               iflp-&gt;max_bw, VTY_NEWLINE);</a>
+<a name="ln2148">      return CMD_WARNING;</a>
+<a name="ln2149">    }</a>
+<a name="ln2150"> </a>
+<a name="ln2151">  /* Update Residual Bandwidth if needed */</a>
+<a name="ln2152">  link_param_cmd_set_float (ifp, &amp;iflp-&gt;res_bw, LP_RES_BW, bw);</a>
+<a name="ln2153">  </a>
+<a name="ln2154">  return CMD_SUCCESS;</a>
+<a name="ln2155">}</a>
+<a name="ln2156"> </a>
+<a name="ln2157">DEFUN (no_link_params_res_bw,</a>
+<a name="ln2158">       no_link_params_res_bw_cmd,</a>
+<a name="ln2159">       &quot;no res-bw&quot;,</a>
+<a name="ln2160">       NO_STR</a>
+<a name="ln2161">       &quot;Disable Unidirectional Residual Bandwidth on this interface\n&quot;)</a>
+<a name="ln2162">{</a>
+<a name="ln2163">  struct interface *ifp = (struct interface *) vty-&gt;index;</a>
+<a name="ln2164">  </a>
+<a name="ln2165">  /* Unset Residual Bandwidth */</a>
+<a name="ln2166">  link_param_cmd_unset(ifp, LP_RES_BW);</a>
+<a name="ln2167">  </a>
+<a name="ln2168">  return CMD_SUCCESS;</a>
+<a name="ln2169">}</a>
+<a name="ln2170"> </a>
+<a name="ln2171">DEFUN (link_params_ava_bw,</a>
+<a name="ln2172">       link_params_ava_bw_cmd,</a>
+<a name="ln2173">       &quot;ava-bw BANDWIDTH&quot;,</a>
+<a name="ln2174">       &quot;Unidirectional Available Bandwidth\n&quot;</a>
+<a name="ln2175">       &quot;Bytes/second (IEEE floating point format)\n&quot;)</a>
+<a name="ln2176">{</a>
+<a name="ln2177">  struct interface *ifp = (struct interface *) vty-&gt;index;</a>
+<a name="ln2178">  struct if_link_params *iflp = if_link_params_get (ifp);</a>
+<a name="ln2179">  float bw;</a>
+<a name="ln2180"> </a>
+<a name="ln2181">  if (sscanf (argv[0], &quot;%g&quot;, &amp;bw) != 1)</a>
+<a name="ln2182">    {</a>
+<a name="ln2183">      vty_out (vty, &quot;link_params_ava_bw: fscanf: %s%s&quot;, safe_strerror (errno),</a>
+<a name="ln2184">               VTY_NEWLINE);</a>
+<a name="ln2185">      return CMD_WARNING;</a>
+<a name="ln2186">    }</a>
+<a name="ln2187"> </a>
+<a name="ln2188">  /* Check that bandwidth is not greater than maximum bandwidth parameter */</a>
+<a name="ln2189">  if (bw &gt; iflp-&gt;max_bw)</a>
+<a name="ln2190">    {</a>
+<a name="ln2191">      vty_out (vty,</a>
+<a name="ln2192">               &quot;Available Bandwidth could not be greater than Maximum Bandwidth (%g)%s&quot;,</a>
+<a name="ln2193">               iflp-&gt;max_bw, VTY_NEWLINE);</a>
+<a name="ln2194">      return CMD_WARNING;</a>
+<a name="ln2195">    }</a>
+<a name="ln2196"> </a>
+<a name="ln2197">  /* Update Residual Bandwidth if needed */</a>
+<a name="ln2198">  link_param_cmd_set_float (ifp, &amp;iflp-&gt;ava_bw, LP_AVA_BW, bw);</a>
+<a name="ln2199">  </a>
+<a name="ln2200">  return CMD_SUCCESS;</a>
+<a name="ln2201">}</a>
+<a name="ln2202"> </a>
+<a name="ln2203">DEFUN (no_link_params_ava_bw,</a>
+<a name="ln2204">       no_link_params_ava_bw_cmd,</a>
+<a name="ln2205">       &quot;no ava-bw&quot;,</a>
+<a name="ln2206">       NO_STR</a>
+<a name="ln2207">       &quot;Disable Unidirectional Available Bandwidth on this interface\n&quot;)</a>
+<a name="ln2208">{</a>
+<a name="ln2209">  struct interface *ifp = (struct interface *) vty-&gt;index;</a>
+<a name="ln2210">  </a>
+<a name="ln2211">  /* Unset Available Bandwidth */</a>
+<a name="ln2212">  link_param_cmd_unset(ifp, LP_AVA_BW);</a>
+<a name="ln2213">  </a>
+<a name="ln2214">  return CMD_SUCCESS;</a>
+<a name="ln2215">}</a>
+<a name="ln2216"> </a>
+<a name="ln2217">DEFUN (link_params_use_bw,</a>
+<a name="ln2218">       link_params_use_bw_cmd,</a>
+<a name="ln2219">       &quot;use-bw BANDWIDTH&quot;,</a>
+<a name="ln2220">       &quot;Unidirectional Utilised Bandwidth\n&quot;</a>
+<a name="ln2221">       &quot;Bytes/second (IEEE floating point format)\n&quot;)</a>
+<a name="ln2222">{</a>
+<a name="ln2223">  struct interface *ifp = (struct interface *) vty-&gt;index;</a>
+<a name="ln2224">  struct if_link_params *iflp = if_link_params_get (ifp);</a>
+<a name="ln2225">  float bw;</a>
+<a name="ln2226"> </a>
+<a name="ln2227">  if (sscanf (argv[0], &quot;%g&quot;, &amp;bw) != 1)</a>
+<a name="ln2228">    {</a>
+<a name="ln2229">      vty_out (vty, &quot;link_params_use_bw: fscanf: %s%s&quot;, safe_strerror (errno),</a>
+<a name="ln2230">               VTY_NEWLINE);</a>
+<a name="ln2231">      return CMD_WARNING;</a>
+<a name="ln2232">    }</a>
+<a name="ln2233"> </a>
+<a name="ln2234">  /* Check that bandwidth is not greater than maximum bandwidth parameter */</a>
+<a name="ln2235">  if (bw &gt; iflp-&gt;max_bw)</a>
+<a name="ln2236">    {</a>
+<a name="ln2237">      vty_out (vty,</a>
+<a name="ln2238">               &quot;Utilised Bandwidth could not be greater than Maximum Bandwidth (%g)%s&quot;,</a>
+<a name="ln2239">               iflp-&gt;max_bw, VTY_NEWLINE);</a>
+<a name="ln2240">      return CMD_WARNING;</a>
+<a name="ln2241">    }</a>
+<a name="ln2242"> </a>
+<a name="ln2243">  /* Update Utilized Bandwidth if needed */</a>
+<a name="ln2244">  link_param_cmd_set_float (ifp, &amp;iflp-&gt;use_bw, LP_USE_BW, bw);</a>
+<a name="ln2245">  </a>
+<a name="ln2246">  return CMD_SUCCESS;</a>
+<a name="ln2247">}</a>
+<a name="ln2248"> </a>
+<a name="ln2249">DEFUN (no_link_params_use_bw,</a>
+<a name="ln2250">       no_link_params_use_bw_cmd,</a>
+<a name="ln2251">       &quot;no use-bw&quot;,</a>
+<a name="ln2252">       NO_STR</a>
+<a name="ln2253">       &quot;Disable Unidirectional Utilised Bandwidth on this interface\n&quot;)</a>
+<a name="ln2254">{</a>
+<a name="ln2255">  struct interface *ifp = (struct interface *) vty-&gt;index;</a>
+<a name="ln2256">  </a>
+<a name="ln2257">  /* Unset Utilised Bandwidth */</a>
+<a name="ln2258">  link_param_cmd_unset(ifp, LP_USE_BW);</a>
+<a name="ln2259">  </a>
+<a name="ln2260">  return CMD_SUCCESS;</a>
+<a name="ln2261">}</a>
+<a name="ln2262"> </a>
+<a name="ln2263">static int</a>
+<a name="ln2264">ip_address_install (struct vty *vty, struct interface *ifp,</a>
+<a name="ln2265">		    const char *addr_str, const char *peer_str,</a>
+<a name="ln2266">		    const char *label)</a>
+<a name="ln2267">{</a>
+<a name="ln2268">  struct zebra_if *if_data;</a>
+<a name="ln2269">  struct prefix_ipv4 cp;</a>
+<a name="ln2270">  struct connected *ifc;</a>
+<a name="ln2271">  struct prefix_ipv4 *p;</a>
+<a name="ln2272">  int ret;</a>
+<a name="ln2273"> </a>
+<a name="ln2274">  if_data = ifp-&gt;info;</a>
+<a name="ln2275"> </a>
+<a name="ln2276">  ret = str2prefix_ipv4 (addr_str, &amp;cp);</a>
+<a name="ln2277">  if (ret &lt;= 0)</a>
+<a name="ln2278">    {</a>
+<a name="ln2279">      vty_out (vty, &quot;%% Malformed address %s&quot;, VTY_NEWLINE);</a>
+<a name="ln2280">      return CMD_WARNING;</a>
+<a name="ln2281">    }</a>
+<a name="ln2282"> </a>
+<a name="ln2283">  ifc = connected_check (ifp, (struct prefix *) &amp;cp);</a>
+<a name="ln2284">  if (! ifc)</a>
+<a name="ln2285">    {</a>
+<a name="ln2286">      ifc = connected_new ();</a>
+<a name="ln2287">      ifc-&gt;ifp = ifp;</a>
+<a name="ln2288"> </a>
+<a name="ln2289">      /* Address. */</a>
+<a name="ln2290">      p = prefix_ipv4_new ();</a>
+<a name="ln2291">      *p = cp;</a>
+<a name="ln2292">      ifc-&gt;address = (struct prefix *) p;</a>
+<a name="ln2293"> </a>
+<a name="ln2294">      /* Broadcast. */</a>
+<a name="ln2295">      if (p-&gt;prefixlen &lt;= IPV4_MAX_PREFIXLEN-2)</a>
+<a name="ln2296">	{</a>
+<a name="ln2297">	  p = prefix_ipv4_new ();</a>
+<a name="ln2298">	  *p = cp;</a>
+<a name="ln2299">	  p-&gt;prefix.s_addr = ipv4_broadcast_addr(p-&gt;prefix.s_addr,p-&gt;prefixlen);</a>
+<a name="ln2300">	  ifc-&gt;destination = (struct prefix *) p;</a>
+<a name="ln2301">	}</a>
+<a name="ln2302"> </a>
+<a name="ln2303">      /* Label. */</a>
+<a name="ln2304">      if (label)</a>
+<a name="ln2305">	ifc-&gt;label = XSTRDUP (MTYPE_CONNECTED_LABEL, label);</a>
+<a name="ln2306"> </a>
+<a name="ln2307">      /* Add to linked list. */</a>
+<a name="ln2308">      listnode_add (ifp-&gt;connected, ifc);</a>
+<a name="ln2309">    }</a>
+<a name="ln2310"> </a>
+<a name="ln2311">  /* This address is configured from zebra. */</a>
+<a name="ln2312">  if (! CHECK_FLAG (ifc-&gt;conf, ZEBRA_IFC_CONFIGURED))</a>
+<a name="ln2313">    SET_FLAG (ifc-&gt;conf, ZEBRA_IFC_CONFIGURED);</a>
+<a name="ln2314"> </a>
+<a name="ln2315">  /* In case of this route need to install kernel. */</a>
+<a name="ln2316">  if (! CHECK_FLAG (ifc-&gt;conf, ZEBRA_IFC_QUEUED)</a>
+<a name="ln2317">      &amp;&amp; CHECK_FLAG (ifp-&gt;status, ZEBRA_INTERFACE_ACTIVE)</a>
+<a name="ln2318">      &amp;&amp; !(if_data &amp;&amp; if_data-&gt;shutdown == IF_ZEBRA_SHUTDOWN_ON))</a>
+<a name="ln2319">    {</a>
+<a name="ln2320">      /* Some system need to up the interface to set IP address. */</a>
+<a name="ln2321">      if (! if_is_up (ifp))</a>
+<a name="ln2322">	{</a>
+<a name="ln2323">	  if_set_flags (ifp, IFF_UP | IFF_RUNNING);</a>
+<a name="ln2324">	  if_refresh (ifp);</a>
+<a name="ln2325">	}</a>
+<a name="ln2326"> </a>
+<a name="ln2327">      ret = if_set_prefix (ifp, ifc);</a>
+<a name="ln2328">      if (ret &lt; 0)</a>
+<a name="ln2329">	{</a>
+<a name="ln2330">	  vty_out (vty, &quot;%% Can't set interface IP address: %s.%s&quot;, </a>
+<a name="ln2331">		   safe_strerror(errno), VTY_NEWLINE);</a>
+<a name="ln2332">	  return CMD_WARNING;</a>
+<a name="ln2333">	}</a>
+<a name="ln2334"> </a>
+<a name="ln2335">      SET_FLAG (ifc-&gt;conf, ZEBRA_IFC_QUEUED);</a>
+<a name="ln2336">      /* The address will be advertised to zebra clients when the notification</a>
+<a name="ln2337">       * from the kernel has been received.</a>
+<a name="ln2338">       * It will also be added to the subnet chain list, then. */</a>
+<a name="ln2339">    }</a>
+<a name="ln2340"> </a>
+<a name="ln2341">  return CMD_SUCCESS;</a>
+<a name="ln2342">}</a>
+<a name="ln2343"> </a>
+<a name="ln2344">static int</a>
+<a name="ln2345">ip_address_uninstall (struct vty *vty, struct interface *ifp,</a>
+<a name="ln2346">		      const char *addr_str, const char *peer_str,</a>
+<a name="ln2347">		      const char *label)</a>
+<a name="ln2348">{</a>
+<a name="ln2349">  struct prefix_ipv4 cp;</a>
+<a name="ln2350">  struct connected *ifc;</a>
+<a name="ln2351">  int ret;</a>
+<a name="ln2352"> </a>
+<a name="ln2353">  /* Convert to prefix structure. */</a>
+<a name="ln2354">  ret = str2prefix_ipv4 (addr_str, &amp;cp);</a>
+<a name="ln2355">  if (ret &lt;= 0)</a>
+<a name="ln2356">    {</a>
+<a name="ln2357">      vty_out (vty, &quot;%% Malformed address %s&quot;, VTY_NEWLINE);</a>
+<a name="ln2358">      return CMD_WARNING;</a>
+<a name="ln2359">    }</a>
+<a name="ln2360"> </a>
+<a name="ln2361">  /* Check current interface address. */</a>
+<a name="ln2362">  ifc = connected_check (ifp, (struct prefix *) &amp;cp);</a>
+<a name="ln2363">  if (! ifc)</a>
+<a name="ln2364">    {</a>
+<a name="ln2365">      vty_out (vty, &quot;%% Can't find address%s&quot;, VTY_NEWLINE);</a>
+<a name="ln2366">      return CMD_WARNING;</a>
+<a name="ln2367">    }</a>
+<a name="ln2368"> </a>
+<a name="ln2369">  /* This is not configured address. */</a>
+<a name="ln2370">  if (! CHECK_FLAG (ifc-&gt;conf, ZEBRA_IFC_CONFIGURED))</a>
+<a name="ln2371">    return CMD_WARNING;</a>
+<a name="ln2372"> </a>
+<a name="ln2373">  UNSET_FLAG (ifc-&gt;conf, ZEBRA_IFC_CONFIGURED);</a>
+<a name="ln2374">  </a>
+<a name="ln2375">  /* This is not real address or interface is not active. */</a>
+<a name="ln2376">  if (! CHECK_FLAG (ifc-&gt;conf, ZEBRA_IFC_QUEUED)</a>
+<a name="ln2377">      || ! CHECK_FLAG (ifp-&gt;status, ZEBRA_INTERFACE_ACTIVE))</a>
+<a name="ln2378">    {</a>
+<a name="ln2379">      listnode_delete (ifp-&gt;connected, ifc);</a>
+<a name="ln2380">      connected_free (ifc);</a>
+<a name="ln2381">      return CMD_WARNING;</a>
+<a name="ln2382">    }</a>
+<a name="ln2383"> </a>
+<a name="ln2384">  /* This is real route. */</a>
+<a name="ln2385">  ret = if_unset_prefix (ifp, ifc);</a>
+<a name="ln2386">  if (ret &lt; 0)</a>
+<a name="ln2387">    {</a>
+<a name="ln2388">      vty_out (vty, &quot;%% Can't unset interface IP address: %s.%s&quot;, </a>
+<a name="ln2389">	       safe_strerror(errno), VTY_NEWLINE);</a>
+<a name="ln2390">      return CMD_WARNING;</a>
+<a name="ln2391">    }</a>
+<a name="ln2392">  UNSET_FLAG (ifc-&gt;conf, ZEBRA_IFC_QUEUED);</a>
+<a name="ln2393">  /* we will receive a kernel notification about this route being removed.</a>
+<a name="ln2394">   * this will trigger its removal from the connected list. */</a>
+<a name="ln2395">  return CMD_SUCCESS;</a>
+<a name="ln2396">}</a>
+<a name="ln2397"> </a>
+<a name="ln2398">DEFUN (ip_address,</a>
+<a name="ln2399">       ip_address_cmd,</a>
+<a name="ln2400">       &quot;ip address A.B.C.D/M&quot;,</a>
+<a name="ln2401">       &quot;Interface Internet Protocol config commands\n&quot;</a>
+<a name="ln2402">       &quot;Set the IP address of an interface\n&quot;</a>
+<a name="ln2403">       &quot;IP address (e.g. 10.0.0.1/8)\n&quot;)</a>
+<a name="ln2404">{</a>
+<a name="ln2405">  return ip_address_install (vty, vty-&gt;index, argv[0], NULL, NULL);</a>
+<a name="ln2406">}</a>
+<a name="ln2407"> </a>
+<a name="ln2408">DEFUN (no_ip_address,</a>
+<a name="ln2409">       no_ip_address_cmd,</a>
+<a name="ln2410">       &quot;no ip address A.B.C.D/M&quot;,</a>
+<a name="ln2411">       NO_STR</a>
+<a name="ln2412">       &quot;Interface Internet Protocol config commands\n&quot;</a>
+<a name="ln2413">       &quot;Set the IP address of an interface\n&quot;</a>
+<a name="ln2414">       &quot;IP Address (e.g. 10.0.0.1/8)&quot;)</a>
+<a name="ln2415">{</a>
+<a name="ln2416">  return ip_address_uninstall (vty, vty-&gt;index, argv[0], NULL, NULL);</a>
+<a name="ln2417">}</a>
+<a name="ln2418"> </a>
+<a name="ln2419">#ifdef HAVE_NETLINK</a>
+<a name="ln2420">DEFUN (ip_address_label,</a>
+<a name="ln2421">       ip_address_label_cmd,</a>
+<a name="ln2422">       &quot;ip address A.B.C.D/M label LINE&quot;,</a>
+<a name="ln2423">       &quot;Interface Internet Protocol config commands\n&quot;</a>
+<a name="ln2424">       &quot;Set the IP address of an interface\n&quot;</a>
+<a name="ln2425">       &quot;IP address (e.g. 10.0.0.1/8)\n&quot;</a>
+<a name="ln2426">       &quot;Label of this address\n&quot;</a>
+<a name="ln2427">       &quot;Label\n&quot;)</a>
+<a name="ln2428">{</a>
+<a name="ln2429">  return ip_address_install (vty, vty-&gt;index, argv[0], NULL, argv[1]);</a>
+<a name="ln2430">}</a>
+<a name="ln2431"> </a>
+<a name="ln2432">DEFUN (no_ip_address_label,</a>
+<a name="ln2433">       no_ip_address_label_cmd,</a>
+<a name="ln2434">       &quot;no ip address A.B.C.D/M label LINE&quot;,</a>
+<a name="ln2435">       NO_STR</a>
+<a name="ln2436">       &quot;Interface Internet Protocol config commands\n&quot;</a>
+<a name="ln2437">       &quot;Set the IP address of an interface\n&quot;</a>
+<a name="ln2438">       &quot;IP address (e.g. 10.0.0.1/8)\n&quot;</a>
+<a name="ln2439">       &quot;Label of this address\n&quot;</a>
+<a name="ln2440">       &quot;Label\n&quot;)</a>
+<a name="ln2441">{</a>
+<a name="ln2442">  return ip_address_uninstall (vty, vty-&gt;index, argv[0], NULL, argv[1]);</a>
+<a name="ln2443">}</a>
+<a name="ln2444">#endif /* HAVE_NETLINK */</a>
+<a name="ln2445"> </a>
+<a name="ln2446">#ifdef HAVE_IPV6</a>
+<a name="ln2447">static int</a>
+<a name="ln2448">ipv6_address_install (struct vty *vty, struct interface *ifp,</a>
+<a name="ln2449">		      const char *addr_str, const char *peer_str,</a>
+<a name="ln2450">		      const char *label, int secondary)</a>
+<a name="ln2451">{</a>
+<a name="ln2452">  struct zebra_if *if_data;</a>
+<a name="ln2453">  struct prefix_ipv6 cp;</a>
+<a name="ln2454">  struct connected *ifc;</a>
+<a name="ln2455">  struct prefix_ipv6 *p;</a>
+<a name="ln2456">  int ret;</a>
+<a name="ln2457"> </a>
+<a name="ln2458">  if_data = ifp-&gt;info;</a>
+<a name="ln2459"> </a>
+<a name="ln2460">  ret = str2prefix_ipv6 (addr_str, &amp;cp);</a>
+<a name="ln2461">  if (ret &lt;= 0)</a>
+<a name="ln2462">    {</a>
+<a name="ln2463">      vty_out (vty, &quot;%% Malformed address %s&quot;, VTY_NEWLINE);</a>
+<a name="ln2464">      return CMD_WARNING;</a>
+<a name="ln2465">    }</a>
+<a name="ln2466"> </a>
+<a name="ln2467">  ifc = connected_check (ifp, (struct prefix *) &amp;cp);</a>
+<a name="ln2468">  if (! ifc)</a>
+<a name="ln2469">    {</a>
+<a name="ln2470">      ifc = connected_new ();</a>
+<a name="ln2471">      ifc-&gt;ifp = ifp;</a>
+<a name="ln2472"> </a>
+<a name="ln2473">      /* Address. */</a>
+<a name="ln2474">      p = prefix_ipv6_new ();</a>
+<a name="ln2475">      *p = cp;</a>
+<a name="ln2476">      ifc-&gt;address = (struct prefix *) p;</a>
+<a name="ln2477"> </a>
+<a name="ln2478">      /* Secondary. */</a>
+<a name="ln2479">      if (secondary)</a>
+<a name="ln2480">	SET_FLAG (ifc-&gt;flags, ZEBRA_IFA_SECONDARY);</a>
+<a name="ln2481"> </a>
+<a name="ln2482">      /* Label. */</a>
+<a name="ln2483">      if (label)</a>
+<a name="ln2484">	ifc-&gt;label = XSTRDUP (MTYPE_CONNECTED_LABEL, label);</a>
+<a name="ln2485"> </a>
+<a name="ln2486">      /* Add to linked list. */</a>
+<a name="ln2487">      listnode_add (ifp-&gt;connected, ifc);</a>
+<a name="ln2488">    }</a>
+<a name="ln2489"> </a>
+<a name="ln2490">  /* This address is configured from zebra. */</a>
+<a name="ln2491">  if (! CHECK_FLAG (ifc-&gt;conf, ZEBRA_IFC_CONFIGURED))</a>
+<a name="ln2492">    SET_FLAG (ifc-&gt;conf, ZEBRA_IFC_CONFIGURED);</a>
+<a name="ln2493"> </a>
+<a name="ln2494">  /* In case of this route need to install kernel. */</a>
+<a name="ln2495">  if (! CHECK_FLAG (ifc-&gt;conf, ZEBRA_IFC_QUEUED)</a>
+<a name="ln2496">      &amp;&amp; CHECK_FLAG (ifp-&gt;status, ZEBRA_INTERFACE_ACTIVE)</a>
+<a name="ln2497">      &amp;&amp; !(if_data &amp;&amp; if_data-&gt;shutdown == IF_ZEBRA_SHUTDOWN_ON))</a>
+<a name="ln2498">    {</a>
+<a name="ln2499">      /* Some system need to up the interface to set IP address. */</a>
+<a name="ln2500">      if (! if_is_up (ifp))</a>
+<a name="ln2501">	{</a>
+<a name="ln2502">	  if_set_flags (ifp, IFF_UP | IFF_RUNNING);</a>
+<a name="ln2503">	  if_refresh (ifp);</a>
+<a name="ln2504">	}</a>
+<a name="ln2505"> </a>
+<a name="ln2506">      ret = if_prefix_add_ipv6 (ifp, ifc);</a>
+<a name="ln2507"> </a>
+<a name="ln2508">      if (ret &lt; 0)</a>
+<a name="ln2509">	{</a>
+<a name="ln2510">	  vty_out (vty, &quot;%% Can't set interface IP address: %s.%s&quot;, </a>
+<a name="ln2511">		   safe_strerror(errno), VTY_NEWLINE);</a>
+<a name="ln2512">	  return CMD_WARNING;</a>
+<a name="ln2513">	}</a>
+<a name="ln2514"> </a>
+<a name="ln2515">      SET_FLAG (ifc-&gt;conf, ZEBRA_IFC_QUEUED);</a>
+<a name="ln2516">      /* The address will be advertised to zebra clients when the notification</a>
+<a name="ln2517">       * from the kernel has been received. */</a>
+<a name="ln2518">    }</a>
+<a name="ln2519"> </a>
+<a name="ln2520">  return CMD_SUCCESS;</a>
+<a name="ln2521">}</a>
+<a name="ln2522"> </a>
+<a name="ln2523">static int</a>
+<a name="ln2524">ipv6_address_uninstall (struct vty *vty, struct interface *ifp,</a>
+<a name="ln2525">			const char *addr_str, const char *peer_str,</a>
+<a name="ln2526">			const char *label, int secondry)</a>
+<a name="ln2527">{</a>
+<a name="ln2528">  struct prefix_ipv6 cp;</a>
+<a name="ln2529">  struct connected *ifc;</a>
+<a name="ln2530">  int ret;</a>
+<a name="ln2531"> </a>
+<a name="ln2532">  /* Convert to prefix structure. */</a>
+<a name="ln2533">  ret = str2prefix_ipv6 (addr_str, &amp;cp);</a>
+<a name="ln2534">  if (ret &lt;= 0)</a>
+<a name="ln2535">    {</a>
+<a name="ln2536">      vty_out (vty, &quot;%% Malformed address %s&quot;, VTY_NEWLINE);</a>
+<a name="ln2537">      return CMD_WARNING;</a>
+<a name="ln2538">    }</a>
+<a name="ln2539"> </a>
+<a name="ln2540">  /* Check current interface address. */</a>
+<a name="ln2541">  ifc = connected_check (ifp, (struct prefix *) &amp;cp);</a>
+<a name="ln2542">  if (! ifc)</a>
+<a name="ln2543">    {</a>
+<a name="ln2544">      vty_out (vty, &quot;%% Can't find address%s&quot;, VTY_NEWLINE);</a>
+<a name="ln2545">      return CMD_WARNING;</a>
+<a name="ln2546">    }</a>
+<a name="ln2547"> </a>
+<a name="ln2548">  /* This is not configured address. */</a>
+<a name="ln2549">  if (! CHECK_FLAG (ifc-&gt;conf, ZEBRA_IFC_CONFIGURED))</a>
+<a name="ln2550">    return CMD_WARNING;</a>
+<a name="ln2551"> </a>
+<a name="ln2552">  UNSET_FLAG (ifc-&gt;conf, ZEBRA_IFC_CONFIGURED);</a>
+<a name="ln2553"> </a>
+<a name="ln2554">  /* This is not real address or interface is not active. */</a>
+<a name="ln2555">  if (! CHECK_FLAG (ifc-&gt;conf, ZEBRA_IFC_QUEUED)</a>
+<a name="ln2556">      || ! CHECK_FLAG (ifp-&gt;status, ZEBRA_INTERFACE_ACTIVE))</a>
+<a name="ln2557">    {</a>
+<a name="ln2558">      listnode_delete (ifp-&gt;connected, ifc);</a>
+<a name="ln2559">      connected_free (ifc);</a>
+<a name="ln2560">      return CMD_WARNING;</a>
+<a name="ln2561">    }</a>
+<a name="ln2562"> </a>
+<a name="ln2563">  /* This is real route. */</a>
+<a name="ln2564">  ret = if_prefix_delete_ipv6 (ifp, ifc);</a>
+<a name="ln2565">  if (ret &lt; 0)</a>
+<a name="ln2566">    {</a>
+<a name="ln2567">      vty_out (vty, &quot;%% Can't unset interface IP address: %s.%s&quot;, </a>
+<a name="ln2568">	       safe_strerror(errno), VTY_NEWLINE);</a>
+<a name="ln2569">      return CMD_WARNING;</a>
+<a name="ln2570">    }</a>
+<a name="ln2571"> </a>
+<a name="ln2572">  UNSET_FLAG (ifc-&gt;conf, ZEBRA_IFC_QUEUED);</a>
+<a name="ln2573">  /* This information will be propagated to the zclients when the</a>
+<a name="ln2574">   * kernel notification is received. */</a>
+<a name="ln2575">  return CMD_SUCCESS;</a>
+<a name="ln2576">}</a>
+<a name="ln2577"> </a>
+<a name="ln2578">DEFUN (ipv6_address,</a>
+<a name="ln2579">       ipv6_address_cmd,</a>
+<a name="ln2580">       &quot;ipv6 address X:X::X:X/M&quot;,</a>
+<a name="ln2581">       &quot;Interface IPv6 config commands\n&quot;</a>
+<a name="ln2582">       &quot;Set the IP address of an interface\n&quot;</a>
+<a name="ln2583">       &quot;IPv6 address (e.g. 3ffe:506::1/48)\n&quot;)</a>
+<a name="ln2584">{</a>
+<a name="ln2585">  return ipv6_address_install (vty, vty-&gt;index, argv[0], NULL, NULL, 0);</a>
+<a name="ln2586">}</a>
+<a name="ln2587"> </a>
+<a name="ln2588">DEFUN (no_ipv6_address,</a>
+<a name="ln2589">       no_ipv6_address_cmd,</a>
+<a name="ln2590">       &quot;no ipv6 address X:X::X:X/M&quot;,</a>
+<a name="ln2591">       NO_STR</a>
+<a name="ln2592">       &quot;Interface IPv6 config commands\n&quot;</a>
+<a name="ln2593">       &quot;Set the IP address of an interface\n&quot;</a>
+<a name="ln2594">       &quot;IPv6 address (e.g. 3ffe:506::1/48)\n&quot;)</a>
+<a name="ln2595">{</a>
+<a name="ln2596">  return ipv6_address_uninstall (vty, vty-&gt;index, argv[0], NULL, NULL, 0);</a>
+<a name="ln2597">}</a>
+<a name="ln2598">#endif /* HAVE_IPV6 */</a>
+<a name="ln2599"> </a>
+<a name="ln2600">static int</a>
+<a name="ln2601">link_params_config_write (struct vty *vty, struct interface *ifp)</a>
+<a name="ln2602">{</a>
+<a name="ln2603">  int i;</a>
+<a name="ln2604">  </a>
+<a name="ln2605">  if ((ifp == NULL) || !HAS_LINK_PARAMS(ifp))</a>
+<a name="ln2606">    return -1;</a>
+<a name="ln2607">  </a>
+<a name="ln2608">  struct if_link_params *iflp = ifp-&gt;link_params;</a>
+<a name="ln2609"> </a>
+<a name="ln2610">  vty_out (vty, &quot; link-params%s&quot;, VTY_NEWLINE);</a>
+<a name="ln2611">  vty_out(vty, &quot;  enable%s&quot;, VTY_NEWLINE);</a>
+<a name="ln2612">  if (IS_PARAM_SET(iflp, LP_TE))</a>
+<a name="ln2613">    vty_out(vty, &quot;  metric %u%s&quot;,iflp-&gt;te_metric, VTY_NEWLINE);</a>
+<a name="ln2614">  if (IS_PARAM_SET(iflp, LP_MAX_BW))</a>
+<a name="ln2615">    vty_out(vty, &quot;  max-bw %g%s&quot;, iflp-&gt;max_bw, VTY_NEWLINE);</a>
+<a name="ln2616">  if (IS_PARAM_SET(iflp, LP_MAX_RSV_BW))</a>
+<a name="ln2617">    vty_out(vty, &quot;  max-rsv-bw %g%s&quot;, iflp-&gt;max_rsv_bw, VTY_NEWLINE);</a>
+<a name="ln2618">  if (IS_PARAM_SET(iflp, LP_UNRSV_BW))</a>
+<a name="ln2619">    {</a>
+<a name="ln2620">      for (i = 0; i &lt; 8; i++)</a>
+<a name="ln2621">        vty_out(vty, &quot;  unrsv-bw %d %g%s&quot;,</a>
+<a name="ln2622">            i, iflp-&gt;unrsv_bw[i], VTY_NEWLINE);</a>
+<a name="ln2623">    }</a>
+<a name="ln2624">  if (IS_PARAM_SET(iflp, LP_ADM_GRP))</a>
+<a name="ln2625">    vty_out(vty, &quot;  admin-grp %u%s&quot;, iflp-&gt;admin_grp, VTY_NEWLINE);</a>
+<a name="ln2626">  if (IS_PARAM_SET(iflp, LP_DELAY))</a>
+<a name="ln2627">    {</a>
+<a name="ln2628">      vty_out(vty, &quot;  delay %u&quot;, iflp-&gt;av_delay);</a>
+<a name="ln2629">      if (IS_PARAM_SET(iflp, LP_MM_DELAY))</a>
+<a name="ln2630">        {</a>
+<a name="ln2631">          vty_out(vty, &quot; min %u&quot;, iflp-&gt;min_delay);</a>
+<a name="ln2632">          vty_out(vty, &quot; max %u&quot;, iflp-&gt;max_delay);</a>
+<a name="ln2633">        }</a>
+<a name="ln2634">      vty_out(vty, &quot;%s&quot;, VTY_NEWLINE);</a>
+<a name="ln2635">    }</a>
+<a name="ln2636">  if (IS_PARAM_SET(iflp, LP_DELAY_VAR))</a>
+<a name="ln2637">    vty_out(vty, &quot;  delay-variation %u%s&quot;, iflp-&gt;delay_var, VTY_NEWLINE);</a>
+<a name="ln2638">  if (IS_PARAM_SET(iflp, LP_PKT_LOSS))</a>
+<a name="ln2639">    vty_out(vty, &quot;  packet-loss %g%s&quot;, iflp-&gt;pkt_loss, VTY_NEWLINE);</a>
+<a name="ln2640">  if (IS_PARAM_SET(iflp, LP_AVA_BW))</a>
+<a name="ln2641">    vty_out(vty, &quot;  ava-bw %g%s&quot;, iflp-&gt;ava_bw, VTY_NEWLINE);</a>
+<a name="ln2642">  if (IS_PARAM_SET(iflp, LP_RES_BW))</a>
+<a name="ln2643">    vty_out(vty, &quot;  res-bw %g%s&quot;, iflp-&gt;res_bw, VTY_NEWLINE);</a>
+<a name="ln2644">  if (IS_PARAM_SET(iflp, LP_USE_BW))</a>
+<a name="ln2645">    vty_out(vty, &quot;  use-bw %g%s&quot;, iflp-&gt;use_bw, VTY_NEWLINE);</a>
+<a name="ln2646">  if (IS_PARAM_SET(iflp, LP_RMT_AS))</a>
+<a name="ln2647">    vty_out(vty, &quot;  neighbor %s as %u%s&quot;, inet_ntoa(iflp-&gt;rmt_ip),</a>
+<a name="ln2648">        iflp-&gt;rmt_as, VTY_NEWLINE);</a>
+<a name="ln2649">  vty_out(vty, &quot;  exit-link-params%s&quot;, VTY_NEWLINE);</a>
+<a name="ln2650">  return 0;</a>
+<a name="ln2651">}</a>
+<a name="ln2652"> </a>
+<a name="ln2653">static int</a>
+<a name="ln2654">if_config_write (struct vty *vty)</a>
+<a name="ln2655">{</a>
+<a name="ln2656">  struct listnode *node;</a>
+<a name="ln2657">  struct interface *ifp;</a>
+<a name="ln2658">  vrf_iter_t iter;</a>
+<a name="ln2659"> </a>
+<a name="ln2660">  for (iter = vrf_first (); iter != VRF_ITER_INVALID; iter = vrf_next (iter))</a>
+<a name="ln2661">  for (ALL_LIST_ELEMENTS_RO (vrf_iter2iflist (iter), node, ifp))</a>
+<a name="ln2662">    {</a>
+<a name="ln2663">      struct zebra_if *if_data;</a>
+<a name="ln2664">      struct listnode *addrnode;</a>
+<a name="ln2665">      struct connected *ifc;</a>
+<a name="ln2666">      struct prefix *p;</a>
+<a name="ln2667"> </a>
+<a name="ln2668">      if_data = ifp-&gt;info;</a>
+<a name="ln2669"> </a>
+<a name="ln2670">      if (ifp-&gt;vrf_id == VRF_DEFAULT)</a>
+<a name="ln2671">        vty_out (vty, &quot;interface %s%s&quot;, ifp-&gt;name, VTY_NEWLINE);</a>
+<a name="ln2672">      else</a>
+<a name="ln2673">        vty_out (vty, &quot;interface %s vrf %u%s&quot;, ifp-&gt;name, ifp-&gt;vrf_id,</a>
+<a name="ln2674">                 VTY_NEWLINE);</a>
+<a name="ln2675"> </a>
+<a name="ln2676">      if (if_data)</a>
+<a name="ln2677">	{</a>
+<a name="ln2678">	  if (if_data-&gt;shutdown == IF_ZEBRA_SHUTDOWN_ON)</a>
+<a name="ln2679">	    vty_out (vty, &quot; shutdown%s&quot;, VTY_NEWLINE);</a>
+<a name="ln2680">	}</a>
+<a name="ln2681"> </a>
+<a name="ln2682">      if (ifp-&gt;desc)</a>
+<a name="ln2683">	vty_out (vty, &quot; description %s%s&quot;, ifp-&gt;desc,</a>
+<a name="ln2684">		 VTY_NEWLINE);</a>
+<a name="ln2685"> </a>
+<a name="ln2686">      /* Assign bandwidth here to avoid unnecessary interface flap</a>
+<a name="ln2687">	 while processing config script */</a>
+<a name="ln2688">      if (ifp-&gt;bandwidth != 0)</a>
+<a name="ln2689">	vty_out(vty, &quot; bandwidth %u%s&quot;, ifp-&gt;bandwidth, VTY_NEWLINE); </a>
+<a name="ln2690">      </a>
+<a name="ln2691">      switch (if_data-&gt;linkdetect)</a>
+<a name="ln2692">        {</a>
+<a name="ln2693">          case IF_LINKDETECT_ON:</a>
+<a name="ln2694">            vty_out(vty, &quot; link-detect%s&quot;, VTY_NEWLINE);</a>
+<a name="ln2695">            break;</a>
+<a name="ln2696">          case IF_LINKDETECT_OFF:</a>
+<a name="ln2697">            vty_out(vty, &quot; no link-detect%s&quot;, VTY_NEWLINE);</a>
+<a name="ln2698">            break;</a>
+<a name="ln2699">          default: break;</a>
+<a name="ln2700">        }</a>
+<a name="ln2701">      </a>
+<a name="ln2702">      for (ALL_LIST_ELEMENTS_RO (ifp-&gt;connected, addrnode, ifc))</a>
+<a name="ln2703">	  {</a>
+<a name="ln2704">	    if (CHECK_FLAG (ifc-&gt;conf, ZEBRA_IFC_CONFIGURED))</a>
+<a name="ln2705">	      {</a>
+<a name="ln2706">		char buf[INET6_ADDRSTRLEN];</a>
+<a name="ln2707">		p = ifc-&gt;address;</a>
+<a name="ln2708">		vty_out (vty, &quot; ip%s address %s&quot;,</a>
+<a name="ln2709">			 p-&gt;family == AF_INET ? &quot;&quot; : &quot;v6&quot;,</a>
+<a name="ln2710">			 prefix2str (p, buf, sizeof(buf)));</a>
+<a name="ln2711"> </a>
+<a name="ln2712">		if (ifc-&gt;label)</a>
+<a name="ln2713">		  vty_out (vty, &quot; label %s&quot;, ifc-&gt;label);</a>
+<a name="ln2714"> </a>
+<a name="ln2715">		vty_out (vty, &quot;%s&quot;, VTY_NEWLINE);</a>
+<a name="ln2716">	      }</a>
+<a name="ln2717">	  }</a>
+<a name="ln2718"> </a>
+<a name="ln2719">      if (if_data)</a>
+<a name="ln2720">	{</a>
+<a name="ln2721">	  if (if_data-&gt;multicast != IF_ZEBRA_MULTICAST_UNSPEC)</a>
+<a name="ln2722">	    vty_out (vty, &quot; %smulticast%s&quot;,</a>
+<a name="ln2723">		     if_data-&gt;multicast == IF_ZEBRA_MULTICAST_ON ? &quot;&quot; : &quot;no &quot;,</a>
+<a name="ln2724">		     VTY_NEWLINE);</a>
+<a name="ln2725">	}</a>
+<a name="ln2726"> </a>
+<a name="ln2727">#if defined (HAVE_RTADV)</a>
+<a name="ln2728">      rtadv_config_write (vty, ifp);</a>
+<a name="ln2729">#endif /* HAVE_RTADV */</a>
+<a name="ln2730"> </a>
+<a name="ln2731">#ifdef HAVE_IRDP</a>
+<a name="ln2732">      irdp_config_write (vty, ifp);</a>
+<a name="ln2733">#endif /* IRDP */</a>
+<a name="ln2734"> </a>
+<a name="ln2735">      link_params_config_write (vty, ifp);</a>
+<a name="ln2736"> </a>
+<a name="ln2737">      vty_out (vty, &quot;!%s&quot;, VTY_NEWLINE);</a>
+<a name="ln2738">    }</a>
+<a name="ln2739">  return 0;</a>
+<a name="ln2740">}</a>
+<a name="ln2741"> </a>
+<a name="ln2742"> </a>
+<a name="ln2743">/* Allocate and initialize interface vector. */</a>
+<a name="ln2744">void</a>
+<a name="ln2745">zebra_if_init (void)</a>
+<a name="ln2746">{</a>
+<a name="ln2747">  /* Initialize interface and new hook. */</a>
+<a name="ln2748">  if_add_hook (IF_NEW_HOOK, if_zebra_new_hook);</a>
+<a name="ln2749">  if_add_hook (IF_DELETE_HOOK, if_zebra_delete_hook);</a>
+<a name="ln2750">  </a>
+<a name="ln2751">  /* Install configuration write function. */</a>
+<a name="ln2752">  install_node (&amp;interface_node, if_config_write);</a>
+<a name="ln2753">  </a>
+<a name="ln2754">  install_node (&amp;zebra_if_defaults_node, config_write_zebra_if_defaults);</a>
+<a name="ln2755"> </a>
+<a name="ln2756">  install_node (&amp;link_params_node, NULL);</a>
+<a name="ln2757">  </a>
+<a name="ln2758">  install_element (VIEW_NODE, &amp;show_interface_cmd);</a>
+<a name="ln2759">  install_element (VIEW_NODE, &amp;show_interface_vrf_cmd);</a>
+<a name="ln2760">  install_element (VIEW_NODE, &amp;show_interface_vrf_all_cmd);</a>
+<a name="ln2761">  install_element (VIEW_NODE, &amp;show_interface_name_cmd);</a>
+<a name="ln2762">  install_element (VIEW_NODE, &amp;show_interface_name_vrf_cmd);</a>
+<a name="ln2763">  install_element (VIEW_NODE, &amp;show_interface_name_vrf_all_cmd);</a>
+<a name="ln2764">  install_element (CONFIG_NODE, &amp;zebra_interface_cmd);</a>
+<a name="ln2765">  install_element (CONFIG_NODE, &amp;zebra_interface_vrf_cmd);</a>
+<a name="ln2766">  install_element (CONFIG_NODE, &amp;no_interface_cmd);</a>
+<a name="ln2767">  install_element (CONFIG_NODE, &amp;no_interface_vrf_cmd);</a>
+<a name="ln2768">  install_element (CONFIG_NODE, &amp;default_linkdetect_cmd);</a>
+<a name="ln2769">  install_default (INTERFACE_NODE);</a>
+<a name="ln2770">  install_element (INTERFACE_NODE, &amp;interface_desc_cmd);</a>
+<a name="ln2771">  install_element (INTERFACE_NODE, &amp;no_interface_desc_cmd);</a>
+<a name="ln2772">  install_element (INTERFACE_NODE, &amp;multicast_cmd);</a>
+<a name="ln2773">  install_element (INTERFACE_NODE, &amp;no_multicast_cmd);</a>
+<a name="ln2774">  install_element (INTERFACE_NODE, &amp;linkdetect_cmd);</a>
+<a name="ln2775">  install_element (INTERFACE_NODE, &amp;no_linkdetect_cmd);</a>
+<a name="ln2776">  install_element (INTERFACE_NODE, &amp;shutdown_if_cmd);</a>
+<a name="ln2777">  install_element (INTERFACE_NODE, &amp;no_shutdown_if_cmd);</a>
+<a name="ln2778">  install_element (INTERFACE_NODE, &amp;bandwidth_if_cmd);</a>
+<a name="ln2779">  install_element (INTERFACE_NODE, &amp;no_bandwidth_if_cmd);</a>
+<a name="ln2780">  install_element (INTERFACE_NODE, &amp;no_bandwidth_if_val_cmd);</a>
+<a name="ln2781">  install_element (INTERFACE_NODE, &amp;ip_address_cmd);</a>
+<a name="ln2782">  install_element (INTERFACE_NODE, &amp;no_ip_address_cmd);</a>
+<a name="ln2783">#ifdef HAVE_IPV6</a>
+<a name="ln2784">  install_element (INTERFACE_NODE, &amp;ipv6_address_cmd);</a>
+<a name="ln2785">  install_element (INTERFACE_NODE, &amp;no_ipv6_address_cmd);</a>
+<a name="ln2786">#endif /* HAVE_IPV6 */</a>
+<a name="ln2787">#ifdef HAVE_NETLINK</a>
+<a name="ln2788">  install_element (INTERFACE_NODE, &amp;ip_address_label_cmd);</a>
+<a name="ln2789">  install_element (INTERFACE_NODE, &amp;no_ip_address_label_cmd);</a>
+<a name="ln2790">#endif /* HAVE_NETLINK */</a>
+<a name="ln2791">  install_element(INTERFACE_NODE, &amp;link_params_cmd);</a>
+<a name="ln2792">  install_default(LINK_PARAMS_NODE);</a>
+<a name="ln2793">  install_element(LINK_PARAMS_NODE, &amp;link_params_enable_cmd);</a>
+<a name="ln2794">  install_element(LINK_PARAMS_NODE, &amp;no_link_params_enable_cmd);</a>
+<a name="ln2795">  install_element(LINK_PARAMS_NODE, &amp;link_params_metric_cmd);</a>
+<a name="ln2796">  install_element(LINK_PARAMS_NODE, &amp;link_params_maxbw_cmd);</a>
+<a name="ln2797">  install_element(LINK_PARAMS_NODE, &amp;link_params_max_rsv_bw_cmd);</a>
+<a name="ln2798">  install_element(LINK_PARAMS_NODE, &amp;link_params_unrsv_bw_cmd);</a>
+<a name="ln2799">  install_element(LINK_PARAMS_NODE, &amp;link_params_admin_grp_cmd);</a>
+<a name="ln2800">  install_element(LINK_PARAMS_NODE, &amp;no_link_params_admin_grp_cmd);</a>
+<a name="ln2801">  install_element(LINK_PARAMS_NODE, &amp;link_params_inter_as_cmd);</a>
+<a name="ln2802">  install_element(LINK_PARAMS_NODE, &amp;no_link_params_inter_as_cmd);</a>
+<a name="ln2803">  install_element(LINK_PARAMS_NODE, &amp;link_params_delay_cmd);</a>
+<a name="ln2804">  install_element(LINK_PARAMS_NODE, &amp;no_link_params_delay_cmd);</a>
+<a name="ln2805">  install_element(LINK_PARAMS_NODE, &amp;link_params_delay_mm_cmd);</a>
+<a name="ln2806">  install_element(LINK_PARAMS_NODE, &amp;link_params_delay_var_cmd);</a>
+<a name="ln2807">  install_element(LINK_PARAMS_NODE, &amp;no_link_params_delay_var_cmd);</a>
+<a name="ln2808">  install_element(LINK_PARAMS_NODE, &amp;link_params_pkt_loss_cmd);</a>
+<a name="ln2809">  install_element(LINK_PARAMS_NODE, &amp;no_link_params_pkt_loss_cmd);</a>
+<a name="ln2810">  install_element(LINK_PARAMS_NODE, &amp;link_params_ava_bw_cmd);</a>
+<a name="ln2811">  install_element(LINK_PARAMS_NODE, &amp;no_link_params_ava_bw_cmd);</a>
+<a name="ln2812">  install_element(LINK_PARAMS_NODE, &amp;link_params_res_bw_cmd);</a>
+<a name="ln2813">  install_element(LINK_PARAMS_NODE, &amp;no_link_params_res_bw_cmd);</a>
+<a name="ln2814">  install_element(LINK_PARAMS_NODE, &amp;link_params_use_bw_cmd);</a>
+<a name="ln2815">  install_element(LINK_PARAMS_NODE, &amp;no_link_params_use_bw_cmd);</a>
+<a name="ln2816">  install_element(LINK_PARAMS_NODE, &amp;exit_link_params_cmd);</a>
+<a name="ln2817">}</a>
+
+</code></pre>
+<div class="balloon" rel="8"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1042/" target="_blank">V1042</a> This file is marked with copyleft license, which requires you to open the derived source code.</p></div>
+<div class="balloon" rel="470"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v560/" target="_blank">V560</a> A part of conditional expression is always true: if_data.</p></div>
+<div class="balloon" rel="894"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v547/" target="_blank">V547</a> Expression 'rn->info' is always true.</p></div>
+<div class="balloon" rel="2691"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1004/" target="_blank">V1004</a> The 'if_data' pointer was used unsafely after it was verified against nullptr. Check lines: 2676, 2691.</p></div>
+<div class="balloon" rel="2691"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v595/" target="_blank">V595</a> The 'if_data' pointer was utilized before it was verified against nullptr. Check lines: 2691, 2719.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,237 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>resolver.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.5.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/* C-Ares integration to Quagga mainloop</a>
+<a name="ln2"> * Copyright (c) 2014-2015 Timo Teräs</a>
+<a name="ln3"> *</a>
+<a name="ln4"> * This file is free software: you may copy, redistribute and/or modify</a>
+<a name="ln5"> * it under the terms of the GNU General Public License as published by</a>
+<a name="ln6"> * the Free Software Foundation, either version 2 of the License, or</a>
+<a name="ln7"> * (at your option) any later version.</a>
+<a name="ln8"> */</a>
+<a name="ln9"> </a>
+<a name="ln10">#include &lt;ares.h&gt;</a>
+<a name="ln11">#include &lt;ares_version.h&gt;</a>
+<a name="ln12"> </a>
+<a name="ln13">#include &quot;vector.h&quot;</a>
+<a name="ln14">#include &quot;thread.h&quot;</a>
+<a name="ln15">#include &quot;nhrpd.h&quot;</a>
+<a name="ln16"> </a>
+<a name="ln17">struct resolver_state {</a>
+<a name="ln18">	ares_channel channel;</a>
+<a name="ln19">	struct thread *timeout;</a>
+<a name="ln20">	vector read_threads, write_threads;</a>
+<a name="ln21">};</a>
+<a name="ln22"> </a>
+<a name="ln23">static struct resolver_state state;</a>
+<a name="ln24"> </a>
+<a name="ln25">#define THREAD_RUNNING ((struct thread *)-1)</a>
+<a name="ln26"> </a>
+<a name="ln27">static void resolver_update_timeouts(struct resolver_state *r);</a>
+<a name="ln28"> </a>
+<a name="ln29">static int resolver_cb_timeout(struct thread *t)</a>
+<a name="ln30">{</a>
+<a name="ln31">	struct resolver_state *r = THREAD_ARG(t);</a>
+<a name="ln32"> </a>
+<a name="ln33">	r-&gt;timeout = THREAD_RUNNING;</a>
+<a name="ln34">	ares_process(r-&gt;channel, NULL, NULL);</a>
+<a name="ln35">	r-&gt;timeout = NULL;</a>
+<a name="ln36">	resolver_update_timeouts(r);</a>
+<a name="ln37"> </a>
+<a name="ln38">	return 0;</a>
+<a name="ln39">}</a>
+<a name="ln40"> </a>
+<a name="ln41">static int resolver_cb_socket_readable(struct thread *t)</a>
+<a name="ln42">{</a>
+<a name="ln43">	struct resolver_state *r = THREAD_ARG(t);</a>
+<a name="ln44">	int fd = THREAD_FD(t);</a>
+<a name="ln45"> </a>
+<a name="ln46">	vector_set_index(r-&gt;read_threads, fd, THREAD_RUNNING);</a>
+<a name="ln47">	ares_process_fd(r-&gt;channel, fd, ARES_SOCKET_BAD);</a>
+<a name="ln48">	if (vector_lookup(r-&gt;read_threads, fd) == THREAD_RUNNING) {</a>
+<a name="ln49">		t = NULL;</a>
+<a name="ln50">		THREAD_READ_ON(master, t, resolver_cb_socket_readable, r, fd);</a>
+<a name="ln51">		vector_set_index(r-&gt;read_threads, fd, t);</a>
+<a name="ln52">	}</a>
+<a name="ln53">	resolver_update_timeouts(r);</a>
+<a name="ln54"> </a>
+<a name="ln55">	return 0;</a>
+<a name="ln56">}</a>
+<a name="ln57"> </a>
+<a name="ln58">static int resolver_cb_socket_writable(struct thread *t)</a>
+<a name="ln59">{</a>
+<a name="ln60">	struct resolver_state *r = THREAD_ARG(t);</a>
+<a name="ln61">	int fd = THREAD_FD(t);</a>
+<a name="ln62"> </a>
+<a name="ln63">	vector_set_index(r-&gt;write_threads, fd, THREAD_RUNNING);</a>
+<a name="ln64">	ares_process_fd(r-&gt;channel, ARES_SOCKET_BAD, fd);</a>
+<a name="ln65">	if (vector_lookup(r-&gt;write_threads, fd) == THREAD_RUNNING) {</a>
+<a name="ln66">		t = NULL;</a>
+<a name="ln67">		THREAD_WRITE_ON(master, t, resolver_cb_socket_writable, r, fd);</a>
+<a name="ln68">		vector_set_index(r-&gt;write_threads, fd, t);</a>
+<a name="ln69">	}</a>
+<a name="ln70">	resolver_update_timeouts(r);</a>
+<a name="ln71"> </a>
+<a name="ln72">	return 0;</a>
+<a name="ln73">}</a>
+<a name="ln74"> </a>
+<a name="ln75">static void resolver_update_timeouts(struct resolver_state *r)</a>
+<a name="ln76">{</a>
+<a name="ln77">	struct timeval *tv, tvbuf;</a>
+<a name="ln78"> </a>
+<a name="ln79">	if (r-&gt;timeout == THREAD_RUNNING) return;</a>
+<a name="ln80"> </a>
+<a name="ln81">	THREAD_OFF(r-&gt;timeout);</a>
+<a name="ln82">	tv = ares_timeout(r-&gt;channel, NULL, &amp;tvbuf);</a>
+<a name="ln83">	if (tv) {</a>
+<a name="ln84">		unsigned int timeoutms = tv-&gt;tv_sec * 1000 + tv-&gt;tv_usec / 1000;</a>
+<a name="ln85">		THREAD_TIMER_MSEC_ON(master, r-&gt;timeout, resolver_cb_timeout, r, timeoutms);</a>
+<a name="ln86">	}</a>
+<a name="ln87">}</a>
+<a name="ln88"> </a>
+<a name="ln89">static void ares_socket_cb(void *data, ares_socket_t fd, int readable, int writable)</a>
+<a name="ln90">{</a>
+<a name="ln91">	struct resolver_state *r = (struct resolver_state *) data;</a>
+<a name="ln92">	struct thread *t;</a>
+<a name="ln93"> </a>
+<a name="ln94">	if (readable) {</a>
+<a name="ln95">		t = vector_lookup_ensure(r-&gt;read_threads, fd);</a>
+<a name="ln96">		if (!t) {</a>
+<a name="ln97">			THREAD_READ_ON(master, t, resolver_cb_socket_readable, r, fd);</a>
+<a name="ln98">			vector_set_index(r-&gt;read_threads, fd, t);</a>
+<a name="ln99">		}</a>
+<a name="ln100">	} else {</a>
+<a name="ln101">		t = vector_lookup(r-&gt;read_threads, fd);</a>
+<a name="ln102">		if (t) {</a>
+<a name="ln103">			if (t != THREAD_RUNNING) {</a>
+<a name="ln104">				THREAD_OFF(t);</a>
+<a name="ln105">			}</a>
+<a name="ln106">			vector_unset(r-&gt;read_threads, fd);</a>
+<a name="ln107">		}</a>
+<a name="ln108">	}</a>
+<a name="ln109"> </a>
+<a name="ln110">	if (writable) {</a>
+<a name="ln111">		t = vector_lookup_ensure(r-&gt;write_threads, fd);</a>
+<a name="ln112">		if (!t) {</a>
+<a name="ln113">			THREAD_READ_ON(master, t, resolver_cb_socket_writable, r, fd);</a>
+<a name="ln114">			vector_set_index(r-&gt;write_threads, fd, t);</a>
+<a name="ln115">		}</a>
+<a name="ln116">	} else {</a>
+<a name="ln117">		t = vector_lookup(r-&gt;write_threads, fd);</a>
+<a name="ln118">		if (t) {</a>
+<a name="ln119">			if (t != THREAD_RUNNING) {</a>
+<a name="ln120">				THREAD_OFF(t);</a>
+<a name="ln121">			}</a>
+<a name="ln122">			vector_unset(r-&gt;write_threads, fd);</a>
+<a name="ln123">		}</a>
+<a name="ln124">	}</a>
+<a name="ln125">}</a>
+<a name="ln126"> </a>
+<a name="ln127">void resolver_init(void)</a>
+<a name="ln128">{</a>
+<a name="ln129">	struct ares_options ares_opts;</a>
+<a name="ln130"> </a>
+<a name="ln131">	state.read_threads = vector_init(1);</a>
+<a name="ln132">	state.write_threads = vector_init(1);</a>
+<a name="ln133"> </a>
+<a name="ln134">	ares_opts = (struct ares_options) {</a>
+<a name="ln135">		.sock_state_cb = &amp;ares_socket_cb,</a>
+<a name="ln136">		.sock_state_cb_data = &amp;state,</a>
+<a name="ln137">		.timeout = 2,</a>
+<a name="ln138">		.tries = 3,</a>
+<a name="ln139">	};</a>
+<a name="ln140"> </a>
+<a name="ln141">	ares_init_options(&amp;state.channel, &amp;ares_opts,</a>
+<a name="ln142">		ARES_OPT_SOCK_STATE_CB | ARES_OPT_TIMEOUT |</a>
+<a name="ln143">		ARES_OPT_TRIES);</a>
+<a name="ln144">}</a>
+<a name="ln145"> </a>
+<a name="ln146"> </a>
+<a name="ln147">static void ares_address_cb(void *arg, int status, int timeouts, struct hostent *he)</a>
+<a name="ln148">{</a>
+<a name="ln149">	struct resolver_query *query = (struct resolver_query *) arg;</a>
+<a name="ln150">	union sockunion addr[16];</a>
+<a name="ln151">	size_t i;</a>
+<a name="ln152"> </a>
+<a name="ln153">	if (status != ARES_SUCCESS) {</a>
+<a name="ln154">		debugf(NHRP_DEBUG_COMMON, &quot;[%p] Resolving failed&quot;, query);</a>
+<a name="ln155">		query-&gt;callback(query, -1, NULL);</a>
+<a name="ln156">		query-&gt;callback = NULL;</a>
+<a name="ln157">		return;</a>
+<a name="ln158">	}</a>
+<a name="ln159"> </a>
+<a name="ln160">	for (i = 0; he-&gt;h_addr_list[i] != NULL &amp;&amp; i &lt; ZEBRA_NUM_OF(addr); i++) {</a>
+<a name="ln161">		memset(&amp;addr[i], 0, sizeof(addr[i]));</a>
+<a name="ln162">		addr[i].sa.sa_family = he-&gt;h_addrtype;</a>
+<a name="ln163">		switch (he-&gt;h_addrtype) {</a>
+<a name="ln164">		case AF_INET:</a>
+<a name="ln165">			memcpy(&amp;addr[i].sin.sin_addr, (uint8_t *) he-&gt;h_addr_list[i], he-&gt;h_length);</a>
+<a name="ln166">			break;</a>
+<a name="ln167">		case AF_INET6:</a>
+<a name="ln168">			memcpy(&amp;addr[i].sin6.sin6_addr, (uint8_t *) he-&gt;h_addr_list[i], he-&gt;h_length);</a>
+<a name="ln169">			break;</a>
+<a name="ln170">		}</a>
+<a name="ln171">	}</a>
+<a name="ln172"> </a>
+<a name="ln173">	debugf(NHRP_DEBUG_COMMON, &quot;[%p] Resolved with %d results&quot;, query, (int) i);</a>
+<a name="ln174">	query-&gt;callback(query, i, &amp;addr[0]);</a>
+<a name="ln175">	query-&gt;callback = NULL;</a>
+<a name="ln176">}</a>
+<a name="ln177"> </a>
+<a name="ln178">void resolver_resolve(struct resolver_query *query, int af, const char *hostname, void (*callback)(struct resolver_query *, int, union sockunion *))</a>
+<a name="ln179">{</a>
+<a name="ln180">	if (query-&gt;callback != NULL) {</a>
+<a name="ln181">		zlog_err(&quot;Trying to resolve '%s', but previous query was not finished yet&quot;, hostname);</a>
+<a name="ln182">		return;</a>
+<a name="ln183">	}</a>
+<a name="ln184"> </a>
+<a name="ln185">	debugf(NHRP_DEBUG_COMMON, &quot;[%p] Resolving '%s'&quot;, query, hostname);</a>
+<a name="ln186"> </a>
+<a name="ln187">	query-&gt;callback = callback;</a>
+<a name="ln188">	ares_gethostbyname(state.channel, hostname, af, ares_address_cb, query);</a>
+<a name="ln189">	resolver_update_timeouts(&amp;state);</a>
+<a name="ln190">}</a>
+
+</code></pre>
+<div class="balloon" rel="5"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1042/" target="_blank">V1042</a> This file is marked with copyleft license, which requires you to open the derived source code.</p></div>
+<div class="balloon" rel="160"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v781/" target="_blank">V781</a> The value of the 'i' index is checked after it was used. Perhaps there is a mistake in program logic.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

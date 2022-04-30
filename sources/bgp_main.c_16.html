@@ -1,0 +1,537 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>bgp_main.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.5.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/* Main routine of bgpd.</a>
+<a name="ln2">   Copyright (C) 1996, 97, 98, 1999 Kunihiro Ishiguro</a>
+<a name="ln3"> </a>
+<a name="ln4">This file is part of GNU Zebra.</a>
+<a name="ln5"> </a>
+<a name="ln6">GNU Zebra is free software; you can redistribute it and/or modify it</a>
+<a name="ln7">under the terms of the GNU General Public License as published by the</a>
+<a name="ln8">Free Software Foundation; either version 2, or (at your option) any</a>
+<a name="ln9">later version.</a>
+<a name="ln10"> </a>
+<a name="ln11">GNU Zebra is distributed in the hope that it will be useful, but</a>
+<a name="ln12">WITHOUT ANY WARRANTY; without even the implied warranty of</a>
+<a name="ln13">MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU</a>
+<a name="ln14">General Public License for more details.</a>
+<a name="ln15"> </a>
+<a name="ln16">You should have received a copy of the GNU General Public License</a>
+<a name="ln17">along with GNU Zebra; see the file COPYING.  If not, write to the Free</a>
+<a name="ln18">Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA</a>
+<a name="ln19">02111-1307, USA.  */</a>
+<a name="ln20"> </a>
+<a name="ln21">#include &lt;zebra.h&gt;</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &quot;vector.h&quot;</a>
+<a name="ln24">#include &quot;vty.h&quot;</a>
+<a name="ln25">#include &quot;command.h&quot;</a>
+<a name="ln26">#include &quot;getopt.h&quot;</a>
+<a name="ln27">#include &quot;thread.h&quot;</a>
+<a name="ln28">#include &lt;lib/version.h&gt;</a>
+<a name="ln29">#include &quot;memory.h&quot;</a>
+<a name="ln30">#include &quot;prefix.h&quot;</a>
+<a name="ln31">#include &quot;log.h&quot;</a>
+<a name="ln32">#include &quot;privs.h&quot;</a>
+<a name="ln33">#include &quot;sigevent.h&quot;</a>
+<a name="ln34">#include &quot;zclient.h&quot;</a>
+<a name="ln35">#include &quot;routemap.h&quot;</a>
+<a name="ln36">#include &quot;filter.h&quot;</a>
+<a name="ln37">#include &quot;plist.h&quot;</a>
+<a name="ln38">#include &quot;stream.h&quot;</a>
+<a name="ln39">#include &quot;vrf.h&quot;</a>
+<a name="ln40">#include &quot;workqueue.h&quot;</a>
+<a name="ln41"> </a>
+<a name="ln42">#include &quot;bgpd/bgpd.h&quot;</a>
+<a name="ln43">#include &quot;bgpd/bgp_attr.h&quot;</a>
+<a name="ln44">#include &quot;bgpd/bgp_mplsvpn.h&quot;</a>
+<a name="ln45">#include &quot;bgpd/bgp_aspath.h&quot;</a>
+<a name="ln46">#include &quot;bgpd/bgp_dump.h&quot;</a>
+<a name="ln47">#include &quot;bgpd/bgp_route.h&quot;</a>
+<a name="ln48">#include &quot;bgpd/bgp_nexthop.h&quot;</a>
+<a name="ln49">#include &quot;bgpd/bgp_regex.h&quot;</a>
+<a name="ln50">#include &quot;bgpd/bgp_clist.h&quot;</a>
+<a name="ln51">#include &quot;bgpd/bgp_debug.h&quot;</a>
+<a name="ln52">#include &quot;bgpd/bgp_filter.h&quot;</a>
+<a name="ln53">#include &quot;bgpd/bgp_zebra.h&quot;</a>
+<a name="ln54"> </a>
+<a name="ln55">/* bgpd options, we use GNU getopt library. */</a>
+<a name="ln56">static const struct option longopts[] = </a>
+<a name="ln57">{</a>
+<a name="ln58">  { &quot;daemon&quot;,      no_argument,       NULL, 'd'},</a>
+<a name="ln59">  { &quot;config_file&quot;, required_argument, NULL, 'f'},</a>
+<a name="ln60">  { &quot;pid_file&quot;,    required_argument, NULL, 'i'},</a>
+<a name="ln61">  { &quot;socket&quot;,      required_argument, NULL, 'z'},</a>
+<a name="ln62">  { &quot;bgp_port&quot;,    required_argument, NULL, 'p'},</a>
+<a name="ln63">  { &quot;listenon&quot;,    required_argument, NULL, 'l'},</a>
+<a name="ln64">  { &quot;vty_addr&quot;,    required_argument, NULL, 'A'},</a>
+<a name="ln65">  { &quot;vty_port&quot;,    required_argument, NULL, 'P'},</a>
+<a name="ln66">  { &quot;retain&quot;,      no_argument,       NULL, 'r'},</a>
+<a name="ln67">  { &quot;no_kernel&quot;,   no_argument,       NULL, 'n'},</a>
+<a name="ln68">  { &quot;user&quot;,        required_argument, NULL, 'u'},</a>
+<a name="ln69">  { &quot;group&quot;,       required_argument, NULL, 'g'},</a>
+<a name="ln70">  { &quot;skip_runas&quot;,  no_argument,       NULL, 'S'},</a>
+<a name="ln71">  { &quot;version&quot;,     no_argument,       NULL, 'v'},</a>
+<a name="ln72">  { &quot;dryrun&quot;,      no_argument,       NULL, 'C'},</a>
+<a name="ln73">  { &quot;help&quot;,        no_argument,       NULL, 'h'},</a>
+<a name="ln74">  { 0 }</a>
+<a name="ln75">};</a>
+<a name="ln76"> </a>
+<a name="ln77">/* signal definitions */</a>
+<a name="ln78">void sighup (void);</a>
+<a name="ln79">void sigint (void);</a>
+<a name="ln80">void sigusr1 (void);</a>
+<a name="ln81"> </a>
+<a name="ln82">static void bgp_exit (int);</a>
+<a name="ln83"> </a>
+<a name="ln84">static struct quagga_signal_t bgp_signals[] = </a>
+<a name="ln85">{</a>
+<a name="ln86">  { </a>
+<a name="ln87">    .signal = SIGHUP, </a>
+<a name="ln88">    .handler = &amp;sighup,</a>
+<a name="ln89">  },</a>
+<a name="ln90">  {</a>
+<a name="ln91">    .signal = SIGUSR1,</a>
+<a name="ln92">    .handler = &amp;sigusr1,</a>
+<a name="ln93">  },</a>
+<a name="ln94">  {</a>
+<a name="ln95">    .signal = SIGINT,</a>
+<a name="ln96">    .handler = &amp;sigint,</a>
+<a name="ln97">  },</a>
+<a name="ln98">  {</a>
+<a name="ln99">    .signal = SIGTERM,</a>
+<a name="ln100">    .handler = &amp;sigint,</a>
+<a name="ln101">  },</a>
+<a name="ln102">};</a>
+<a name="ln103"> </a>
+<a name="ln104">/* Configuration file and directory. */</a>
+<a name="ln105">char config_default[] = SYSCONFDIR BGP_DEFAULT_CONFIG;</a>
+<a name="ln106"> </a>
+<a name="ln107">/* Route retain mode flag. */</a>
+<a name="ln108">static int retain_mode = 0;</a>
+<a name="ln109"> </a>
+<a name="ln110">/* Manually specified configuration file name.  */</a>
+<a name="ln111">char *config_file = NULL;</a>
+<a name="ln112"> </a>
+<a name="ln113">/* Process ID saved for use by init system */</a>
+<a name="ln114">static const char *pid_file = PATH_BGPD_PID;</a>
+<a name="ln115"> </a>
+<a name="ln116">/* VTY port number and address.  */</a>
+<a name="ln117">int vty_port = BGP_VTY_PORT;</a>
+<a name="ln118">char *vty_addr = NULL;</a>
+<a name="ln119"> </a>
+<a name="ln120">/* privileges */</a>
+<a name="ln121">static zebra_capabilities_t _caps_p [] =  </a>
+<a name="ln122">{</a>
+<a name="ln123">    ZCAP_BIND, </a>
+<a name="ln124">    ZCAP_NET_RAW,</a>
+<a name="ln125">    ZCAP_NET_ADMIN,</a>
+<a name="ln126">};</a>
+<a name="ln127"> </a>
+<a name="ln128">struct zebra_privs_t bgpd_privs =</a>
+<a name="ln129">{</a>
+<a name="ln130">#if defined(QUAGGA_USER) &amp;&amp; defined(QUAGGA_GROUP)</a>
+<a name="ln131">  .user = QUAGGA_USER,</a>
+<a name="ln132">  .group = QUAGGA_GROUP,</a>
+<a name="ln133">#endif</a>
+<a name="ln134">#ifdef VTY_GROUP</a>
+<a name="ln135">  .vty_group = VTY_GROUP,</a>
+<a name="ln136">#endif</a>
+<a name="ln137">  .caps_p = _caps_p,</a>
+<a name="ln138">  .cap_num_p = array_size(_caps_p),</a>
+<a name="ln139">  .cap_num_i = 0,</a>
+<a name="ln140">};</a>
+<a name="ln141"> </a>
+<a name="ln142">/* Help information display. */</a>
+<a name="ln143">static void</a>
+<a name="ln144">usage (char *progname, int status)</a>
+<a name="ln145">{</a>
+<a name="ln146">  if (status != 0)</a>
+<a name="ln147">    fprintf (stderr, &quot;Try `%s --help' for more information.\n&quot;, progname);</a>
+<a name="ln148">  else</a>
+<a name="ln149">    {    </a>
+<a name="ln150">      printf (&quot;Usage : %s [OPTION...]\n\n\</a>
+<a name="ln151">Daemon which manages kernel routing table management and \</a>
+<a name="ln152">redistribution between different routing protocols.\n\n\</a>
+<a name="ln153">-d, --daemon       Runs in daemon mode\n\</a>
+<a name="ln154">-f, --config_file  Set configuration file name\n\</a>
+<a name="ln155">-i, --pid_file     Set process identifier file name\n\</a>
+<a name="ln156">-z, --socket       Set path of zebra socket\n\</a>
+<a name="ln157">-p, --bgp_port     Set bgp protocol's port number\n\</a>
+<a name="ln158">-l, --listenon     Listen on specified address (implies -n)\n\</a>
+<a name="ln159">-A, --vty_addr     Set vty's bind address\n\</a>
+<a name="ln160">-P, --vty_port     Set vty's port number\n\</a>
+<a name="ln161">-r, --retain       When program terminates, retain added route by bgpd.\n\</a>
+<a name="ln162">-n, --no_kernel    Do not install route to kernel.\n\</a>
+<a name="ln163">-u, --user         User to run as\n\</a>
+<a name="ln164">-g, --group        Group to run as\n\</a>
+<a name="ln165">-S, --skip_runas   Skip user and group run as\n\</a>
+<a name="ln166">-v, --version      Print program version\n\</a>
+<a name="ln167">-C, --dryrun       Check configuration for validity and exit\n\</a>
+<a name="ln168">-h, --help         Display this help and exit\n\</a>
+<a name="ln169">\n\</a>
+<a name="ln170">Report bugs to %s\n&quot;, progname, ZEBRA_BUG_ADDRESS);</a>
+<a name="ln171">    }</a>
+<a name="ln172"> </a>
+<a name="ln173">  exit (status);</a>
+<a name="ln174">}</a>
+<a name="ln175"> </a>
+<a name="ln176">/* SIGHUP handler. */</a>
+<a name="ln177">void </a>
+<a name="ln178">sighup (void)</a>
+<a name="ln179">{</a>
+<a name="ln180">  zlog (NULL, LOG_INFO, &quot;SIGHUP received&quot;);</a>
+<a name="ln181"> </a>
+<a name="ln182">  /* Terminate all thread. */</a>
+<a name="ln183">  bgp_terminate ();</a>
+<a name="ln184">  bgp_reset ();</a>
+<a name="ln185">  zlog_info (&quot;bgpd restarting!&quot;);</a>
+<a name="ln186"> </a>
+<a name="ln187">  /* Reload config file. */</a>
+<a name="ln188">  vty_read_config (config_file, config_default);</a>
+<a name="ln189"> </a>
+<a name="ln190">  /* Create VTY's socket */</a>
+<a name="ln191">  vty_serv_sock (vty_addr, vty_port, BGP_VTYSH_PATH);</a>
+<a name="ln192"> </a>
+<a name="ln193">  /* Try to return to normal operation. */</a>
+<a name="ln194">}</a>
+<a name="ln195"> </a>
+<a name="ln196">/* SIGINT handler. */</a>
+<a name="ln197">void</a>
+<a name="ln198">sigint (void)</a>
+<a name="ln199">{</a>
+<a name="ln200">  zlog_notice (&quot;Terminating on signal&quot;);</a>
+<a name="ln201"> </a>
+<a name="ln202">  if (! retain_mode) </a>
+<a name="ln203">    {</a>
+<a name="ln204">      bgp_terminate ();</a>
+<a name="ln205">      if (bgpd_privs.user)      /* NULL if skip_runas flag set */</a>
+<a name="ln206">        zprivs_terminate (&amp;bgpd_privs);</a>
+<a name="ln207">    }</a>
+<a name="ln208"> </a>
+<a name="ln209">  bgp_exit (0);</a>
+<a name="ln210">}</a>
+<a name="ln211"> </a>
+<a name="ln212">/* SIGUSR1 handler. */</a>
+<a name="ln213">void</a>
+<a name="ln214">sigusr1 (void)</a>
+<a name="ln215">{</a>
+<a name="ln216">  zlog_rotate (NULL);</a>
+<a name="ln217">}</a>
+<a name="ln218"> </a>
+<a name="ln219">/*</a>
+<a name="ln220">  Try to free up allocations we know about so that diagnostic tools such as</a>
+<a name="ln221">  valgrind are able to better illuminate leaks.</a>
+<a name="ln222"> </a>
+<a name="ln223">  Zebra route removal and protocol teardown are not meant to be done here.</a>
+<a name="ln224">  For example, &quot;retain_mode&quot; may be set.</a>
+<a name="ln225">*/</a>
+<a name="ln226">static void</a>
+<a name="ln227">bgp_exit (int status)</a>
+<a name="ln228">{</a>
+<a name="ln229">  struct bgp *bgp;</a>
+<a name="ln230">  struct listnode *node, *nnode;</a>
+<a name="ln231">  int *socket;</a>
+<a name="ln232">  struct interface *ifp;</a>
+<a name="ln233"> </a>
+<a name="ln234">  /* it only makes sense for this to be called on a clean exit */</a>
+<a name="ln235">  assert (status == 0);</a>
+<a name="ln236"> </a>
+<a name="ln237">  /* reverse bgp_master_init */</a>
+<a name="ln238">  for (ALL_LIST_ELEMENTS (bm-&gt;bgp, node, nnode, bgp))</a>
+<a name="ln239">    bgp_delete (bgp);</a>
+<a name="ln240">  list_free (bm-&gt;bgp);</a>
+<a name="ln241">  bm-&gt;bgp = NULL;</a>
+<a name="ln242">  </a>
+<a name="ln243">  /*</a>
+<a name="ln244">   * bgp_delete can re-allocate the process queues after they were</a>
+<a name="ln245">   * deleted in bgp_terminate. delete them again.</a>
+<a name="ln246">   *</a>
+<a name="ln247">   * It might be better to ensure the RIBs (including static routes)</a>
+<a name="ln248">   * are cleared by bgp_terminate() during its call to bgp_cleanup_routes(),</a>
+<a name="ln249">   * which currently only deletes the kernel routes.</a>
+<a name="ln250">   */</a>
+<a name="ln251">  if (bm-&gt;process_main_queue)</a>
+<a name="ln252">    {</a>
+<a name="ln253">     work_queue_free (bm-&gt;process_main_queue);</a>
+<a name="ln254">     bm-&gt;process_main_queue = NULL;</a>
+<a name="ln255">    }</a>
+<a name="ln256">  if (bm-&gt;process_rsclient_queue)</a>
+<a name="ln257">    {</a>
+<a name="ln258">      work_queue_free (bm-&gt;process_rsclient_queue);</a>
+<a name="ln259">      bm-&gt;process_rsclient_queue = NULL;</a>
+<a name="ln260">    }</a>
+<a name="ln261">  </a>
+<a name="ln262">  /* reverse bgp_master_init */</a>
+<a name="ln263">  for (ALL_LIST_ELEMENTS_RO(bm-&gt;listen_sockets, node, socket))</a>
+<a name="ln264">    {</a>
+<a name="ln265">      if (close ((int)(long)socket) == -1)</a>
+<a name="ln266">        zlog_err (&quot;close (%d): %s&quot;, (int)(long)socket, safe_strerror (errno));</a>
+<a name="ln267">    }</a>
+<a name="ln268">  list_delete (bm-&gt;listen_sockets);</a>
+<a name="ln269"> </a>
+<a name="ln270">  /* reverse bgp_zebra_init/if_init */</a>
+<a name="ln271">  if (retain_mode)</a>
+<a name="ln272">    if_add_hook (IF_DELETE_HOOK, NULL);</a>
+<a name="ln273">  for (ALL_LIST_ELEMENTS_RO (iflist, node, ifp))</a>
+<a name="ln274">    {</a>
+<a name="ln275">      struct listnode *c_node, *c_nnode;</a>
+<a name="ln276">      struct connected *c;</a>
+<a name="ln277"> </a>
+<a name="ln278">      for (ALL_LIST_ELEMENTS (ifp-&gt;connected, c_node, c_nnode, c))</a>
+<a name="ln279">        bgp_connected_delete (c);</a>
+<a name="ln280">    }</a>
+<a name="ln281"> </a>
+<a name="ln282">  /* reverse bgp_attr_init */</a>
+<a name="ln283">  bgp_attr_finish ();</a>
+<a name="ln284"> </a>
+<a name="ln285">  /* reverse bgp_dump_init */</a>
+<a name="ln286">  bgp_dump_finish ();</a>
+<a name="ln287"> </a>
+<a name="ln288">  /* reverse bgp_route_init */</a>
+<a name="ln289">  bgp_route_finish ();</a>
+<a name="ln290"> </a>
+<a name="ln291">  /* reverse bgp_route_map_init/route_map_init */</a>
+<a name="ln292">  route_map_finish ();</a>
+<a name="ln293"> </a>
+<a name="ln294">  /* reverse access_list_init */</a>
+<a name="ln295">  access_list_add_hook (NULL);</a>
+<a name="ln296">  access_list_delete_hook (NULL);</a>
+<a name="ln297">  access_list_reset ();</a>
+<a name="ln298"> </a>
+<a name="ln299">  /* reverse bgp_filter_init */</a>
+<a name="ln300">  as_list_add_hook (NULL);</a>
+<a name="ln301">  as_list_delete_hook (NULL);</a>
+<a name="ln302">  bgp_filter_reset ();</a>
+<a name="ln303"> </a>
+<a name="ln304">  /* reverse prefix_list_init */</a>
+<a name="ln305">  prefix_list_add_hook (NULL);</a>
+<a name="ln306">  prefix_list_delete_hook (NULL);</a>
+<a name="ln307">  prefix_list_reset ();</a>
+<a name="ln308"> </a>
+<a name="ln309">  /* reverse community_list_init */</a>
+<a name="ln310">  community_list_terminate (bgp_clist);</a>
+<a name="ln311"> </a>
+<a name="ln312">  vrf_terminate ();</a>
+<a name="ln313">  cmd_terminate ();</a>
+<a name="ln314">  vty_terminate ();</a>
+<a name="ln315">  bgp_address_destroy();</a>
+<a name="ln316">  bgp_scan_destroy();</a>
+<a name="ln317">  bgp_zebra_destroy();</a>
+<a name="ln318">  if (bgp_nexthop_buf)</a>
+<a name="ln319">    stream_free (bgp_nexthop_buf);</a>
+<a name="ln320">  if (bgp_ifindices_buf)</a>
+<a name="ln321">    stream_free (bgp_ifindices_buf);</a>
+<a name="ln322"> </a>
+<a name="ln323">  /* reverse bgp_scan_init */</a>
+<a name="ln324">  bgp_scan_finish ();</a>
+<a name="ln325"> </a>
+<a name="ln326">  /* reverse bgp_master_init */</a>
+<a name="ln327">  if (bm-&gt;master)</a>
+<a name="ln328">    thread_master_free (bm-&gt;master);</a>
+<a name="ln329"> </a>
+<a name="ln330">  if (zlog_default)</a>
+<a name="ln331">    closezlog (zlog_default);</a>
+<a name="ln332"> </a>
+<a name="ln333">  if (CONF_BGP_DEBUG (normal, NORMAL))</a>
+<a name="ln334">    log_memstats_stderr (&quot;bgpd&quot;);</a>
+<a name="ln335"> </a>
+<a name="ln336">  exit (status);</a>
+<a name="ln337">}</a>
+<a name="ln338"> </a>
+<a name="ln339">/* Main routine of bgpd. Treatment of argument and start bgp finite</a>
+<a name="ln340">   state machine is handled at here. */</a>
+<a name="ln341">int</a>
+<a name="ln342">main (int argc, char **argv)</a>
+<a name="ln343">{</a>
+<a name="ln344">  char *p;</a>
+<a name="ln345">  int opt;</a>
+<a name="ln346">  int daemon_mode = 0;</a>
+<a name="ln347">  int dryrun = 0;</a>
+<a name="ln348">  char *progname;</a>
+<a name="ln349">  int tmp_port;</a>
+<a name="ln350">  int skip_runas = 0;</a>
+<a name="ln351"> </a>
+<a name="ln352">  /* Set umask before anything for security */</a>
+<a name="ln353">  umask (0027);</a>
+<a name="ln354"> </a>
+<a name="ln355">  /* Preserve name of myself. */</a>
+<a name="ln356">  progname = ((p = strrchr (argv[0], '/')) ? ++p : argv[0]);</a>
+<a name="ln357"> </a>
+<a name="ln358">  zlog_default = openzlog (progname, ZLOG_BGP,</a>
+<a name="ln359">			   LOG_CONS|LOG_NDELAY|LOG_PID, LOG_DAEMON);</a>
+<a name="ln360"> </a>
+<a name="ln361">  /* BGP master init. */</a>
+<a name="ln362">  bgp_master_init ();</a>
+<a name="ln363"> </a>
+<a name="ln364">  /* Command line argument treatment. */</a>
+<a name="ln365">  while (1) </a>
+<a name="ln366">    {</a>
+<a name="ln367">      opt = getopt_long (argc, argv, &quot;df:i:z:hp:l:A:P:rnu:g:vCS&quot;, longopts, 0);</a>
+<a name="ln368">    </a>
+<a name="ln369">      if (opt == EOF)</a>
+<a name="ln370">	break;</a>
+<a name="ln371"> </a>
+<a name="ln372">      switch (opt) </a>
+<a name="ln373">	{</a>
+<a name="ln374">	case 0:</a>
+<a name="ln375">	  break;</a>
+<a name="ln376">	case 'd':</a>
+<a name="ln377">	  daemon_mode = 1;</a>
+<a name="ln378">	  break;</a>
+<a name="ln379">	case 'f':</a>
+<a name="ln380">	  config_file = optarg;</a>
+<a name="ln381">	  break;</a>
+<a name="ln382">        case 'i':</a>
+<a name="ln383">          pid_file = optarg;</a>
+<a name="ln384">          break;</a>
+<a name="ln385">	case 'z':</a>
+<a name="ln386">	  zclient_serv_path_set (optarg);</a>
+<a name="ln387">	  break;</a>
+<a name="ln388">	case 'p':</a>
+<a name="ln389">	  tmp_port = atoi (optarg);</a>
+<a name="ln390">	  if (tmp_port &lt;= 0 || tmp_port &gt; 0xffff)</a>
+<a name="ln391">	    bm-&gt;port = BGP_PORT_DEFAULT;</a>
+<a name="ln392">	  else</a>
+<a name="ln393">	    bm-&gt;port = tmp_port;</a>
+<a name="ln394">	  break;</a>
+<a name="ln395">	case 'A':</a>
+<a name="ln396">	  vty_addr = optarg;</a>
+<a name="ln397">	  break;</a>
+<a name="ln398">	case 'P':</a>
+<a name="ln399">          /* Deal with atoi() returning 0 on failure, and bgpd not</a>
+<a name="ln400">             listening on bgp port... */</a>
+<a name="ln401">          if (strcmp(optarg, &quot;0&quot;) == 0) </a>
+<a name="ln402">            {</a>
+<a name="ln403">              vty_port = 0;</a>
+<a name="ln404">              break;</a>
+<a name="ln405">            } </a>
+<a name="ln406">          vty_port = atoi (optarg);</a>
+<a name="ln407">	  if (vty_port &lt;= 0 || vty_port &gt; 0xffff)</a>
+<a name="ln408">	    vty_port = BGP_VTY_PORT;</a>
+<a name="ln409">	  break;</a>
+<a name="ln410">	case 'r':</a>
+<a name="ln411">	  retain_mode = 1;</a>
+<a name="ln412">	  break;</a>
+<a name="ln413">	case 'l':</a>
+<a name="ln414">	  bm-&gt;address = optarg;</a>
+<a name="ln415">	  /* listenon implies -n */</a>
+<a name="ln416">	case 'n':</a>
+<a name="ln417">	  bgp_option_set (BGP_OPT_NO_FIB);</a>
+<a name="ln418">	  break;</a>
+<a name="ln419">	case 'u':</a>
+<a name="ln420">	  bgpd_privs.user = optarg;</a>
+<a name="ln421">	  break;</a>
+<a name="ln422">	case 'g':</a>
+<a name="ln423">	  bgpd_privs.group = optarg;</a>
+<a name="ln424">	  break;</a>
+<a name="ln425">	case 'S':   /* skip run as = override bgpd_privs */</a>
+<a name="ln426">          skip_runas = 1;</a>
+<a name="ln427">	  break;</a>
+<a name="ln428">	case 'v':</a>
+<a name="ln429">	  print_version (progname);</a>
+<a name="ln430">	  exit (0);</a>
+<a name="ln431">	  break;</a>
+<a name="ln432">	case 'C':</a>
+<a name="ln433">	  dryrun = 1;</a>
+<a name="ln434">	  break;</a>
+<a name="ln435">	case 'h':</a>
+<a name="ln436">	  usage (progname, 0);</a>
+<a name="ln437">	  break;</a>
+<a name="ln438">	default:</a>
+<a name="ln439">	  usage (progname, 1);</a>
+<a name="ln440">	  break;</a>
+<a name="ln441">	}</a>
+<a name="ln442">    }</a>
+<a name="ln443"> </a>
+<a name="ln444">  /* Initializations. */</a>
+<a name="ln445">  srandom (time (NULL));</a>
+<a name="ln446">  signal_init (bm-&gt;master, array_size(bgp_signals), bgp_signals);</a>
+<a name="ln447">  if (skip_runas)</a>
+<a name="ln448">    memset (&amp;bgpd_privs, 0, sizeof (bgpd_privs));</a>
+<a name="ln449">  zprivs_init (&amp;bgpd_privs);</a>
+<a name="ln450">  cmd_init (1);</a>
+<a name="ln451">  vty_init (bm-&gt;master);</a>
+<a name="ln452">  memory_init ();</a>
+<a name="ln453">  vrf_init ();</a>
+<a name="ln454"> </a>
+<a name="ln455">  /* BGP related initialization.  */</a>
+<a name="ln456">  bgp_init ();</a>
+<a name="ln457"> </a>
+<a name="ln458">  /* Parse config file. */</a>
+<a name="ln459">  vty_read_config (config_file, config_default);</a>
+<a name="ln460"> </a>
+<a name="ln461">  /* Start execution only if not in dry-run mode */</a>
+<a name="ln462">  if(dryrun)</a>
+<a name="ln463">    return(0);</a>
+<a name="ln464">  </a>
+<a name="ln465">  /* Turn into daemon if daemon_mode is set. */</a>
+<a name="ln466">  if (daemon_mode &amp;&amp; daemon (0, 0) &lt; 0)</a>
+<a name="ln467">    {</a>
+<a name="ln468">      zlog_err(&quot;BGPd daemon failed: %s&quot;, strerror(errno));</a>
+<a name="ln469">      return (1);</a>
+<a name="ln470">    }</a>
+<a name="ln471"> </a>
+<a name="ln472"> </a>
+<a name="ln473">  /* Process ID file creation. */</a>
+<a name="ln474">  pid_output (pid_file);</a>
+<a name="ln475"> </a>
+<a name="ln476">  /* Make bgp vty socket. */</a>
+<a name="ln477">  vty_serv_sock (vty_addr, vty_port, BGP_VTYSH_PATH);</a>
+<a name="ln478"> </a>
+<a name="ln479">  /* Print banner. */</a>
+<a name="ln480">  zlog_notice (&quot;BGPd %s starting: vty@%d, bgp@%s:%d pid %d&quot;, QUAGGA_VERSION,</a>
+<a name="ln481">	       vty_port, </a>
+<a name="ln482">	       (bm-&gt;address ? bm-&gt;address : &quot;&lt;all&gt;&quot;),</a>
+<a name="ln483">	       bm-&gt;port,</a>
+<a name="ln484">	       getpid ());</a>
+<a name="ln485"> </a>
+<a name="ln486">  /* Start finite state machine, here we go! */</a>
+<a name="ln487">  thread_main (bm-&gt;master);</a>
+<a name="ln488"> </a>
+<a name="ln489">  /* Not reached. */</a>
+<a name="ln490">  return (0);</a>
+<a name="ln491">}</a>
+
+</code></pre>
+<div class="balloon" rel="7"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1042/" target="_blank">V1042</a> This file is marked with copyleft license, which requires you to open the derived source code.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

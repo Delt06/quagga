@@ -1,0 +1,854 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>pim_assert.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.5.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2">  PIM for Quagga</a>
+<a name="ln3">  Copyright (C) 2008  Everton da Silva Marques</a>
+<a name="ln4"> </a>
+<a name="ln5">  This program is free software; you can redistribute it and/or modify</a>
+<a name="ln6">  it under the terms of the GNU General Public License as published by</a>
+<a name="ln7">  the Free Software Foundation; either version 2 of the License, or</a>
+<a name="ln8">  (at your option) any later version.</a>
+<a name="ln9"> </a>
+<a name="ln10">  This program is distributed in the hope that it will be useful, but</a>
+<a name="ln11">  WITHOUT ANY WARRANTY; without even the implied warranty of</a>
+<a name="ln12">  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU</a>
+<a name="ln13">  General Public License for more details.</a>
+<a name="ln14">  </a>
+<a name="ln15">  You should have received a copy of the GNU General Public License</a>
+<a name="ln16">  along with this program; see the file COPYING; if not, write to the</a>
+<a name="ln17">  Free Software Foundation, Inc., 51 Franklin St, Fifth Floor, Boston,</a>
+<a name="ln18">  MA 02110-1301 USA</a>
+<a name="ln19">  </a>
+<a name="ln20">  $QuaggaId: $Format:%an, %ai, %h$ $</a>
+<a name="ln21">*/</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &lt;zebra.h&gt;</a>
+<a name="ln24"> </a>
+<a name="ln25">#include &quot;log.h&quot;</a>
+<a name="ln26">#include &quot;prefix.h&quot;</a>
+<a name="ln27"> </a>
+<a name="ln28">#include &quot;pimd.h&quot;</a>
+<a name="ln29">#include &quot;pim_str.h&quot;</a>
+<a name="ln30">#include &quot;pim_tlv.h&quot;</a>
+<a name="ln31">#include &quot;pim_msg.h&quot;</a>
+<a name="ln32">#include &quot;pim_pim.h&quot;</a>
+<a name="ln33">#include &quot;pim_int.h&quot;</a>
+<a name="ln34">#include &quot;pim_time.h&quot;</a>
+<a name="ln35">#include &quot;pim_iface.h&quot;</a>
+<a name="ln36">#include &quot;pim_hello.h&quot;</a>
+<a name="ln37">#include &quot;pim_macro.h&quot;</a>
+<a name="ln38">#include &quot;pim_assert.h&quot;</a>
+<a name="ln39">#include &quot;pim_ifchannel.h&quot;</a>
+<a name="ln40"> </a>
+<a name="ln41">static int assert_action_a3(struct pim_ifchannel *ch);</a>
+<a name="ln42">static void assert_action_a2(struct pim_ifchannel *ch,</a>
+<a name="ln43">			     struct pim_assert_metric winner_metric);</a>
+<a name="ln44">static void assert_action_a6(struct pim_ifchannel *ch,</a>
+<a name="ln45">			     struct pim_assert_metric winner_metric);</a>
+<a name="ln46"> </a>
+<a name="ln47">void pim_ifassert_winner_set(struct pim_ifchannel     *ch,</a>
+<a name="ln48">			     enum pim_ifassert_state   new_state,</a>
+<a name="ln49">			     struct in_addr            winner,</a>
+<a name="ln50">			     struct pim_assert_metric  winner_metric)</a>
+<a name="ln51">{</a>
+<a name="ln52">  int winner_changed = (ch-&gt;ifassert_winner.s_addr != winner.s_addr);</a>
+<a name="ln53">  int metric_changed = !pim_assert_metric_match(&amp;ch-&gt;ifassert_winner_metric,</a>
+<a name="ln54">						&amp;winner_metric);</a>
+<a name="ln55"> </a>
+<a name="ln56">  if (PIM_DEBUG_PIM_EVENTS) {</a>
+<a name="ln57">    if (ch-&gt;ifassert_state != new_state) {</a>
+<a name="ln58">      char src_str[100];</a>
+<a name="ln59">      char grp_str[100];</a>
+<a name="ln60">      pim_inet4_dump(&quot;&lt;src?&gt;&quot;, ch-&gt;source_addr, src_str, sizeof(src_str));</a>
+<a name="ln61">      pim_inet4_dump(&quot;&lt;grp?&gt;&quot;, ch-&gt;group_addr, grp_str, sizeof(grp_str));</a>
+<a name="ln62">      zlog_debug(&quot;%s: (S,G)=(%s,%s) assert state changed from %s to %s on interface %s&quot;,</a>
+<a name="ln63">		__PRETTY_FUNCTION__,</a>
+<a name="ln64">		src_str, grp_str,</a>
+<a name="ln65">		pim_ifchannel_ifassert_name(ch-&gt;ifassert_state),</a>
+<a name="ln66">		pim_ifchannel_ifassert_name(new_state),</a>
+<a name="ln67">		ch-&gt;interface-&gt;name);</a>
+<a name="ln68">    }</a>
+<a name="ln69"> </a>
+<a name="ln70">    if (winner_changed) {</a>
+<a name="ln71">      char src_str[100];</a>
+<a name="ln72">      char grp_str[100];</a>
+<a name="ln73">      char was_str[100];</a>
+<a name="ln74">      char winner_str[100];</a>
+<a name="ln75">      pim_inet4_dump(&quot;&lt;src?&gt;&quot;, ch-&gt;source_addr, src_str, sizeof(src_str));</a>
+<a name="ln76">      pim_inet4_dump(&quot;&lt;grp?&gt;&quot;, ch-&gt;group_addr, grp_str, sizeof(grp_str));</a>
+<a name="ln77">      pim_inet4_dump(&quot;&lt;was?&gt;&quot;, ch-&gt;ifassert_winner, was_str, sizeof(was_str));</a>
+<a name="ln78">      pim_inet4_dump(&quot;&lt;winner?&gt;&quot;, winner, winner_str, sizeof(winner_str));</a>
+<a name="ln79">      zlog_debug(&quot;%s: (S,G)=(%s,%s) assert winner changed from %s to %s on interface %s&quot;,</a>
+<a name="ln80">		__PRETTY_FUNCTION__,</a>
+<a name="ln81">		src_str, grp_str,</a>
+<a name="ln82">		was_str, winner_str, ch-&gt;interface-&gt;name);</a>
+<a name="ln83">    }</a>
+<a name="ln84">  } /* PIM_DEBUG_PIM_EVENTS */</a>
+<a name="ln85"> </a>
+<a name="ln86">  ch-&gt;ifassert_state         = new_state;</a>
+<a name="ln87">  ch-&gt;ifassert_winner        = winner;</a>
+<a name="ln88">  ch-&gt;ifassert_winner_metric = winner_metric;</a>
+<a name="ln89">  ch-&gt;ifassert_creation      = pim_time_monotonic_sec();</a>
+<a name="ln90"> </a>
+<a name="ln91">  if (winner_changed || metric_changed) {</a>
+<a name="ln92">    pim_upstream_update_join_desired(ch-&gt;upstream);</a>
+<a name="ln93">    pim_ifchannel_update_could_assert(ch);</a>
+<a name="ln94">    pim_ifchannel_update_assert_tracking_desired(ch);</a>
+<a name="ln95">  }</a>
+<a name="ln96">}</a>
+<a name="ln97"> </a>
+<a name="ln98">static void on_trace(const char *label,</a>
+<a name="ln99">		     struct interface *ifp, struct in_addr src)</a>
+<a name="ln100">{</a>
+<a name="ln101">  if (PIM_DEBUG_PIM_TRACE) {</a>
+<a name="ln102">    char src_str[100];</a>
+<a name="ln103">    pim_inet4_dump(&quot;&lt;src?&gt;&quot;, src, src_str, sizeof(src_str));</a>
+<a name="ln104">    zlog_debug(&quot;%s: from %s on %s&quot;,</a>
+<a name="ln105">	       label, src_str, ifp-&gt;name);</a>
+<a name="ln106">  }</a>
+<a name="ln107">}</a>
+<a name="ln108"> </a>
+<a name="ln109">static int preferred_assert(const struct pim_ifchannel *ch,</a>
+<a name="ln110">			    const struct pim_assert_metric *recv_metric)</a>
+<a name="ln111">{</a>
+<a name="ln112">  return pim_assert_metric_better(recv_metric,</a>
+<a name="ln113">				  &amp;ch-&gt;ifassert_winner_metric);</a>
+<a name="ln114">}</a>
+<a name="ln115"> </a>
+<a name="ln116">static int acceptable_assert(const struct pim_assert_metric *my_metric,</a>
+<a name="ln117">			     const struct pim_assert_metric *recv_metric)</a>
+<a name="ln118">{</a>
+<a name="ln119">  return pim_assert_metric_better(recv_metric,</a>
+<a name="ln120">				  my_metric);</a>
+<a name="ln121">}</a>
+<a name="ln122"> </a>
+<a name="ln123">static int inferior_assert(const struct pim_assert_metric *my_metric,</a>
+<a name="ln124">			   const struct pim_assert_metric *recv_metric)</a>
+<a name="ln125">{</a>
+<a name="ln126">  return pim_assert_metric_better(my_metric,</a>
+<a name="ln127">				  recv_metric);</a>
+<a name="ln128">}</a>
+<a name="ln129"> </a>
+<a name="ln130">static int cancel_assert(const struct pim_assert_metric *recv_metric)</a>
+<a name="ln131">{</a>
+<a name="ln132">  return (recv_metric-&gt;metric_preference == PIM_ASSERT_METRIC_PREFERENCE_MAX)</a>
+<a name="ln133">    &amp;&amp;</a>
+<a name="ln134">    (recv_metric-&gt;route_metric == PIM_ASSERT_ROUTE_METRIC_MAX);</a>
+<a name="ln135">}</a>
+<a name="ln136"> </a>
+<a name="ln137">static void if_could_assert_do_a1(const char *caller,</a>
+<a name="ln138">				  struct pim_ifchannel *ch)</a>
+<a name="ln139">{</a>
+<a name="ln140">  if (PIM_IF_FLAG_TEST_COULD_ASSERT(ch-&gt;flags)) {</a>
+<a name="ln141">    if (assert_action_a1(ch)) {</a>
+<a name="ln142">      char src_str[100];</a>
+<a name="ln143">      char grp_str[100];</a>
+<a name="ln144">      pim_inet4_dump(&quot;&lt;src?&gt;&quot;, ch-&gt;source_addr, src_str, sizeof(src_str));</a>
+<a name="ln145">      pim_inet4_dump(&quot;&lt;grp?&gt;&quot;, ch-&gt;group_addr, grp_str, sizeof(grp_str));</a>
+<a name="ln146">      zlog_warn(&quot;%s: %s: (S,G)=(%s,%s) assert_action_a1 failure on interface %s&quot;,</a>
+<a name="ln147">		__PRETTY_FUNCTION__, caller,</a>
+<a name="ln148">		src_str, grp_str, ch-&gt;interface-&gt;name);</a>
+<a name="ln149">      /* log warning only */</a>
+<a name="ln150">    }</a>
+<a name="ln151">  }</a>
+<a name="ln152">}</a>
+<a name="ln153"> </a>
+<a name="ln154">static int dispatch_assert(struct interface *ifp,</a>
+<a name="ln155">			   struct in_addr source_addr,</a>
+<a name="ln156">			   struct in_addr group_addr,</a>
+<a name="ln157">			   struct pim_assert_metric recv_metric)</a>
+<a name="ln158">{</a>
+<a name="ln159">  struct pim_ifchannel *ch;</a>
+<a name="ln160"> </a>
+<a name="ln161">  ch = pim_ifchannel_add(ifp, source_addr, group_addr);</a>
+<a name="ln162">  if (!ch) {</a>
+<a name="ln163">    char source_str[100];</a>
+<a name="ln164">    char group_str[100];</a>
+<a name="ln165">    pim_inet4_dump(&quot;&lt;src?&gt;&quot;, source_addr, source_str, sizeof(source_str));</a>
+<a name="ln166">    pim_inet4_dump(&quot;&lt;grp?&gt;&quot;, group_addr, group_str, sizeof(group_str));</a>
+<a name="ln167">    zlog_warn(&quot;%s: (S,G)=(%s,%s) failure creating channel on interface %s&quot;,</a>
+<a name="ln168">	      __PRETTY_FUNCTION__,</a>
+<a name="ln169">	      source_str, group_str, ifp-&gt;name);</a>
+<a name="ln170">    return -1;</a>
+<a name="ln171">  }</a>
+<a name="ln172"> </a>
+<a name="ln173">  switch (ch-&gt;ifassert_state) {</a>
+<a name="ln174">  case PIM_IFASSERT_NOINFO:</a>
+<a name="ln175">    if (recv_metric.rpt_bit_flag) {</a>
+<a name="ln176">      /* RPT bit set */</a>
+<a name="ln177">      if_could_assert_do_a1(__PRETTY_FUNCTION__, ch);</a>
+<a name="ln178">    }</a>
+<a name="ln179">    else {</a>
+<a name="ln180">      /* RPT bit clear */</a>
+<a name="ln181">      if (inferior_assert(&amp;ch-&gt;ifassert_my_metric, &amp;recv_metric)) {</a>
+<a name="ln182">	if_could_assert_do_a1(__PRETTY_FUNCTION__, ch);</a>
+<a name="ln183">      }</a>
+<a name="ln184">      else if (acceptable_assert(&amp;ch-&gt;ifassert_my_metric, &amp;recv_metric)) {</a>
+<a name="ln185">	if (PIM_IF_FLAG_TEST_ASSERT_TRACKING_DESIRED(ch-&gt;flags)) {</a>
+<a name="ln186">	  assert_action_a6(ch, recv_metric);</a>
+<a name="ln187">	}</a>
+<a name="ln188">      }</a>
+<a name="ln189">    }</a>
+<a name="ln190">    break;</a>
+<a name="ln191">  case PIM_IFASSERT_I_AM_WINNER:</a>
+<a name="ln192">    if (preferred_assert(ch, &amp;recv_metric)) {</a>
+<a name="ln193">      assert_action_a2(ch, recv_metric);</a>
+<a name="ln194">    }</a>
+<a name="ln195">    else {</a>
+<a name="ln196">      if (inferior_assert(&amp;ch-&gt;ifassert_my_metric, &amp;recv_metric)) {</a>
+<a name="ln197">	zassert(ch-&gt;ifassert_state == PIM_IFASSERT_I_AM_WINNER); /* a3 requirement */</a>
+<a name="ln198">	assert_action_a3(ch);</a>
+<a name="ln199">      }</a>
+<a name="ln200">    }</a>
+<a name="ln201">    break;</a>
+<a name="ln202">  case PIM_IFASSERT_I_AM_LOSER:</a>
+<a name="ln203">    if (recv_metric.ip_address.s_addr == ch-&gt;ifassert_winner.s_addr) {</a>
+<a name="ln204">      /* Assert from current winner */</a>
+<a name="ln205"> </a>
+<a name="ln206">      if (cancel_assert(&amp;recv_metric)) {</a>
+<a name="ln207">	assert_action_a5(ch);</a>
+<a name="ln208">      }</a>
+<a name="ln209">      else {</a>
+<a name="ln210">	if (inferior_assert(&amp;ch-&gt;ifassert_my_metric, &amp;recv_metric)) {</a>
+<a name="ln211">	  assert_action_a5(ch);</a>
+<a name="ln212">	}</a>
+<a name="ln213">	else if (acceptable_assert(&amp;ch-&gt;ifassert_my_metric, &amp;recv_metric)) {</a>
+<a name="ln214">	  if (!recv_metric.rpt_bit_flag) {</a>
+<a name="ln215">	    assert_action_a2(ch, recv_metric);</a>
+<a name="ln216">	  }</a>
+<a name="ln217">	}</a>
+<a name="ln218">      }</a>
+<a name="ln219">    }</a>
+<a name="ln220">    else if (preferred_assert(ch, &amp;recv_metric)) {</a>
+<a name="ln221">      assert_action_a2(ch, recv_metric);</a>
+<a name="ln222">    }</a>
+<a name="ln223">    break;</a>
+<a name="ln224">  default:</a>
+<a name="ln225">    {</a>
+<a name="ln226">      char source_str[100];</a>
+<a name="ln227">      char group_str[100];</a>
+<a name="ln228">      pim_inet4_dump(&quot;&lt;src?&gt;&quot;, source_addr, source_str, sizeof(source_str));</a>
+<a name="ln229">      pim_inet4_dump(&quot;&lt;grp?&gt;&quot;, group_addr, group_str, sizeof(group_str));</a>
+<a name="ln230">      zlog_warn(&quot;%s: (S,G)=(%s,%s) invalid assert state %d on interface %s&quot;,</a>
+<a name="ln231">		__PRETTY_FUNCTION__,</a>
+<a name="ln232">		source_str, group_str, ch-&gt;ifassert_state, ifp-&gt;name);</a>
+<a name="ln233">    }</a>
+<a name="ln234">    return -2;</a>
+<a name="ln235">  }</a>
+<a name="ln236"> </a>
+<a name="ln237">  return 0;</a>
+<a name="ln238">}</a>
+<a name="ln239"> </a>
+<a name="ln240">int pim_assert_recv(struct interface *ifp,</a>
+<a name="ln241">		    struct pim_neighbor *neigh,</a>
+<a name="ln242">		    struct in_addr src_addr,</a>
+<a name="ln243">		    uint8_t *buf, int buf_size)</a>
+<a name="ln244">{</a>
+<a name="ln245">  struct prefix            msg_group_addr;</a>
+<a name="ln246">  struct prefix            msg_source_addr;</a>
+<a name="ln247">  struct pim_assert_metric msg_metric;</a>
+<a name="ln248">  int offset;</a>
+<a name="ln249">  uint8_t *curr;</a>
+<a name="ln250">  int curr_size;</a>
+<a name="ln251"> </a>
+<a name="ln252">  on_trace(__PRETTY_FUNCTION__, ifp, src_addr);</a>
+<a name="ln253"> </a>
+<a name="ln254">  curr      = buf;</a>
+<a name="ln255">  curr_size = buf_size;</a>
+<a name="ln256"> </a>
+<a name="ln257">  /*</a>
+<a name="ln258">    Parse assert group addr</a>
+<a name="ln259">   */</a>
+<a name="ln260">  offset = pim_parse_addr_group(ifp-&gt;name, src_addr,</a>
+<a name="ln261">				&amp;msg_group_addr,</a>
+<a name="ln262">				curr, curr_size);</a>
+<a name="ln263">  if (offset &lt; 1) {</a>
+<a name="ln264">    char src_str[100];</a>
+<a name="ln265">    pim_inet4_dump(&quot;&lt;src?&gt;&quot;, src_addr, src_str, sizeof(src_str));</a>
+<a name="ln266">    zlog_warn(&quot;%s: pim_parse_addr_group() failure: from %s on %s&quot;,</a>
+<a name="ln267">	      __PRETTY_FUNCTION__,</a>
+<a name="ln268">	      src_str, ifp-&gt;name);</a>
+<a name="ln269">    return -1;</a>
+<a name="ln270">  }</a>
+<a name="ln271">  curr      += offset;</a>
+<a name="ln272">  curr_size -= offset;</a>
+<a name="ln273"> </a>
+<a name="ln274">  /*</a>
+<a name="ln275">    Parse assert source addr</a>
+<a name="ln276">  */</a>
+<a name="ln277">  offset = pim_parse_addr_ucast(ifp-&gt;name, src_addr,</a>
+<a name="ln278">				&amp;msg_source_addr,</a>
+<a name="ln279">				curr, curr_size);</a>
+<a name="ln280">  if (offset &lt; 1) {</a>
+<a name="ln281">    char src_str[100];</a>
+<a name="ln282">    pim_inet4_dump(&quot;&lt;src?&gt;&quot;, src_addr, src_str, sizeof(src_str));</a>
+<a name="ln283">    zlog_warn(&quot;%s: pim_parse_addr_ucast() failure: from %s on %s&quot;,</a>
+<a name="ln284">	      __PRETTY_FUNCTION__,</a>
+<a name="ln285">	      src_str, ifp-&gt;name);</a>
+<a name="ln286">    return -2;</a>
+<a name="ln287">  }</a>
+<a name="ln288">  curr      += offset;</a>
+<a name="ln289">  curr_size -= offset;</a>
+<a name="ln290"> </a>
+<a name="ln291">  if (curr_size != 8) {</a>
+<a name="ln292">    char src_str[100];</a>
+<a name="ln293">    pim_inet4_dump(&quot;&lt;src?&gt;&quot;, src_addr, src_str, sizeof(src_str));</a>
+<a name="ln294">    zlog_warn(&quot;%s: preference/metric size is not 8: size=%d from %s on interface %s&quot;,</a>
+<a name="ln295">	      __PRETTY_FUNCTION__,</a>
+<a name="ln296">	      curr_size,</a>
+<a name="ln297">	      src_str, ifp-&gt;name);</a>
+<a name="ln298">    return -3;</a>
+<a name="ln299">  }</a>
+<a name="ln300"> </a>
+<a name="ln301">  /*</a>
+<a name="ln302">    Parse assert metric preference</a>
+<a name="ln303">  */</a>
+<a name="ln304"> </a>
+<a name="ln305">  msg_metric.metric_preference = pim_read_uint32_host(curr);</a>
+<a name="ln306"> </a>
+<a name="ln307">  msg_metric.rpt_bit_flag = msg_metric.metric_preference &amp; 0x80000000; /* save highest bit */</a>
+<a name="ln308">  msg_metric.metric_preference &amp;= ~0x80000000; /* clear highest bit */</a>
+<a name="ln309"> </a>
+<a name="ln310">  curr += 4;</a>
+<a name="ln311"> </a>
+<a name="ln312">  /*</a>
+<a name="ln313">    Parse assert route metric</a>
+<a name="ln314">  */</a>
+<a name="ln315"> </a>
+<a name="ln316">  msg_metric.route_metric = pim_read_uint32_host(curr);</a>
+<a name="ln317"> </a>
+<a name="ln318">  if (PIM_DEBUG_PIM_TRACE) {</a>
+<a name="ln319">    char neigh_str[100];</a>
+<a name="ln320">    char source_str[100];</a>
+<a name="ln321">    char group_str[100];</a>
+<a name="ln322">    pim_inet4_dump(&quot;&lt;neigh?&gt;&quot;, src_addr, neigh_str, sizeof(neigh_str));</a>
+<a name="ln323">    pim_inet4_dump(&quot;&lt;src?&gt;&quot;, msg_source_addr.u.prefix4, source_str, sizeof(source_str));</a>
+<a name="ln324">    pim_inet4_dump(&quot;&lt;grp?&gt;&quot;, msg_group_addr.u.prefix4, group_str, sizeof(group_str));</a>
+<a name="ln325">    zlog_debug(&quot;%s: from %s on %s: (S,G)=(%s,%s) pref=%u metric=%u rpt_bit=%u&quot;,</a>
+<a name="ln326">	       __PRETTY_FUNCTION__, neigh_str, ifp-&gt;name,</a>
+<a name="ln327">	       source_str, group_str,</a>
+<a name="ln328">	       msg_metric.metric_preference,</a>
+<a name="ln329">	       msg_metric.route_metric,</a>
+<a name="ln330">	       PIM_FORCE_BOOLEAN(msg_metric.rpt_bit_flag));</a>
+<a name="ln331">  }</a>
+<a name="ln332"> </a>
+<a name="ln333">  msg_metric.ip_address = src_addr;</a>
+<a name="ln334"> </a>
+<a name="ln335">  return dispatch_assert(ifp,</a>
+<a name="ln336">			 msg_source_addr.u.prefix4,</a>
+<a name="ln337">			 msg_group_addr.u.prefix4,</a>
+<a name="ln338">			 msg_metric);</a>
+<a name="ln339">}</a>
+<a name="ln340"> </a>
+<a name="ln341">/*</a>
+<a name="ln342">  RFC 4601: 4.6.3.  Assert Metrics</a>
+<a name="ln343"> </a>
+<a name="ln344">   Assert metrics are defined as:</a>
+<a name="ln345"> </a>
+<a name="ln346">   When comparing assert_metrics, the rpt_bit_flag, metric_preference,</a>
+<a name="ln347">   and route_metric field are compared in order, where the first lower</a>
+<a name="ln348">   value wins.  If all fields are equal, the primary IP address of the</a>
+<a name="ln349">   router that sourced the Assert message is used as a tie-breaker,</a>
+<a name="ln350">   with the highest IP address winning.</a>
+<a name="ln351">*/</a>
+<a name="ln352">int pim_assert_metric_better(const struct pim_assert_metric *m1,</a>
+<a name="ln353">			     const struct pim_assert_metric *m2)</a>
+<a name="ln354">{</a>
+<a name="ln355">  if (m1-&gt;rpt_bit_flag &lt; m2-&gt;rpt_bit_flag)</a>
+<a name="ln356">    return 1;</a>
+<a name="ln357">  if (m1-&gt;rpt_bit_flag &gt; m2-&gt;rpt_bit_flag)</a>
+<a name="ln358">    return 0;</a>
+<a name="ln359"> </a>
+<a name="ln360">  if (m1-&gt;metric_preference &lt; m2-&gt;metric_preference)</a>
+<a name="ln361">    return 1;</a>
+<a name="ln362">  if (m1-&gt;metric_preference &gt; m2-&gt;metric_preference)</a>
+<a name="ln363">    return 0;</a>
+<a name="ln364"> </a>
+<a name="ln365">  if (m1-&gt;route_metric &lt; m2-&gt;route_metric)</a>
+<a name="ln366">    return 1;</a>
+<a name="ln367">  if (m1-&gt;route_metric &gt; m2-&gt;route_metric)</a>
+<a name="ln368">    return 0;</a>
+<a name="ln369"> </a>
+<a name="ln370">  return ntohl(m1-&gt;ip_address.s_addr) &gt; ntohl(m2-&gt;ip_address.s_addr);</a>
+<a name="ln371">}</a>
+<a name="ln372"> </a>
+<a name="ln373">int pim_assert_metric_match(const struct pim_assert_metric *m1,</a>
+<a name="ln374">			    const struct pim_assert_metric *m2)</a>
+<a name="ln375">{</a>
+<a name="ln376">  if (m1-&gt;rpt_bit_flag != m2-&gt;rpt_bit_flag)</a>
+<a name="ln377">    return 0;</a>
+<a name="ln378">  if (m1-&gt;metric_preference != m2-&gt;metric_preference)</a>
+<a name="ln379">    return 0;</a>
+<a name="ln380">  if (m1-&gt;route_metric != m2-&gt;route_metric)</a>
+<a name="ln381">    return 0;</a>
+<a name="ln382">  </a>
+<a name="ln383">  return m1-&gt;ip_address.s_addr == m2-&gt;ip_address.s_addr;</a>
+<a name="ln384">}</a>
+<a name="ln385"> </a>
+<a name="ln386">int pim_assert_build_msg(uint8_t *pim_msg, int buf_size,</a>
+<a name="ln387">			 struct interface *ifp,</a>
+<a name="ln388">			 struct in_addr group_addr,</a>
+<a name="ln389">			 struct in_addr source_addr,</a>
+<a name="ln390">			 uint32_t metric_preference,</a>
+<a name="ln391">			 uint32_t route_metric,</a>
+<a name="ln392">			 uint32_t rpt_bit_flag)</a>
+<a name="ln393">{</a>
+<a name="ln394">  uint8_t *buf_pastend = pim_msg + buf_size;</a>
+<a name="ln395">  uint8_t *pim_msg_curr;</a>
+<a name="ln396">  int pim_msg_size;</a>
+<a name="ln397">  int remain;</a>
+<a name="ln398"> </a>
+<a name="ln399">  pim_msg_curr = pim_msg + PIM_MSG_HEADER_LEN; /* skip room for pim header */</a>
+<a name="ln400"> </a>
+<a name="ln401">  /* Encode group */</a>
+<a name="ln402">  remain = buf_pastend - pim_msg_curr;</a>
+<a name="ln403">  pim_msg_curr = pim_msg_addr_encode_ipv4_group(pim_msg_curr,</a>
+<a name="ln404">						remain,</a>
+<a name="ln405">						group_addr);</a>
+<a name="ln406">  if (!pim_msg_curr) {</a>
+<a name="ln407">    char group_str[100];</a>
+<a name="ln408">    pim_inet4_dump(&quot;&lt;grp?&gt;&quot;, group_addr, group_str, sizeof(group_str));</a>
+<a name="ln409">    zlog_warn(&quot;%s: failure encoding group address %s: space left=%d&quot;,</a>
+<a name="ln410">	      __PRETTY_FUNCTION__, group_str, remain);</a>
+<a name="ln411">    return -1;</a>
+<a name="ln412">  }</a>
+<a name="ln413"> </a>
+<a name="ln414">  /* Encode source */</a>
+<a name="ln415">  remain = buf_pastend - pim_msg_curr;</a>
+<a name="ln416">  pim_msg_curr = pim_msg_addr_encode_ipv4_ucast(pim_msg_curr,</a>
+<a name="ln417">						remain,</a>
+<a name="ln418">						source_addr);</a>
+<a name="ln419">  if (!pim_msg_curr) {</a>
+<a name="ln420">    char source_str[100];</a>
+<a name="ln421">    pim_inet4_dump(&quot;&lt;src?&gt;&quot;, source_addr, source_str, sizeof(source_str));</a>
+<a name="ln422">    zlog_warn(&quot;%s: failure encoding source address %s: space left=%d&quot;,</a>
+<a name="ln423">	      __PRETTY_FUNCTION__, source_str, remain);</a>
+<a name="ln424">    return -2;</a>
+<a name="ln425">  }</a>
+<a name="ln426"> </a>
+<a name="ln427">  /* Metric preference */</a>
+<a name="ln428">  pim_write_uint32(pim_msg_curr, rpt_bit_flag ?</a>
+<a name="ln429">		   metric_preference | 0x80000000 :</a>
+<a name="ln430">		   metric_preference);</a>
+<a name="ln431">  pim_msg_curr += 4;</a>
+<a name="ln432"> </a>
+<a name="ln433">  /* Route metric */</a>
+<a name="ln434">  pim_write_uint32(pim_msg_curr, route_metric);</a>
+<a name="ln435">  pim_msg_curr += 4;</a>
+<a name="ln436"> </a>
+<a name="ln437">  /*</a>
+<a name="ln438">    Add PIM header</a>
+<a name="ln439">  */</a>
+<a name="ln440">  pim_msg_size = pim_msg_curr - pim_msg;</a>
+<a name="ln441">  pim_msg_build_header(pim_msg, pim_msg_size,</a>
+<a name="ln442">		       PIM_MSG_TYPE_ASSERT);</a>
+<a name="ln443"> </a>
+<a name="ln444">  return pim_msg_size;</a>
+<a name="ln445">}</a>
+<a name="ln446"> </a>
+<a name="ln447">static int pim_assert_do(struct pim_ifchannel *ch,</a>
+<a name="ln448">			 struct pim_assert_metric metric)</a>
+<a name="ln449">{</a>
+<a name="ln450">  struct interface *ifp;</a>
+<a name="ln451">  struct pim_interface *pim_ifp;</a>
+<a name="ln452">  uint8_t pim_msg[1000];</a>
+<a name="ln453">  int pim_msg_size;</a>
+<a name="ln454"> </a>
+<a name="ln455">  ifp = ch-&gt;interface;</a>
+<a name="ln456">  zassert(ifp);</a>
+<a name="ln457"> </a>
+<a name="ln458">  pim_ifp = ifp-&gt;info;</a>
+<a name="ln459">  if (!pim_ifp) {</a>
+<a name="ln460">    zlog_warn(&quot;%s: pim not enabled on interface: %s&quot;,</a>
+<a name="ln461">	      __PRETTY_FUNCTION__, ifp-&gt;name);</a>
+<a name="ln462">    return -1;</a>
+<a name="ln463">  }</a>
+<a name="ln464"> </a>
+<a name="ln465">  pim_msg_size = pim_assert_build_msg(pim_msg, sizeof(pim_msg), ifp,</a>
+<a name="ln466">				      ch-&gt;group_addr, ch-&gt;source_addr,</a>
+<a name="ln467">				      metric.metric_preference,</a>
+<a name="ln468">				      metric.route_metric,</a>
+<a name="ln469">				      metric.rpt_bit_flag);</a>
+<a name="ln470">  if (pim_msg_size &lt; 1) {</a>
+<a name="ln471">    zlog_warn(&quot;%s: failure building PIM assert message: msg_size=%d&quot;,</a>
+<a name="ln472">	      __PRETTY_FUNCTION__, pim_msg_size);</a>
+<a name="ln473">    return -2;</a>
+<a name="ln474">  }</a>
+<a name="ln475"> </a>
+<a name="ln476">  /*</a>
+<a name="ln477">    RFC 4601: 4.3.1.  Sending Hello Messages</a>
+<a name="ln478">    </a>
+<a name="ln479">    Thus, if a router needs to send a Join/Prune or Assert message on</a>
+<a name="ln480">    an interface on which it has not yet sent a Hello message with the</a>
+<a name="ln481">    currently configured IP address, then it MUST immediately send the</a>
+<a name="ln482">    relevant Hello message without waiting for the Hello Timer to</a>
+<a name="ln483">    expire, followed by the Join/Prune or Assert message.</a>
+<a name="ln484">  */</a>
+<a name="ln485">  pim_hello_require(ifp);</a>
+<a name="ln486"> </a>
+<a name="ln487">  if (PIM_DEBUG_PIM_TRACE) {</a>
+<a name="ln488">    char source_str[100];</a>
+<a name="ln489">    char group_str[100];</a>
+<a name="ln490">    pim_inet4_dump(&quot;&lt;src?&gt;&quot;, ch-&gt;source_addr, source_str, sizeof(source_str));</a>
+<a name="ln491">    pim_inet4_dump(&quot;&lt;grp?&gt;&quot;, ch-&gt;group_addr, group_str, sizeof(group_str));</a>
+<a name="ln492">    zlog_debug(&quot;%s: to %s: (S,G)=(%s,%s) pref=%u metric=%u rpt_bit=%u&quot;,</a>
+<a name="ln493">	       __PRETTY_FUNCTION__, </a>
+<a name="ln494">	       ifp-&gt;name, source_str, group_str,</a>
+<a name="ln495">	       metric.metric_preference,</a>
+<a name="ln496">	       metric.route_metric,</a>
+<a name="ln497">	       PIM_FORCE_BOOLEAN(metric.rpt_bit_flag));</a>
+<a name="ln498">  }</a>
+<a name="ln499"> </a>
+<a name="ln500">  if (pim_msg_send(pim_ifp-&gt;pim_sock_fd,</a>
+<a name="ln501">		   qpim_all_pim_routers_addr,</a>
+<a name="ln502">		   pim_msg,</a>
+<a name="ln503">		   pim_msg_size,</a>
+<a name="ln504">		   ifp-&gt;name)) {</a>
+<a name="ln505">    zlog_warn(&quot;%s: could not send PIM message on interface %s&quot;,</a>
+<a name="ln506">	      __PRETTY_FUNCTION__, ifp-&gt;name);</a>
+<a name="ln507">    return -3;</a>
+<a name="ln508">  }</a>
+<a name="ln509"> </a>
+<a name="ln510">  return 0;</a>
+<a name="ln511">}</a>
+<a name="ln512"> </a>
+<a name="ln513">int pim_assert_send(struct pim_ifchannel *ch)</a>
+<a name="ln514">{</a>
+<a name="ln515">  return pim_assert_do(ch, ch-&gt;ifassert_my_metric);</a>
+<a name="ln516">}</a>
+<a name="ln517"> </a>
+<a name="ln518">/*</a>
+<a name="ln519">  RFC 4601: 4.6.4.  AssertCancel Messages</a>
+<a name="ln520"> </a>
+<a name="ln521">  An AssertCancel(S,G) is an infinite metric assert with the RPT bit</a>
+<a name="ln522">  set that names S as the source.</a>
+<a name="ln523"> */</a>
+<a name="ln524">static int pim_assert_cancel(struct pim_ifchannel *ch)</a>
+<a name="ln525">{</a>
+<a name="ln526">  struct pim_assert_metric metric;</a>
+<a name="ln527"> </a>
+<a name="ln528">  metric.rpt_bit_flag      = 0;</a>
+<a name="ln529">  metric.metric_preference = PIM_ASSERT_METRIC_PREFERENCE_MAX;</a>
+<a name="ln530">  metric.route_metric      = PIM_ASSERT_ROUTE_METRIC_MAX;</a>
+<a name="ln531">  metric.ip_address        = ch-&gt;source_addr;</a>
+<a name="ln532"> </a>
+<a name="ln533">  return pim_assert_do(ch, metric);</a>
+<a name="ln534">}</a>
+<a name="ln535"> </a>
+<a name="ln536">static int on_assert_timer(struct thread *t)</a>
+<a name="ln537">{</a>
+<a name="ln538">  struct pim_ifchannel *ch;</a>
+<a name="ln539">  struct interface *ifp;</a>
+<a name="ln540"> </a>
+<a name="ln541">  zassert(t);</a>
+<a name="ln542">  ch = THREAD_ARG(t);</a>
+<a name="ln543">  zassert(ch);</a>
+<a name="ln544"> </a>
+<a name="ln545">  ifp = ch-&gt;interface;</a>
+<a name="ln546">  zassert(ifp);</a>
+<a name="ln547"> </a>
+<a name="ln548">  if (PIM_DEBUG_PIM_TRACE) {</a>
+<a name="ln549">    char src_str[100];</a>
+<a name="ln550">    char grp_str[100];</a>
+<a name="ln551">    pim_inet4_dump(&quot;&lt;src?&gt;&quot;, ch-&gt;source_addr, src_str, sizeof(src_str));</a>
+<a name="ln552">    pim_inet4_dump(&quot;&lt;grp?&gt;&quot;, ch-&gt;group_addr, grp_str, sizeof(grp_str));</a>
+<a name="ln553">    zlog_debug(&quot;%s: (S,G)=(%s,%s) timer expired on interface %s&quot;,</a>
+<a name="ln554">	       __PRETTY_FUNCTION__,</a>
+<a name="ln555">	       src_str, grp_str, ifp-&gt;name);</a>
+<a name="ln556">  }</a>
+<a name="ln557"> </a>
+<a name="ln558">  ch-&gt;t_ifassert_timer = 0;</a>
+<a name="ln559"> </a>
+<a name="ln560">  switch (ch-&gt;ifassert_state) {</a>
+<a name="ln561">  case PIM_IFASSERT_I_AM_WINNER:</a>
+<a name="ln562">    zassert(ch-&gt;ifassert_state == PIM_IFASSERT_I_AM_WINNER); /* a3 requirement */</a>
+<a name="ln563">    assert_action_a3(ch);</a>
+<a name="ln564">    break;</a>
+<a name="ln565">  case PIM_IFASSERT_I_AM_LOSER:</a>
+<a name="ln566">    assert_action_a5(ch);</a>
+<a name="ln567">    break;</a>
+<a name="ln568">  default:</a>
+<a name="ln569">    {</a>
+<a name="ln570">      char source_str[100];</a>
+<a name="ln571">      char group_str[100];</a>
+<a name="ln572">      pim_inet4_dump(&quot;&lt;src?&gt;&quot;, ch-&gt;source_addr, source_str, sizeof(source_str));</a>
+<a name="ln573">      pim_inet4_dump(&quot;&lt;grp?&gt;&quot;, ch-&gt;group_addr, group_str, sizeof(group_str));</a>
+<a name="ln574">      zlog_warn(&quot;%s: (S,G)=(%s,%s) invalid assert state %d on interface %s&quot;,</a>
+<a name="ln575">		__PRETTY_FUNCTION__,</a>
+<a name="ln576">		source_str, group_str, ch-&gt;ifassert_state, ifp-&gt;name);</a>
+<a name="ln577">    }</a>
+<a name="ln578">  }</a>
+<a name="ln579"> </a>
+<a name="ln580">  return 0;</a>
+<a name="ln581">}</a>
+<a name="ln582"> </a>
+<a name="ln583">static void assert_timer_off(struct pim_ifchannel *ch)</a>
+<a name="ln584">{</a>
+<a name="ln585">  struct interface *ifp;</a>
+<a name="ln586"> </a>
+<a name="ln587">  zassert(ch);</a>
+<a name="ln588">  ifp = ch-&gt;interface;</a>
+<a name="ln589">  zassert(ifp);</a>
+<a name="ln590"> </a>
+<a name="ln591">  if (PIM_DEBUG_PIM_TRACE) {</a>
+<a name="ln592">    if (ch-&gt;t_ifassert_timer) {</a>
+<a name="ln593">      char src_str[100];</a>
+<a name="ln594">      char grp_str[100];</a>
+<a name="ln595">      pim_inet4_dump(&quot;&lt;src?&gt;&quot;, ch-&gt;source_addr, src_str, sizeof(src_str));</a>
+<a name="ln596">      pim_inet4_dump(&quot;&lt;grp?&gt;&quot;, ch-&gt;group_addr, grp_str, sizeof(grp_str));</a>
+<a name="ln597">      zlog_debug(&quot;%s: (S,G)=(%s,%s) cancelling timer on interface %s&quot;,</a>
+<a name="ln598">		 __PRETTY_FUNCTION__,</a>
+<a name="ln599">		 src_str, grp_str, ifp-&gt;name);</a>
+<a name="ln600">    }</a>
+<a name="ln601">  }</a>
+<a name="ln602">  THREAD_OFF(ch-&gt;t_ifassert_timer);</a>
+<a name="ln603">  zassert(!ch-&gt;t_ifassert_timer);</a>
+<a name="ln604">}</a>
+<a name="ln605"> </a>
+<a name="ln606">static void pim_assert_timer_set(struct pim_ifchannel *ch,</a>
+<a name="ln607">				 int interval)</a>
+<a name="ln608">{</a>
+<a name="ln609">  struct interface *ifp;</a>
+<a name="ln610"> </a>
+<a name="ln611">  zassert(ch);</a>
+<a name="ln612">  ifp = ch-&gt;interface;</a>
+<a name="ln613">  zassert(ifp);</a>
+<a name="ln614"> </a>
+<a name="ln615">  assert_timer_off(ch);</a>
+<a name="ln616"> </a>
+<a name="ln617">  if (PIM_DEBUG_PIM_TRACE) {</a>
+<a name="ln618">    char src_str[100];</a>
+<a name="ln619">    char grp_str[100];</a>
+<a name="ln620">    pim_inet4_dump(&quot;&lt;src?&gt;&quot;, ch-&gt;source_addr, src_str, sizeof(src_str));</a>
+<a name="ln621">    pim_inet4_dump(&quot;&lt;grp?&gt;&quot;, ch-&gt;group_addr, grp_str, sizeof(grp_str));</a>
+<a name="ln622">    zlog_debug(&quot;%s: (S,G)=(%s,%s) starting %u sec timer on interface %s&quot;,</a>
+<a name="ln623">	       __PRETTY_FUNCTION__,</a>
+<a name="ln624">	       src_str, grp_str, interval, ifp-&gt;name);</a>
+<a name="ln625">  }</a>
+<a name="ln626"> </a>
+<a name="ln627">  THREAD_TIMER_ON(master, ch-&gt;t_ifassert_timer,</a>
+<a name="ln628">		  on_assert_timer,</a>
+<a name="ln629">		  ch, interval);</a>
+<a name="ln630">}</a>
+<a name="ln631"> </a>
+<a name="ln632">static void pim_assert_timer_reset(struct pim_ifchannel *ch)</a>
+<a name="ln633">{</a>
+<a name="ln634">  pim_assert_timer_set(ch, PIM_ASSERT_TIME - PIM_ASSERT_OVERRIDE_INTERVAL);</a>
+<a name="ln635">}</a>
+<a name="ln636"> </a>
+<a name="ln637">/*</a>
+<a name="ln638">  RFC 4601: 4.6.1.  (S,G) Assert Message State Machine</a>
+<a name="ln639"> </a>
+<a name="ln640">  (S,G) Assert State machine Actions</a>
+<a name="ln641"> </a>
+<a name="ln642">  A1:  Send Assert(S,G).</a>
+<a name="ln643">  Set Assert Timer to (Assert_Time - Assert_Override_Interval).</a>
+<a name="ln644">  Store self as AssertWinner(S,G,I).</a>
+<a name="ln645">  Store spt_assert_metric(S,I) as AssertWinnerMetric(S,G,I).</a>
+<a name="ln646">*/</a>
+<a name="ln647">int assert_action_a1(struct pim_ifchannel *ch)</a>
+<a name="ln648">{</a>
+<a name="ln649">  struct interface *ifp = ch-&gt;interface;</a>
+<a name="ln650">  struct pim_interface *pim_ifp;</a>
+<a name="ln651"> </a>
+<a name="ln652">  zassert(ifp);</a>
+<a name="ln653"> </a>
+<a name="ln654">  pim_ifp = ifp-&gt;info;</a>
+<a name="ln655">  if (!pim_ifp) {</a>
+<a name="ln656">    char src_str[100];</a>
+<a name="ln657">    char grp_str[100];</a>
+<a name="ln658">    pim_inet4_dump(&quot;&lt;src?&gt;&quot;, ch-&gt;source_addr, src_str, sizeof(src_str));</a>
+<a name="ln659">    pim_inet4_dump(&quot;&lt;grp?&gt;&quot;, ch-&gt;group_addr, grp_str, sizeof(grp_str));</a>
+<a name="ln660">    zlog_warn(&quot;%s: (S,G)=(%s,%s) multicast not enabled on interface %s&quot;,</a>
+<a name="ln661">	      __PRETTY_FUNCTION__,</a>
+<a name="ln662">	      src_str, grp_str, ifp-&gt;name);</a>
+<a name="ln663">    return -1; /* must return since pim_ifp is used below */</a>
+<a name="ln664">  }</a>
+<a name="ln665"> </a>
+<a name="ln666">  /* Switch to I_AM_WINNER before performing action_a3 below */</a>
+<a name="ln667">  pim_ifassert_winner_set(ch, PIM_IFASSERT_I_AM_WINNER,</a>
+<a name="ln668">			  pim_ifp-&gt;primary_address,</a>
+<a name="ln669">			  pim_macro_spt_assert_metric(&amp;ch-&gt;upstream-&gt;rpf,</a>
+<a name="ln670">						      pim_ifp-&gt;primary_address));</a>
+<a name="ln671"> </a>
+<a name="ln672">  zassert(ch-&gt;ifassert_state == PIM_IFASSERT_I_AM_WINNER); /* a3 requirement */</a>
+<a name="ln673">  if (assert_action_a3(ch)) {</a>
+<a name="ln674">    char src_str[100];</a>
+<a name="ln675">    char grp_str[100];</a>
+<a name="ln676">    pim_inet4_dump(&quot;&lt;src?&gt;&quot;, ch-&gt;source_addr, src_str, sizeof(src_str));</a>
+<a name="ln677">    pim_inet4_dump(&quot;&lt;grp?&gt;&quot;, ch-&gt;group_addr, grp_str, sizeof(grp_str));</a>
+<a name="ln678">    zlog_warn(&quot;%s: (S,G)=(%s,%s) assert_action_a3 failure on interface %s&quot;,</a>
+<a name="ln679">	      __PRETTY_FUNCTION__,</a>
+<a name="ln680">	      src_str, grp_str, ifp-&gt;name);</a>
+<a name="ln681">    /* warning only */</a>
+<a name="ln682">  }</a>
+<a name="ln683"> </a>
+<a name="ln684">  zassert(ch-&gt;ifassert_state == PIM_IFASSERT_I_AM_WINNER);</a>
+<a name="ln685"> </a>
+<a name="ln686">  return 0;</a>
+<a name="ln687">}</a>
+<a name="ln688"> </a>
+<a name="ln689">/*</a>
+<a name="ln690">  RFC 4601: 4.6.1.  (S,G) Assert Message State Machine</a>
+<a name="ln691"> </a>
+<a name="ln692">  (S,G) Assert State machine Actions</a>
+<a name="ln693"> </a>
+<a name="ln694">     A2:  Store new assert winner as AssertWinner(S,G,I) and assert</a>
+<a name="ln695">          winner metric as AssertWinnerMetric(S,G,I).</a>
+<a name="ln696">          Set Assert Timer to Assert_Time.</a>
+<a name="ln697">*/</a>
+<a name="ln698">static void assert_action_a2(struct pim_ifchannel *ch,</a>
+<a name="ln699">			     struct pim_assert_metric winner_metric)</a>
+<a name="ln700">{</a>
+<a name="ln701">  pim_ifassert_winner_set(ch, PIM_IFASSERT_I_AM_LOSER,</a>
+<a name="ln702">			  winner_metric.ip_address,</a>
+<a name="ln703">			  winner_metric);</a>
+<a name="ln704">  </a>
+<a name="ln705">  pim_assert_timer_set(ch, PIM_ASSERT_TIME);</a>
+<a name="ln706"> </a>
+<a name="ln707">  zassert(ch-&gt;ifassert_state == PIM_IFASSERT_I_AM_LOSER);</a>
+<a name="ln708">}</a>
+<a name="ln709"> </a>
+<a name="ln710">/*</a>
+<a name="ln711">  RFC 4601: 4.6.1.  (S,G) Assert Message State Machine</a>
+<a name="ln712"> </a>
+<a name="ln713">  (S,G) Assert State machine Actions</a>
+<a name="ln714"> </a>
+<a name="ln715">  A3:  Send Assert(S,G).</a>
+<a name="ln716">  Set Assert Timer to (Assert_Time - Assert_Override_Interval).</a>
+<a name="ln717">*/</a>
+<a name="ln718">static int assert_action_a3(struct pim_ifchannel *ch)</a>
+<a name="ln719">{</a>
+<a name="ln720">  zassert(ch-&gt;ifassert_state == PIM_IFASSERT_I_AM_WINNER);</a>
+<a name="ln721"> </a>
+<a name="ln722">  pim_assert_timer_reset(ch);</a>
+<a name="ln723"> </a>
+<a name="ln724">  if (pim_assert_send(ch)) {</a>
+<a name="ln725">    char src_str[100];</a>
+<a name="ln726">    char grp_str[100];</a>
+<a name="ln727">    pim_inet4_dump(&quot;&lt;src?&gt;&quot;, ch-&gt;source_addr, src_str, sizeof(src_str));</a>
+<a name="ln728">    pim_inet4_dump(&quot;&lt;grp?&gt;&quot;, ch-&gt;group_addr, grp_str, sizeof(grp_str));</a>
+<a name="ln729"> </a>
+<a name="ln730">    zlog_warn(&quot;%s: (S,G)=(%s,%s) failure sending assert on interface %s&quot;,</a>
+<a name="ln731">	      __PRETTY_FUNCTION__,</a>
+<a name="ln732">	      src_str, grp_str, ch-&gt;interface-&gt;name);</a>
+<a name="ln733">    return -1;</a>
+<a name="ln734">  }</a>
+<a name="ln735"> </a>
+<a name="ln736">  zassert(ch-&gt;ifassert_state == PIM_IFASSERT_I_AM_WINNER);</a>
+<a name="ln737"> </a>
+<a name="ln738">  return 0;</a>
+<a name="ln739">}</a>
+<a name="ln740"> </a>
+<a name="ln741">/*</a>
+<a name="ln742">  RFC 4601: 4.6.1.  (S,G) Assert Message State Machine</a>
+<a name="ln743"> </a>
+<a name="ln744">  (S,G) Assert State machine Actions</a>
+<a name="ln745"> </a>
+<a name="ln746">     A4:  Send AssertCancel(S,G).</a>
+<a name="ln747">          Delete assert info (AssertWinner(S,G,I) and</a>
+<a name="ln748">          AssertWinnerMetric(S,G,I) will then return their default</a>
+<a name="ln749">          values).</a>
+<a name="ln750">*/</a>
+<a name="ln751">void assert_action_a4(struct pim_ifchannel *ch)</a>
+<a name="ln752">{</a>
+<a name="ln753">  if (pim_assert_cancel(ch)) {</a>
+<a name="ln754">    char src_str[100];</a>
+<a name="ln755">    char grp_str[100];</a>
+<a name="ln756">    pim_inet4_dump(&quot;&lt;src?&gt;&quot;, ch-&gt;source_addr, src_str, sizeof(src_str));</a>
+<a name="ln757">    pim_inet4_dump(&quot;&lt;grp?&gt;&quot;, ch-&gt;group_addr, grp_str, sizeof(grp_str));</a>
+<a name="ln758">    zlog_warn(&quot;%s: failure sending AssertCancel(%s,%s) on interface %s&quot;,</a>
+<a name="ln759">	      __PRETTY_FUNCTION__,</a>
+<a name="ln760">	      src_str, grp_str, ch-&gt;interface-&gt;name);</a>
+<a name="ln761">    /* log warning only */</a>
+<a name="ln762">  }</a>
+<a name="ln763"> </a>
+<a name="ln764">  assert_action_a5(ch);</a>
+<a name="ln765"> </a>
+<a name="ln766">  zassert(ch-&gt;ifassert_state == PIM_IFASSERT_NOINFO);</a>
+<a name="ln767">}</a>
+<a name="ln768"> </a>
+<a name="ln769">/*</a>
+<a name="ln770">  RFC 4601: 4.6.1.  (S,G) Assert Message State Machine</a>
+<a name="ln771"> </a>
+<a name="ln772">  (S,G) Assert State machine Actions</a>
+<a name="ln773"> </a>
+<a name="ln774">  A5: Delete assert info (AssertWinner(S,G,I) and</a>
+<a name="ln775">  AssertWinnerMetric(S,G,I) will then return their default values).</a>
+<a name="ln776">*/</a>
+<a name="ln777">void assert_action_a5(struct pim_ifchannel *ch)</a>
+<a name="ln778">{</a>
+<a name="ln779">  reset_ifassert_state(ch);</a>
+<a name="ln780">  zassert(ch-&gt;ifassert_state == PIM_IFASSERT_NOINFO);</a>
+<a name="ln781">}</a>
+<a name="ln782"> </a>
+<a name="ln783">/*</a>
+<a name="ln784">  RFC 4601: 4.6.1.  (S,G) Assert Message State Machine</a>
+<a name="ln785"> </a>
+<a name="ln786">  (S,G) Assert State machine Actions</a>
+<a name="ln787"> </a>
+<a name="ln788">     A6:  Store new assert winner as AssertWinner(S,G,I) and assert</a>
+<a name="ln789">          winner metric as AssertWinnerMetric(S,G,I).</a>
+<a name="ln790">          Set Assert Timer to Assert_Time.</a>
+<a name="ln791">          If (I is RPF_interface(S)) AND (UpstreamJPState(S,G) == true)</a>
+<a name="ln792">          set SPTbit(S,G) to TRUE.</a>
+<a name="ln793">*/</a>
+<a name="ln794">static void assert_action_a6(struct pim_ifchannel *ch,</a>
+<a name="ln795">			     struct pim_assert_metric winner_metric)</a>
+<a name="ln796">{</a>
+<a name="ln797">  assert_action_a2(ch, winner_metric);</a>
+<a name="ln798"> </a>
+<a name="ln799">  /*</a>
+<a name="ln800">    If (I is RPF_interface(S)) AND (UpstreamJPState(S,G) == true) set</a>
+<a name="ln801">    SPTbit(S,G) to TRUE.</a>
+<a name="ln802">    </a>
+<a name="ln803">    Notice: For PIM SSM, SPTbit(S,G) is already always true.</a>
+<a name="ln804">  */</a>
+<a name="ln805"> </a>
+<a name="ln806">  zassert(ch-&gt;ifassert_state == PIM_IFASSERT_I_AM_LOSER);</a>
+<a name="ln807">}</a>
+<a name="ln808"> </a>
+
+</code></pre>
+<div class="balloon" rel="6"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1042/" target="_blank">V1042</a> This file is marked with copyleft license, which requires you to open the derived source code.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

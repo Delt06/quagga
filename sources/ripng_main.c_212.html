@@ -1,0 +1,360 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>ripng_main.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.5.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * RIPngd main routine.</a>
+<a name="ln3"> * Copyright (C) 1998, 1999 Kunihiro Ishiguro</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * This file is part of GNU Zebra.</a>
+<a name="ln6"> *</a>
+<a name="ln7"> * GNU Zebra is free software; you can redistribute it and/or modify it</a>
+<a name="ln8"> * under the terms of the GNU General Public License as published by the</a>
+<a name="ln9"> * Free Software Foundation; either version 2, or (at your option) any</a>
+<a name="ln10"> * later version.</a>
+<a name="ln11"> *</a>
+<a name="ln12"> * GNU Zebra is distributed in the hope that it will be useful, but</a>
+<a name="ln13"> * WITHOUT ANY WARRANTY; without even the implied warranty of</a>
+<a name="ln14"> * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU</a>
+<a name="ln15"> * General Public License for more details.</a>
+<a name="ln16"> *</a>
+<a name="ln17"> * You should have received a copy of the GNU General Public License</a>
+<a name="ln18"> * along with GNU Zebra; see the file COPYING.  If not, write to the Free</a>
+<a name="ln19"> * Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA</a>
+<a name="ln20"> * 02111-1307, USA.  </a>
+<a name="ln21"> */</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &lt;zebra.h&gt;</a>
+<a name="ln24"> </a>
+<a name="ln25">#include &lt;lib/version.h&gt;</a>
+<a name="ln26">#include &quot;getopt.h&quot;</a>
+<a name="ln27">#include &quot;vector.h&quot;</a>
+<a name="ln28">#include &quot;vty.h&quot;</a>
+<a name="ln29">#include &quot;command.h&quot;</a>
+<a name="ln30">#include &quot;memory.h&quot;</a>
+<a name="ln31">#include &quot;thread.h&quot;</a>
+<a name="ln32">#include &quot;log.h&quot;</a>
+<a name="ln33">#include &quot;prefix.h&quot;</a>
+<a name="ln34">#include &quot;if.h&quot;</a>
+<a name="ln35">#include &quot;privs.h&quot;</a>
+<a name="ln36">#include &quot;sigevent.h&quot;</a>
+<a name="ln37">#include &quot;vrf.h&quot;</a>
+<a name="ln38"> </a>
+<a name="ln39">#include &quot;ripngd/ripngd.h&quot;</a>
+<a name="ln40"> </a>
+<a name="ln41">/* Configuration filename and directory. */</a>
+<a name="ln42">char config_default[] = SYSCONFDIR RIPNG_DEFAULT_CONFIG;</a>
+<a name="ln43">char *config_file = NULL;</a>
+<a name="ln44"> </a>
+<a name="ln45">/* RIPngd options. */</a>
+<a name="ln46">struct option longopts[] = </a>
+<a name="ln47">{</a>
+<a name="ln48">  { &quot;daemon&quot;,      no_argument,       NULL, 'd'},</a>
+<a name="ln49">  { &quot;config_file&quot;, required_argument, NULL, 'f'},</a>
+<a name="ln50">  { &quot;pid_file&quot;,    required_argument, NULL, 'i'},</a>
+<a name="ln51">  { &quot;socket&quot;,      required_argument, NULL, 'z'},</a>
+<a name="ln52">  { &quot;dryrun&quot;,      no_argument,       NULL, 'C'},</a>
+<a name="ln53">  { &quot;help&quot;,        no_argument,       NULL, 'h'},</a>
+<a name="ln54">  { &quot;vty_addr&quot;,    required_argument, NULL, 'A'},</a>
+<a name="ln55">  { &quot;vty_port&quot;,    required_argument, NULL, 'P'},</a>
+<a name="ln56">  { &quot;retain&quot;,      no_argument,       NULL, 'r'},</a>
+<a name="ln57">  { &quot;user&quot;,        required_argument, NULL, 'u'},</a>
+<a name="ln58">  { &quot;group&quot;,       required_argument, NULL, 'g'},</a>
+<a name="ln59">  { &quot;version&quot;,     no_argument,       NULL, 'v'},</a>
+<a name="ln60">  { 0 }</a>
+<a name="ln61">};</a>
+<a name="ln62"> </a>
+<a name="ln63">/* ripngd privileges */</a>
+<a name="ln64">zebra_capabilities_t _caps_p [] = </a>
+<a name="ln65">{</a>
+<a name="ln66">  ZCAP_NET_RAW,</a>
+<a name="ln67">  ZCAP_BIND</a>
+<a name="ln68">};</a>
+<a name="ln69"> </a>
+<a name="ln70">struct zebra_privs_t ripngd_privs =</a>
+<a name="ln71">{</a>
+<a name="ln72">#if defined(QUAGGA_USER)</a>
+<a name="ln73">  .user = QUAGGA_USER,</a>
+<a name="ln74">#endif</a>
+<a name="ln75">#if defined QUAGGA_GROUP</a>
+<a name="ln76">  .group = QUAGGA_GROUP,</a>
+<a name="ln77">#endif</a>
+<a name="ln78">#ifdef VTY_GROUP</a>
+<a name="ln79">  .vty_group = VTY_GROUP,</a>
+<a name="ln80">#endif</a>
+<a name="ln81">  .caps_p = _caps_p,</a>
+<a name="ln82">  .cap_num_p = 2,</a>
+<a name="ln83">  .cap_num_i = 0</a>
+<a name="ln84">};</a>
+<a name="ln85"> </a>
+<a name="ln86"> </a>
+<a name="ln87">/* RIPngd program name */</a>
+<a name="ln88"> </a>
+<a name="ln89">/* Route retain mode flag. */</a>
+<a name="ln90">int retain_mode = 0;</a>
+<a name="ln91"> </a>
+<a name="ln92">/* RIPng VTY bind address. */</a>
+<a name="ln93">char *vty_addr = NULL;</a>
+<a name="ln94"> </a>
+<a name="ln95">/* RIPng VTY connection port. */</a>
+<a name="ln96">int vty_port = RIPNG_VTY_PORT;</a>
+<a name="ln97"> </a>
+<a name="ln98">/* Master of threads. */</a>
+<a name="ln99">struct thread_master *master;</a>
+<a name="ln100"> </a>
+<a name="ln101">/* Process ID saved for use by init system */</a>
+<a name="ln102">const char *pid_file = PATH_RIPNGD_PID;</a>
+<a name="ln103"> </a>
+<a name="ln104">/* Help information display. */</a>
+<a name="ln105">static void</a>
+<a name="ln106">usage (char *progname, int status)</a>
+<a name="ln107">{</a>
+<a name="ln108">  if (status != 0)</a>
+<a name="ln109">    fprintf (stderr, &quot;Try `%s --help' for more information.\n&quot;, progname);</a>
+<a name="ln110">  else</a>
+<a name="ln111">    {    </a>
+<a name="ln112">      printf (&quot;Usage : %s [OPTION...]\n\</a>
+<a name="ln113">Daemon which manages RIPng.\n\n\</a>
+<a name="ln114">-d, --daemon       Runs in daemon mode\n\</a>
+<a name="ln115">-f, --config_file  Set configuration file name\n\</a>
+<a name="ln116">-i, --pid_file     Set process identifier file name\n\</a>
+<a name="ln117">-z, --socket       Set path of zebra socket\n\</a>
+<a name="ln118">-A, --vty_addr     Set vty's bind address\n\</a>
+<a name="ln119">-P, --vty_port     Set vty's port number\n\</a>
+<a name="ln120">-r, --retain       When program terminates, retain added route by ripngd.\n\</a>
+<a name="ln121">-u, --user         User to run as\n\</a>
+<a name="ln122">-g, --group        Group to run as\n\</a>
+<a name="ln123">-v, --version      Print program version\n\</a>
+<a name="ln124">-C, --dryrun       Check configuration for validity and exit\n\</a>
+<a name="ln125">-h, --help         Display this help and exit\n\</a>
+<a name="ln126">\n\</a>
+<a name="ln127">Report bugs to %s\n&quot;, progname, ZEBRA_BUG_ADDRESS);</a>
+<a name="ln128">    }</a>
+<a name="ln129">  exit (status);</a>
+<a name="ln130">}</a>
+<a name="ln131"> </a>
+<a name="ln132">/* SIGHUP handler. */</a>
+<a name="ln133">static void </a>
+<a name="ln134">sighup (void)</a>
+<a name="ln135">{</a>
+<a name="ln136">  zlog_info (&quot;SIGHUP received&quot;);</a>
+<a name="ln137">  ripng_clean ();</a>
+<a name="ln138">  ripng_reset ();</a>
+<a name="ln139"> </a>
+<a name="ln140">  /* Reload config file. */</a>
+<a name="ln141">  vty_read_config (config_file, config_default);</a>
+<a name="ln142">  /* Create VTY's socket */</a>
+<a name="ln143">  vty_serv_sock (vty_addr, vty_port, RIPNG_VTYSH_PATH);</a>
+<a name="ln144"> </a>
+<a name="ln145">  /* Try to return to normal operation. */</a>
+<a name="ln146">}</a>
+<a name="ln147"> </a>
+<a name="ln148">/* SIGINT handler. */</a>
+<a name="ln149">static void</a>
+<a name="ln150">sigint (void)</a>
+<a name="ln151">{</a>
+<a name="ln152">  zlog_notice (&quot;Terminating on signal&quot;);</a>
+<a name="ln153"> </a>
+<a name="ln154">  if (! retain_mode)</a>
+<a name="ln155">    ripng_clean ();</a>
+<a name="ln156"> </a>
+<a name="ln157">  exit (0);</a>
+<a name="ln158">}</a>
+<a name="ln159"> </a>
+<a name="ln160">/* SIGUSR1 handler. */</a>
+<a name="ln161">static void</a>
+<a name="ln162">sigusr1 (void)</a>
+<a name="ln163">{</a>
+<a name="ln164">  zlog_rotate (NULL);</a>
+<a name="ln165">}</a>
+<a name="ln166"> </a>
+<a name="ln167">struct quagga_signal_t ripng_signals[] =</a>
+<a name="ln168">{</a>
+<a name="ln169">  { </a>
+<a name="ln170">    .signal = SIGHUP, </a>
+<a name="ln171">    .handler = &amp;sighup,</a>
+<a name="ln172">  },</a>
+<a name="ln173">  {</a>
+<a name="ln174">    .signal = SIGUSR1,</a>
+<a name="ln175">    .handler = &amp;sigusr1,</a>
+<a name="ln176">  },</a>
+<a name="ln177">  {</a>
+<a name="ln178">    .signal = SIGINT,</a>
+<a name="ln179">    .handler = &amp;sigint,</a>
+<a name="ln180">  },</a>
+<a name="ln181">  {</a>
+<a name="ln182">    .signal = SIGTERM,</a>
+<a name="ln183">    .handler = &amp;sigint,</a>
+<a name="ln184">  },</a>
+<a name="ln185">};</a>
+<a name="ln186"> </a>
+<a name="ln187">/* RIPngd main routine. */</a>
+<a name="ln188">int</a>
+<a name="ln189">main (int argc, char **argv)</a>
+<a name="ln190">{</a>
+<a name="ln191">  char *p;</a>
+<a name="ln192">  int vty_port = RIPNG_VTY_PORT;</a>
+<a name="ln193">  int daemon_mode = 0;</a>
+<a name="ln194">  char *progname;</a>
+<a name="ln195">  int dryrun = 0;</a>
+<a name="ln196"> </a>
+<a name="ln197">  /* Set umask before anything for security */</a>
+<a name="ln198">  umask (0027);</a>
+<a name="ln199"> </a>
+<a name="ln200">  /* get program name */</a>
+<a name="ln201">  progname = ((p = strrchr (argv[0], '/')) ? ++p : argv[0]);</a>
+<a name="ln202"> </a>
+<a name="ln203">  zlog_default = openzlog(progname, ZLOG_RIPNG,</a>
+<a name="ln204">			  LOG_CONS|LOG_NDELAY|LOG_PID, LOG_DAEMON);</a>
+<a name="ln205"> </a>
+<a name="ln206">  while (1) </a>
+<a name="ln207">    {</a>
+<a name="ln208">      int opt;</a>
+<a name="ln209"> </a>
+<a name="ln210">      opt = getopt_long (argc, argv, &quot;df:i:z:hA:P:u:g:vC&quot;, longopts, 0);</a>
+<a name="ln211">    </a>
+<a name="ln212">      if (opt == EOF)</a>
+<a name="ln213">	break;</a>
+<a name="ln214"> </a>
+<a name="ln215">      switch (opt) </a>
+<a name="ln216">	{</a>
+<a name="ln217">	case 0:</a>
+<a name="ln218">	  break;</a>
+<a name="ln219">	case 'd':</a>
+<a name="ln220">	  daemon_mode = 1;</a>
+<a name="ln221">	  break;</a>
+<a name="ln222">	case 'f':</a>
+<a name="ln223">	  config_file = optarg;</a>
+<a name="ln224">	  break;</a>
+<a name="ln225">	case 'A':</a>
+<a name="ln226">	  vty_addr = optarg;</a>
+<a name="ln227">	  break;</a>
+<a name="ln228">        case 'i':</a>
+<a name="ln229">          pid_file = optarg;</a>
+<a name="ln230">          break;</a>
+<a name="ln231">	case 'z':</a>
+<a name="ln232">	  zclient_serv_path_set (optarg);</a>
+<a name="ln233">	  break;</a>
+<a name="ln234">	case 'P':</a>
+<a name="ln235">          /* Deal with atoi() returning 0 on failure, and ripngd not</a>
+<a name="ln236">             listening on ripngd port... */</a>
+<a name="ln237">          if (strcmp(optarg, &quot;0&quot;) == 0) </a>
+<a name="ln238">            {</a>
+<a name="ln239">              vty_port = 0;</a>
+<a name="ln240">              break;</a>
+<a name="ln241">            } </a>
+<a name="ln242">          vty_port = atoi (optarg);</a>
+<a name="ln243">          if (vty_port &lt;= 0 || vty_port &gt; 0xffff)</a>
+<a name="ln244">            vty_port = RIPNG_VTY_PORT;</a>
+<a name="ln245">          break;</a>
+<a name="ln246">	case 'r':</a>
+<a name="ln247">	  retain_mode = 1;</a>
+<a name="ln248">	  break;</a>
+<a name="ln249">	case 'u':</a>
+<a name="ln250">	  ripngd_privs.user = optarg;</a>
+<a name="ln251">	  break;</a>
+<a name="ln252">	case 'g':</a>
+<a name="ln253">	  ripngd_privs.group = optarg;</a>
+<a name="ln254">	  break;</a>
+<a name="ln255">	case 'v':</a>
+<a name="ln256">	  print_version (progname);</a>
+<a name="ln257">	  exit (0);</a>
+<a name="ln258">	  break;</a>
+<a name="ln259">	case 'C':</a>
+<a name="ln260">	  dryrun = 1;</a>
+<a name="ln261">	  break;</a>
+<a name="ln262">	case 'h':</a>
+<a name="ln263">	  usage (progname, 0);</a>
+<a name="ln264">	  break;</a>
+<a name="ln265">	default:</a>
+<a name="ln266">	  usage (progname, 1);</a>
+<a name="ln267">	  break;</a>
+<a name="ln268">	}</a>
+<a name="ln269">    }</a>
+<a name="ln270"> </a>
+<a name="ln271">  master = thread_master_create ();</a>
+<a name="ln272"> </a>
+<a name="ln273">  /* Library inits. */</a>
+<a name="ln274">  zprivs_init (&amp;ripngd_privs);</a>
+<a name="ln275">  signal_init (master, array_size(ripng_signals), ripng_signals);</a>
+<a name="ln276">  cmd_init (1);</a>
+<a name="ln277">  vty_init (master);</a>
+<a name="ln278">  memory_init ();</a>
+<a name="ln279">  vrf_init ();</a>
+<a name="ln280"> </a>
+<a name="ln281">  /* RIPngd inits. */</a>
+<a name="ln282">  ripng_init ();</a>
+<a name="ln283">  zebra_init (master);</a>
+<a name="ln284">  ripng_peer_init ();</a>
+<a name="ln285"> </a>
+<a name="ln286">  /* Get configuration file. */</a>
+<a name="ln287">  vty_read_config (config_file, config_default);</a>
+<a name="ln288"> </a>
+<a name="ln289">  /* Start execution only if not in dry-run mode */</a>
+<a name="ln290">  if(dryrun)</a>
+<a name="ln291">    return(0);</a>
+<a name="ln292">  </a>
+<a name="ln293">  /* Change to the daemon program. */</a>
+<a name="ln294">  if (daemon_mode &amp;&amp; daemon (0, 0) &lt; 0)</a>
+<a name="ln295">    {</a>
+<a name="ln296">      zlog_err(&quot;RIPNGd daemon failed: %s&quot;, strerror(errno));</a>
+<a name="ln297">      exit (1);</a>
+<a name="ln298">    }</a>
+<a name="ln299"> </a>
+<a name="ln300">  /* Create VTY socket */</a>
+<a name="ln301">  vty_serv_sock (vty_addr, vty_port, RIPNG_VTYSH_PATH);</a>
+<a name="ln302"> </a>
+<a name="ln303">  /* Process id file create. */</a>
+<a name="ln304">  pid_output (pid_file);</a>
+<a name="ln305"> </a>
+<a name="ln306">  /* Print banner. */</a>
+<a name="ln307">  zlog_notice (&quot;RIPNGd %s starting: vty@%d&quot;, QUAGGA_VERSION, vty_port);</a>
+<a name="ln308"> </a>
+<a name="ln309">  /* Fetch next active thread. */</a>
+<a name="ln310">  thread_main (master);</a>
+<a name="ln311"> </a>
+<a name="ln312">  /* Not reached. */</a>
+<a name="ln313">  return 0;</a>
+<a name="ln314">}</a>
+
+</code></pre>
+<div class="balloon" rel="8"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1042/" target="_blank">V1042</a> This file is marked with copyleft license, which requires you to open the derived source code.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

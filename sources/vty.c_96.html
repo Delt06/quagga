@@ -1,0 +1,3269 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>vty.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.5.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Virtual terminal [aka TeletYpe] interface routine.</a>
+<a name="ln3"> * Copyright (C) 1997, 98 Kunihiro Ishiguro</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * This file is part of GNU Zebra.</a>
+<a name="ln6"> *</a>
+<a name="ln7"> * GNU Zebra is free software; you can redistribute it and/or modify it</a>
+<a name="ln8"> * under the terms of the GNU General Public License as published by the</a>
+<a name="ln9"> * Free Software Foundation; either version 2, or (at your option) any</a>
+<a name="ln10"> * later version.</a>
+<a name="ln11"> *</a>
+<a name="ln12"> * GNU Zebra is distributed in the hope that it will be useful, but</a>
+<a name="ln13"> * WITHOUT ANY WARRANTY; without even the implied warranty of</a>
+<a name="ln14"> * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU</a>
+<a name="ln15"> * General Public License for more details.</a>
+<a name="ln16"> *</a>
+<a name="ln17"> * You should have received a copy of the GNU General Public License</a>
+<a name="ln18"> * along with GNU Zebra; see the file COPYING.  If not, write to the Free</a>
+<a name="ln19"> * Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA</a>
+<a name="ln20"> * 02111-1307, USA.  </a>
+<a name="ln21"> */</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &lt;zebra.h&gt;</a>
+<a name="ln24"> </a>
+<a name="ln25">#include &quot;linklist.h&quot;</a>
+<a name="ln26">#include &quot;thread.h&quot;</a>
+<a name="ln27">#include &quot;buffer.h&quot;</a>
+<a name="ln28">#include &lt;lib/version.h&gt;</a>
+<a name="ln29">#include &quot;command.h&quot;</a>
+<a name="ln30">#include &quot;sockunion.h&quot;</a>
+<a name="ln31">#include &quot;memory.h&quot;</a>
+<a name="ln32">#include &quot;str.h&quot;</a>
+<a name="ln33">#include &quot;log.h&quot;</a>
+<a name="ln34">#include &quot;prefix.h&quot;</a>
+<a name="ln35">#include &quot;filter.h&quot;</a>
+<a name="ln36">#include &quot;vty.h&quot;</a>
+<a name="ln37">#include &quot;privs.h&quot;</a>
+<a name="ln38">#include &quot;network.h&quot;</a>
+<a name="ln39"> </a>
+<a name="ln40">#include &lt;arpa/telnet.h&gt;</a>
+<a name="ln41">#include &lt;termios.h&gt;</a>
+<a name="ln42"> </a>
+<a name="ln43">#define VTY_BUFSIZ 4096</a>
+<a name="ln44"> </a>
+<a name="ln45">/* Vty events */</a>
+<a name="ln46">enum event </a>
+<a name="ln47">{</a>
+<a name="ln48">  VTY_SERV,</a>
+<a name="ln49">  VTY_READ,</a>
+<a name="ln50">  VTY_WRITE,</a>
+<a name="ln51">  VTY_TIMEOUT_RESET,</a>
+<a name="ln52">#ifdef VTYSH</a>
+<a name="ln53">  VTYSH_SERV,</a>
+<a name="ln54">  VTYSH_READ,</a>
+<a name="ln55">  VTYSH_WRITE</a>
+<a name="ln56">#endif /* VTYSH */</a>
+<a name="ln57">};</a>
+<a name="ln58"> </a>
+<a name="ln59">static void vty_event (enum event, int, struct vty *);</a>
+<a name="ln60"> </a>
+<a name="ln61">/* Extern host structure from command.c */</a>
+<a name="ln62">extern struct host host;</a>
+<a name="ln63"> </a>
+<a name="ln64">/* Vector which store each vty structure. */</a>
+<a name="ln65">static vector vtyvec;</a>
+<a name="ln66"> </a>
+<a name="ln67">/* Vty timeout value. */</a>
+<a name="ln68">static unsigned long vty_timeout_val = VTY_TIMEOUT_DEFAULT;</a>
+<a name="ln69"> </a>
+<a name="ln70">/* Vty access-class command */</a>
+<a name="ln71">static char *vty_accesslist_name = NULL;</a>
+<a name="ln72"> </a>
+<a name="ln73">/* Vty access-calss for IPv6. */</a>
+<a name="ln74">static char *vty_ipv6_accesslist_name = NULL;</a>
+<a name="ln75"> </a>
+<a name="ln76">/* VTY server thread. */</a>
+<a name="ln77">static vector Vvty_serv_thread;</a>
+<a name="ln78"> </a>
+<a name="ln79">/* Current directory. */</a>
+<a name="ln80">char *vty_cwd = NULL;</a>
+<a name="ln81"> </a>
+<a name="ln82">/* Configure lock. */</a>
+<a name="ln83">static int vty_config;</a>
+<a name="ln84"> </a>
+<a name="ln85">/* Login password check. */</a>
+<a name="ln86">static int no_password_check = 0;</a>
+<a name="ln87"> </a>
+<a name="ln88">/* Restrict unauthenticated logins? */</a>
+<a name="ln89">static const u_char restricted_mode_default = 0;</a>
+<a name="ln90">static u_char restricted_mode = 0;</a>
+<a name="ln91"> </a>
+<a name="ln92">/* Integrated configuration file path */</a>
+<a name="ln93">char integrate_default[] = SYSCONFDIR INTEGRATE_DEFAULT_CONFIG;</a>
+<a name="ln94"> </a>
+<a name="ln95">static int do_log_commands = 0;</a>
+<a name="ln96"> </a>
+<a name="ln97">static void</a>
+<a name="ln98">vty_buf_assert (struct vty *vty)</a>
+<a name="ln99">{</a>
+<a name="ln100">  assert (vty-&gt;cp &lt;= vty-&gt;length);</a>
+<a name="ln101">  assert (vty-&gt;length &lt; vty-&gt;max); </a>
+<a name="ln102">  assert (vty-&gt;buf[vty-&gt;length] == '\0');</a>
+<a name="ln103">}</a>
+<a name="ln104"> </a>
+<a name="ln105">/* Sanity/safety wrappers around access to vty-&gt;buf */</a>
+<a name="ln106">static void</a>
+<a name="ln107">vty_buf_put (struct vty *vty, char c)</a>
+<a name="ln108">{</a>
+<a name="ln109">  vty_buf_assert (vty);</a>
+<a name="ln110">  vty-&gt;buf[vty-&gt;cp] = c;</a>
+<a name="ln111">  vty-&gt;buf[vty-&gt;max - 1] = '\0';</a>
+<a name="ln112">}</a>
+<a name="ln113"> </a>
+<a name="ln114">/* VTY standard output function. */</a>
+<a name="ln115">int</a>
+<a name="ln116">vty_out (struct vty *vty, const char *format, ...)</a>
+<a name="ln117">{</a>
+<a name="ln118">  va_list args;</a>
+<a name="ln119">  int len = 0;</a>
+<a name="ln120">  int size = 1024;</a>
+<a name="ln121">  char buf[1024];</a>
+<a name="ln122">  char *p = NULL;</a>
+<a name="ln123"> </a>
+<a name="ln124">  if (vty_shell (vty))</a>
+<a name="ln125">    {</a>
+<a name="ln126">      va_start (args, format);</a>
+<a name="ln127">      vprintf (format, args);</a>
+<a name="ln128">      va_end (args);</a>
+<a name="ln129">    }</a>
+<a name="ln130">  else</a>
+<a name="ln131">    {</a>
+<a name="ln132">      /* Try to write to initial buffer.  */</a>
+<a name="ln133">      va_start (args, format);</a>
+<a name="ln134">      len = vsnprintf (buf, sizeof(buf), format, args);</a>
+<a name="ln135">      va_end (args);</a>
+<a name="ln136"> </a>
+<a name="ln137">      /* Initial buffer is not enough.  */</a>
+<a name="ln138">      if (len &lt; 0 || len &gt;= size)</a>
+<a name="ln139">	{</a>
+<a name="ln140">	  while (1)</a>
+<a name="ln141">	    {</a>
+<a name="ln142">	      if (len &gt; -1)</a>
+<a name="ln143">		size = len + 1;</a>
+<a name="ln144">	      else</a>
+<a name="ln145">		size = size * 2;</a>
+<a name="ln146"> </a>
+<a name="ln147">	      p = XREALLOC (MTYPE_VTY_OUT_BUF, p, size);</a>
+<a name="ln148">	      if (! p)</a>
+<a name="ln149">		return -1;</a>
+<a name="ln150"> </a>
+<a name="ln151">	      va_start (args, format);</a>
+<a name="ln152">	      len = vsnprintf (p, size, format, args);</a>
+<a name="ln153">	      va_end (args);</a>
+<a name="ln154"> </a>
+<a name="ln155">	      if (len &gt; -1 &amp;&amp; len &lt; size)</a>
+<a name="ln156">		break;</a>
+<a name="ln157">	    }</a>
+<a name="ln158">	}</a>
+<a name="ln159"> </a>
+<a name="ln160">      /* When initial buffer is enough to store all output.  */</a>
+<a name="ln161">      if (! p)</a>
+<a name="ln162">	p = buf;</a>
+<a name="ln163"> </a>
+<a name="ln164">      /* Pointer p must point out buffer. */</a>
+<a name="ln165">      buffer_put (vty-&gt;obuf, (u_char *) p, len);</a>
+<a name="ln166"> </a>
+<a name="ln167">      /* If p is not different with buf, it is allocated buffer.  */</a>
+<a name="ln168">      if (p != buf)</a>
+<a name="ln169">	XFREE (MTYPE_VTY_OUT_BUF, p);</a>
+<a name="ln170">    }</a>
+<a name="ln171"> </a>
+<a name="ln172">  return len;</a>
+<a name="ln173">}</a>
+<a name="ln174"> </a>
+<a name="ln175">static int</a>
+<a name="ln176">vty_log_out (struct vty *vty, const char *level, const char *proto_str,</a>
+<a name="ln177">	     const char *format, struct timestamp_control *ctl, va_list va)</a>
+<a name="ln178">{</a>
+<a name="ln179">  int ret;</a>
+<a name="ln180">  int len;</a>
+<a name="ln181">  char buf[1024];</a>
+<a name="ln182"> </a>
+<a name="ln183">  if (!ctl-&gt;already_rendered)</a>
+<a name="ln184">    {</a>
+<a name="ln185">      ctl-&gt;len = quagga_timestamp(ctl-&gt;precision, ctl-&gt;buf, sizeof(ctl-&gt;buf));</a>
+<a name="ln186">      ctl-&gt;already_rendered = 1;</a>
+<a name="ln187">    }</a>
+<a name="ln188">  if (ctl-&gt;len+1 &gt;= sizeof(buf))</a>
+<a name="ln189">    return -1;</a>
+<a name="ln190">  memcpy(buf, ctl-&gt;buf, len = ctl-&gt;len);</a>
+<a name="ln191">  buf[len++] = ' ';</a>
+<a name="ln192">  buf[len] = '\0';</a>
+<a name="ln193"> </a>
+<a name="ln194">  if (level)</a>
+<a name="ln195">    ret = snprintf(buf+len, sizeof(buf)-len, &quot;%s: %s: &quot;, level, proto_str);</a>
+<a name="ln196">  else</a>
+<a name="ln197">    ret = snprintf(buf+len, sizeof(buf)-len, &quot;%s: &quot;, proto_str);</a>
+<a name="ln198">  if ((ret &lt; 0) || ((size_t)(len += ret) &gt;= sizeof(buf)))</a>
+<a name="ln199">    return -1;</a>
+<a name="ln200"> </a>
+<a name="ln201">  if (((ret = vsnprintf(buf+len, sizeof(buf)-len, format, va)) &lt; 0) ||</a>
+<a name="ln202">      ((size_t)((len += ret)+2) &gt; sizeof(buf)))</a>
+<a name="ln203">    return -1;</a>
+<a name="ln204"> </a>
+<a name="ln205">  buf[len++] = '\r';</a>
+<a name="ln206">  buf[len++] = '\n';</a>
+<a name="ln207"> </a>
+<a name="ln208">  if (write(vty-&gt;wfd, buf, len) &lt; 0)</a>
+<a name="ln209">    {</a>
+<a name="ln210">      if (ERRNO_IO_RETRY(errno))</a>
+<a name="ln211">	/* Kernel buffer is full, probably too much debugging output, so just</a>
+<a name="ln212">	   drop the data and ignore. */</a>
+<a name="ln213">	return -1;</a>
+<a name="ln214">      /* Fatal I/O error. */</a>
+<a name="ln215">      vty-&gt;monitor = 0; /* disable monitoring to avoid infinite recursion */</a>
+<a name="ln216">      zlog_warn(&quot;%s: write failed to vty client fd %d, closing: %s&quot;,</a>
+<a name="ln217">		__func__, vty-&gt;fd, safe_strerror(errno));</a>
+<a name="ln218">      buffer_reset(vty-&gt;obuf);</a>
+<a name="ln219">      /* cannot call vty_close, because a parent routine may still try</a>
+<a name="ln220">         to access the vty struct */</a>
+<a name="ln221">      vty-&gt;status = VTY_CLOSE;</a>
+<a name="ln222">      shutdown(vty-&gt;fd, SHUT_RDWR);</a>
+<a name="ln223">      return -1;</a>
+<a name="ln224">    }</a>
+<a name="ln225">  return 0;</a>
+<a name="ln226">}</a>
+<a name="ln227"> </a>
+<a name="ln228">/* Output current time to the vty. */</a>
+<a name="ln229">void</a>
+<a name="ln230">vty_time_print (struct vty *vty, int cr)</a>
+<a name="ln231">{</a>
+<a name="ln232">  char buf[QUAGGA_TIMESTAMP_LEN];</a>
+<a name="ln233">  </a>
+<a name="ln234">  if (quagga_timestamp(0, buf, sizeof(buf)) == 0)</a>
+<a name="ln235">    {</a>
+<a name="ln236">      zlog (NULL, LOG_INFO, &quot;quagga_timestamp error&quot;);</a>
+<a name="ln237">      return;</a>
+<a name="ln238">    }</a>
+<a name="ln239">  if (cr)</a>
+<a name="ln240">    vty_out (vty, &quot;%s\n&quot;, buf);</a>
+<a name="ln241">  else</a>
+<a name="ln242">    vty_out (vty, &quot;%s &quot;, buf);</a>
+<a name="ln243"> </a>
+<a name="ln244">  return;</a>
+<a name="ln245">}</a>
+<a name="ln246"> </a>
+<a name="ln247">/* Say hello to vty interface. */</a>
+<a name="ln248">void</a>
+<a name="ln249">vty_hello (struct vty *vty)</a>
+<a name="ln250">{</a>
+<a name="ln251">  if (host.motdfile)</a>
+<a name="ln252">    {</a>
+<a name="ln253">      FILE *f;</a>
+<a name="ln254">      char buf[4096];</a>
+<a name="ln255"> </a>
+<a name="ln256">      f = fopen (host.motdfile, &quot;r&quot;);</a>
+<a name="ln257">      if (f)</a>
+<a name="ln258">	{</a>
+<a name="ln259">	  while (fgets (buf, sizeof (buf), f))</a>
+<a name="ln260">	    {</a>
+<a name="ln261">	      char *s;</a>
+<a name="ln262">	      /* work backwards to ignore trailling isspace() */</a>
+<a name="ln263">	      for (s = buf + strlen (buf); (s &gt; buf) &amp;&amp; isspace ((int)*(s - 1));</a>
+<a name="ln264">		   s--);</a>
+<a name="ln265">	      *s = '\0';</a>
+<a name="ln266">	      vty_out (vty, &quot;%s%s&quot;, buf, VTY_NEWLINE);</a>
+<a name="ln267">	    }</a>
+<a name="ln268">	  fclose (f);</a>
+<a name="ln269">	}</a>
+<a name="ln270">      else</a>
+<a name="ln271">	vty_out (vty, &quot;MOTD file not found%s&quot;, VTY_NEWLINE);</a>
+<a name="ln272">    }</a>
+<a name="ln273">  else if (host.motd)</a>
+<a name="ln274">    vty_out (vty, &quot;%s&quot;, host.motd);</a>
+<a name="ln275">}</a>
+<a name="ln276"> </a>
+<a name="ln277">/* Put out prompt and wait input from user. */</a>
+<a name="ln278">static void</a>
+<a name="ln279">vty_prompt (struct vty *vty)</a>
+<a name="ln280">{</a>
+<a name="ln281">  struct utsname names;</a>
+<a name="ln282">  const char*hostname;</a>
+<a name="ln283"> </a>
+<a name="ln284">  if (vty-&gt;type == VTY_TERM)</a>
+<a name="ln285">    {</a>
+<a name="ln286">      hostname = host.name;</a>
+<a name="ln287">      if (!hostname)</a>
+<a name="ln288">	{</a>
+<a name="ln289">	  uname (&amp;names);</a>
+<a name="ln290">	  hostname = names.nodename;</a>
+<a name="ln291">	}</a>
+<a name="ln292">      vty_out (vty, cmd_prompt (vty-&gt;node), hostname);</a>
+<a name="ln293">    }</a>
+<a name="ln294">}</a>
+<a name="ln295"> </a>
+<a name="ln296">/* Send WILL TELOPT_ECHO to remote server. */</a>
+<a name="ln297">static void</a>
+<a name="ln298">vty_will_echo (struct vty *vty)</a>
+<a name="ln299">{</a>
+<a name="ln300">  unsigned char cmd[] = { IAC, WILL, TELOPT_ECHO, '\0' };</a>
+<a name="ln301">  vty_out (vty, &quot;%s&quot;, cmd);</a>
+<a name="ln302">}</a>
+<a name="ln303"> </a>
+<a name="ln304">/* Make suppress Go-Ahead telnet option. */</a>
+<a name="ln305">static void</a>
+<a name="ln306">vty_will_suppress_go_ahead (struct vty *vty)</a>
+<a name="ln307">{</a>
+<a name="ln308">  unsigned char cmd[] = { IAC, WILL, TELOPT_SGA, '\0' };</a>
+<a name="ln309">  vty_out (vty, &quot;%s&quot;, cmd);</a>
+<a name="ln310">}</a>
+<a name="ln311"> </a>
+<a name="ln312">/* Make don't use linemode over telnet. */</a>
+<a name="ln313">static void</a>
+<a name="ln314">vty_dont_linemode (struct vty *vty)</a>
+<a name="ln315">{</a>
+<a name="ln316">  unsigned char cmd[] = { IAC, DONT, TELOPT_LINEMODE, '\0' };</a>
+<a name="ln317">  vty_out (vty, &quot;%s&quot;, cmd);</a>
+<a name="ln318">}</a>
+<a name="ln319"> </a>
+<a name="ln320">/* Use window size. */</a>
+<a name="ln321">static void</a>
+<a name="ln322">vty_do_window_size (struct vty *vty)</a>
+<a name="ln323">{</a>
+<a name="ln324">  unsigned char cmd[] = { IAC, DO, TELOPT_NAWS, '\0' };</a>
+<a name="ln325">  vty_out (vty, &quot;%s&quot;, cmd);</a>
+<a name="ln326">}</a>
+<a name="ln327"> </a>
+<a name="ln328">#if 0 /* Currently not used. */</a>
+<a name="ln329">/* Make don't use lflow vty interface. */</a>
+<a name="ln330">static void</a>
+<a name="ln331">vty_dont_lflow_ahead (struct vty *vty)</a>
+<a name="ln332">{</a>
+<a name="ln333">  unsigned char cmd[] = { IAC, DONT, TELOPT_LFLOW, '\0' };</a>
+<a name="ln334">  vty_out (vty, &quot;%s&quot;, cmd);</a>
+<a name="ln335">}</a>
+<a name="ln336">#endif /* 0 */</a>
+<a name="ln337"> </a>
+<a name="ln338">/* Allocate new vty struct. */</a>
+<a name="ln339">struct vty *</a>
+<a name="ln340">vty_new ()</a>
+<a name="ln341">{</a>
+<a name="ln342">  struct vty *new = XCALLOC (MTYPE_VTY, sizeof (struct vty));</a>
+<a name="ln343"> </a>
+<a name="ln344">  new-&gt;obuf = buffer_new(0);	/* Use default buffer size. */</a>
+<a name="ln345">  new-&gt;buf = XCALLOC (MTYPE_VTY, VTY_BUFSIZ);</a>
+<a name="ln346">  new-&gt;max = VTY_BUFSIZ;</a>
+<a name="ln347"> </a>
+<a name="ln348">  return new;</a>
+<a name="ln349">}</a>
+<a name="ln350"> </a>
+<a name="ln351">/* Authentication of vty */</a>
+<a name="ln352">static void</a>
+<a name="ln353">vty_auth (struct vty *vty, char *buf)</a>
+<a name="ln354">{</a>
+<a name="ln355">  char *passwd = NULL;</a>
+<a name="ln356">  enum node_type next_node = 0;</a>
+<a name="ln357">  int fail;</a>
+<a name="ln358">  char *crypt (const char *, const char *);</a>
+<a name="ln359"> </a>
+<a name="ln360">  switch (vty-&gt;node)</a>
+<a name="ln361">    {</a>
+<a name="ln362">    case AUTH_NODE:</a>
+<a name="ln363">      if (host.encrypt)</a>
+<a name="ln364">	passwd = host.password_encrypt;</a>
+<a name="ln365">      else</a>
+<a name="ln366">	passwd = host.password;</a>
+<a name="ln367">      if (host.advanced)</a>
+<a name="ln368">	next_node = host.enable ? VIEW_NODE : ENABLE_NODE;</a>
+<a name="ln369">      else</a>
+<a name="ln370">	next_node = VIEW_NODE;</a>
+<a name="ln371">      break;</a>
+<a name="ln372">    case AUTH_ENABLE_NODE:</a>
+<a name="ln373">      if (host.encrypt)</a>
+<a name="ln374">	passwd = host.enable_encrypt;</a>
+<a name="ln375">      else</a>
+<a name="ln376">	passwd = host.enable;</a>
+<a name="ln377">      next_node = ENABLE_NODE;</a>
+<a name="ln378">      break;</a>
+<a name="ln379">    }</a>
+<a name="ln380"> </a>
+<a name="ln381">  if (passwd)</a>
+<a name="ln382">    {</a>
+<a name="ln383">      if (host.encrypt)</a>
+<a name="ln384">	fail = strcmp (crypt(buf, passwd), passwd);</a>
+<a name="ln385">      else</a>
+<a name="ln386">	fail = strcmp (buf, passwd);</a>
+<a name="ln387">    }</a>
+<a name="ln388">  else</a>
+<a name="ln389">    fail = 1;</a>
+<a name="ln390"> </a>
+<a name="ln391">  if (! fail)</a>
+<a name="ln392">    {</a>
+<a name="ln393">      vty-&gt;fail = 0;</a>
+<a name="ln394">      vty-&gt;node = next_node;	/* Success ! */</a>
+<a name="ln395">    }</a>
+<a name="ln396">  else</a>
+<a name="ln397">    {</a>
+<a name="ln398">      vty-&gt;fail++;</a>
+<a name="ln399">      if (vty-&gt;fail &gt;= 3)</a>
+<a name="ln400">	{</a>
+<a name="ln401">	  if (vty-&gt;node == AUTH_NODE)</a>
+<a name="ln402">	    {</a>
+<a name="ln403">	      vty_out (vty, &quot;%% Bad passwords, too many failures!%s&quot;, VTY_NEWLINE);</a>
+<a name="ln404">	      vty-&gt;status = VTY_CLOSE;</a>
+<a name="ln405">	    }</a>
+<a name="ln406">	  else			</a>
+<a name="ln407">	    {</a>
+<a name="ln408">	      /* AUTH_ENABLE_NODE */</a>
+<a name="ln409">	      vty-&gt;fail = 0;</a>
+<a name="ln410">	      vty_out (vty, &quot;%% Bad enable passwords, too many failures!%s&quot;, VTY_NEWLINE);</a>
+<a name="ln411">	      vty-&gt;node = restricted_mode ? RESTRICTED_NODE : VIEW_NODE;</a>
+<a name="ln412">	    }</a>
+<a name="ln413">	}</a>
+<a name="ln414">    }</a>
+<a name="ln415">}</a>
+<a name="ln416"> </a>
+<a name="ln417">/* Command execution over the vty interface. */</a>
+<a name="ln418">static int</a>
+<a name="ln419">vty_command (struct vty *vty, char *buf)</a>
+<a name="ln420">{</a>
+<a name="ln421">  int ret;</a>
+<a name="ln422">  vector vline;</a>
+<a name="ln423">  const char *protocolname;</a>
+<a name="ln424">  char *cp = NULL;</a>
+<a name="ln425"> </a>
+<a name="ln426">  /*</a>
+<a name="ln427">   * Log non empty command lines</a>
+<a name="ln428">   */</a>
+<a name="ln429">  if (do_log_commands)</a>
+<a name="ln430">    cp = buf;</a>
+<a name="ln431">  if (cp != NULL)</a>
+<a name="ln432">    {</a>
+<a name="ln433">      /* Skip white spaces. */</a>
+<a name="ln434">      while (isspace ((int) *cp) &amp;&amp; *cp != '\0')</a>
+<a name="ln435">        cp++;</a>
+<a name="ln436">    }</a>
+<a name="ln437">  if (cp != NULL &amp;&amp; *cp != '\0')</a>
+<a name="ln438">    {</a>
+<a name="ln439">      unsigned i;</a>
+<a name="ln440">      char	vty_str[VTY_BUFSIZ];</a>
+<a name="ln441">      char        prompt_str[VTY_BUFSIZ];</a>
+<a name="ln442"> </a>
+<a name="ln443">      /* format the base vty info */</a>
+<a name="ln444">      snprintf(vty_str, sizeof(vty_str), &quot;vty[??]@%s&quot;, vty-&gt;address);</a>
+<a name="ln445">      if (vty)</a>
+<a name="ln446">        for (i = 0; i &lt; vector_active (vtyvec); i++)</a>
+<a name="ln447">          if (vty == vector_slot (vtyvec, i))</a>
+<a name="ln448">            {</a>
+<a name="ln449">              snprintf(vty_str, sizeof(vty_str), &quot;vty[%d]@%s&quot;,</a>
+<a name="ln450">                                                 i, vty-&gt;address);</a>
+<a name="ln451">              break;</a>
+<a name="ln452">            }</a>
+<a name="ln453"> </a>
+<a name="ln454">      /* format the prompt */</a>
+<a name="ln455">      snprintf(prompt_str, sizeof(prompt_str), cmd_prompt (vty-&gt;node), vty_str);</a>
+<a name="ln456"> </a>
+<a name="ln457">      /* now log the command */</a>
+<a name="ln458">      zlog(NULL, LOG_ERR, &quot;%s%s&quot;, prompt_str, buf);</a>
+<a name="ln459">    }</a>
+<a name="ln460">  /* Split readline string up into the vector */</a>
+<a name="ln461">  vline = cmd_make_strvec (buf);</a>
+<a name="ln462"> </a>
+<a name="ln463">  if (vline == NULL)</a>
+<a name="ln464">    return CMD_SUCCESS;</a>
+<a name="ln465"> </a>
+<a name="ln466">#ifdef CONSUMED_TIME_CHECK</a>
+<a name="ln467">  {</a>
+<a name="ln468">    RUSAGE_T before;</a>
+<a name="ln469">    RUSAGE_T after;</a>
+<a name="ln470">    unsigned long realtime, cputime;</a>
+<a name="ln471"> </a>
+<a name="ln472">    GETRUSAGE(&amp;before);</a>
+<a name="ln473">#endif /* CONSUMED_TIME_CHECK */</a>
+<a name="ln474"> </a>
+<a name="ln475">  ret = cmd_execute_command (vline, vty, NULL, 0);</a>
+<a name="ln476"> </a>
+<a name="ln477">  /* Get the name of the protocol if any */</a>
+<a name="ln478">  if (zlog_default)</a>
+<a name="ln479">      protocolname = zlog_proto_names[zlog_default-&gt;protocol];</a>
+<a name="ln480">  else</a>
+<a name="ln481">      protocolname = zlog_proto_names[ZLOG_NONE];</a>
+<a name="ln482">                                                                           </a>
+<a name="ln483">#ifdef CONSUMED_TIME_CHECK</a>
+<a name="ln484">    GETRUSAGE(&amp;after);</a>
+<a name="ln485">    if ((realtime = thread_consumed_time(&amp;after, &amp;before, &amp;cputime)) &gt;</a>
+<a name="ln486">    	CONSUMED_TIME_CHECK)</a>
+<a name="ln487">      /* Warn about CPU hog that must be fixed. */</a>
+<a name="ln488">      zlog_warn(&quot;SLOW COMMAND: command took %lums (cpu time %lums): %s&quot;,</a>
+<a name="ln489">      		realtime/1000, cputime/1000, buf);</a>
+<a name="ln490">  }</a>
+<a name="ln491">#endif /* CONSUMED_TIME_CHECK */</a>
+<a name="ln492"> </a>
+<a name="ln493">  if (ret != CMD_SUCCESS)</a>
+<a name="ln494">    switch (ret)</a>
+<a name="ln495">      {</a>
+<a name="ln496">      case CMD_WARNING:</a>
+<a name="ln497">	if (vty-&gt;type == VTY_FILE)</a>
+<a name="ln498">	  vty_out (vty, &quot;Warning...%s&quot;, VTY_NEWLINE);</a>
+<a name="ln499">	break;</a>
+<a name="ln500">      case CMD_ERR_AMBIGUOUS:</a>
+<a name="ln501">	vty_out (vty, &quot;%% Ambiguous command.%s&quot;, VTY_NEWLINE);</a>
+<a name="ln502">	break;</a>
+<a name="ln503">      case CMD_ERR_NO_MATCH:</a>
+<a name="ln504">	vty_out (vty, &quot;%% [%s] Unknown command: %s%s&quot;, protocolname, buf, VTY_NEWLINE);</a>
+<a name="ln505">	break;</a>
+<a name="ln506">      case CMD_ERR_INCOMPLETE:</a>
+<a name="ln507">	vty_out (vty, &quot;%% Command incomplete.%s&quot;, VTY_NEWLINE);</a>
+<a name="ln508">	break;</a>
+<a name="ln509">      }</a>
+<a name="ln510">  cmd_free_strvec (vline);</a>
+<a name="ln511"> </a>
+<a name="ln512">  return ret;</a>
+<a name="ln513">}</a>
+<a name="ln514"> </a>
+<a name="ln515">static const char telnet_backward_char = 0x08;</a>
+<a name="ln516">static const char telnet_space_char = ' ';</a>
+<a name="ln517"> </a>
+<a name="ln518">/* Basic function to write buffer to vty. */</a>
+<a name="ln519">static void</a>
+<a name="ln520">vty_write (struct vty *vty, const char *buf, size_t nbytes)</a>
+<a name="ln521">{</a>
+<a name="ln522">  if ((vty-&gt;node == AUTH_NODE) || (vty-&gt;node == AUTH_ENABLE_NODE))</a>
+<a name="ln523">    return;</a>
+<a name="ln524"> </a>
+<a name="ln525">  /* Should we do buffering here ?  And make vty_flush (vty) ? */</a>
+<a name="ln526">  buffer_put (vty-&gt;obuf, buf, nbytes);</a>
+<a name="ln527">}</a>
+<a name="ln528"> </a>
+<a name="ln529">/* Basic function to insert character into vty. */</a>
+<a name="ln530">static void</a>
+<a name="ln531">vty_self_insert (struct vty *vty, char c)</a>
+<a name="ln532">{</a>
+<a name="ln533">  int i;</a>
+<a name="ln534">  int length;</a>
+<a name="ln535">  </a>
+<a name="ln536">  vty_buf_assert (vty);</a>
+<a name="ln537">  </a>
+<a name="ln538">  /* length is sans nul, max is with */</a>
+<a name="ln539">  if (vty-&gt;length + 1 &gt;= vty-&gt;max)</a>
+<a name="ln540">    return;</a>
+<a name="ln541"> </a>
+<a name="ln542">  length = vty-&gt;length - vty-&gt;cp;</a>
+<a name="ln543">  memmove (&amp;vty-&gt;buf[vty-&gt;cp + 1], &amp;vty-&gt;buf[vty-&gt;cp], length);</a>
+<a name="ln544">  vty-&gt;length++;</a>
+<a name="ln545">  vty-&gt;buf[vty-&gt;length] = '\0';</a>
+<a name="ln546"> </a>
+<a name="ln547">  vty_buf_put (vty, c);</a>
+<a name="ln548"> </a>
+<a name="ln549">  vty_write (vty, &amp;vty-&gt;buf[vty-&gt;cp], length + 1);</a>
+<a name="ln550">  for (i = 0; i &lt; length; i++)</a>
+<a name="ln551">    vty_write (vty, &amp;telnet_backward_char, 1);</a>
+<a name="ln552"> </a>
+<a name="ln553">  vty-&gt;cp++;</a>
+<a name="ln554">  </a>
+<a name="ln555">  vty_buf_assert (vty);</a>
+<a name="ln556">}</a>
+<a name="ln557"> </a>
+<a name="ln558">/* Self insert character 'c' in overwrite mode. */</a>
+<a name="ln559">static void</a>
+<a name="ln560">vty_self_insert_overwrite (struct vty *vty, char c)</a>
+<a name="ln561">{</a>
+<a name="ln562">  vty_buf_assert (vty);</a>
+<a name="ln563">  </a>
+<a name="ln564">  if (vty-&gt;cp == vty-&gt;length)</a>
+<a name="ln565">    {</a>
+<a name="ln566">      vty_self_insert (vty, c);</a>
+<a name="ln567">      return;</a>
+<a name="ln568">    }</a>
+<a name="ln569"> </a>
+<a name="ln570">  vty_buf_put (vty, c);</a>
+<a name="ln571">  vty-&gt;cp++;</a>
+<a name="ln572">  </a>
+<a name="ln573">  vty_buf_assert (vty);</a>
+<a name="ln574">  </a>
+<a name="ln575">  vty_write (vty, &amp;c, 1);</a>
+<a name="ln576">}</a>
+<a name="ln577"> </a>
+<a name="ln578">/**</a>
+<a name="ln579"> * Insert a string into vty-&gt;buf at the current cursor position.</a>
+<a name="ln580"> *</a>
+<a name="ln581"> * If the resultant string would be larger than VTY_BUFSIZ it is</a>
+<a name="ln582"> * truncated to fit.</a>
+<a name="ln583"> */</a>
+<a name="ln584">static void</a>
+<a name="ln585">vty_insert_word_overwrite (struct vty *vty, char *str)</a>
+<a name="ln586">{</a>
+<a name="ln587">  vty_buf_assert (vty);</a>
+<a name="ln588">  </a>
+<a name="ln589">  size_t nwrite = MIN ((int) strlen (str), vty-&gt;max - vty-&gt;cp - 1);</a>
+<a name="ln590">  memcpy (&amp;vty-&gt;buf[vty-&gt;cp], str, nwrite);</a>
+<a name="ln591">  vty-&gt;cp += nwrite;</a>
+<a name="ln592">  vty-&gt;length = vty-&gt;cp;</a>
+<a name="ln593">  vty-&gt;buf[vty-&gt;length] = '\0';</a>
+<a name="ln594">  vty_buf_assert (vty);</a>
+<a name="ln595">  </a>
+<a name="ln596">  vty_write (vty, str, nwrite);</a>
+<a name="ln597">}</a>
+<a name="ln598"> </a>
+<a name="ln599">/* Forward character. */</a>
+<a name="ln600">static void</a>
+<a name="ln601">vty_forward_char (struct vty *vty)</a>
+<a name="ln602">{</a>
+<a name="ln603">  vty_buf_assert (vty);</a>
+<a name="ln604">  </a>
+<a name="ln605">  if (vty-&gt;cp &lt; vty-&gt;length)</a>
+<a name="ln606">    {</a>
+<a name="ln607">      vty_write (vty, &amp;vty-&gt;buf[vty-&gt;cp], 1);</a>
+<a name="ln608">      vty-&gt;cp++;</a>
+<a name="ln609">    }</a>
+<a name="ln610">  </a>
+<a name="ln611">  vty_buf_assert (vty);</a>
+<a name="ln612">}</a>
+<a name="ln613"> </a>
+<a name="ln614">/* Backward character. */</a>
+<a name="ln615">static void</a>
+<a name="ln616">vty_backward_char (struct vty *vty)</a>
+<a name="ln617">{</a>
+<a name="ln618">  vty_buf_assert (vty);</a>
+<a name="ln619">  </a>
+<a name="ln620">  if (vty-&gt;cp &gt; 0)</a>
+<a name="ln621">    {</a>
+<a name="ln622">      vty-&gt;cp--;</a>
+<a name="ln623">      vty_write (vty, &amp;telnet_backward_char, 1);</a>
+<a name="ln624">    }</a>
+<a name="ln625">  </a>
+<a name="ln626">  vty_buf_assert (vty);</a>
+<a name="ln627">}</a>
+<a name="ln628"> </a>
+<a name="ln629">/* Move to the beginning of the line. */</a>
+<a name="ln630">static void</a>
+<a name="ln631">vty_beginning_of_line (struct vty *vty)</a>
+<a name="ln632">{</a>
+<a name="ln633">  while (vty-&gt;cp)</a>
+<a name="ln634">    vty_backward_char (vty);</a>
+<a name="ln635">}</a>
+<a name="ln636"> </a>
+<a name="ln637">/* Move to the end of the line. */</a>
+<a name="ln638">static void</a>
+<a name="ln639">vty_end_of_line (struct vty *vty)</a>
+<a name="ln640">{</a>
+<a name="ln641">  while (vty-&gt;cp &lt; vty-&gt;length)</a>
+<a name="ln642">    vty_forward_char (vty);</a>
+<a name="ln643">}</a>
+<a name="ln644"> </a>
+<a name="ln645">static void vty_kill_line_from_beginning (struct vty *);</a>
+<a name="ln646">static void vty_redraw_line (struct vty *);</a>
+<a name="ln647"> </a>
+<a name="ln648">/* Print command line history.  This function is called from</a>
+<a name="ln649">   vty_next_line and vty_previous_line. */</a>
+<a name="ln650">static void</a>
+<a name="ln651">vty_history_print (struct vty *vty)</a>
+<a name="ln652">{</a>
+<a name="ln653">  int length;</a>
+<a name="ln654"> </a>
+<a name="ln655">  vty_kill_line_from_beginning (vty);</a>
+<a name="ln656"> </a>
+<a name="ln657">  /* Get previous line from history buffer */</a>
+<a name="ln658">  length = strlen (vty-&gt;hist[vty-&gt;hp]);</a>
+<a name="ln659">  memcpy (vty-&gt;buf, vty-&gt;hist[vty-&gt;hp], length);</a>
+<a name="ln660">  vty-&gt;cp = vty-&gt;length = length;</a>
+<a name="ln661">  vty-&gt;buf[vty-&gt;length] = '\0';</a>
+<a name="ln662">  vty_buf_assert (vty);</a>
+<a name="ln663">  </a>
+<a name="ln664">  /* Redraw current line */</a>
+<a name="ln665">  vty_redraw_line (vty);</a>
+<a name="ln666">}</a>
+<a name="ln667"> </a>
+<a name="ln668">/* Show next command line history. */</a>
+<a name="ln669">static void</a>
+<a name="ln670">vty_next_line (struct vty *vty)</a>
+<a name="ln671">{</a>
+<a name="ln672">  int try_index;</a>
+<a name="ln673"> </a>
+<a name="ln674">  if (vty-&gt;hp == vty-&gt;hindex)</a>
+<a name="ln675">    return;</a>
+<a name="ln676"> </a>
+<a name="ln677">  /* Try is there history exist or not. */</a>
+<a name="ln678">  try_index = vty-&gt;hp;</a>
+<a name="ln679">  if (try_index == (VTY_MAXHIST - 1))</a>
+<a name="ln680">    try_index = 0;</a>
+<a name="ln681">  else</a>
+<a name="ln682">    try_index++;</a>
+<a name="ln683"> </a>
+<a name="ln684">  /* If there is not history return. */</a>
+<a name="ln685">  if (vty-&gt;hist[try_index] == NULL)</a>
+<a name="ln686">    return;</a>
+<a name="ln687">  else</a>
+<a name="ln688">    vty-&gt;hp = try_index;</a>
+<a name="ln689"> </a>
+<a name="ln690">  vty_history_print (vty);</a>
+<a name="ln691">}</a>
+<a name="ln692"> </a>
+<a name="ln693">/* Show previous command line history. */</a>
+<a name="ln694">static void</a>
+<a name="ln695">vty_previous_line (struct vty *vty)</a>
+<a name="ln696">{</a>
+<a name="ln697">  int try_index;</a>
+<a name="ln698"> </a>
+<a name="ln699">  try_index = vty-&gt;hp;</a>
+<a name="ln700">  if (try_index == 0)</a>
+<a name="ln701">    try_index = VTY_MAXHIST - 1;</a>
+<a name="ln702">  else</a>
+<a name="ln703">    try_index--;</a>
+<a name="ln704"> </a>
+<a name="ln705">  if (vty-&gt;hist[try_index] == NULL)</a>
+<a name="ln706">    return;</a>
+<a name="ln707">  else</a>
+<a name="ln708">    vty-&gt;hp = try_index;</a>
+<a name="ln709"> </a>
+<a name="ln710">  vty_history_print (vty);</a>
+<a name="ln711">}</a>
+<a name="ln712"> </a>
+<a name="ln713">/* This function redraw all of the command line character. */</a>
+<a name="ln714">static void</a>
+<a name="ln715">vty_redraw_line (struct vty *vty)</a>
+<a name="ln716">{</a>
+<a name="ln717">  vty_write (vty, vty-&gt;buf, vty-&gt;length);</a>
+<a name="ln718">  vty-&gt;cp = vty-&gt;length;</a>
+<a name="ln719">  </a>
+<a name="ln720">  vty_buf_assert (vty);</a>
+<a name="ln721">}</a>
+<a name="ln722"> </a>
+<a name="ln723">/* Forward word. */</a>
+<a name="ln724">static void</a>
+<a name="ln725">vty_forward_word (struct vty *vty)</a>
+<a name="ln726">{</a>
+<a name="ln727">  while (vty-&gt;cp != vty-&gt;length &amp;&amp; vty-&gt;buf[vty-&gt;cp] != ' ')</a>
+<a name="ln728">    vty_forward_char (vty);</a>
+<a name="ln729">  </a>
+<a name="ln730">  while (vty-&gt;cp != vty-&gt;length &amp;&amp; vty-&gt;buf[vty-&gt;cp] == ' ')</a>
+<a name="ln731">    vty_forward_char (vty);</a>
+<a name="ln732">}</a>
+<a name="ln733"> </a>
+<a name="ln734">/* Backward word without skipping training space. */</a>
+<a name="ln735">static void</a>
+<a name="ln736">vty_backward_pure_word (struct vty *vty)</a>
+<a name="ln737">{</a>
+<a name="ln738">  while (vty-&gt;cp &gt; 0 &amp;&amp; vty-&gt;buf[vty-&gt;cp - 1] != ' ')</a>
+<a name="ln739">    vty_backward_char (vty);</a>
+<a name="ln740">}</a>
+<a name="ln741"> </a>
+<a name="ln742">/* Backward word. */</a>
+<a name="ln743">static void</a>
+<a name="ln744">vty_backward_word (struct vty *vty)</a>
+<a name="ln745">{</a>
+<a name="ln746">  while (vty-&gt;cp &gt; 0 &amp;&amp; vty-&gt;buf[vty-&gt;cp - 1] == ' ')</a>
+<a name="ln747">    vty_backward_char (vty);</a>
+<a name="ln748"> </a>
+<a name="ln749">  while (vty-&gt;cp &gt; 0 &amp;&amp; vty-&gt;buf[vty-&gt;cp - 1] != ' ')</a>
+<a name="ln750">    vty_backward_char (vty);</a>
+<a name="ln751">}</a>
+<a name="ln752"> </a>
+<a name="ln753">/* When '^D' is typed at the beginning of the line we move to the down</a>
+<a name="ln754">   level. */</a>
+<a name="ln755">static void</a>
+<a name="ln756">vty_down_level (struct vty *vty)</a>
+<a name="ln757">{</a>
+<a name="ln758">  vty_out (vty, &quot;%s&quot;, VTY_NEWLINE);</a>
+<a name="ln759">  (*config_exit_cmd.func)(NULL, vty, 0, NULL);</a>
+<a name="ln760">  vty_prompt (vty);</a>
+<a name="ln761">  vty-&gt;cp = 0;</a>
+<a name="ln762">}</a>
+<a name="ln763"> </a>
+<a name="ln764">/* When '^Z' is received from vty, move down to the enable mode. */</a>
+<a name="ln765">static void</a>
+<a name="ln766">vty_end_config (struct vty *vty)</a>
+<a name="ln767">{</a>
+<a name="ln768">  vty_out (vty, &quot;%s&quot;, VTY_NEWLINE);</a>
+<a name="ln769"> </a>
+<a name="ln770">  switch (vty-&gt;node)</a>
+<a name="ln771">    {</a>
+<a name="ln772">    case VIEW_NODE:</a>
+<a name="ln773">    case ENABLE_NODE:</a>
+<a name="ln774">    case RESTRICTED_NODE:</a>
+<a name="ln775">      /* Nothing to do. */</a>
+<a name="ln776">      break;</a>
+<a name="ln777">    case CONFIG_NODE:</a>
+<a name="ln778">    case INTERFACE_NODE:</a>
+<a name="ln779">    case ZEBRA_NODE:</a>
+<a name="ln780">    case RIP_NODE:</a>
+<a name="ln781">    case RIPNG_NODE:</a>
+<a name="ln782">    case BABEL_NODE:</a>
+<a name="ln783">    case BGP_NODE:</a>
+<a name="ln784">    case BGP_VPNV4_NODE:</a>
+<a name="ln785">    case BGP_VPNV6_NODE:</a>
+<a name="ln786">    case BGP_ENCAP_NODE:</a>
+<a name="ln787">    case BGP_ENCAPV6_NODE:</a>
+<a name="ln788">    case BGP_IPV4_NODE:</a>
+<a name="ln789">    case BGP_IPV4M_NODE:</a>
+<a name="ln790">    case BGP_IPV6_NODE:</a>
+<a name="ln791">    case BGP_IPV6M_NODE:</a>
+<a name="ln792">    case RMAP_NODE:</a>
+<a name="ln793">    case OSPF_NODE:</a>
+<a name="ln794">    case OSPF6_NODE:</a>
+<a name="ln795">    case ISIS_NODE:</a>
+<a name="ln796">    case KEYCHAIN_NODE:</a>
+<a name="ln797">    case KEYCHAIN_KEY_NODE:</a>
+<a name="ln798">    case MASC_NODE:</a>
+<a name="ln799">    case PIM_NODE:</a>
+<a name="ln800">    case VTY_NODE:</a>
+<a name="ln801">      vty_config_unlock (vty);</a>
+<a name="ln802">      vty-&gt;node = ENABLE_NODE;</a>
+<a name="ln803">      break;</a>
+<a name="ln804">    default:</a>
+<a name="ln805">      /* Unknown node, we have to ignore it. */</a>
+<a name="ln806">      break;</a>
+<a name="ln807">    }</a>
+<a name="ln808"> </a>
+<a name="ln809">  vty_prompt (vty);</a>
+<a name="ln810">  vty-&gt;cp = 0;</a>
+<a name="ln811">}</a>
+<a name="ln812"> </a>
+<a name="ln813">/* Delete a charcter at the current point. */</a>
+<a name="ln814">static void</a>
+<a name="ln815">vty_delete_char (struct vty *vty)</a>
+<a name="ln816">{</a>
+<a name="ln817">  int i;</a>
+<a name="ln818">  int size;</a>
+<a name="ln819"> </a>
+<a name="ln820">  if (vty-&gt;length == 0)</a>
+<a name="ln821">    {</a>
+<a name="ln822">      vty_down_level (vty);</a>
+<a name="ln823">      return;</a>
+<a name="ln824">    }</a>
+<a name="ln825">  </a>
+<a name="ln826">  if (vty-&gt;cp == vty-&gt;length)</a>
+<a name="ln827">    return;			/* completion need here? */</a>
+<a name="ln828"> </a>
+<a name="ln829">  vty_buf_assert (vty);</a>
+<a name="ln830">  </a>
+<a name="ln831">  size = vty-&gt;length - vty-&gt;cp;</a>
+<a name="ln832"> </a>
+<a name="ln833">  vty-&gt;length--;</a>
+<a name="ln834">  memmove (&amp;vty-&gt;buf[vty-&gt;cp], &amp;vty-&gt;buf[vty-&gt;cp + 1], size - 1);</a>
+<a name="ln835">  vty-&gt;buf[vty-&gt;length] = '\0';</a>
+<a name="ln836">  </a>
+<a name="ln837">  if (vty-&gt;node == AUTH_NODE || vty-&gt;node == AUTH_ENABLE_NODE)</a>
+<a name="ln838">    return;</a>
+<a name="ln839"> </a>
+<a name="ln840">  vty_write (vty, &amp;vty-&gt;buf[vty-&gt;cp], size - 1);</a>
+<a name="ln841">  vty_write (vty, &amp;telnet_space_char, 1);</a>
+<a name="ln842"> </a>
+<a name="ln843">  for (i = 0; i &lt; size; i++)</a>
+<a name="ln844">    vty_write (vty, &amp;telnet_backward_char, 1);</a>
+<a name="ln845">}</a>
+<a name="ln846"> </a>
+<a name="ln847">/* Delete a character before the point. */</a>
+<a name="ln848">static void</a>
+<a name="ln849">vty_delete_backward_char (struct vty *vty)</a>
+<a name="ln850">{</a>
+<a name="ln851">  if (vty-&gt;cp == 0)</a>
+<a name="ln852">    return;</a>
+<a name="ln853"> </a>
+<a name="ln854">  vty_backward_char (vty);</a>
+<a name="ln855">  vty_delete_char (vty);</a>
+<a name="ln856">}</a>
+<a name="ln857"> </a>
+<a name="ln858">/* Kill rest of line from current point. */</a>
+<a name="ln859">static void</a>
+<a name="ln860">vty_kill_line (struct vty *vty)</a>
+<a name="ln861">{</a>
+<a name="ln862">  int i;</a>
+<a name="ln863">  int size;</a>
+<a name="ln864"> </a>
+<a name="ln865">  size = vty-&gt;length - vty-&gt;cp;</a>
+<a name="ln866">  </a>
+<a name="ln867">  if (size == 0)</a>
+<a name="ln868">    return;</a>
+<a name="ln869"> </a>
+<a name="ln870">  for (i = 0; i &lt; size; i++)</a>
+<a name="ln871">    vty_write (vty, &amp;telnet_space_char, 1);</a>
+<a name="ln872">  for (i = 0; i &lt; size; i++)</a>
+<a name="ln873">    vty_write (vty, &amp;telnet_backward_char, 1);</a>
+<a name="ln874"> </a>
+<a name="ln875">  memset (&amp;vty-&gt;buf[vty-&gt;cp], 0, size);</a>
+<a name="ln876">  vty-&gt;length = vty-&gt;cp;</a>
+<a name="ln877">  vty_buf_assert (vty);</a>
+<a name="ln878">}</a>
+<a name="ln879"> </a>
+<a name="ln880">/* Kill line from the beginning. */</a>
+<a name="ln881">static void</a>
+<a name="ln882">vty_kill_line_from_beginning (struct vty *vty)</a>
+<a name="ln883">{</a>
+<a name="ln884">  vty_beginning_of_line (vty);</a>
+<a name="ln885">  vty_kill_line (vty);</a>
+<a name="ln886">}</a>
+<a name="ln887"> </a>
+<a name="ln888">/* Delete a word before the point. */</a>
+<a name="ln889">static void</a>
+<a name="ln890">vty_forward_kill_word (struct vty *vty)</a>
+<a name="ln891">{</a>
+<a name="ln892">  while (vty-&gt;cp != vty-&gt;length &amp;&amp; vty-&gt;buf[vty-&gt;cp] == ' ')</a>
+<a name="ln893">    vty_delete_char (vty);</a>
+<a name="ln894">  while (vty-&gt;cp != vty-&gt;length &amp;&amp; vty-&gt;buf[vty-&gt;cp] != ' ')</a>
+<a name="ln895">    vty_delete_char (vty);</a>
+<a name="ln896">}</a>
+<a name="ln897"> </a>
+<a name="ln898">/* Delete a word before the point. */</a>
+<a name="ln899">static void</a>
+<a name="ln900">vty_backward_kill_word (struct vty *vty)</a>
+<a name="ln901">{</a>
+<a name="ln902">  while (vty-&gt;cp &gt; 0 &amp;&amp; vty-&gt;buf[vty-&gt;cp - 1] == ' ')</a>
+<a name="ln903">    vty_delete_backward_char (vty);</a>
+<a name="ln904">  while (vty-&gt;cp &gt; 0 &amp;&amp; vty-&gt;buf[vty-&gt;cp - 1] != ' ')</a>
+<a name="ln905">    vty_delete_backward_char (vty);</a>
+<a name="ln906">}</a>
+<a name="ln907"> </a>
+<a name="ln908">/* Transpose chars before or at the point. */</a>
+<a name="ln909">static void</a>
+<a name="ln910">vty_transpose_chars (struct vty *vty)</a>
+<a name="ln911">{</a>
+<a name="ln912">  char c1, c2;</a>
+<a name="ln913"> </a>
+<a name="ln914">  /* If length is short or point is near by the beginning of line then</a>
+<a name="ln915">     return. */</a>
+<a name="ln916">  if (vty-&gt;length &lt; 2 || vty-&gt;cp &lt; 1)</a>
+<a name="ln917">    return;</a>
+<a name="ln918"> </a>
+<a name="ln919">  /* In case of point is located at the end of the line. */</a>
+<a name="ln920">  if (vty-&gt;cp == vty-&gt;length)</a>
+<a name="ln921">    {</a>
+<a name="ln922">      c1 = vty-&gt;buf[vty-&gt;cp - 1];</a>
+<a name="ln923">      c2 = vty-&gt;buf[vty-&gt;cp - 2];</a>
+<a name="ln924"> </a>
+<a name="ln925">      vty_backward_char (vty);</a>
+<a name="ln926">      vty_backward_char (vty);</a>
+<a name="ln927">      vty_self_insert_overwrite (vty, c1);</a>
+<a name="ln928">      vty_self_insert_overwrite (vty, c2);</a>
+<a name="ln929">    }</a>
+<a name="ln930">  else</a>
+<a name="ln931">    {</a>
+<a name="ln932">      c1 = vty-&gt;buf[vty-&gt;cp];</a>
+<a name="ln933">      c2 = vty-&gt;buf[vty-&gt;cp - 1];</a>
+<a name="ln934"> </a>
+<a name="ln935">      vty_backward_char (vty);</a>
+<a name="ln936">      vty_self_insert_overwrite (vty, c1);</a>
+<a name="ln937">      vty_self_insert_overwrite (vty, c2);</a>
+<a name="ln938">    }</a>
+<a name="ln939">}</a>
+<a name="ln940"> </a>
+<a name="ln941">/* Do completion at vty interface. */</a>
+<a name="ln942">static void</a>
+<a name="ln943">vty_complete_command (struct vty *vty)</a>
+<a name="ln944">{</a>
+<a name="ln945">  int i;</a>
+<a name="ln946">  int ret;</a>
+<a name="ln947">  char **matched = NULL;</a>
+<a name="ln948">  vector vline;</a>
+<a name="ln949"> </a>
+<a name="ln950">  if (vty-&gt;node == AUTH_NODE || vty-&gt;node == AUTH_ENABLE_NODE)</a>
+<a name="ln951">    return;</a>
+<a name="ln952"> </a>
+<a name="ln953">  vline = cmd_make_strvec (vty-&gt;buf);</a>
+<a name="ln954">  if (vline == NULL)</a>
+<a name="ln955">    return;</a>
+<a name="ln956"> </a>
+<a name="ln957">  /* In case of 'help \t'. */</a>
+<a name="ln958">  if (isspace ((int) vty-&gt;buf[vty-&gt;length - 1]))</a>
+<a name="ln959">    vector_set (vline, NULL);</a>
+<a name="ln960"> </a>
+<a name="ln961">  matched = cmd_complete_command_lib (vline, vty, &amp;ret, 1);</a>
+<a name="ln962">  </a>
+<a name="ln963">  cmd_free_strvec (vline);</a>
+<a name="ln964"> </a>
+<a name="ln965">  vty_out (vty, &quot;%s&quot;, VTY_NEWLINE);</a>
+<a name="ln966">  switch (ret)</a>
+<a name="ln967">    {</a>
+<a name="ln968">    case CMD_ERR_AMBIGUOUS:</a>
+<a name="ln969">      vty_out (vty, &quot;%% Ambiguous command.%s&quot;, VTY_NEWLINE);</a>
+<a name="ln970">      vty_prompt (vty);</a>
+<a name="ln971">      vty_redraw_line (vty);</a>
+<a name="ln972">      break;</a>
+<a name="ln973">    case CMD_ERR_NO_MATCH:</a>
+<a name="ln974">      /* vty_out (vty, &quot;%% There is no matched command.%s&quot;, VTY_NEWLINE); */</a>
+<a name="ln975">      vty_prompt (vty);</a>
+<a name="ln976">      vty_redraw_line (vty);</a>
+<a name="ln977">      break;</a>
+<a name="ln978">    case CMD_COMPLETE_FULL_MATCH:</a>
+<a name="ln979">      vty_prompt (vty);</a>
+<a name="ln980">      vty_redraw_line (vty);</a>
+<a name="ln981">      vty_backward_pure_word (vty);</a>
+<a name="ln982">      vty_insert_word_overwrite (vty, matched[0]);</a>
+<a name="ln983">      vty_self_insert (vty, ' ');</a>
+<a name="ln984">      XFREE (MTYPE_TMP, matched[0]);</a>
+<a name="ln985">      break;</a>
+<a name="ln986">    case CMD_COMPLETE_MATCH:</a>
+<a name="ln987">      vty_prompt (vty);</a>
+<a name="ln988">      vty_redraw_line (vty);</a>
+<a name="ln989">      vty_backward_pure_word (vty);</a>
+<a name="ln990">      vty_insert_word_overwrite (vty, matched[0]);</a>
+<a name="ln991">      XFREE (MTYPE_TMP, matched[0]);</a>
+<a name="ln992">      vector_only_index_free (matched);</a>
+<a name="ln993">      return;</a>
+<a name="ln994">      break;</a>
+<a name="ln995">    case CMD_COMPLETE_LIST_MATCH:</a>
+<a name="ln996">      for (i = 0; matched[i] != NULL; i++)</a>
+<a name="ln997">	{</a>
+<a name="ln998">	  if (i != 0 &amp;&amp; ((i % 6) == 0))</a>
+<a name="ln999">	    vty_out (vty, &quot;%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1000">	  vty_out (vty, &quot;%-10s &quot;, matched[i]);</a>
+<a name="ln1001">	  XFREE (MTYPE_TMP, matched[i]);</a>
+<a name="ln1002">	}</a>
+<a name="ln1003">      vty_out (vty, &quot;%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1004"> </a>
+<a name="ln1005">      vty_prompt (vty);</a>
+<a name="ln1006">      vty_redraw_line (vty);</a>
+<a name="ln1007">      break;</a>
+<a name="ln1008">    case CMD_ERR_NOTHING_TODO:</a>
+<a name="ln1009">      vty_prompt (vty);</a>
+<a name="ln1010">      vty_redraw_line (vty);</a>
+<a name="ln1011">      break;</a>
+<a name="ln1012">    default:</a>
+<a name="ln1013">      break;</a>
+<a name="ln1014">    }</a>
+<a name="ln1015">  if (matched)</a>
+<a name="ln1016">    vector_only_index_free (matched);</a>
+<a name="ln1017">}</a>
+<a name="ln1018"> </a>
+<a name="ln1019">static void</a>
+<a name="ln1020">vty_describe_fold (struct vty *vty, int cmd_width,</a>
+<a name="ln1021">		   unsigned int desc_width, struct cmd_token *token)</a>
+<a name="ln1022">{</a>
+<a name="ln1023">  char *buf;</a>
+<a name="ln1024">  const char *cmd, *p;</a>
+<a name="ln1025">  int pos;</a>
+<a name="ln1026"> </a>
+<a name="ln1027">  cmd = token-&gt;cmd[0] == '.' ? token-&gt;cmd + 1 : token-&gt;cmd;</a>
+<a name="ln1028"> </a>
+<a name="ln1029">  if (desc_width &lt;= 0)</a>
+<a name="ln1030">    {</a>
+<a name="ln1031">      vty_out (vty, &quot;  %-*s  %s%s&quot;, cmd_width, cmd, token-&gt;desc, VTY_NEWLINE);</a>
+<a name="ln1032">      return;</a>
+<a name="ln1033">    }</a>
+<a name="ln1034"> </a>
+<a name="ln1035">  buf = XCALLOC (MTYPE_TMP, strlen (token-&gt;desc) + 1);</a>
+<a name="ln1036"> </a>
+<a name="ln1037">  for (p = token-&gt;desc; strlen (p) &gt; desc_width; p += pos + 1)</a>
+<a name="ln1038">    {</a>
+<a name="ln1039">      for (pos = desc_width; pos &gt; 0; pos--)</a>
+<a name="ln1040">      if (*(p + pos) == ' ')</a>
+<a name="ln1041">        break;</a>
+<a name="ln1042"> </a>
+<a name="ln1043">      if (pos == 0)</a>
+<a name="ln1044">      break;</a>
+<a name="ln1045"> </a>
+<a name="ln1046">      strncpy (buf, p, pos);</a>
+<a name="ln1047">      buf[pos] = '\0';</a>
+<a name="ln1048">      vty_out (vty, &quot;  %-*s  %s%s&quot;, cmd_width, cmd, buf, VTY_NEWLINE);</a>
+<a name="ln1049"> </a>
+<a name="ln1050">      cmd = &quot;&quot;;</a>
+<a name="ln1051">    }</a>
+<a name="ln1052"> </a>
+<a name="ln1053">  vty_out (vty, &quot;  %-*s  %s%s&quot;, cmd_width, cmd, p, VTY_NEWLINE);</a>
+<a name="ln1054"> </a>
+<a name="ln1055">  XFREE (MTYPE_TMP, buf);</a>
+<a name="ln1056">}</a>
+<a name="ln1057"> </a>
+<a name="ln1058">/* Describe matched command function. */</a>
+<a name="ln1059">static void</a>
+<a name="ln1060">vty_describe_command (struct vty *vty)</a>
+<a name="ln1061">{</a>
+<a name="ln1062">  int ret;</a>
+<a name="ln1063">  vector vline;</a>
+<a name="ln1064">  vector describe;</a>
+<a name="ln1065">  unsigned int i, width, desc_width;</a>
+<a name="ln1066">  struct cmd_token *token, *token_cr = NULL;</a>
+<a name="ln1067"> </a>
+<a name="ln1068">  vline = cmd_make_strvec (vty-&gt;buf);</a>
+<a name="ln1069"> </a>
+<a name="ln1070">  /* In case of '&gt; ?'. */</a>
+<a name="ln1071">  if (vline == NULL)</a>
+<a name="ln1072">    {</a>
+<a name="ln1073">      vline = vector_init (1);</a>
+<a name="ln1074">      vector_set (vline, NULL);</a>
+<a name="ln1075">    }</a>
+<a name="ln1076">  else </a>
+<a name="ln1077">    if (isspace ((int) vty-&gt;buf[vty-&gt;length - 1]))</a>
+<a name="ln1078">      vector_set (vline, NULL);</a>
+<a name="ln1079"> </a>
+<a name="ln1080">  describe = cmd_describe_command (vline, vty, &amp;ret);</a>
+<a name="ln1081"> </a>
+<a name="ln1082">  vty_out (vty, &quot;%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1083"> </a>
+<a name="ln1084">  /* Ambiguous error. */</a>
+<a name="ln1085">  switch (ret)</a>
+<a name="ln1086">    {</a>
+<a name="ln1087">    case CMD_ERR_AMBIGUOUS:</a>
+<a name="ln1088">      vty_out (vty, &quot;%% Ambiguous command.%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1089">      goto out;</a>
+<a name="ln1090">      break;</a>
+<a name="ln1091">    case CMD_ERR_NO_MATCH:</a>
+<a name="ln1092">      vty_out (vty, &quot;%% There is no matched command.%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1093">      goto out;</a>
+<a name="ln1094">      break;</a>
+<a name="ln1095">    }  </a>
+<a name="ln1096"> </a>
+<a name="ln1097">  /* Get width of command string. */</a>
+<a name="ln1098">  width = 0;</a>
+<a name="ln1099">  for (i = 0; i &lt; vector_active (describe); i++)</a>
+<a name="ln1100">    if ((token = vector_slot (describe, i)) != NULL)</a>
+<a name="ln1101">      {</a>
+<a name="ln1102">	unsigned int len;</a>
+<a name="ln1103"> </a>
+<a name="ln1104">	if (token-&gt;cmd[0] == '\0')</a>
+<a name="ln1105">	  continue;</a>
+<a name="ln1106"> </a>
+<a name="ln1107">	len = strlen (token-&gt;cmd);</a>
+<a name="ln1108">	if (token-&gt;cmd[0] == '.')</a>
+<a name="ln1109">	  len--;</a>
+<a name="ln1110"> </a>
+<a name="ln1111">	if (width &lt; len)</a>
+<a name="ln1112">	  width = len;</a>
+<a name="ln1113">      }</a>
+<a name="ln1114"> </a>
+<a name="ln1115">  /* Get width of description string. */</a>
+<a name="ln1116">  desc_width = vty-&gt;width - (width + 6);</a>
+<a name="ln1117"> </a>
+<a name="ln1118">  /* Print out description. */</a>
+<a name="ln1119">  for (i = 0; i &lt; vector_active (describe); i++)</a>
+<a name="ln1120">    if ((token = vector_slot (describe, i)) != NULL)</a>
+<a name="ln1121">      {</a>
+<a name="ln1122">	if (token-&gt;cmd[0] == '\0')</a>
+<a name="ln1123">	  continue;</a>
+<a name="ln1124">	</a>
+<a name="ln1125">	if (strcmp (token-&gt;cmd, command_cr) == 0)</a>
+<a name="ln1126">	  {</a>
+<a name="ln1127">	    token_cr = token;</a>
+<a name="ln1128">	    continue;</a>
+<a name="ln1129">	  }</a>
+<a name="ln1130"> </a>
+<a name="ln1131">	if (!token-&gt;desc)</a>
+<a name="ln1132">	  vty_out (vty, &quot;  %-s%s&quot;,</a>
+<a name="ln1133">		   token-&gt;cmd[0] == '.' ? token-&gt;cmd + 1 : token-&gt;cmd,</a>
+<a name="ln1134">		   VTY_NEWLINE);</a>
+<a name="ln1135">	else if (desc_width &gt;= strlen (token-&gt;desc))</a>
+<a name="ln1136">	  vty_out (vty, &quot;  %-*s  %s%s&quot;, width,</a>
+<a name="ln1137">		   token-&gt;cmd[0] == '.' ? token-&gt;cmd + 1 : token-&gt;cmd,</a>
+<a name="ln1138">		   token-&gt;desc, VTY_NEWLINE);</a>
+<a name="ln1139">	else</a>
+<a name="ln1140">	  vty_describe_fold (vty, width, desc_width, token);</a>
+<a name="ln1141"> </a>
+<a name="ln1142">#if 0</a>
+<a name="ln1143">	vty_out (vty, &quot;  %-*s %s%s&quot;, width</a>
+<a name="ln1144">		 desc-&gt;cmd[0] == '.' ? desc-&gt;cmd + 1 : desc-&gt;cmd,</a>
+<a name="ln1145">		 desc-&gt;str ? desc-&gt;str : &quot;&quot;, VTY_NEWLINE);</a>
+<a name="ln1146">#endif /* 0 */</a>
+<a name="ln1147">      }</a>
+<a name="ln1148"> </a>
+<a name="ln1149">  if ((token = token_cr))</a>
+<a name="ln1150">    {</a>
+<a name="ln1151">      if (!token-&gt;desc)</a>
+<a name="ln1152">	vty_out (vty, &quot;  %-s%s&quot;,</a>
+<a name="ln1153">		 token-&gt;cmd[0] == '.' ? token-&gt;cmd + 1 : token-&gt;cmd,</a>
+<a name="ln1154">		 VTY_NEWLINE);</a>
+<a name="ln1155">      else if (desc_width &gt;= strlen (token-&gt;desc))</a>
+<a name="ln1156">	vty_out (vty, &quot;  %-*s  %s%s&quot;, width,</a>
+<a name="ln1157">		 token-&gt;cmd[0] == '.' ? token-&gt;cmd + 1 : token-&gt;cmd,</a>
+<a name="ln1158">		 token-&gt;desc, VTY_NEWLINE);</a>
+<a name="ln1159">      else</a>
+<a name="ln1160">	vty_describe_fold (vty, width, desc_width, token);</a>
+<a name="ln1161">    }</a>
+<a name="ln1162"> </a>
+<a name="ln1163">out:</a>
+<a name="ln1164">  cmd_free_strvec (vline);</a>
+<a name="ln1165">  if (describe)</a>
+<a name="ln1166">    vector_free (describe);</a>
+<a name="ln1167"> </a>
+<a name="ln1168">  vty_prompt (vty);</a>
+<a name="ln1169">  vty_redraw_line (vty);</a>
+<a name="ln1170">}</a>
+<a name="ln1171"> </a>
+<a name="ln1172">static void</a>
+<a name="ln1173">vty_clear_buf (struct vty *vty)</a>
+<a name="ln1174">{</a>
+<a name="ln1175">  memset (vty-&gt;buf, 0, vty-&gt;max);</a>
+<a name="ln1176">}</a>
+<a name="ln1177"> </a>
+<a name="ln1178">/* ^C stop current input and do not add command line to the history. */</a>
+<a name="ln1179">static void</a>
+<a name="ln1180">vty_stop_input (struct vty *vty)</a>
+<a name="ln1181">{</a>
+<a name="ln1182">  vty-&gt;cp = vty-&gt;length = 0;</a>
+<a name="ln1183">  vty_clear_buf (vty);</a>
+<a name="ln1184">  vty_out (vty, &quot;%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1185"> </a>
+<a name="ln1186">  switch (vty-&gt;node)</a>
+<a name="ln1187">    {</a>
+<a name="ln1188">    case VIEW_NODE:</a>
+<a name="ln1189">    case ENABLE_NODE:</a>
+<a name="ln1190">    case RESTRICTED_NODE:</a>
+<a name="ln1191">      /* Nothing to do. */</a>
+<a name="ln1192">      break;</a>
+<a name="ln1193">    case CONFIG_NODE:</a>
+<a name="ln1194">    case INTERFACE_NODE:</a>
+<a name="ln1195">    case ZEBRA_NODE:</a>
+<a name="ln1196">    case RIP_NODE:</a>
+<a name="ln1197">    case RIPNG_NODE:</a>
+<a name="ln1198">    case BABEL_NODE:</a>
+<a name="ln1199">    case BGP_NODE:</a>
+<a name="ln1200">    case RMAP_NODE:</a>
+<a name="ln1201">    case OSPF_NODE:</a>
+<a name="ln1202">    case OSPF6_NODE:</a>
+<a name="ln1203">    case ISIS_NODE:</a>
+<a name="ln1204">    case KEYCHAIN_NODE:</a>
+<a name="ln1205">    case KEYCHAIN_KEY_NODE:</a>
+<a name="ln1206">    case MASC_NODE:</a>
+<a name="ln1207">    case PIM_NODE:</a>
+<a name="ln1208">    case VTY_NODE:</a>
+<a name="ln1209">      vty_config_unlock (vty);</a>
+<a name="ln1210">      vty-&gt;node = ENABLE_NODE;</a>
+<a name="ln1211">      break;</a>
+<a name="ln1212">    default:</a>
+<a name="ln1213">      /* Unknown node, we have to ignore it. */</a>
+<a name="ln1214">      break;</a>
+<a name="ln1215">    }</a>
+<a name="ln1216">  vty_prompt (vty);</a>
+<a name="ln1217"> </a>
+<a name="ln1218">  /* Set history pointer to the latest one. */</a>
+<a name="ln1219">  vty-&gt;hp = vty-&gt;hindex;</a>
+<a name="ln1220">}</a>
+<a name="ln1221"> </a>
+<a name="ln1222">/* Add current command line to the history buffer. */</a>
+<a name="ln1223">static void</a>
+<a name="ln1224">vty_hist_add (struct vty *vty)</a>
+<a name="ln1225">{</a>
+<a name="ln1226">  int index;</a>
+<a name="ln1227"> </a>
+<a name="ln1228">  if (vty-&gt;length == 0)</a>
+<a name="ln1229">    return;</a>
+<a name="ln1230"> </a>
+<a name="ln1231">  index = vty-&gt;hindex ? vty-&gt;hindex - 1 : VTY_MAXHIST - 1;</a>
+<a name="ln1232"> </a>
+<a name="ln1233">  /* Ignore the same string as previous one. */</a>
+<a name="ln1234">  if (vty-&gt;hist[index])</a>
+<a name="ln1235">    if (strcmp (vty-&gt;buf, vty-&gt;hist[index]) == 0)</a>
+<a name="ln1236">      {</a>
+<a name="ln1237">      vty-&gt;hp = vty-&gt;hindex;</a>
+<a name="ln1238">      return;</a>
+<a name="ln1239">      }</a>
+<a name="ln1240"> </a>
+<a name="ln1241">  /* Insert history entry. */</a>
+<a name="ln1242">  if (vty-&gt;hist[vty-&gt;hindex])</a>
+<a name="ln1243">    XFREE (MTYPE_VTY_HIST, vty-&gt;hist[vty-&gt;hindex]);</a>
+<a name="ln1244">  vty-&gt;hist[vty-&gt;hindex] = XSTRDUP (MTYPE_VTY_HIST, vty-&gt;buf);</a>
+<a name="ln1245"> </a>
+<a name="ln1246">  /* History index rotation. */</a>
+<a name="ln1247">  vty-&gt;hindex++;</a>
+<a name="ln1248">  if (vty-&gt;hindex == VTY_MAXHIST)</a>
+<a name="ln1249">    vty-&gt;hindex = 0;</a>
+<a name="ln1250"> </a>
+<a name="ln1251">  vty-&gt;hp = vty-&gt;hindex;</a>
+<a name="ln1252">}</a>
+<a name="ln1253"> </a>
+<a name="ln1254">/* #define TELNET_OPTION_DEBUG */</a>
+<a name="ln1255"> </a>
+<a name="ln1256">/* Get telnet window size. */</a>
+<a name="ln1257">static int</a>
+<a name="ln1258">vty_telnet_option (struct vty *vty, unsigned char *buf, int nbytes)</a>
+<a name="ln1259">{</a>
+<a name="ln1260">#ifdef TELNET_OPTION_DEBUG</a>
+<a name="ln1261">  int i;</a>
+<a name="ln1262"> </a>
+<a name="ln1263">  for (i = 0; i &lt; nbytes; i++)</a>
+<a name="ln1264">    {</a>
+<a name="ln1265">      switch (buf[i])</a>
+<a name="ln1266">	{</a>
+<a name="ln1267">	case IAC:</a>
+<a name="ln1268">	  vty_out (vty, &quot;IAC &quot;);</a>
+<a name="ln1269">	  break;</a>
+<a name="ln1270">	case WILL:</a>
+<a name="ln1271">	  vty_out (vty, &quot;WILL &quot;);</a>
+<a name="ln1272">	  break;</a>
+<a name="ln1273">	case WONT:</a>
+<a name="ln1274">	  vty_out (vty, &quot;WONT &quot;);</a>
+<a name="ln1275">	  break;</a>
+<a name="ln1276">	case DO:</a>
+<a name="ln1277">	  vty_out (vty, &quot;DO &quot;);</a>
+<a name="ln1278">	  break;</a>
+<a name="ln1279">	case DONT:</a>
+<a name="ln1280">	  vty_out (vty, &quot;DONT &quot;);</a>
+<a name="ln1281">	  break;</a>
+<a name="ln1282">	case SB:</a>
+<a name="ln1283">	  vty_out (vty, &quot;SB &quot;);</a>
+<a name="ln1284">	  break;</a>
+<a name="ln1285">	case SE:</a>
+<a name="ln1286">	  vty_out (vty, &quot;SE &quot;);</a>
+<a name="ln1287">	  break;</a>
+<a name="ln1288">	case TELOPT_ECHO:</a>
+<a name="ln1289">	  vty_out (vty, &quot;TELOPT_ECHO %s&quot;, VTY_NEWLINE);</a>
+<a name="ln1290">	  break;</a>
+<a name="ln1291">	case TELOPT_SGA:</a>
+<a name="ln1292">	  vty_out (vty, &quot;TELOPT_SGA %s&quot;, VTY_NEWLINE);</a>
+<a name="ln1293">	  break;</a>
+<a name="ln1294">	case TELOPT_NAWS:</a>
+<a name="ln1295">	  vty_out (vty, &quot;TELOPT_NAWS %s&quot;, VTY_NEWLINE);</a>
+<a name="ln1296">	  break;</a>
+<a name="ln1297">	default:</a>
+<a name="ln1298">	  vty_out (vty, &quot;%x &quot;, buf[i]);</a>
+<a name="ln1299">	  break;</a>
+<a name="ln1300">	}</a>
+<a name="ln1301">    }</a>
+<a name="ln1302">  vty_out (vty, &quot;%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1303"> </a>
+<a name="ln1304">#endif /* TELNET_OPTION_DEBUG */</a>
+<a name="ln1305"> </a>
+<a name="ln1306">  switch (buf[0])</a>
+<a name="ln1307">    {</a>
+<a name="ln1308">    case SB:</a>
+<a name="ln1309">      vty-&gt;sb_len = 0;</a>
+<a name="ln1310">      vty-&gt;iac_sb_in_progress = 1;</a>
+<a name="ln1311">      return 0;</a>
+<a name="ln1312">      break;</a>
+<a name="ln1313">    case SE: </a>
+<a name="ln1314">      {</a>
+<a name="ln1315">	if (!vty-&gt;iac_sb_in_progress)</a>
+<a name="ln1316">	  return 0;</a>
+<a name="ln1317"> </a>
+<a name="ln1318">	if ((vty-&gt;sb_len == 0) || (vty-&gt;sb_buf[0] == '\0'))</a>
+<a name="ln1319">	  {</a>
+<a name="ln1320">	    vty-&gt;iac_sb_in_progress = 0;</a>
+<a name="ln1321">	    return 0;</a>
+<a name="ln1322">	  }</a>
+<a name="ln1323">	switch (vty-&gt;sb_buf[0])</a>
+<a name="ln1324">	  {</a>
+<a name="ln1325">	  case TELOPT_NAWS:</a>
+<a name="ln1326">	    if (vty-&gt;sb_len != TELNET_NAWS_SB_LEN)</a>
+<a name="ln1327">	      zlog_warn(&quot;RFC 1073 violation detected: telnet NAWS option &quot;</a>
+<a name="ln1328">			&quot;should send %d characters, but we received %lu&quot;,</a>
+<a name="ln1329">			TELNET_NAWS_SB_LEN, (u_long)vty-&gt;sb_len);</a>
+<a name="ln1330">	    else if (sizeof(vty-&gt;sb_buf) &lt; TELNET_NAWS_SB_LEN)</a>
+<a name="ln1331">	      zlog_err(&quot;Bug detected: sizeof(vty-&gt;sb_buf) %lu &lt; %d, &quot;</a>
+<a name="ln1332">		       &quot;too small to handle the telnet NAWS option&quot;,</a>
+<a name="ln1333">		       (u_long)sizeof(vty-&gt;sb_buf), TELNET_NAWS_SB_LEN);</a>
+<a name="ln1334">	    else</a>
+<a name="ln1335">	      {</a>
+<a name="ln1336">		vty-&gt;width = ((vty-&gt;sb_buf[1] &lt;&lt; 8)|vty-&gt;sb_buf[2]);</a>
+<a name="ln1337">		vty-&gt;height = ((vty-&gt;sb_buf[3] &lt;&lt; 8)|vty-&gt;sb_buf[4]);</a>
+<a name="ln1338">#ifdef TELNET_OPTION_DEBUG</a>
+<a name="ln1339">		vty_out(vty, &quot;TELNET NAWS window size negotiation completed: &quot;</a>
+<a name="ln1340">			      &quot;width %d, height %d%s&quot;,</a>
+<a name="ln1341">			vty-&gt;width, vty-&gt;height, VTY_NEWLINE);</a>
+<a name="ln1342">#endif</a>
+<a name="ln1343">	      }</a>
+<a name="ln1344">	    break;</a>
+<a name="ln1345">	  }</a>
+<a name="ln1346">	vty-&gt;iac_sb_in_progress = 0;</a>
+<a name="ln1347">	return 0;</a>
+<a name="ln1348">	break;</a>
+<a name="ln1349">      }</a>
+<a name="ln1350">    default:</a>
+<a name="ln1351">      break;</a>
+<a name="ln1352">    }</a>
+<a name="ln1353">  return 1;</a>
+<a name="ln1354">}</a>
+<a name="ln1355"> </a>
+<a name="ln1356">/* Execute current command line. */</a>
+<a name="ln1357">static int</a>
+<a name="ln1358">vty_execute (struct vty *vty)</a>
+<a name="ln1359">{</a>
+<a name="ln1360">  int ret;</a>
+<a name="ln1361"> </a>
+<a name="ln1362">  ret = CMD_SUCCESS;</a>
+<a name="ln1363"> </a>
+<a name="ln1364">  switch (vty-&gt;node)</a>
+<a name="ln1365">    {</a>
+<a name="ln1366">    case AUTH_NODE:</a>
+<a name="ln1367">    case AUTH_ENABLE_NODE:</a>
+<a name="ln1368">      vty_auth (vty, vty-&gt;buf);</a>
+<a name="ln1369">      break;</a>
+<a name="ln1370">    default:</a>
+<a name="ln1371">      ret = vty_command (vty, vty-&gt;buf);</a>
+<a name="ln1372">      if (vty-&gt;type == VTY_TERM)</a>
+<a name="ln1373">	vty_hist_add (vty);</a>
+<a name="ln1374">      break;</a>
+<a name="ln1375">    }</a>
+<a name="ln1376"> </a>
+<a name="ln1377">  /* Clear command line buffer. */</a>
+<a name="ln1378">  vty-&gt;cp = vty-&gt;length = 0;</a>
+<a name="ln1379">  vty_clear_buf (vty);</a>
+<a name="ln1380"> </a>
+<a name="ln1381">  if (vty-&gt;status != VTY_CLOSE )</a>
+<a name="ln1382">    vty_prompt (vty);</a>
+<a name="ln1383"> </a>
+<a name="ln1384">  return ret;</a>
+<a name="ln1385">}</a>
+<a name="ln1386"> </a>
+<a name="ln1387">#define CONTROL(X)  ((X) - '@')</a>
+<a name="ln1388">#define VTY_NORMAL     0</a>
+<a name="ln1389">#define VTY_PRE_ESCAPE 1  /* Esc seen */</a>
+<a name="ln1390">#define VTY_ESCAPE     2  /* ANSI terminal escape (Esc-[) seen */</a>
+<a name="ln1391">#define VTY_LITERAL    3  /* Next char taken as literal */</a>
+<a name="ln1392"> </a>
+<a name="ln1393">/* Escape character command map. */</a>
+<a name="ln1394">static void</a>
+<a name="ln1395">vty_escape_map (unsigned char c, struct vty *vty)</a>
+<a name="ln1396">{</a>
+<a name="ln1397">  switch (c)</a>
+<a name="ln1398">    {</a>
+<a name="ln1399">    case ('A'):</a>
+<a name="ln1400">      vty_previous_line (vty);</a>
+<a name="ln1401">      break;</a>
+<a name="ln1402">    case ('B'):</a>
+<a name="ln1403">      vty_next_line (vty);</a>
+<a name="ln1404">      break;</a>
+<a name="ln1405">    case ('C'):</a>
+<a name="ln1406">      vty_forward_char (vty);</a>
+<a name="ln1407">      break;</a>
+<a name="ln1408">    case ('D'):</a>
+<a name="ln1409">      vty_backward_char (vty);</a>
+<a name="ln1410">      break;</a>
+<a name="ln1411">    default:</a>
+<a name="ln1412">      break;</a>
+<a name="ln1413">    }</a>
+<a name="ln1414"> </a>
+<a name="ln1415">  /* Go back to normal mode. */</a>
+<a name="ln1416">  vty-&gt;escape = VTY_NORMAL;</a>
+<a name="ln1417">}</a>
+<a name="ln1418"> </a>
+<a name="ln1419">/* Quit print out to the buffer. */</a>
+<a name="ln1420">static void</a>
+<a name="ln1421">vty_buffer_reset (struct vty *vty)</a>
+<a name="ln1422">{</a>
+<a name="ln1423">  buffer_reset (vty-&gt;obuf);</a>
+<a name="ln1424">  vty_prompt (vty);</a>
+<a name="ln1425">  vty_redraw_line (vty);</a>
+<a name="ln1426">}</a>
+<a name="ln1427"> </a>
+<a name="ln1428">/* Read data via vty socket. */</a>
+<a name="ln1429">static int</a>
+<a name="ln1430">vty_read (struct thread *thread)</a>
+<a name="ln1431">{</a>
+<a name="ln1432">  int i;</a>
+<a name="ln1433">  int nbytes;</a>
+<a name="ln1434">  unsigned char buf[VTY_READ_BUFSIZ];</a>
+<a name="ln1435"> </a>
+<a name="ln1436">  int vty_sock = THREAD_FD (thread);</a>
+<a name="ln1437">  struct vty *vty = THREAD_ARG (thread);</a>
+<a name="ln1438">  vty-&gt;t_read = NULL;</a>
+<a name="ln1439"> </a>
+<a name="ln1440">  /* Read raw data from socket */</a>
+<a name="ln1441">  if ((nbytes = read (vty-&gt;fd, buf, VTY_READ_BUFSIZ)) &lt;= 0)</a>
+<a name="ln1442">    {</a>
+<a name="ln1443">      if (nbytes &lt; 0)</a>
+<a name="ln1444">	{</a>
+<a name="ln1445">	  if (ERRNO_IO_RETRY(errno))</a>
+<a name="ln1446">	    {</a>
+<a name="ln1447">	      vty_event (VTY_READ, vty_sock, vty);</a>
+<a name="ln1448">	      return 0;</a>
+<a name="ln1449">	    }</a>
+<a name="ln1450">	  vty-&gt;monitor = 0; /* disable monitoring to avoid infinite recursion */</a>
+<a name="ln1451">	  zlog_warn(&quot;%s: read error on vty client fd %d, closing: %s&quot;,</a>
+<a name="ln1452">		    __func__, vty-&gt;fd, safe_strerror(errno));</a>
+<a name="ln1453">          buffer_reset(vty-&gt;obuf);</a>
+<a name="ln1454">	}</a>
+<a name="ln1455">      vty-&gt;status = VTY_CLOSE;</a>
+<a name="ln1456">    }</a>
+<a name="ln1457"> </a>
+<a name="ln1458">  for (i = 0; i &lt; nbytes; i++) </a>
+<a name="ln1459">    {</a>
+<a name="ln1460">      if (buf[i] == IAC)</a>
+<a name="ln1461">	{</a>
+<a name="ln1462">	  if (!vty-&gt;iac)</a>
+<a name="ln1463">	    {</a>
+<a name="ln1464">	      vty-&gt;iac = 1;</a>
+<a name="ln1465">	      continue;</a>
+<a name="ln1466">	    }</a>
+<a name="ln1467">	  else</a>
+<a name="ln1468">	    {</a>
+<a name="ln1469">	      vty-&gt;iac = 0;</a>
+<a name="ln1470">	    }</a>
+<a name="ln1471">	}</a>
+<a name="ln1472">      </a>
+<a name="ln1473">      if (vty-&gt;iac_sb_in_progress &amp;&amp; !vty-&gt;iac)</a>
+<a name="ln1474">	{</a>
+<a name="ln1475">	    if (vty-&gt;sb_len &lt; sizeof(vty-&gt;sb_buf))</a>
+<a name="ln1476">	      vty-&gt;sb_buf[vty-&gt;sb_len] = buf[i];</a>
+<a name="ln1477">	    vty-&gt;sb_len++;</a>
+<a name="ln1478">	    continue;</a>
+<a name="ln1479">	}</a>
+<a name="ln1480"> </a>
+<a name="ln1481">      if (vty-&gt;iac)</a>
+<a name="ln1482">	{</a>
+<a name="ln1483">	  /* In case of telnet command */</a>
+<a name="ln1484">	  int ret = 0;</a>
+<a name="ln1485">	  ret = vty_telnet_option (vty, buf + i, nbytes - i);</a>
+<a name="ln1486">	  vty-&gt;iac = 0;</a>
+<a name="ln1487">	  i += ret;</a>
+<a name="ln1488">	  continue;</a>
+<a name="ln1489">	}</a>
+<a name="ln1490">	        </a>
+<a name="ln1491"> </a>
+<a name="ln1492">      if (vty-&gt;status == VTY_MORE)</a>
+<a name="ln1493">	{</a>
+<a name="ln1494">	  switch (buf[i])</a>
+<a name="ln1495">	    {</a>
+<a name="ln1496">	    case CONTROL('C'):</a>
+<a name="ln1497">	    case 'q':</a>
+<a name="ln1498">	    case 'Q':</a>
+<a name="ln1499">	      vty_buffer_reset (vty);</a>
+<a name="ln1500">	      break;</a>
+<a name="ln1501">#if 0 /* More line does not work for &quot;show ip bgp&quot;.  */</a>
+<a name="ln1502">	    case '\n':</a>
+<a name="ln1503">	    case '\r':</a>
+<a name="ln1504">	      vty-&gt;status = VTY_MORELINE;</a>
+<a name="ln1505">	      break;</a>
+<a name="ln1506">#endif</a>
+<a name="ln1507">	    default:</a>
+<a name="ln1508">	      break;</a>
+<a name="ln1509">	    }</a>
+<a name="ln1510">	  continue;</a>
+<a name="ln1511">	}</a>
+<a name="ln1512"> </a>
+<a name="ln1513">      /* Escape character. */</a>
+<a name="ln1514">      if (vty-&gt;escape == VTY_ESCAPE)</a>
+<a name="ln1515">	{</a>
+<a name="ln1516">	  vty_escape_map (buf[i], vty);</a>
+<a name="ln1517">	  continue;</a>
+<a name="ln1518">	}</a>
+<a name="ln1519">      </a>
+<a name="ln1520">      if (vty-&gt;escape == VTY_LITERAL)</a>
+<a name="ln1521">        {</a>
+<a name="ln1522">          vty_self_insert (vty, buf[i]);</a>
+<a name="ln1523">          vty-&gt;escape = VTY_NORMAL;</a>
+<a name="ln1524">          continue;</a>
+<a name="ln1525">        }</a>
+<a name="ln1526">      </a>
+<a name="ln1527">      /* Pre-escape status. */</a>
+<a name="ln1528">      if (vty-&gt;escape == VTY_PRE_ESCAPE)</a>
+<a name="ln1529">	{</a>
+<a name="ln1530">	  switch (buf[i])</a>
+<a name="ln1531">	    {</a>
+<a name="ln1532">	    case '[':</a>
+<a name="ln1533">	      vty-&gt;escape = VTY_ESCAPE;</a>
+<a name="ln1534">	      break;</a>
+<a name="ln1535">	    case 'b':</a>
+<a name="ln1536">	      vty_backward_word (vty);</a>
+<a name="ln1537">	      vty-&gt;escape = VTY_NORMAL;</a>
+<a name="ln1538">	      break;</a>
+<a name="ln1539">	    case 'f':</a>
+<a name="ln1540">	      vty_forward_word (vty);</a>
+<a name="ln1541">	      vty-&gt;escape = VTY_NORMAL;</a>
+<a name="ln1542">	      break;</a>
+<a name="ln1543">	    case 'd':</a>
+<a name="ln1544">	      vty_forward_kill_word (vty);</a>
+<a name="ln1545">	      vty-&gt;escape = VTY_NORMAL;</a>
+<a name="ln1546">	      break;</a>
+<a name="ln1547">	    case CONTROL('H'):</a>
+<a name="ln1548">	    case 0x7f:</a>
+<a name="ln1549">	      vty_backward_kill_word (vty);</a>
+<a name="ln1550">	      vty-&gt;escape = VTY_NORMAL;</a>
+<a name="ln1551">	      break;</a>
+<a name="ln1552">	    default:</a>
+<a name="ln1553">	      vty-&gt;escape = VTY_NORMAL;</a>
+<a name="ln1554">	      break;</a>
+<a name="ln1555">	    }</a>
+<a name="ln1556">	  continue;</a>
+<a name="ln1557">	}</a>
+<a name="ln1558"> </a>
+<a name="ln1559">      switch (buf[i])</a>
+<a name="ln1560">	{</a>
+<a name="ln1561">	case CONTROL('A'):</a>
+<a name="ln1562">	  vty_beginning_of_line (vty);</a>
+<a name="ln1563">	  break;</a>
+<a name="ln1564">	case CONTROL('B'):</a>
+<a name="ln1565">	  vty_backward_char (vty);</a>
+<a name="ln1566">	  break;</a>
+<a name="ln1567">	case CONTROL('C'):</a>
+<a name="ln1568">	  vty_stop_input (vty);</a>
+<a name="ln1569">	  break;</a>
+<a name="ln1570">	case CONTROL('D'):</a>
+<a name="ln1571">	  vty_delete_char (vty);</a>
+<a name="ln1572">	  break;</a>
+<a name="ln1573">	case CONTROL('E'):</a>
+<a name="ln1574">	  vty_end_of_line (vty);</a>
+<a name="ln1575">	  break;</a>
+<a name="ln1576">	case CONTROL('F'):</a>
+<a name="ln1577">	  vty_forward_char (vty);</a>
+<a name="ln1578">	  break;</a>
+<a name="ln1579">	case CONTROL('H'):</a>
+<a name="ln1580">	case 0x7f:</a>
+<a name="ln1581">	  vty_delete_backward_char (vty);</a>
+<a name="ln1582">	  break;</a>
+<a name="ln1583">	case CONTROL('K'):</a>
+<a name="ln1584">	  vty_kill_line (vty);</a>
+<a name="ln1585">	  break;</a>
+<a name="ln1586">	case CONTROL('N'):</a>
+<a name="ln1587">	  vty_next_line (vty);</a>
+<a name="ln1588">	  break;</a>
+<a name="ln1589">	case CONTROL('P'):</a>
+<a name="ln1590">	  vty_previous_line (vty);</a>
+<a name="ln1591">	  break;</a>
+<a name="ln1592">	case CONTROL('T'):</a>
+<a name="ln1593">	  vty_transpose_chars (vty);</a>
+<a name="ln1594">	  break;</a>
+<a name="ln1595">	case CONTROL('U'):</a>
+<a name="ln1596">	  vty_kill_line_from_beginning (vty);</a>
+<a name="ln1597">	  break;</a>
+<a name="ln1598">        case CONTROL('V'):</a>
+<a name="ln1599">          vty-&gt;escape = VTY_LITERAL;</a>
+<a name="ln1600">          break;</a>
+<a name="ln1601">	case CONTROL('W'):</a>
+<a name="ln1602">	  vty_backward_kill_word (vty);</a>
+<a name="ln1603">	  break;</a>
+<a name="ln1604">	case CONTROL('Z'):</a>
+<a name="ln1605">	  vty_end_config (vty);</a>
+<a name="ln1606">	  break;</a>
+<a name="ln1607">	case '\n':</a>
+<a name="ln1608">	case '\r':</a>
+<a name="ln1609">	  vty_out (vty, &quot;%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1610">	  vty_execute (vty);</a>
+<a name="ln1611">	  break;</a>
+<a name="ln1612">	case '\t':</a>
+<a name="ln1613">	  vty_complete_command (vty);</a>
+<a name="ln1614">	  break;</a>
+<a name="ln1615">	case '?':</a>
+<a name="ln1616">	  if (vty-&gt;node == AUTH_NODE || vty-&gt;node == AUTH_ENABLE_NODE)</a>
+<a name="ln1617">	    vty_self_insert (vty, buf[i]);</a>
+<a name="ln1618">	  else</a>
+<a name="ln1619">	    vty_describe_command (vty);</a>
+<a name="ln1620">	  break;</a>
+<a name="ln1621">	case '\033':</a>
+<a name="ln1622">	  if (i + 1 &lt; nbytes &amp;&amp; buf[i + 1] == '[')</a>
+<a name="ln1623">	    {</a>
+<a name="ln1624">	      vty-&gt;escape = VTY_ESCAPE;</a>
+<a name="ln1625">	      i++;</a>
+<a name="ln1626">	    }</a>
+<a name="ln1627">	  else</a>
+<a name="ln1628">	    vty-&gt;escape = VTY_PRE_ESCAPE;</a>
+<a name="ln1629">	  break;</a>
+<a name="ln1630">	default:</a>
+<a name="ln1631">	  if (buf[i] &gt; 31 &amp;&amp; buf[i] &lt; 127)</a>
+<a name="ln1632">	    vty_self_insert (vty, buf[i]);</a>
+<a name="ln1633">	  break;</a>
+<a name="ln1634">	}</a>
+<a name="ln1635">    }</a>
+<a name="ln1636"> </a>
+<a name="ln1637">  /* Check status. */</a>
+<a name="ln1638">  if (vty-&gt;status == VTY_CLOSE)</a>
+<a name="ln1639">    vty_close (vty);</a>
+<a name="ln1640">  else</a>
+<a name="ln1641">    {</a>
+<a name="ln1642">      vty_event (VTY_WRITE, vty-&gt;wfd, vty);</a>
+<a name="ln1643">      vty_event (VTY_READ, vty_sock, vty);</a>
+<a name="ln1644">    }</a>
+<a name="ln1645">  return 0;</a>
+<a name="ln1646">}</a>
+<a name="ln1647"> </a>
+<a name="ln1648">/* Flush buffer to the vty. */</a>
+<a name="ln1649">static int</a>
+<a name="ln1650">vty_flush (struct thread *thread)</a>
+<a name="ln1651">{</a>
+<a name="ln1652">  int erase;</a>
+<a name="ln1653">  buffer_status_t flushrc;</a>
+<a name="ln1654">  int vty_sock = THREAD_FD (thread);</a>
+<a name="ln1655">  struct vty *vty = THREAD_ARG (thread);</a>
+<a name="ln1656"> </a>
+<a name="ln1657">  vty-&gt;t_write = NULL;</a>
+<a name="ln1658"> </a>
+<a name="ln1659">  /* Tempolary disable read thread. */</a>
+<a name="ln1660">  if ((vty-&gt;lines == 0) &amp;&amp; vty-&gt;t_read)</a>
+<a name="ln1661">    {</a>
+<a name="ln1662">      thread_cancel (vty-&gt;t_read);</a>
+<a name="ln1663">      vty-&gt;t_read = NULL;</a>
+<a name="ln1664">    }</a>
+<a name="ln1665"> </a>
+<a name="ln1666">  /* Function execution continue. */</a>
+<a name="ln1667">  erase = ((vty-&gt;status == VTY_MORE || vty-&gt;status == VTY_MORELINE));</a>
+<a name="ln1668"> </a>
+<a name="ln1669">  /* N.B. if width is 0, that means we don't know the window size. */</a>
+<a name="ln1670">  if ((vty-&gt;lines == 0) || (vty-&gt;width == 0) || (vty-&gt;height == 0))</a>
+<a name="ln1671">    flushrc = buffer_flush_available(vty-&gt;obuf, vty_sock);</a>
+<a name="ln1672">  else if (vty-&gt;status == VTY_MORELINE)</a>
+<a name="ln1673">    flushrc = buffer_flush_window(vty-&gt;obuf, vty_sock, vty-&gt;width,</a>
+<a name="ln1674">				  1, erase, 0);</a>
+<a name="ln1675">  else</a>
+<a name="ln1676">    flushrc = buffer_flush_window(vty-&gt;obuf, vty_sock, vty-&gt;width,</a>
+<a name="ln1677">				  vty-&gt;lines &gt;= 0 ? vty-&gt;lines :</a>
+<a name="ln1678">						    vty-&gt;height,</a>
+<a name="ln1679">				  erase, 0);</a>
+<a name="ln1680">  switch (flushrc)</a>
+<a name="ln1681">    {</a>
+<a name="ln1682">    case BUFFER_ERROR:</a>
+<a name="ln1683">      vty-&gt;monitor = 0; /* disable monitoring to avoid infinite recursion */</a>
+<a name="ln1684">      zlog_warn(&quot;buffer_flush failed on vty client fd %d, closing&quot;,</a>
+<a name="ln1685">		vty-&gt;fd);</a>
+<a name="ln1686">      buffer_reset(vty-&gt;obuf);</a>
+<a name="ln1687">      vty_close(vty);</a>
+<a name="ln1688">      return 0;</a>
+<a name="ln1689">    case BUFFER_EMPTY:</a>
+<a name="ln1690">      if (vty-&gt;status == VTY_CLOSE)</a>
+<a name="ln1691">	vty_close (vty);</a>
+<a name="ln1692">      else</a>
+<a name="ln1693">	{</a>
+<a name="ln1694">	  vty-&gt;status = VTY_NORMAL;</a>
+<a name="ln1695">	  if (vty-&gt;lines == 0)</a>
+<a name="ln1696">	    vty_event (VTY_READ, vty_sock, vty);</a>
+<a name="ln1697">	}</a>
+<a name="ln1698">      break;</a>
+<a name="ln1699">    case BUFFER_PENDING:</a>
+<a name="ln1700">      /* There is more data waiting to be written. */</a>
+<a name="ln1701">      vty-&gt;status = VTY_MORE;</a>
+<a name="ln1702">      if (vty-&gt;lines == 0)</a>
+<a name="ln1703">	vty_event (VTY_WRITE, vty_sock, vty);</a>
+<a name="ln1704">      break;</a>
+<a name="ln1705">    }</a>
+<a name="ln1706"> </a>
+<a name="ln1707">  return 0;</a>
+<a name="ln1708">}</a>
+<a name="ln1709"> </a>
+<a name="ln1710">/* allocate and initialise vty */</a>
+<a name="ln1711">static struct vty *</a>
+<a name="ln1712">vty_new_init (int vty_sock)</a>
+<a name="ln1713">{</a>
+<a name="ln1714">  struct vty *vty;</a>
+<a name="ln1715"> </a>
+<a name="ln1716">  vty = vty_new ();</a>
+<a name="ln1717">  vty-&gt;fd = vty_sock;</a>
+<a name="ln1718">  vty-&gt;wfd = vty_sock;</a>
+<a name="ln1719">  vty-&gt;type = VTY_TERM;</a>
+<a name="ln1720">  vty-&gt;node = AUTH_NODE;</a>
+<a name="ln1721">  vty-&gt;fail = 0;</a>
+<a name="ln1722">  vty-&gt;cp = 0;</a>
+<a name="ln1723">  vty_clear_buf (vty);</a>
+<a name="ln1724">  vty-&gt;length = 0;</a>
+<a name="ln1725">  memset (vty-&gt;hist, 0, sizeof (vty-&gt;hist));</a>
+<a name="ln1726">  vty-&gt;hp = 0;</a>
+<a name="ln1727">  vty-&gt;hindex = 0;</a>
+<a name="ln1728">  vector_set_index (vtyvec, vty_sock, vty);</a>
+<a name="ln1729">  vty-&gt;status = VTY_NORMAL;</a>
+<a name="ln1730">  vty-&gt;lines = -1;</a>
+<a name="ln1731">  vty-&gt;iac = 0;</a>
+<a name="ln1732">  vty-&gt;iac_sb_in_progress = 0;</a>
+<a name="ln1733">  vty-&gt;sb_len = 0;</a>
+<a name="ln1734"> </a>
+<a name="ln1735">  return vty;</a>
+<a name="ln1736">}</a>
+<a name="ln1737"> </a>
+<a name="ln1738">/* Create new vty structure. */</a>
+<a name="ln1739">static struct vty *</a>
+<a name="ln1740">vty_create (int vty_sock, union sockunion *su)</a>
+<a name="ln1741">{</a>
+<a name="ln1742">  char buf[SU_ADDRSTRLEN];</a>
+<a name="ln1743">  struct vty *vty;</a>
+<a name="ln1744"> </a>
+<a name="ln1745">  sockunion2str(su, buf, SU_ADDRSTRLEN);</a>
+<a name="ln1746"> </a>
+<a name="ln1747">  /* Allocate new vty structure and set up default values. */</a>
+<a name="ln1748">  vty = vty_new_init (vty_sock);</a>
+<a name="ln1749"> </a>
+<a name="ln1750">  /* configurable parameters not part of basic init */</a>
+<a name="ln1751">  vty-&gt;v_timeout = vty_timeout_val;</a>
+<a name="ln1752">  strcpy (vty-&gt;address, buf);</a>
+<a name="ln1753">  if (no_password_check)</a>
+<a name="ln1754">    {</a>
+<a name="ln1755">      if (restricted_mode)</a>
+<a name="ln1756">        vty-&gt;node = RESTRICTED_NODE;</a>
+<a name="ln1757">      else if (host.advanced)</a>
+<a name="ln1758">	vty-&gt;node = ENABLE_NODE;</a>
+<a name="ln1759">      else</a>
+<a name="ln1760">	vty-&gt;node = VIEW_NODE;</a>
+<a name="ln1761">    }</a>
+<a name="ln1762">  if (host.lines &gt;= 0)</a>
+<a name="ln1763">    vty-&gt;lines = host.lines;</a>
+<a name="ln1764"> </a>
+<a name="ln1765">  if (! no_password_check)</a>
+<a name="ln1766">    {</a>
+<a name="ln1767">      /* Vty is not available if password isn't set. */</a>
+<a name="ln1768">      if (host.password == NULL &amp;&amp; host.password_encrypt == NULL)</a>
+<a name="ln1769">	{</a>
+<a name="ln1770">	  vty_out (vty, &quot;Vty password is not set.%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1771">	  vty-&gt;status = VTY_CLOSE;</a>
+<a name="ln1772">	  vty_close (vty);</a>
+<a name="ln1773">	  return NULL;</a>
+<a name="ln1774">	}</a>
+<a name="ln1775">    }</a>
+<a name="ln1776"> </a>
+<a name="ln1777">  /* Say hello to the world. */</a>
+<a name="ln1778">  vty_hello (vty);</a>
+<a name="ln1779">  if (! no_password_check)</a>
+<a name="ln1780">    vty_out (vty, &quot;%sUser Access Verification%s%s&quot;, VTY_NEWLINE, VTY_NEWLINE, VTY_NEWLINE);</a>
+<a name="ln1781"> </a>
+<a name="ln1782">  /* Setting up terminal. */</a>
+<a name="ln1783">  vty_will_echo (vty);</a>
+<a name="ln1784">  vty_will_suppress_go_ahead (vty);</a>
+<a name="ln1785"> </a>
+<a name="ln1786">  vty_dont_linemode (vty);</a>
+<a name="ln1787">  vty_do_window_size (vty);</a>
+<a name="ln1788">  /* vty_dont_lflow_ahead (vty); */</a>
+<a name="ln1789"> </a>
+<a name="ln1790">  vty_prompt (vty);</a>
+<a name="ln1791"> </a>
+<a name="ln1792">  /* Add read/write thread. */</a>
+<a name="ln1793">  vty_event (VTY_WRITE, vty_sock, vty);</a>
+<a name="ln1794">  vty_event (VTY_READ, vty_sock, vty);</a>
+<a name="ln1795"> </a>
+<a name="ln1796">  return vty;</a>
+<a name="ln1797">}</a>
+<a name="ln1798"> </a>
+<a name="ln1799">/* create vty for stdio */</a>
+<a name="ln1800">static struct termios stdio_orig_termios;</a>
+<a name="ln1801">static struct vty *stdio_vty = NULL;</a>
+<a name="ln1802">static void (*stdio_vty_atclose)(void);</a>
+<a name="ln1803"> </a>
+<a name="ln1804">static void</a>
+<a name="ln1805">vty_stdio_reset (void)</a>
+<a name="ln1806">{</a>
+<a name="ln1807">  if (stdio_vty)</a>
+<a name="ln1808">    {</a>
+<a name="ln1809">      tcsetattr (0, TCSANOW, &amp;stdio_orig_termios);</a>
+<a name="ln1810">      stdio_vty = NULL;</a>
+<a name="ln1811"> </a>
+<a name="ln1812">      if (stdio_vty_atclose)</a>
+<a name="ln1813">        stdio_vty_atclose ();</a>
+<a name="ln1814">      stdio_vty_atclose = NULL;</a>
+<a name="ln1815">    }</a>
+<a name="ln1816">}</a>
+<a name="ln1817"> </a>
+<a name="ln1818">struct vty *</a>
+<a name="ln1819">vty_stdio (void (*atclose)())</a>
+<a name="ln1820">{</a>
+<a name="ln1821">  struct vty *vty;</a>
+<a name="ln1822">  struct termios termios;</a>
+<a name="ln1823"> </a>
+<a name="ln1824">  /* refuse creating two vtys on stdio */</a>
+<a name="ln1825">  if (stdio_vty)</a>
+<a name="ln1826">    return NULL;</a>
+<a name="ln1827"> </a>
+<a name="ln1828">  vty = stdio_vty = vty_new_init (0);</a>
+<a name="ln1829">  stdio_vty_atclose = atclose;</a>
+<a name="ln1830">  vty-&gt;wfd = 1;</a>
+<a name="ln1831"> </a>
+<a name="ln1832">  /* always have stdio vty in a known _unchangeable_ state, don't want config</a>
+<a name="ln1833">   * to have any effect here to make sure scripting this works as intended */</a>
+<a name="ln1834">  vty-&gt;node = ENABLE_NODE;</a>
+<a name="ln1835">  vty-&gt;v_timeout = 0;</a>
+<a name="ln1836">  strcpy (vty-&gt;address, &quot;console&quot;);</a>
+<a name="ln1837"> </a>
+<a name="ln1838">  if (!tcgetattr (0, &amp;stdio_orig_termios))</a>
+<a name="ln1839">    {</a>
+<a name="ln1840">      termios = stdio_orig_termios;</a>
+<a name="ln1841">      termios.c_iflag &amp;= ~(IGNBRK | BRKINT | PARMRK | ISTRIP</a>
+<a name="ln1842">                           | INLCR | IGNCR | ICRNL | IXON);</a>
+<a name="ln1843">      termios.c_oflag &amp;= ~OPOST;</a>
+<a name="ln1844">      termios.c_lflag &amp;= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);</a>
+<a name="ln1845">      termios.c_cflag &amp;= ~(CSIZE | PARENB);</a>
+<a name="ln1846">      termios.c_cflag |= CS8;</a>
+<a name="ln1847">      tcsetattr (0, TCSANOW, &amp;termios);</a>
+<a name="ln1848">    }</a>
+<a name="ln1849"> </a>
+<a name="ln1850">  vty_prompt (vty);</a>
+<a name="ln1851"> </a>
+<a name="ln1852">  /* Add read/write thread. */</a>
+<a name="ln1853">  vty_event (VTY_WRITE, 1, vty);</a>
+<a name="ln1854">  vty_event (VTY_READ, 0, vty);</a>
+<a name="ln1855"> </a>
+<a name="ln1856">  return vty;</a>
+<a name="ln1857">}</a>
+<a name="ln1858"> </a>
+<a name="ln1859">/* Accept connection from the network. */</a>
+<a name="ln1860">static int</a>
+<a name="ln1861">vty_accept (struct thread *thread)</a>
+<a name="ln1862">{</a>
+<a name="ln1863">  int vty_sock;</a>
+<a name="ln1864">  union sockunion su;</a>
+<a name="ln1865">  int ret;</a>
+<a name="ln1866">  unsigned int on;</a>
+<a name="ln1867">  int accept_sock;</a>
+<a name="ln1868">  struct prefix p;</a>
+<a name="ln1869">  struct access_list *acl = NULL;</a>
+<a name="ln1870">  char buf[SU_ADDRSTRLEN];</a>
+<a name="ln1871"> </a>
+<a name="ln1872">  accept_sock = THREAD_FD (thread);</a>
+<a name="ln1873"> </a>
+<a name="ln1874">  /* We continue hearing vty socket. */</a>
+<a name="ln1875">  vty_event (VTY_SERV, accept_sock, NULL);</a>
+<a name="ln1876"> </a>
+<a name="ln1877">  memset (&amp;su, 0, sizeof (union sockunion));</a>
+<a name="ln1878"> </a>
+<a name="ln1879">  /* We can handle IPv4 or IPv6 socket. */</a>
+<a name="ln1880">  vty_sock = sockunion_accept (accept_sock, &amp;su);</a>
+<a name="ln1881">  if (vty_sock &lt; 0)</a>
+<a name="ln1882">    {</a>
+<a name="ln1883">      zlog_warn (&quot;can't accept vty socket : %s&quot;, safe_strerror (errno));</a>
+<a name="ln1884">      return -1;</a>
+<a name="ln1885">    }</a>
+<a name="ln1886">  set_nonblocking(vty_sock);</a>
+<a name="ln1887"> </a>
+<a name="ln1888">  sockunion2hostprefix (&amp;su, &amp;p);</a>
+<a name="ln1889"> </a>
+<a name="ln1890">  /* VTY's accesslist apply. */</a>
+<a name="ln1891">  if (p.family == AF_INET &amp;&amp; vty_accesslist_name)</a>
+<a name="ln1892">    {</a>
+<a name="ln1893">      if ((acl = access_list_lookup (AFI_IP, vty_accesslist_name)) &amp;&amp;</a>
+<a name="ln1894">	  (access_list_apply (acl, &amp;p) == FILTER_DENY))</a>
+<a name="ln1895">	{</a>
+<a name="ln1896">	  zlog (NULL, LOG_INFO, &quot;Vty connection refused from %s&quot;,</a>
+<a name="ln1897">		sockunion2str (&amp;su, buf, SU_ADDRSTRLEN));</a>
+<a name="ln1898">	  close (vty_sock);</a>
+<a name="ln1899">	  </a>
+<a name="ln1900">	  /* continue accepting connections */</a>
+<a name="ln1901">	  vty_event (VTY_SERV, accept_sock, NULL);</a>
+<a name="ln1902">	  </a>
+<a name="ln1903">	  return 0;</a>
+<a name="ln1904">	}</a>
+<a name="ln1905">    }</a>
+<a name="ln1906"> </a>
+<a name="ln1907">#ifdef HAVE_IPV6</a>
+<a name="ln1908">  /* VTY's ipv6 accesslist apply. */</a>
+<a name="ln1909">  if (p.family == AF_INET6 &amp;&amp; vty_ipv6_accesslist_name)</a>
+<a name="ln1910">    {</a>
+<a name="ln1911">      if ((acl = access_list_lookup (AFI_IP6, vty_ipv6_accesslist_name)) &amp;&amp;</a>
+<a name="ln1912">	  (access_list_apply (acl, &amp;p) == FILTER_DENY))</a>
+<a name="ln1913">	{</a>
+<a name="ln1914">	  zlog (NULL, LOG_INFO, &quot;Vty connection refused from %s&quot;,</a>
+<a name="ln1915">		sockunion2str (&amp;su, buf, SU_ADDRSTRLEN));</a>
+<a name="ln1916">	  close (vty_sock);</a>
+<a name="ln1917">	  </a>
+<a name="ln1918">	  /* continue accepting connections */</a>
+<a name="ln1919">	  vty_event (VTY_SERV, accept_sock, NULL);</a>
+<a name="ln1920">	  </a>
+<a name="ln1921">	  return 0;</a>
+<a name="ln1922">	}</a>
+<a name="ln1923">    }</a>
+<a name="ln1924">#endif /* HAVE_IPV6 */</a>
+<a name="ln1925">  </a>
+<a name="ln1926">  on = 1;</a>
+<a name="ln1927">  ret = setsockopt (vty_sock, IPPROTO_TCP, TCP_NODELAY, </a>
+<a name="ln1928">		    (char *) &amp;on, sizeof (on));</a>
+<a name="ln1929">  if (ret &lt; 0)</a>
+<a name="ln1930">    zlog (NULL, LOG_INFO, &quot;can't set sockopt to vty_sock : %s&quot;, </a>
+<a name="ln1931">	  safe_strerror (errno));</a>
+<a name="ln1932"> </a>
+<a name="ln1933">  zlog (NULL, LOG_INFO, &quot;Vty connection from %s&quot;,</a>
+<a name="ln1934">	sockunion2str (&amp;su, buf, SU_ADDRSTRLEN));</a>
+<a name="ln1935"> </a>
+<a name="ln1936">  vty_create (vty_sock, &amp;su);</a>
+<a name="ln1937"> </a>
+<a name="ln1938">  return 0;</a>
+<a name="ln1939">}</a>
+<a name="ln1940"> </a>
+<a name="ln1941">#ifdef HAVE_IPV6</a>
+<a name="ln1942">static void</a>
+<a name="ln1943">vty_serv_sock_addrinfo (const char *hostname, unsigned short port)</a>
+<a name="ln1944">{</a>
+<a name="ln1945">  int ret;</a>
+<a name="ln1946">  struct addrinfo req;</a>
+<a name="ln1947">  struct addrinfo *ainfo;</a>
+<a name="ln1948">  struct addrinfo *ainfo_save;</a>
+<a name="ln1949">  int sock;</a>
+<a name="ln1950">  char port_str[BUFSIZ];</a>
+<a name="ln1951"> </a>
+<a name="ln1952">  memset (&amp;req, 0, sizeof (struct addrinfo));</a>
+<a name="ln1953">  req.ai_flags = AI_PASSIVE;</a>
+<a name="ln1954">  req.ai_family = AF_UNSPEC;</a>
+<a name="ln1955">  req.ai_socktype = SOCK_STREAM;</a>
+<a name="ln1956">  sprintf (port_str, &quot;%d&quot;, port);</a>
+<a name="ln1957">  port_str[sizeof (port_str) - 1] = '\0';</a>
+<a name="ln1958"> </a>
+<a name="ln1959">  ret = getaddrinfo (hostname, port_str, &amp;req, &amp;ainfo);</a>
+<a name="ln1960"> </a>
+<a name="ln1961">  if (ret != 0)</a>
+<a name="ln1962">    {</a>
+<a name="ln1963">      fprintf (stderr, &quot;getaddrinfo failed: %s\n&quot;, gai_strerror (ret));</a>
+<a name="ln1964">      exit (1);</a>
+<a name="ln1965">    }</a>
+<a name="ln1966"> </a>
+<a name="ln1967">  ainfo_save = ainfo;</a>
+<a name="ln1968"> </a>
+<a name="ln1969">  do</a>
+<a name="ln1970">    {</a>
+<a name="ln1971">      if (ainfo-&gt;ai_family != AF_INET</a>
+<a name="ln1972">#ifdef HAVE_IPV6</a>
+<a name="ln1973">	  &amp;&amp; ainfo-&gt;ai_family != AF_INET6</a>
+<a name="ln1974">#endif /* HAVE_IPV6 */</a>
+<a name="ln1975">	  )</a>
+<a name="ln1976">	continue;</a>
+<a name="ln1977"> </a>
+<a name="ln1978">      sock = socket (ainfo-&gt;ai_family, ainfo-&gt;ai_socktype, ainfo-&gt;ai_protocol);</a>
+<a name="ln1979">      if (sock &lt; 0)</a>
+<a name="ln1980">	continue;</a>
+<a name="ln1981"> </a>
+<a name="ln1982">      sockopt_v6only (ainfo-&gt;ai_family, sock);</a>
+<a name="ln1983">      sockopt_reuseaddr (sock);</a>
+<a name="ln1984">      sockopt_reuseport (sock);</a>
+<a name="ln1985"> </a>
+<a name="ln1986">      ret = bind (sock, ainfo-&gt;ai_addr, ainfo-&gt;ai_addrlen);</a>
+<a name="ln1987">      if (ret &lt; 0)</a>
+<a name="ln1988">	{</a>
+<a name="ln1989">	  close (sock);	/* Avoid sd leak. */</a>
+<a name="ln1990">	continue;</a>
+<a name="ln1991">	}</a>
+<a name="ln1992"> </a>
+<a name="ln1993">      ret = listen (sock, 3);</a>
+<a name="ln1994">      if (ret &lt; 0) </a>
+<a name="ln1995">	{</a>
+<a name="ln1996">	  close (sock);	/* Avoid sd leak. */</a>
+<a name="ln1997">	continue;</a>
+<a name="ln1998">	}</a>
+<a name="ln1999"> </a>
+<a name="ln2000">      vty_event (VTY_SERV, sock, NULL);</a>
+<a name="ln2001">    }</a>
+<a name="ln2002">  while ((ainfo = ainfo-&gt;ai_next) != NULL);</a>
+<a name="ln2003"> </a>
+<a name="ln2004">  freeaddrinfo (ainfo_save);</a>
+<a name="ln2005">}</a>
+<a name="ln2006">#else /* HAVE_IPV6 */</a>
+<a name="ln2007"> </a>
+<a name="ln2008">/* Make vty server socket. */</a>
+<a name="ln2009">static void</a>
+<a name="ln2010">vty_serv_sock_family (const char* addr, unsigned short port, int family)</a>
+<a name="ln2011">{</a>
+<a name="ln2012">  int ret;</a>
+<a name="ln2013">  union sockunion su;</a>
+<a name="ln2014">  int accept_sock;</a>
+<a name="ln2015">  void* naddr=NULL;</a>
+<a name="ln2016"> </a>
+<a name="ln2017">  memset (&amp;su, 0, sizeof (union sockunion));</a>
+<a name="ln2018">  su.sa.sa_family = family;</a>
+<a name="ln2019">  if(addr)</a>
+<a name="ln2020">    switch(family)</a>
+<a name="ln2021">    {</a>
+<a name="ln2022">      case AF_INET:</a>
+<a name="ln2023">        naddr=&amp;su.sin.sin_addr;</a>
+<a name="ln2024">        break;</a>
+<a name="ln2025">#ifdef HAVE_IPV6</a>
+<a name="ln2026">      case AF_INET6:</a>
+<a name="ln2027">        naddr=&amp;su.sin6.sin6_addr;</a>
+<a name="ln2028">        break;</a>
+<a name="ln2029">#endif	</a>
+<a name="ln2030">    }</a>
+<a name="ln2031"> </a>
+<a name="ln2032">  if(naddr)</a>
+<a name="ln2033">    switch(inet_pton(family,addr,naddr))</a>
+<a name="ln2034">    {</a>
+<a name="ln2035">      case -1:</a>
+<a name="ln2036">        zlog_err(&quot;bad address %s&quot;,addr);</a>
+<a name="ln2037">	naddr=NULL;</a>
+<a name="ln2038">	break;</a>
+<a name="ln2039">      case 0:</a>
+<a name="ln2040">        zlog_err(&quot;error translating address %s: %s&quot;,addr,safe_strerror(errno));</a>
+<a name="ln2041">	naddr=NULL;</a>
+<a name="ln2042">    }</a>
+<a name="ln2043"> </a>
+<a name="ln2044">  /* Make new socket. */</a>
+<a name="ln2045">  accept_sock = sockunion_stream_socket (&amp;su);</a>
+<a name="ln2046">  if (accept_sock &lt; 0)</a>
+<a name="ln2047">    return;</a>
+<a name="ln2048"> </a>
+<a name="ln2049">  /* This is server, so reuse address. */</a>
+<a name="ln2050">  sockopt_reuseaddr (accept_sock);</a>
+<a name="ln2051">  sockopt_reuseport (accept_sock);</a>
+<a name="ln2052"> </a>
+<a name="ln2053">  /* Bind socket to universal address and given port. */</a>
+<a name="ln2054">  ret = sockunion_bind (accept_sock, &amp;su, port, naddr);</a>
+<a name="ln2055">  if (ret &lt; 0)</a>
+<a name="ln2056">    {</a>
+<a name="ln2057">      zlog_warn(&quot;can't bind socket&quot;);</a>
+<a name="ln2058">      close (accept_sock);	/* Avoid sd leak. */</a>
+<a name="ln2059">      return;</a>
+<a name="ln2060">    }</a>
+<a name="ln2061"> </a>
+<a name="ln2062">  /* Listen socket under queue 3. */</a>
+<a name="ln2063">  ret = listen (accept_sock, 3);</a>
+<a name="ln2064">  if (ret &lt; 0) </a>
+<a name="ln2065">    {</a>
+<a name="ln2066">      zlog (NULL, LOG_WARNING, &quot;can't listen socket&quot;);</a>
+<a name="ln2067">      close (accept_sock);	/* Avoid sd leak. */</a>
+<a name="ln2068">      return;</a>
+<a name="ln2069">    }</a>
+<a name="ln2070"> </a>
+<a name="ln2071">  /* Add vty server event. */</a>
+<a name="ln2072">  vty_event (VTY_SERV, accept_sock, NULL);</a>
+<a name="ln2073">}</a>
+<a name="ln2074">#endif /* HAVE_IPV6 */</a>
+<a name="ln2075"> </a>
+<a name="ln2076">#ifdef VTYSH</a>
+<a name="ln2077">/* For sockaddr_un. */</a>
+<a name="ln2078">#include &lt;sys/un.h&gt;</a>
+<a name="ln2079"> </a>
+<a name="ln2080">/* VTY shell UNIX domain socket. */</a>
+<a name="ln2081">static void</a>
+<a name="ln2082">vty_serv_un (const char *path)</a>
+<a name="ln2083">{</a>
+<a name="ln2084">  int ret;</a>
+<a name="ln2085">  int sock, len;</a>
+<a name="ln2086">  struct sockaddr_un serv;</a>
+<a name="ln2087">  mode_t old_mask;</a>
+<a name="ln2088">  struct zprivs_ids_t ids;</a>
+<a name="ln2089">  </a>
+<a name="ln2090">  /* First of all, unlink existing socket */</a>
+<a name="ln2091">  unlink (path);</a>
+<a name="ln2092"> </a>
+<a name="ln2093">  /* Set umask */</a>
+<a name="ln2094">  old_mask = umask (0007);</a>
+<a name="ln2095"> </a>
+<a name="ln2096">  /* Make UNIX domain socket. */</a>
+<a name="ln2097">  sock = socket (AF_UNIX, SOCK_STREAM, 0);</a>
+<a name="ln2098">  if (sock &lt; 0)</a>
+<a name="ln2099">    {</a>
+<a name="ln2100">      zlog_err(&quot;Cannot create unix stream socket: %s&quot;, safe_strerror(errno));</a>
+<a name="ln2101">      return;</a>
+<a name="ln2102">    }</a>
+<a name="ln2103"> </a>
+<a name="ln2104">  /* Make server socket. */</a>
+<a name="ln2105">  memset (&amp;serv, 0, sizeof (struct sockaddr_un));</a>
+<a name="ln2106">  serv.sun_family = AF_UNIX;</a>
+<a name="ln2107">  strncpy (serv.sun_path, path, strlen (path));</a>
+<a name="ln2108">#ifdef HAVE_STRUCT_SOCKADDR_UN_SUN_LEN</a>
+<a name="ln2109">  len = serv.sun_len = SUN_LEN(&amp;serv);</a>
+<a name="ln2110">#else</a>
+<a name="ln2111">  len = sizeof (serv.sun_family) + strlen (serv.sun_path);</a>
+<a name="ln2112">#endif /* HAVE_STRUCT_SOCKADDR_UN_SUN_LEN */</a>
+<a name="ln2113"> </a>
+<a name="ln2114">  ret = bind (sock, (struct sockaddr *) &amp;serv, len);</a>
+<a name="ln2115">  if (ret &lt; 0)</a>
+<a name="ln2116">    {</a>
+<a name="ln2117">      zlog_err(&quot;Cannot bind path %s: %s&quot;, path, safe_strerror(errno));</a>
+<a name="ln2118">      close (sock);	/* Avoid sd leak. */</a>
+<a name="ln2119">      return;</a>
+<a name="ln2120">    }</a>
+<a name="ln2121"> </a>
+<a name="ln2122">  ret = listen (sock, 5);</a>
+<a name="ln2123">  if (ret &lt; 0)</a>
+<a name="ln2124">    {</a>
+<a name="ln2125">      zlog_err(&quot;listen(fd %d) failed: %s&quot;, sock, safe_strerror(errno));</a>
+<a name="ln2126">      close (sock);	/* Avoid sd leak. */</a>
+<a name="ln2127">      return;</a>
+<a name="ln2128">    }</a>
+<a name="ln2129"> </a>
+<a name="ln2130">  umask (old_mask);</a>
+<a name="ln2131"> </a>
+<a name="ln2132">  zprivs_get_ids(&amp;ids);</a>
+<a name="ln2133">  </a>
+<a name="ln2134">  if (ids.gid_vty &gt; 0)</a>
+<a name="ln2135">    {</a>
+<a name="ln2136">      /* set group of socket */</a>
+<a name="ln2137">      if ( chown (path, -1, ids.gid_vty) )</a>
+<a name="ln2138">        {</a>
+<a name="ln2139">          zlog_err (&quot;vty_serv_un: could chown socket, %s&quot;,</a>
+<a name="ln2140">                     safe_strerror (errno) );</a>
+<a name="ln2141">        }</a>
+<a name="ln2142">    }</a>
+<a name="ln2143"> </a>
+<a name="ln2144">  vty_event (VTYSH_SERV, sock, NULL);</a>
+<a name="ln2145">}</a>
+<a name="ln2146"> </a>
+<a name="ln2147">/* #define VTYSH_DEBUG 1 */</a>
+<a name="ln2148"> </a>
+<a name="ln2149">static int</a>
+<a name="ln2150">vtysh_accept (struct thread *thread)</a>
+<a name="ln2151">{</a>
+<a name="ln2152">  int accept_sock;</a>
+<a name="ln2153">  int sock;</a>
+<a name="ln2154">  int client_len;</a>
+<a name="ln2155">  struct sockaddr_un client;</a>
+<a name="ln2156">  struct vty *vty;</a>
+<a name="ln2157">  </a>
+<a name="ln2158">  accept_sock = THREAD_FD (thread);</a>
+<a name="ln2159"> </a>
+<a name="ln2160">  vty_event (VTYSH_SERV, accept_sock, NULL);</a>
+<a name="ln2161"> </a>
+<a name="ln2162">  memset (&amp;client, 0, sizeof (struct sockaddr_un));</a>
+<a name="ln2163">  client_len = sizeof (struct sockaddr_un);</a>
+<a name="ln2164"> </a>
+<a name="ln2165">  sock = accept (accept_sock, (struct sockaddr *) &amp;client,</a>
+<a name="ln2166">		 (socklen_t *) &amp;client_len);</a>
+<a name="ln2167"> </a>
+<a name="ln2168">  if (sock &lt; 0)</a>
+<a name="ln2169">    {</a>
+<a name="ln2170">      zlog_warn (&quot;can't accept vty socket : %s&quot;, safe_strerror (errno));</a>
+<a name="ln2171">      return -1;</a>
+<a name="ln2172">    }</a>
+<a name="ln2173"> </a>
+<a name="ln2174">  if (set_nonblocking(sock) &lt; 0)</a>
+<a name="ln2175">    {</a>
+<a name="ln2176">      zlog_warn (&quot;vtysh_accept: could not set vty socket %d to non-blocking,&quot;</a>
+<a name="ln2177">                 &quot; %s, closing&quot;, sock, safe_strerror (errno));</a>
+<a name="ln2178">      close (sock);</a>
+<a name="ln2179">      return -1;</a>
+<a name="ln2180">    }</a>
+<a name="ln2181">  </a>
+<a name="ln2182">#ifdef VTYSH_DEBUG</a>
+<a name="ln2183">  printf (&quot;VTY shell accept\n&quot;);</a>
+<a name="ln2184">#endif /* VTYSH_DEBUG */</a>
+<a name="ln2185"> </a>
+<a name="ln2186">  vty = vty_new ();</a>
+<a name="ln2187">  vty-&gt;fd = sock;</a>
+<a name="ln2188">  vty-&gt;wfd = sock;</a>
+<a name="ln2189">  vty-&gt;type = VTY_SHELL_SERV;</a>
+<a name="ln2190">  vty-&gt;node = VIEW_NODE;</a>
+<a name="ln2191"> </a>
+<a name="ln2192">  vty_event (VTYSH_READ, sock, vty);</a>
+<a name="ln2193"> </a>
+<a name="ln2194">  return 0;</a>
+<a name="ln2195">}</a>
+<a name="ln2196"> </a>
+<a name="ln2197">static int</a>
+<a name="ln2198">vtysh_flush(struct vty *vty)</a>
+<a name="ln2199">{</a>
+<a name="ln2200">  switch (buffer_flush_available(vty-&gt;obuf, vty-&gt;wfd))</a>
+<a name="ln2201">    {</a>
+<a name="ln2202">    case BUFFER_PENDING:</a>
+<a name="ln2203">      vty_event(VTYSH_WRITE, vty-&gt;wfd, vty);</a>
+<a name="ln2204">      break;</a>
+<a name="ln2205">    case BUFFER_ERROR:</a>
+<a name="ln2206">      vty-&gt;monitor = 0; /* disable monitoring to avoid infinite recursion */</a>
+<a name="ln2207">      zlog_warn(&quot;%s: write error to fd %d, closing&quot;, __func__, vty-&gt;fd);</a>
+<a name="ln2208">      buffer_reset(vty-&gt;obuf);</a>
+<a name="ln2209">      vty_close(vty);</a>
+<a name="ln2210">      return -1;</a>
+<a name="ln2211">      break;</a>
+<a name="ln2212">    case BUFFER_EMPTY:</a>
+<a name="ln2213">      break;</a>
+<a name="ln2214">    }</a>
+<a name="ln2215">  return 0;</a>
+<a name="ln2216">}</a>
+<a name="ln2217"> </a>
+<a name="ln2218">static int</a>
+<a name="ln2219">vtysh_read (struct thread *thread)</a>
+<a name="ln2220">{</a>
+<a name="ln2221">  int ret;</a>
+<a name="ln2222">  int sock;</a>
+<a name="ln2223">  int nbytes;</a>
+<a name="ln2224">  struct vty *vty;</a>
+<a name="ln2225">  unsigned char buf[VTY_READ_BUFSIZ];</a>
+<a name="ln2226">  unsigned char *p;</a>
+<a name="ln2227">  u_char header[4] = {0, 0, 0, 0};</a>
+<a name="ln2228"> </a>
+<a name="ln2229">  sock = THREAD_FD (thread);</a>
+<a name="ln2230">  vty = THREAD_ARG (thread);</a>
+<a name="ln2231">  vty-&gt;t_read = NULL;</a>
+<a name="ln2232"> </a>
+<a name="ln2233">  if ((nbytes = read (sock, buf, VTY_READ_BUFSIZ)) &lt;= 0)</a>
+<a name="ln2234">    {</a>
+<a name="ln2235">      if (nbytes &lt; 0)</a>
+<a name="ln2236">	{</a>
+<a name="ln2237">	  if (ERRNO_IO_RETRY(errno))</a>
+<a name="ln2238">	    {</a>
+<a name="ln2239">	      vty_event (VTYSH_READ, sock, vty);</a>
+<a name="ln2240">	      return 0;</a>
+<a name="ln2241">	    }</a>
+<a name="ln2242">	  vty-&gt;monitor = 0; /* disable monitoring to avoid infinite recursion */</a>
+<a name="ln2243">	  zlog_warn(&quot;%s: read failed on vtysh client fd %d, closing: %s&quot;,</a>
+<a name="ln2244">		    __func__, sock, safe_strerror(errno));</a>
+<a name="ln2245">	}</a>
+<a name="ln2246">      buffer_reset(vty-&gt;obuf);</a>
+<a name="ln2247">      vty_close (vty);</a>
+<a name="ln2248">#ifdef VTYSH_DEBUG</a>
+<a name="ln2249">      printf (&quot;close vtysh\n&quot;);</a>
+<a name="ln2250">#endif /* VTYSH_DEBUG */</a>
+<a name="ln2251">      return 0;</a>
+<a name="ln2252">    }</a>
+<a name="ln2253"> </a>
+<a name="ln2254">#ifdef VTYSH_DEBUG</a>
+<a name="ln2255">  printf (&quot;line: %.*s\n&quot;, nbytes, buf);</a>
+<a name="ln2256">#endif /* VTYSH_DEBUG */</a>
+<a name="ln2257"> </a>
+<a name="ln2258">  if (vty-&gt;length + nbytes &gt;= vty-&gt;max)</a>
+<a name="ln2259">    {</a>
+<a name="ln2260">      /* Clear command line buffer. */</a>
+<a name="ln2261">      vty-&gt;cp = vty-&gt;length = 0;</a>
+<a name="ln2262">      vty_clear_buf (vty);</a>
+<a name="ln2263">      vty_out (vty, &quot;%% Command is too long.%s&quot;, VTY_NEWLINE);</a>
+<a name="ln2264">      goto out;</a>
+<a name="ln2265">    }</a>
+<a name="ln2266">  </a>
+<a name="ln2267">  for (p = buf; p &lt; buf+nbytes; p++)</a>
+<a name="ln2268">    {</a>
+<a name="ln2269">      vty-&gt;buf[vty-&gt;length++] = *p;</a>
+<a name="ln2270">      if (*p == '\0')</a>
+<a name="ln2271">	{</a>
+<a name="ln2272">	  </a>
+<a name="ln2273">	  /* Pass this line to parser. */</a>
+<a name="ln2274">	  ret = vty_execute (vty);</a>
+<a name="ln2275">	  /* Note that vty_execute clears the command buffer and resets</a>
+<a name="ln2276">	     vty-&gt;length to 0. */</a>
+<a name="ln2277"> </a>
+<a name="ln2278">	  /* Return result. */</a>
+<a name="ln2279">#ifdef VTYSH_DEBUG</a>
+<a name="ln2280">	  printf (&quot;result: %d\n&quot;, ret);</a>
+<a name="ln2281">	  printf (&quot;vtysh node: %d\n&quot;, vty-&gt;node);</a>
+<a name="ln2282">#endif /* VTYSH_DEBUG */</a>
+<a name="ln2283"> </a>
+<a name="ln2284">	  header[3] = ret;</a>
+<a name="ln2285">	  buffer_put(vty-&gt;obuf, header, 4);</a>
+<a name="ln2286"> </a>
+<a name="ln2287">	  if (!vty-&gt;t_write &amp;&amp; (vtysh_flush(vty) &lt; 0))</a>
+<a name="ln2288">	    /* Try to flush results; exit if a write error occurs. */</a>
+<a name="ln2289">	    return 0;</a>
+<a name="ln2290">	}</a>
+<a name="ln2291">    }</a>
+<a name="ln2292"> </a>
+<a name="ln2293">out:</a>
+<a name="ln2294">  vty_event (VTYSH_READ, sock, vty);</a>
+<a name="ln2295"> </a>
+<a name="ln2296">  return 0;</a>
+<a name="ln2297">}</a>
+<a name="ln2298"> </a>
+<a name="ln2299">static int</a>
+<a name="ln2300">vtysh_write (struct thread *thread)</a>
+<a name="ln2301">{</a>
+<a name="ln2302">  struct vty *vty = THREAD_ARG (thread);</a>
+<a name="ln2303"> </a>
+<a name="ln2304">  vty-&gt;t_write = NULL;</a>
+<a name="ln2305">  vtysh_flush(vty);</a>
+<a name="ln2306">  return 0;</a>
+<a name="ln2307">}</a>
+<a name="ln2308"> </a>
+<a name="ln2309">#endif /* VTYSH */</a>
+<a name="ln2310"> </a>
+<a name="ln2311">/* Determine address family to bind. */</a>
+<a name="ln2312">void</a>
+<a name="ln2313">vty_serv_sock (const char *addr, unsigned short port, const char *path)</a>
+<a name="ln2314">{</a>
+<a name="ln2315">  /* If port is set to 0, do not listen on TCP/IP at all! */</a>
+<a name="ln2316">  if (port)</a>
+<a name="ln2317">    {</a>
+<a name="ln2318"> </a>
+<a name="ln2319">#ifdef HAVE_IPV6</a>
+<a name="ln2320">      vty_serv_sock_addrinfo (addr, port);</a>
+<a name="ln2321">#else /* ! HAVE_IPV6 */</a>
+<a name="ln2322">      vty_serv_sock_family (addr,port, AF_INET);</a>
+<a name="ln2323">#endif /* HAVE_IPV6 */</a>
+<a name="ln2324">    }</a>
+<a name="ln2325"> </a>
+<a name="ln2326">#ifdef VTYSH</a>
+<a name="ln2327">  vty_serv_un (path);</a>
+<a name="ln2328">#endif /* VTYSH */</a>
+<a name="ln2329">}</a>
+<a name="ln2330"> </a>
+<a name="ln2331">/* Close vty interface.  Warning: call this only from functions that</a>
+<a name="ln2332">   will be careful not to access the vty afterwards (since it has</a>
+<a name="ln2333">   now been freed).  This is safest from top-level functions (called</a>
+<a name="ln2334">   directly by the thread dispatcher). */</a>
+<a name="ln2335">void</a>
+<a name="ln2336">vty_close (struct vty *vty)</a>
+<a name="ln2337">{</a>
+<a name="ln2338">  int i;</a>
+<a name="ln2339"> </a>
+<a name="ln2340">  /* Cancel threads.*/</a>
+<a name="ln2341">  if (vty-&gt;t_read)</a>
+<a name="ln2342">    thread_cancel (vty-&gt;t_read);</a>
+<a name="ln2343">  if (vty-&gt;t_write)</a>
+<a name="ln2344">    thread_cancel (vty-&gt;t_write);</a>
+<a name="ln2345">  if (vty-&gt;t_timeout)</a>
+<a name="ln2346">    thread_cancel (vty-&gt;t_timeout);</a>
+<a name="ln2347"> </a>
+<a name="ln2348">  /* Flush buffer. */</a>
+<a name="ln2349">  buffer_flush_all (vty-&gt;obuf, vty-&gt;wfd);</a>
+<a name="ln2350"> </a>
+<a name="ln2351">  /* Free input buffer. */</a>
+<a name="ln2352">  buffer_free (vty-&gt;obuf);</a>
+<a name="ln2353"> </a>
+<a name="ln2354">  /* Free command history. */</a>
+<a name="ln2355">  for (i = 0; i &lt; VTY_MAXHIST; i++)</a>
+<a name="ln2356">    if (vty-&gt;hist[i])</a>
+<a name="ln2357">      XFREE (MTYPE_VTY_HIST, vty-&gt;hist[i]);</a>
+<a name="ln2358"> </a>
+<a name="ln2359">  /* Unset vector. */</a>
+<a name="ln2360">  vector_unset (vtyvec, vty-&gt;fd);</a>
+<a name="ln2361"> </a>
+<a name="ln2362">  /* Close socket. */</a>
+<a name="ln2363">  if (vty-&gt;fd &gt; 0)</a>
+<a name="ln2364">    close (vty-&gt;fd);</a>
+<a name="ln2365">  else</a>
+<a name="ln2366">    vty_stdio_reset ();</a>
+<a name="ln2367"> </a>
+<a name="ln2368">  /* Close output fd (except stdout/stderr) */</a>
+<a name="ln2369">  if (vty-&gt;wfd &gt; 2)</a>
+<a name="ln2370">    close (vty-&gt;wfd);</a>
+<a name="ln2371"> </a>
+<a name="ln2372">  if (vty-&gt;buf)</a>
+<a name="ln2373">    XFREE (MTYPE_VTY, vty-&gt;buf);</a>
+<a name="ln2374"> </a>
+<a name="ln2375">  /* Check configure. */</a>
+<a name="ln2376">  vty_config_unlock (vty);</a>
+<a name="ln2377"> </a>
+<a name="ln2378">  /* OK free vty. */</a>
+<a name="ln2379">  XFREE (MTYPE_VTY, vty);</a>
+<a name="ln2380">}</a>
+<a name="ln2381"> </a>
+<a name="ln2382">/* When time out occur output message then close connection. */</a>
+<a name="ln2383">static int</a>
+<a name="ln2384">vty_timeout (struct thread *thread)</a>
+<a name="ln2385">{</a>
+<a name="ln2386">  struct vty *vty;</a>
+<a name="ln2387"> </a>
+<a name="ln2388">  vty = THREAD_ARG (thread);</a>
+<a name="ln2389">  vty-&gt;t_timeout = NULL;</a>
+<a name="ln2390">  vty-&gt;v_timeout = 0;</a>
+<a name="ln2391"> </a>
+<a name="ln2392">  /* Clear buffer*/</a>
+<a name="ln2393">  buffer_reset (vty-&gt;obuf);</a>
+<a name="ln2394">  vty_out (vty, &quot;%sVty connection is timed out.%s&quot;, VTY_NEWLINE, VTY_NEWLINE);</a>
+<a name="ln2395"> </a>
+<a name="ln2396">  /* Close connection. */</a>
+<a name="ln2397">  vty-&gt;status = VTY_CLOSE;</a>
+<a name="ln2398">  vty_close (vty);</a>
+<a name="ln2399"> </a>
+<a name="ln2400">  return 0;</a>
+<a name="ln2401">}</a>
+<a name="ln2402"> </a>
+<a name="ln2403">/* Read up configuration file from file_name. */</a>
+<a name="ln2404">static void</a>
+<a name="ln2405">vty_read_file (FILE *confp)</a>
+<a name="ln2406">{</a>
+<a name="ln2407">  int ret;</a>
+<a name="ln2408">  struct vty *vty;</a>
+<a name="ln2409">  unsigned int line_num = 0;</a>
+<a name="ln2410"> </a>
+<a name="ln2411">  vty = vty_new ();</a>
+<a name="ln2412">  vty-&gt;wfd = dup(STDERR_FILENO); /* vty_close() will close this */</a>
+<a name="ln2413">  if (vty-&gt;wfd &lt; 0)</a>
+<a name="ln2414">  {</a>
+<a name="ln2415">    /* Fine, we couldn't make a new fd. vty_close doesn't close stdout. */</a>
+<a name="ln2416">    vty-&gt;wfd = STDOUT_FILENO;</a>
+<a name="ln2417">  }</a>
+<a name="ln2418">  vty-&gt;fd = STDIN_FILENO;</a>
+<a name="ln2419">  vty-&gt;type = VTY_FILE;</a>
+<a name="ln2420">  vty-&gt;node = CONFIG_NODE;</a>
+<a name="ln2421">  </a>
+<a name="ln2422">  /* Execute configuration file */</a>
+<a name="ln2423">  ret = config_from_file (vty, confp, &amp;line_num);</a>
+<a name="ln2424"> </a>
+<a name="ln2425">  /* Flush any previous errors before printing messages below */</a>
+<a name="ln2426">  buffer_flush_all (vty-&gt;obuf, vty-&gt;fd);</a>
+<a name="ln2427"> </a>
+<a name="ln2428">  if ( !((ret == CMD_SUCCESS) || (ret == CMD_ERR_NOTHING_TODO)) ) </a>
+<a name="ln2429">    {</a>
+<a name="ln2430">      switch (ret)</a>
+<a name="ln2431">       {</a>
+<a name="ln2432">         case CMD_ERR_AMBIGUOUS:</a>
+<a name="ln2433">           fprintf (stderr, &quot;*** Error reading config: Ambiguous command.\n&quot;);</a>
+<a name="ln2434">           break;</a>
+<a name="ln2435">         case CMD_ERR_NO_MATCH:</a>
+<a name="ln2436">           fprintf (stderr, &quot;*** Error reading config: There is no such command.\n&quot;);</a>
+<a name="ln2437">           break;</a>
+<a name="ln2438">       }</a>
+<a name="ln2439">      fprintf (stderr, &quot;*** Error occurred processing line %u, below:\n%s\n&quot;,</a>
+<a name="ln2440">		       line_num, vty-&gt;buf);</a>
+<a name="ln2441">      vty_close (vty);</a>
+<a name="ln2442">      exit (1);</a>
+<a name="ln2443">    }</a>
+<a name="ln2444"> </a>
+<a name="ln2445">  vty_close (vty);</a>
+<a name="ln2446">}</a>
+<a name="ln2447"> </a>
+<a name="ln2448">static FILE *</a>
+<a name="ln2449">vty_use_backup_config (char *fullpath)</a>
+<a name="ln2450">{</a>
+<a name="ln2451">  char *fullpath_sav, *fullpath_tmp;</a>
+<a name="ln2452">  FILE *ret = NULL;</a>
+<a name="ln2453">  struct stat buf;</a>
+<a name="ln2454">  int tmp, sav;</a>
+<a name="ln2455">  int c;</a>
+<a name="ln2456">  char buffer[512];</a>
+<a name="ln2457">  </a>
+<a name="ln2458">  fullpath_sav = malloc (strlen (fullpath) + strlen (CONF_BACKUP_EXT) + 1);</a>
+<a name="ln2459">  strcpy (fullpath_sav, fullpath);</a>
+<a name="ln2460">  strcat (fullpath_sav, CONF_BACKUP_EXT);</a>
+<a name="ln2461">  if (stat (fullpath_sav, &amp;buf) == -1)</a>
+<a name="ln2462">    {</a>
+<a name="ln2463">      free (fullpath_sav);</a>
+<a name="ln2464">      return NULL;</a>
+<a name="ln2465">    }</a>
+<a name="ln2466"> </a>
+<a name="ln2467">  fullpath_tmp = malloc (strlen (fullpath) + 8);</a>
+<a name="ln2468">  sprintf (fullpath_tmp, &quot;%s.XXXXXX&quot;, fullpath);</a>
+<a name="ln2469">  </a>
+<a name="ln2470">  /* Open file to configuration write. */</a>
+<a name="ln2471">  tmp = mkstemp (fullpath_tmp);</a>
+<a name="ln2472">  if (tmp &lt; 0)</a>
+<a name="ln2473">    {</a>
+<a name="ln2474">      free (fullpath_sav);</a>
+<a name="ln2475">      free (fullpath_tmp);</a>
+<a name="ln2476">      return NULL;</a>
+<a name="ln2477">    }</a>
+<a name="ln2478"> </a>
+<a name="ln2479">  sav = open (fullpath_sav, O_RDONLY);</a>
+<a name="ln2480">  if (sav &lt; 0)</a>
+<a name="ln2481">    {</a>
+<a name="ln2482">      unlink (fullpath_tmp);</a>
+<a name="ln2483">      free (fullpath_sav);</a>
+<a name="ln2484">      free (fullpath_tmp);</a>
+<a name="ln2485">      return NULL;</a>
+<a name="ln2486">    }</a>
+<a name="ln2487">  </a>
+<a name="ln2488">  while((c = read (sav, buffer, 512)) &gt; 0)</a>
+<a name="ln2489">    write (tmp, buffer, c);</a>
+<a name="ln2490">  </a>
+<a name="ln2491">  close (sav);</a>
+<a name="ln2492">  close (tmp);</a>
+<a name="ln2493">  </a>
+<a name="ln2494">  if (chmod(fullpath_tmp, CONFIGFILE_MASK) != 0)</a>
+<a name="ln2495">    {</a>
+<a name="ln2496">      unlink (fullpath_tmp);</a>
+<a name="ln2497">      free (fullpath_sav);</a>
+<a name="ln2498">      free (fullpath_tmp);</a>
+<a name="ln2499">      return NULL;</a>
+<a name="ln2500">    }</a>
+<a name="ln2501">  </a>
+<a name="ln2502">  if (link (fullpath_tmp, fullpath) == 0)</a>
+<a name="ln2503">    ret = fopen (fullpath, &quot;r&quot;);</a>
+<a name="ln2504"> </a>
+<a name="ln2505">  unlink (fullpath_tmp);</a>
+<a name="ln2506">  </a>
+<a name="ln2507">  free (fullpath_sav);</a>
+<a name="ln2508">  free (fullpath_tmp);</a>
+<a name="ln2509">  return ret;</a>
+<a name="ln2510">}</a>
+<a name="ln2511"> </a>
+<a name="ln2512">/* Read up configuration file from file_name. */</a>
+<a name="ln2513">void</a>
+<a name="ln2514">vty_read_config (char *config_file,</a>
+<a name="ln2515">                 char *config_default_dir)</a>
+<a name="ln2516">{</a>
+<a name="ln2517">  char cwd[MAXPATHLEN];</a>
+<a name="ln2518">  FILE *confp = NULL;</a>
+<a name="ln2519">  char *fullpath;</a>
+<a name="ln2520">  char *tmp = NULL;</a>
+<a name="ln2521"> </a>
+<a name="ln2522">  /* If -f flag specified. */</a>
+<a name="ln2523">  if (config_file != NULL)</a>
+<a name="ln2524">    {</a>
+<a name="ln2525">      if (! IS_DIRECTORY_SEP (config_file[0]))</a>
+<a name="ln2526">        {</a>
+<a name="ln2527">          getcwd (cwd, MAXPATHLEN);</a>
+<a name="ln2528">          tmp = XMALLOC (MTYPE_TMP, </a>
+<a name="ln2529"> 			      strlen (cwd) + strlen (config_file) + 2);</a>
+<a name="ln2530">          sprintf (tmp, &quot;%s/%s&quot;, cwd, config_file);</a>
+<a name="ln2531">          fullpath = tmp;</a>
+<a name="ln2532">        }</a>
+<a name="ln2533">      else</a>
+<a name="ln2534">        fullpath = config_file;</a>
+<a name="ln2535"> </a>
+<a name="ln2536">      confp = fopen (fullpath, &quot;r&quot;);</a>
+<a name="ln2537"> </a>
+<a name="ln2538">      if (confp == NULL)</a>
+<a name="ln2539">        {</a>
+<a name="ln2540">          fprintf (stderr, &quot;%s: failed to open configuration file %s: %s\n&quot;,</a>
+<a name="ln2541">                   __func__, fullpath, safe_strerror (errno));</a>
+<a name="ln2542">          </a>
+<a name="ln2543">          confp = vty_use_backup_config (fullpath);</a>
+<a name="ln2544">          if (confp)</a>
+<a name="ln2545">            fprintf (stderr, &quot;WARNING: using backup configuration file!\n&quot;);</a>
+<a name="ln2546">          else</a>
+<a name="ln2547">            {</a>
+<a name="ln2548">              fprintf (stderr, &quot;can't open configuration file [%s]\n&quot;, </a>
+<a name="ln2549">  	               config_file);</a>
+<a name="ln2550">              exit(1);</a>
+<a name="ln2551">            }</a>
+<a name="ln2552">        }</a>
+<a name="ln2553">    }</a>
+<a name="ln2554">  else</a>
+<a name="ln2555">    {</a>
+<a name="ln2556">#ifdef VTYSH</a>
+<a name="ln2557">      int ret;</a>
+<a name="ln2558">      struct stat conf_stat;</a>
+<a name="ln2559"> </a>
+<a name="ln2560">      /* !!!!PLEASE LEAVE!!!!</a>
+<a name="ln2561">       * This is NEEDED for use with vtysh -b, or else you can get</a>
+<a name="ln2562">       * a real configuration food fight with a lot garbage in the</a>
+<a name="ln2563">       * merged configuration file it creates coming from the per</a>
+<a name="ln2564">       * daemon configuration files.  This also allows the daemons</a>
+<a name="ln2565">       * to start if there default configuration file is not</a>
+<a name="ln2566">       * present or ignore them, as needed when using vtysh -b to</a>
+<a name="ln2567">       * configure the daemons at boot - MAG</a>
+<a name="ln2568">       */</a>
+<a name="ln2569"> </a>
+<a name="ln2570">      /* Stat for vtysh Zebra.conf, if found startup and wait for</a>
+<a name="ln2571">       * boot configuration</a>
+<a name="ln2572">       */</a>
+<a name="ln2573"> </a>
+<a name="ln2574">      if ( strstr(config_default_dir, &quot;vtysh&quot;) == NULL)</a>
+<a name="ln2575">        {</a>
+<a name="ln2576">          ret = stat (integrate_default, &amp;conf_stat);</a>
+<a name="ln2577">          if (ret &gt;= 0)</a>
+<a name="ln2578">            return;</a>
+<a name="ln2579">        }</a>
+<a name="ln2580">#endif /* VTYSH */</a>
+<a name="ln2581"> </a>
+<a name="ln2582">      confp = fopen (config_default_dir, &quot;r&quot;);</a>
+<a name="ln2583">      if (confp == NULL)</a>
+<a name="ln2584">        {</a>
+<a name="ln2585">          fprintf (stderr, &quot;%s: failed to open configuration file %s: %s\n&quot;,</a>
+<a name="ln2586">                   __func__, config_default_dir, safe_strerror (errno));</a>
+<a name="ln2587">          </a>
+<a name="ln2588">          confp = vty_use_backup_config (config_default_dir);</a>
+<a name="ln2589">          if (confp)</a>
+<a name="ln2590">            {</a>
+<a name="ln2591">              fprintf (stderr, &quot;WARNING: using backup configuration file!\n&quot;);</a>
+<a name="ln2592">              fullpath = config_default_dir;</a>
+<a name="ln2593">            }</a>
+<a name="ln2594">          else</a>
+<a name="ln2595">            {</a>
+<a name="ln2596">              fprintf (stderr, &quot;can't open configuration file [%s]\n&quot;,</a>
+<a name="ln2597">  		                 config_default_dir);</a>
+<a name="ln2598">  	          exit (1);</a>
+<a name="ln2599">            }</a>
+<a name="ln2600">        }      </a>
+<a name="ln2601">      else</a>
+<a name="ln2602">        fullpath = config_default_dir;</a>
+<a name="ln2603">    }</a>
+<a name="ln2604"> </a>
+<a name="ln2605">  vty_read_file (confp);</a>
+<a name="ln2606"> </a>
+<a name="ln2607">  fclose (confp);</a>
+<a name="ln2608"> </a>
+<a name="ln2609">  host_config_set (fullpath);</a>
+<a name="ln2610">  </a>
+<a name="ln2611">  if (tmp)</a>
+<a name="ln2612">    XFREE (MTYPE_TMP, fullpath);</a>
+<a name="ln2613">}</a>
+<a name="ln2614"> </a>
+<a name="ln2615">/* Small utility function which output log to the VTY. */</a>
+<a name="ln2616">void</a>
+<a name="ln2617">vty_log (const char *level, const char *proto_str,</a>
+<a name="ln2618">	 const char *format, struct timestamp_control *ctl, va_list va)</a>
+<a name="ln2619">{</a>
+<a name="ln2620">  unsigned int i;</a>
+<a name="ln2621">  struct vty *vty;</a>
+<a name="ln2622">  </a>
+<a name="ln2623">  if (!vtyvec)</a>
+<a name="ln2624">    return;</a>
+<a name="ln2625"> </a>
+<a name="ln2626">  for (i = 0; i &lt; vector_active (vtyvec); i++)</a>
+<a name="ln2627">    if ((vty = vector_slot (vtyvec, i)) != NULL)</a>
+<a name="ln2628">      if (vty-&gt;monitor)</a>
+<a name="ln2629">	{</a>
+<a name="ln2630">	  va_list ac;</a>
+<a name="ln2631">	  va_copy(ac, va);</a>
+<a name="ln2632">	  vty_log_out (vty, level, proto_str, format, ctl, ac);</a>
+<a name="ln2633">	  va_end(ac);</a>
+<a name="ln2634">	}</a>
+<a name="ln2635">}</a>
+<a name="ln2636"> </a>
+<a name="ln2637">/* Async-signal-safe version of vty_log for fixed strings. */</a>
+<a name="ln2638">void</a>
+<a name="ln2639">vty_log_fixed (char *buf, size_t len)</a>
+<a name="ln2640">{</a>
+<a name="ln2641">  unsigned int i;</a>
+<a name="ln2642">  struct iovec iov[2];</a>
+<a name="ln2643"> </a>
+<a name="ln2644">  /* vty may not have been initialised */</a>
+<a name="ln2645">  if (!vtyvec)</a>
+<a name="ln2646">    return;</a>
+<a name="ln2647">  </a>
+<a name="ln2648">  iov[0].iov_base = buf;</a>
+<a name="ln2649">  iov[0].iov_len = len;</a>
+<a name="ln2650">  iov[1].iov_base = (void *)&quot;\r\n&quot;;</a>
+<a name="ln2651">  iov[1].iov_len = 2;</a>
+<a name="ln2652"> </a>
+<a name="ln2653">  for (i = 0; i &lt; vector_active (vtyvec); i++)</a>
+<a name="ln2654">    {</a>
+<a name="ln2655">      struct vty *vty;</a>
+<a name="ln2656">      if (((vty = vector_slot (vtyvec, i)) != NULL) &amp;&amp; vty-&gt;monitor)</a>
+<a name="ln2657">	/* N.B. We don't care about the return code, since process is</a>
+<a name="ln2658">	   most likely just about to die anyway. */</a>
+<a name="ln2659">	writev(vty-&gt;wfd, iov, 2);</a>
+<a name="ln2660">    }</a>
+<a name="ln2661">}</a>
+<a name="ln2662"> </a>
+<a name="ln2663">int</a>
+<a name="ln2664">vty_config_lock (struct vty *vty)</a>
+<a name="ln2665">{</a>
+<a name="ln2666">  if (vty_config == 0)</a>
+<a name="ln2667">    {</a>
+<a name="ln2668">      vty-&gt;config = 1;</a>
+<a name="ln2669">      vty_config = 1;</a>
+<a name="ln2670">    }</a>
+<a name="ln2671">  return vty-&gt;config;</a>
+<a name="ln2672">}</a>
+<a name="ln2673"> </a>
+<a name="ln2674">int</a>
+<a name="ln2675">vty_config_unlock (struct vty *vty)</a>
+<a name="ln2676">{</a>
+<a name="ln2677">  if (vty_config == 1 &amp;&amp; vty-&gt;config == 1)</a>
+<a name="ln2678">    {</a>
+<a name="ln2679">      vty-&gt;config = 0;</a>
+<a name="ln2680">      vty_config = 0;</a>
+<a name="ln2681">    }</a>
+<a name="ln2682">  return vty-&gt;config;</a>
+<a name="ln2683">}</a>
+<a name="ln2684"> </a>
+<a name="ln2685">/* Master of the threads. */</a>
+<a name="ln2686">static struct thread_master *vty_master;</a>
+<a name="ln2687"> </a>
+<a name="ln2688">static void</a>
+<a name="ln2689">vty_event (enum event event, int sock, struct vty *vty)</a>
+<a name="ln2690">{</a>
+<a name="ln2691">  struct thread *vty_serv_thread;</a>
+<a name="ln2692"> </a>
+<a name="ln2693">  switch (event)</a>
+<a name="ln2694">    {</a>
+<a name="ln2695">    case VTY_SERV:</a>
+<a name="ln2696">      vty_serv_thread = thread_add_read (vty_master, vty_accept, vty, sock);</a>
+<a name="ln2697">      vector_set_index (Vvty_serv_thread, sock, vty_serv_thread);</a>
+<a name="ln2698">      break;</a>
+<a name="ln2699">#ifdef VTYSH</a>
+<a name="ln2700">    case VTYSH_SERV:</a>
+<a name="ln2701">      vty_serv_thread = thread_add_read (vty_master, vtysh_accept, vty, sock);</a>
+<a name="ln2702">      vector_set_index (Vvty_serv_thread, sock, vty_serv_thread);</a>
+<a name="ln2703">      break;</a>
+<a name="ln2704">    case VTYSH_READ:</a>
+<a name="ln2705">      vty-&gt;t_read = thread_add_read (vty_master, vtysh_read, vty, sock);</a>
+<a name="ln2706">      break;</a>
+<a name="ln2707">    case VTYSH_WRITE:</a>
+<a name="ln2708">      vty-&gt;t_write = thread_add_write (vty_master, vtysh_write, vty, sock);</a>
+<a name="ln2709">      break;</a>
+<a name="ln2710">#endif /* VTYSH */</a>
+<a name="ln2711">    case VTY_READ:</a>
+<a name="ln2712">      vty-&gt;t_read = thread_add_read (vty_master, vty_read, vty, sock);</a>
+<a name="ln2713"> </a>
+<a name="ln2714">      /* Time out treatment. */</a>
+<a name="ln2715">      if (vty-&gt;v_timeout)</a>
+<a name="ln2716">	{</a>
+<a name="ln2717">	  if (vty-&gt;t_timeout)</a>
+<a name="ln2718">	    thread_cancel (vty-&gt;t_timeout);</a>
+<a name="ln2719">	  vty-&gt;t_timeout = </a>
+<a name="ln2720">	    thread_add_timer (vty_master, vty_timeout, vty, vty-&gt;v_timeout);</a>
+<a name="ln2721">	}</a>
+<a name="ln2722">      break;</a>
+<a name="ln2723">    case VTY_WRITE:</a>
+<a name="ln2724">      if (! vty-&gt;t_write)</a>
+<a name="ln2725">	vty-&gt;t_write = thread_add_write (vty_master, vty_flush, vty, sock);</a>
+<a name="ln2726">      break;</a>
+<a name="ln2727">    case VTY_TIMEOUT_RESET:</a>
+<a name="ln2728">      if (vty-&gt;t_timeout)</a>
+<a name="ln2729">	{</a>
+<a name="ln2730">	  thread_cancel (vty-&gt;t_timeout);</a>
+<a name="ln2731">	  vty-&gt;t_timeout = NULL;</a>
+<a name="ln2732">	}</a>
+<a name="ln2733">      if (vty-&gt;v_timeout)</a>
+<a name="ln2734">	{</a>
+<a name="ln2735">	  vty-&gt;t_timeout = </a>
+<a name="ln2736">	    thread_add_timer (vty_master, vty_timeout, vty, vty-&gt;v_timeout);</a>
+<a name="ln2737">	}</a>
+<a name="ln2738">      break;</a>
+<a name="ln2739">    }</a>
+<a name="ln2740">}</a>
+<a name="ln2741"> </a>
+<a name="ln2742">DEFUN (who,</a>
+<a name="ln2743">       who_cmd,</a>
+<a name="ln2744">       &quot;who&quot;,</a>
+<a name="ln2745">       &quot;Display who is on vty\n&quot;)</a>
+<a name="ln2746">{</a>
+<a name="ln2747">  unsigned int i;</a>
+<a name="ln2748">  struct vty *v;</a>
+<a name="ln2749"> </a>
+<a name="ln2750">  for (i = 0; i &lt; vector_active (vtyvec); i++)</a>
+<a name="ln2751">    if ((v = vector_slot (vtyvec, i)) != NULL)</a>
+<a name="ln2752">      vty_out (vty, &quot;%svty[%d] connected from %s.%s&quot;,</a>
+<a name="ln2753">	       v-&gt;config ? &quot;*&quot; : &quot; &quot;,</a>
+<a name="ln2754">	       i, v-&gt;address, VTY_NEWLINE);</a>
+<a name="ln2755">  return CMD_SUCCESS;</a>
+<a name="ln2756">}</a>
+<a name="ln2757"> </a>
+<a name="ln2758">/* Move to vty configuration mode. */</a>
+<a name="ln2759">DEFUN (line_vty,</a>
+<a name="ln2760">       line_vty_cmd,</a>
+<a name="ln2761">       &quot;line vty&quot;,</a>
+<a name="ln2762">       &quot;Configure a terminal line\n&quot;</a>
+<a name="ln2763">       &quot;Virtual terminal\n&quot;)</a>
+<a name="ln2764">{</a>
+<a name="ln2765">  vty-&gt;node = VTY_NODE;</a>
+<a name="ln2766">  return CMD_SUCCESS;</a>
+<a name="ln2767">}</a>
+<a name="ln2768"> </a>
+<a name="ln2769">/* Set time out value. */</a>
+<a name="ln2770">static int</a>
+<a name="ln2771">exec_timeout (struct vty *vty, const char *min_str, const char *sec_str)</a>
+<a name="ln2772">{</a>
+<a name="ln2773">  unsigned long timeout = 0;</a>
+<a name="ln2774"> </a>
+<a name="ln2775">  /* min_str and sec_str are already checked by parser.  So it must be</a>
+<a name="ln2776">     all digit string. */</a>
+<a name="ln2777">  if (min_str)</a>
+<a name="ln2778">    {</a>
+<a name="ln2779">      timeout = strtol (min_str, NULL, 10);</a>
+<a name="ln2780">      timeout *= 60;</a>
+<a name="ln2781">    }</a>
+<a name="ln2782">  if (sec_str)</a>
+<a name="ln2783">    timeout += strtol (sec_str, NULL, 10);</a>
+<a name="ln2784"> </a>
+<a name="ln2785">  vty_timeout_val = timeout;</a>
+<a name="ln2786">  vty-&gt;v_timeout = timeout;</a>
+<a name="ln2787">  vty_event (VTY_TIMEOUT_RESET, 0, vty);</a>
+<a name="ln2788"> </a>
+<a name="ln2789"> </a>
+<a name="ln2790">  return CMD_SUCCESS;</a>
+<a name="ln2791">}</a>
+<a name="ln2792"> </a>
+<a name="ln2793">DEFUN (exec_timeout_min,</a>
+<a name="ln2794">       exec_timeout_min_cmd,</a>
+<a name="ln2795">       &quot;exec-timeout &lt;0-35791&gt;&quot;,</a>
+<a name="ln2796">       &quot;Set timeout value\n&quot;</a>
+<a name="ln2797">       &quot;Timeout value in minutes\n&quot;)</a>
+<a name="ln2798">{</a>
+<a name="ln2799">  return exec_timeout (vty, argv[0], NULL);</a>
+<a name="ln2800">}</a>
+<a name="ln2801"> </a>
+<a name="ln2802">DEFUN (exec_timeout_sec,</a>
+<a name="ln2803">       exec_timeout_sec_cmd,</a>
+<a name="ln2804">       &quot;exec-timeout &lt;0-35791&gt; &lt;0-2147483&gt;&quot;,</a>
+<a name="ln2805">       &quot;Set the EXEC timeout\n&quot;</a>
+<a name="ln2806">       &quot;Timeout in minutes\n&quot;</a>
+<a name="ln2807">       &quot;Timeout in seconds\n&quot;)</a>
+<a name="ln2808">{</a>
+<a name="ln2809">  return exec_timeout (vty, argv[0], argv[1]);</a>
+<a name="ln2810">}</a>
+<a name="ln2811"> </a>
+<a name="ln2812">DEFUN (no_exec_timeout,</a>
+<a name="ln2813">       no_exec_timeout_cmd,</a>
+<a name="ln2814">       &quot;no exec-timeout&quot;,</a>
+<a name="ln2815">       NO_STR</a>
+<a name="ln2816">       &quot;Set the EXEC timeout\n&quot;)</a>
+<a name="ln2817">{</a>
+<a name="ln2818">  return exec_timeout (vty, NULL, NULL);</a>
+<a name="ln2819">}</a>
+<a name="ln2820"> </a>
+<a name="ln2821">/* Set vty access class. */</a>
+<a name="ln2822">DEFUN (vty_access_class,</a>
+<a name="ln2823">       vty_access_class_cmd,</a>
+<a name="ln2824">       &quot;access-class WORD&quot;,</a>
+<a name="ln2825">       &quot;Filter connections based on an IP access list\n&quot;</a>
+<a name="ln2826">       &quot;IP access list\n&quot;)</a>
+<a name="ln2827">{</a>
+<a name="ln2828">  if (vty_accesslist_name)</a>
+<a name="ln2829">    XFREE(MTYPE_VTY, vty_accesslist_name);</a>
+<a name="ln2830"> </a>
+<a name="ln2831">  vty_accesslist_name = XSTRDUP(MTYPE_VTY, argv[0]);</a>
+<a name="ln2832"> </a>
+<a name="ln2833">  return CMD_SUCCESS;</a>
+<a name="ln2834">}</a>
+<a name="ln2835"> </a>
+<a name="ln2836">/* Clear vty access class. */</a>
+<a name="ln2837">DEFUN (no_vty_access_class,</a>
+<a name="ln2838">       no_vty_access_class_cmd,</a>
+<a name="ln2839">       &quot;no access-class [WORD]&quot;,</a>
+<a name="ln2840">       NO_STR</a>
+<a name="ln2841">       &quot;Filter connections based on an IP access list\n&quot;</a>
+<a name="ln2842">       &quot;IP access list\n&quot;)</a>
+<a name="ln2843">{</a>
+<a name="ln2844">  if (! vty_accesslist_name || (argc &amp;&amp; strcmp(vty_accesslist_name, argv[0])))</a>
+<a name="ln2845">    {</a>
+<a name="ln2846">      vty_out (vty, &quot;Access-class is not currently applied to vty%s&quot;,</a>
+<a name="ln2847">	       VTY_NEWLINE);</a>
+<a name="ln2848">      return CMD_WARNING;</a>
+<a name="ln2849">    }</a>
+<a name="ln2850"> </a>
+<a name="ln2851">  XFREE(MTYPE_VTY, vty_accesslist_name);</a>
+<a name="ln2852"> </a>
+<a name="ln2853">  vty_accesslist_name = NULL;</a>
+<a name="ln2854"> </a>
+<a name="ln2855">  return CMD_SUCCESS;</a>
+<a name="ln2856">}</a>
+<a name="ln2857"> </a>
+<a name="ln2858">#ifdef HAVE_IPV6</a>
+<a name="ln2859">/* Set vty access class. */</a>
+<a name="ln2860">DEFUN (vty_ipv6_access_class,</a>
+<a name="ln2861">       vty_ipv6_access_class_cmd,</a>
+<a name="ln2862">       &quot;ipv6 access-class WORD&quot;,</a>
+<a name="ln2863">       IPV6_STR</a>
+<a name="ln2864">       &quot;Filter connections based on an IP access list\n&quot;</a>
+<a name="ln2865">       &quot;IPv6 access list\n&quot;)</a>
+<a name="ln2866">{</a>
+<a name="ln2867">  if (vty_ipv6_accesslist_name)</a>
+<a name="ln2868">    XFREE(MTYPE_VTY, vty_ipv6_accesslist_name);</a>
+<a name="ln2869"> </a>
+<a name="ln2870">  vty_ipv6_accesslist_name = XSTRDUP(MTYPE_VTY, argv[0]);</a>
+<a name="ln2871"> </a>
+<a name="ln2872">  return CMD_SUCCESS;</a>
+<a name="ln2873">}</a>
+<a name="ln2874"> </a>
+<a name="ln2875">/* Clear vty access class. */</a>
+<a name="ln2876">DEFUN (no_vty_ipv6_access_class,</a>
+<a name="ln2877">       no_vty_ipv6_access_class_cmd,</a>
+<a name="ln2878">       &quot;no ipv6 access-class [WORD]&quot;,</a>
+<a name="ln2879">       NO_STR</a>
+<a name="ln2880">       IPV6_STR</a>
+<a name="ln2881">       &quot;Filter connections based on an IP access list\n&quot;</a>
+<a name="ln2882">       &quot;IPv6 access list\n&quot;)</a>
+<a name="ln2883">{</a>
+<a name="ln2884">  if (! vty_ipv6_accesslist_name ||</a>
+<a name="ln2885">      (argc &amp;&amp; strcmp(vty_ipv6_accesslist_name, argv[0])))</a>
+<a name="ln2886">    {</a>
+<a name="ln2887">      vty_out (vty, &quot;IPv6 access-class is not currently applied to vty%s&quot;,</a>
+<a name="ln2888">	       VTY_NEWLINE);</a>
+<a name="ln2889">      return CMD_WARNING;</a>
+<a name="ln2890">    }</a>
+<a name="ln2891"> </a>
+<a name="ln2892">  XFREE(MTYPE_VTY, vty_ipv6_accesslist_name);</a>
+<a name="ln2893"> </a>
+<a name="ln2894">  vty_ipv6_accesslist_name = NULL;</a>
+<a name="ln2895"> </a>
+<a name="ln2896">  return CMD_SUCCESS;</a>
+<a name="ln2897">}</a>
+<a name="ln2898">#endif /* HAVE_IPV6 */</a>
+<a name="ln2899"> </a>
+<a name="ln2900">/* vty login. */</a>
+<a name="ln2901">DEFUN (vty_login,</a>
+<a name="ln2902">       vty_login_cmd,</a>
+<a name="ln2903">       &quot;login&quot;,</a>
+<a name="ln2904">       &quot;Enable password checking\n&quot;)</a>
+<a name="ln2905">{</a>
+<a name="ln2906">  no_password_check = 0;</a>
+<a name="ln2907">  return CMD_SUCCESS;</a>
+<a name="ln2908">}</a>
+<a name="ln2909"> </a>
+<a name="ln2910">DEFUN (no_vty_login,</a>
+<a name="ln2911">       no_vty_login_cmd,</a>
+<a name="ln2912">       &quot;no login&quot;,</a>
+<a name="ln2913">       NO_STR</a>
+<a name="ln2914">       &quot;Enable password checking\n&quot;)</a>
+<a name="ln2915">{</a>
+<a name="ln2916">  no_password_check = 1;</a>
+<a name="ln2917">  return CMD_SUCCESS;</a>
+<a name="ln2918">}</a>
+<a name="ln2919"> </a>
+<a name="ln2920">/* initial mode. */</a>
+<a name="ln2921">DEFUN (vty_restricted_mode,</a>
+<a name="ln2922">       vty_restricted_mode_cmd,</a>
+<a name="ln2923">       &quot;anonymous restricted&quot;,</a>
+<a name="ln2924">       &quot;Restrict view commands available in anonymous, unauthenticated vty\n&quot;)</a>
+<a name="ln2925">{</a>
+<a name="ln2926">  restricted_mode = 1;</a>
+<a name="ln2927">  return CMD_SUCCESS;</a>
+<a name="ln2928">}</a>
+<a name="ln2929"> </a>
+<a name="ln2930">DEFUN (vty_no_restricted_mode,</a>
+<a name="ln2931">       vty_no_restricted_mode_cmd,</a>
+<a name="ln2932">       &quot;no anonymous restricted&quot;,</a>
+<a name="ln2933">       NO_STR</a>
+<a name="ln2934">       &quot;Enable password checking\n&quot;)</a>
+<a name="ln2935">{</a>
+<a name="ln2936">  restricted_mode = 0;</a>
+<a name="ln2937">  return CMD_SUCCESS;</a>
+<a name="ln2938">}</a>
+<a name="ln2939"> </a>
+<a name="ln2940">DEFUN (service_advanced_vty,</a>
+<a name="ln2941">       service_advanced_vty_cmd,</a>
+<a name="ln2942">       &quot;service advanced-vty&quot;,</a>
+<a name="ln2943">       &quot;Set up miscellaneous service\n&quot;</a>
+<a name="ln2944">       &quot;Enable advanced mode vty interface\n&quot;)</a>
+<a name="ln2945">{</a>
+<a name="ln2946">  host.advanced = 1;</a>
+<a name="ln2947">  return CMD_SUCCESS;</a>
+<a name="ln2948">}</a>
+<a name="ln2949"> </a>
+<a name="ln2950">DEFUN (no_service_advanced_vty,</a>
+<a name="ln2951">       no_service_advanced_vty_cmd,</a>
+<a name="ln2952">       &quot;no service advanced-vty&quot;,</a>
+<a name="ln2953">       NO_STR</a>
+<a name="ln2954">       &quot;Set up miscellaneous service\n&quot;</a>
+<a name="ln2955">       &quot;Enable advanced mode vty interface\n&quot;)</a>
+<a name="ln2956">{</a>
+<a name="ln2957">  host.advanced = 0;</a>
+<a name="ln2958">  return CMD_SUCCESS;</a>
+<a name="ln2959">}</a>
+<a name="ln2960"> </a>
+<a name="ln2961">DEFUN (terminal_monitor,</a>
+<a name="ln2962">       terminal_monitor_cmd,</a>
+<a name="ln2963">       &quot;terminal monitor&quot;,</a>
+<a name="ln2964">       &quot;Set terminal line parameters\n&quot;</a>
+<a name="ln2965">       &quot;Copy debug output to the current terminal line\n&quot;)</a>
+<a name="ln2966">{</a>
+<a name="ln2967">  vty-&gt;monitor = 1;</a>
+<a name="ln2968">  return CMD_SUCCESS;</a>
+<a name="ln2969">}</a>
+<a name="ln2970"> </a>
+<a name="ln2971">DEFUN (terminal_no_monitor,</a>
+<a name="ln2972">       terminal_no_monitor_cmd,</a>
+<a name="ln2973">       &quot;terminal no monitor&quot;,</a>
+<a name="ln2974">       &quot;Set terminal line parameters\n&quot;</a>
+<a name="ln2975">       NO_STR</a>
+<a name="ln2976">       &quot;Copy debug output to the current terminal line\n&quot;)</a>
+<a name="ln2977">{</a>
+<a name="ln2978">  vty-&gt;monitor = 0;</a>
+<a name="ln2979">  return CMD_SUCCESS;</a>
+<a name="ln2980">}</a>
+<a name="ln2981"> </a>
+<a name="ln2982">ALIAS (terminal_no_monitor,</a>
+<a name="ln2983">       no_terminal_monitor_cmd,</a>
+<a name="ln2984">       &quot;no terminal monitor&quot;,</a>
+<a name="ln2985">       NO_STR</a>
+<a name="ln2986">       &quot;Set terminal line parameters\n&quot;</a>
+<a name="ln2987">       &quot;Copy debug output to the current terminal line\n&quot;)</a>
+<a name="ln2988"> </a>
+<a name="ln2989">DEFUN (show_history,</a>
+<a name="ln2990">       show_history_cmd,</a>
+<a name="ln2991">       &quot;show history&quot;,</a>
+<a name="ln2992">       SHOW_STR</a>
+<a name="ln2993">       &quot;Display the session command history\n&quot;)</a>
+<a name="ln2994">{</a>
+<a name="ln2995">  int index;</a>
+<a name="ln2996"> </a>
+<a name="ln2997">  for (index = vty-&gt;hindex + 1; index != vty-&gt;hindex;)</a>
+<a name="ln2998">    {</a>
+<a name="ln2999">      if (index == VTY_MAXHIST)</a>
+<a name="ln3000">	{</a>
+<a name="ln3001">	  index = 0;</a>
+<a name="ln3002">	  continue;</a>
+<a name="ln3003">	}</a>
+<a name="ln3004"> </a>
+<a name="ln3005">      if (vty-&gt;hist[index] != NULL)</a>
+<a name="ln3006">	vty_out (vty, &quot;  %s%s&quot;, vty-&gt;hist[index], VTY_NEWLINE);</a>
+<a name="ln3007"> </a>
+<a name="ln3008">      index++;</a>
+<a name="ln3009">    }</a>
+<a name="ln3010"> </a>
+<a name="ln3011">  return CMD_SUCCESS;</a>
+<a name="ln3012">}</a>
+<a name="ln3013"> </a>
+<a name="ln3014">/* vty login. */</a>
+<a name="ln3015">DEFUN (log_commands,</a>
+<a name="ln3016">       log_commands_cmd,</a>
+<a name="ln3017">       &quot;log commands&quot;,</a>
+<a name="ln3018">       &quot;Logging control\n&quot;</a>
+<a name="ln3019">       &quot;Log all commands (can't be unset without restart)\n&quot;)</a>
+<a name="ln3020">{</a>
+<a name="ln3021">  do_log_commands = 1;</a>
+<a name="ln3022">  return CMD_SUCCESS;</a>
+<a name="ln3023">}</a>
+<a name="ln3024"> </a>
+<a name="ln3025">/* Display current configuration. */</a>
+<a name="ln3026">static int</a>
+<a name="ln3027">vty_config_write (struct vty *vty)</a>
+<a name="ln3028">{</a>
+<a name="ln3029">  vty_out (vty, &quot;line vty%s&quot;, VTY_NEWLINE);</a>
+<a name="ln3030"> </a>
+<a name="ln3031">  if (vty_accesslist_name)</a>
+<a name="ln3032">    vty_out (vty, &quot; access-class %s%s&quot;,</a>
+<a name="ln3033">	     vty_accesslist_name, VTY_NEWLINE);</a>
+<a name="ln3034"> </a>
+<a name="ln3035">  if (vty_ipv6_accesslist_name)</a>
+<a name="ln3036">    vty_out (vty, &quot; ipv6 access-class %s%s&quot;,</a>
+<a name="ln3037">	     vty_ipv6_accesslist_name, VTY_NEWLINE);</a>
+<a name="ln3038"> </a>
+<a name="ln3039">  /* exec-timeout */</a>
+<a name="ln3040">  if (vty_timeout_val != VTY_TIMEOUT_DEFAULT)</a>
+<a name="ln3041">    vty_out (vty, &quot; exec-timeout %ld %ld%s&quot;, </a>
+<a name="ln3042">	     vty_timeout_val / 60,</a>
+<a name="ln3043">	     vty_timeout_val % 60, VTY_NEWLINE);</a>
+<a name="ln3044"> </a>
+<a name="ln3045">  /* login */</a>
+<a name="ln3046">  if (no_password_check)</a>
+<a name="ln3047">    vty_out (vty, &quot; no login%s&quot;, VTY_NEWLINE);</a>
+<a name="ln3048">    </a>
+<a name="ln3049">  if (restricted_mode != restricted_mode_default)</a>
+<a name="ln3050">    {</a>
+<a name="ln3051">      if (restricted_mode_default)</a>
+<a name="ln3052">        vty_out (vty, &quot; no anonymous restricted%s&quot;, VTY_NEWLINE);</a>
+<a name="ln3053">      else</a>
+<a name="ln3054">        vty_out (vty, &quot; anonymous restricted%s&quot;, VTY_NEWLINE);</a>
+<a name="ln3055">    }</a>
+<a name="ln3056">  </a>
+<a name="ln3057">  if (do_log_commands)</a>
+<a name="ln3058">    vty_out (vty, &quot;log commands%s&quot;, VTY_NEWLINE);</a>
+<a name="ln3059">     </a>
+<a name="ln3060">  vty_out (vty, &quot;!%s&quot;, VTY_NEWLINE);</a>
+<a name="ln3061"> </a>
+<a name="ln3062">  return CMD_SUCCESS;</a>
+<a name="ln3063">}</a>
+<a name="ln3064"> </a>
+<a name="ln3065">struct cmd_node vty_node =</a>
+<a name="ln3066">{</a>
+<a name="ln3067">  VTY_NODE,</a>
+<a name="ln3068">  &quot;%s(config-line)# &quot;,</a>
+<a name="ln3069">  1,</a>
+<a name="ln3070">};</a>
+<a name="ln3071"> </a>
+<a name="ln3072">/* Reset all VTY status. */</a>
+<a name="ln3073">void</a>
+<a name="ln3074">vty_reset ()</a>
+<a name="ln3075">{</a>
+<a name="ln3076">  unsigned int i;</a>
+<a name="ln3077">  struct vty *vty;</a>
+<a name="ln3078">  struct thread *vty_serv_thread;</a>
+<a name="ln3079"> </a>
+<a name="ln3080">  for (i = 0; i &lt; vector_active (vtyvec); i++)</a>
+<a name="ln3081">    if ((vty = vector_slot (vtyvec, i)) != NULL)</a>
+<a name="ln3082">      {</a>
+<a name="ln3083">	buffer_reset (vty-&gt;obuf);</a>
+<a name="ln3084">	vty-&gt;status = VTY_CLOSE;</a>
+<a name="ln3085">	vty_close (vty);</a>
+<a name="ln3086">      }</a>
+<a name="ln3087"> </a>
+<a name="ln3088">  for (i = 0; i &lt; vector_active (Vvty_serv_thread); i++)</a>
+<a name="ln3089">    if ((vty_serv_thread = vector_slot (Vvty_serv_thread, i)) != NULL)</a>
+<a name="ln3090">      {</a>
+<a name="ln3091">	thread_cancel (vty_serv_thread);</a>
+<a name="ln3092">	vector_slot (Vvty_serv_thread, i) = NULL;</a>
+<a name="ln3093">        close (i);</a>
+<a name="ln3094">      }</a>
+<a name="ln3095"> </a>
+<a name="ln3096">  vty_timeout_val = VTY_TIMEOUT_DEFAULT;</a>
+<a name="ln3097"> </a>
+<a name="ln3098">  if (vty_accesslist_name)</a>
+<a name="ln3099">    {</a>
+<a name="ln3100">      XFREE(MTYPE_VTY, vty_accesslist_name);</a>
+<a name="ln3101">      vty_accesslist_name = NULL;</a>
+<a name="ln3102">    }</a>
+<a name="ln3103"> </a>
+<a name="ln3104">  if (vty_ipv6_accesslist_name)</a>
+<a name="ln3105">    {</a>
+<a name="ln3106">      XFREE(MTYPE_VTY, vty_ipv6_accesslist_name);</a>
+<a name="ln3107">      vty_ipv6_accesslist_name = NULL;</a>
+<a name="ln3108">    }</a>
+<a name="ln3109">}</a>
+<a name="ln3110"> </a>
+<a name="ln3111">static void</a>
+<a name="ln3112">vty_save_cwd (void)</a>
+<a name="ln3113">{</a>
+<a name="ln3114">  char cwd[MAXPATHLEN];</a>
+<a name="ln3115">  char *c;</a>
+<a name="ln3116"> </a>
+<a name="ln3117">  c = getcwd (cwd, MAXPATHLEN);</a>
+<a name="ln3118"> </a>
+<a name="ln3119">  if (!c)</a>
+<a name="ln3120">    {</a>
+<a name="ln3121">      chdir (SYSCONFDIR);</a>
+<a name="ln3122">      getcwd (cwd, MAXPATHLEN);</a>
+<a name="ln3123">    }</a>
+<a name="ln3124"> </a>
+<a name="ln3125">  vty_cwd = XMALLOC (MTYPE_TMP, strlen (cwd) + 1);</a>
+<a name="ln3126">  strcpy (vty_cwd, cwd);</a>
+<a name="ln3127">}</a>
+<a name="ln3128"> </a>
+<a name="ln3129">char *</a>
+<a name="ln3130">vty_get_cwd ()</a>
+<a name="ln3131">{</a>
+<a name="ln3132">  return vty_cwd;</a>
+<a name="ln3133">}</a>
+<a name="ln3134"> </a>
+<a name="ln3135">int</a>
+<a name="ln3136">vty_shell (struct vty *vty)</a>
+<a name="ln3137">{</a>
+<a name="ln3138">  return vty-&gt;type == VTY_SHELL ? 1 : 0;</a>
+<a name="ln3139">}</a>
+<a name="ln3140"> </a>
+<a name="ln3141">int</a>
+<a name="ln3142">vty_shell_serv (struct vty *vty)</a>
+<a name="ln3143">{</a>
+<a name="ln3144">  return vty-&gt;type == VTY_SHELL_SERV ? 1 : 0;</a>
+<a name="ln3145">}</a>
+<a name="ln3146"> </a>
+<a name="ln3147">void</a>
+<a name="ln3148">vty_init_vtysh ()</a>
+<a name="ln3149">{</a>
+<a name="ln3150">  vtyvec = vector_init (VECTOR_MIN_SIZE);</a>
+<a name="ln3151">}</a>
+<a name="ln3152"> </a>
+<a name="ln3153">/* Install vty's own commands like `who' command. */</a>
+<a name="ln3154">void</a>
+<a name="ln3155">vty_init (struct thread_master *master_thread)</a>
+<a name="ln3156">{</a>
+<a name="ln3157">  /* For further configuration read, preserve current directory. */</a>
+<a name="ln3158">  vty_save_cwd ();</a>
+<a name="ln3159"> </a>
+<a name="ln3160">  vtyvec = vector_init (VECTOR_MIN_SIZE);</a>
+<a name="ln3161"> </a>
+<a name="ln3162">  vty_master = master_thread;</a>
+<a name="ln3163"> </a>
+<a name="ln3164">  atexit (vty_stdio_reset);</a>
+<a name="ln3165"> </a>
+<a name="ln3166">  /* Initilize server thread vector. */</a>
+<a name="ln3167">  Vvty_serv_thread = vector_init (VECTOR_MIN_SIZE);</a>
+<a name="ln3168"> </a>
+<a name="ln3169">  /* Install bgp top node. */</a>
+<a name="ln3170">  install_node (&amp;vty_node, vty_config_write);</a>
+<a name="ln3171"> </a>
+<a name="ln3172">  install_element (RESTRICTED_NODE, &amp;who_cmd);</a>
+<a name="ln3173">  install_element (RESTRICTED_NODE, &amp;show_history_cmd);</a>
+<a name="ln3174">  install_element (VIEW_NODE, &amp;who_cmd);</a>
+<a name="ln3175">  install_element (VIEW_NODE, &amp;show_history_cmd);</a>
+<a name="ln3176">  install_element (CONFIG_NODE, &amp;line_vty_cmd);</a>
+<a name="ln3177">  install_element (CONFIG_NODE, &amp;service_advanced_vty_cmd);</a>
+<a name="ln3178">  install_element (CONFIG_NODE, &amp;no_service_advanced_vty_cmd);</a>
+<a name="ln3179">  install_element (CONFIG_NODE, &amp;show_history_cmd);</a>
+<a name="ln3180">  install_element (CONFIG_NODE, &amp;log_commands_cmd);</a>
+<a name="ln3181">  install_element (ENABLE_NODE, &amp;terminal_monitor_cmd);</a>
+<a name="ln3182">  install_element (ENABLE_NODE, &amp;terminal_no_monitor_cmd);</a>
+<a name="ln3183">  install_element (ENABLE_NODE, &amp;no_terminal_monitor_cmd);</a>
+<a name="ln3184"> </a>
+<a name="ln3185">  install_default (VTY_NODE);</a>
+<a name="ln3186">  install_element (VTY_NODE, &amp;exec_timeout_min_cmd);</a>
+<a name="ln3187">  install_element (VTY_NODE, &amp;exec_timeout_sec_cmd);</a>
+<a name="ln3188">  install_element (VTY_NODE, &amp;no_exec_timeout_cmd);</a>
+<a name="ln3189">  install_element (VTY_NODE, &amp;vty_access_class_cmd);</a>
+<a name="ln3190">  install_element (VTY_NODE, &amp;no_vty_access_class_cmd);</a>
+<a name="ln3191">  install_element (VTY_NODE, &amp;vty_login_cmd);</a>
+<a name="ln3192">  install_element (VTY_NODE, &amp;no_vty_login_cmd);</a>
+<a name="ln3193">  install_element (VTY_NODE, &amp;vty_restricted_mode_cmd);</a>
+<a name="ln3194">  install_element (VTY_NODE, &amp;vty_no_restricted_mode_cmd);</a>
+<a name="ln3195">#ifdef HAVE_IPV6</a>
+<a name="ln3196">  install_element (VTY_NODE, &amp;vty_ipv6_access_class_cmd);</a>
+<a name="ln3197">  install_element (VTY_NODE, &amp;no_vty_ipv6_access_class_cmd);</a>
+<a name="ln3198">#endif /* HAVE_IPV6 */</a>
+<a name="ln3199">}</a>
+<a name="ln3200"> </a>
+<a name="ln3201">void</a>
+<a name="ln3202">vty_terminate (void)</a>
+<a name="ln3203">{</a>
+<a name="ln3204">  if (vty_cwd)</a>
+<a name="ln3205">    XFREE (MTYPE_TMP, vty_cwd);</a>
+<a name="ln3206"> </a>
+<a name="ln3207">  if (vtyvec &amp;&amp; Vvty_serv_thread)</a>
+<a name="ln3208">    {</a>
+<a name="ln3209">      vty_reset ();</a>
+<a name="ln3210">      vector_free (vtyvec);</a>
+<a name="ln3211">      vector_free (Vvty_serv_thread);</a>
+<a name="ln3212">    }</a>
+<a name="ln3213">}</a>
+
+</code></pre>
+<div class="balloon" rel="8"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1042/" target="_blank">V1042</a> This file is marked with copyleft license, which requires you to open the derived source code.</p></div>
+<div class="balloon" rel="198"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1019/" target="_blank">V1019</a> Compound assignment expression 'len += ret' is used inside condition.</p></div>
+<div class="balloon" rel="202"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1028/" target="_blank">V1028</a> Possible overflow. Consider casting operands of the '(len += ret) + 2' operator to the 'size_t' type, not the result.</p></div>
+<div class="balloon" rel="202"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1019/" target="_blank">V1019</a> Compound assignment expression 'len += ret' is used inside condition.</p></div>
+<div class="balloon" rel="455"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1004/" target="_blank">V1004</a> The 'vty' pointer was used unsafely after it was verified against nullptr. Check lines: 445, 455.</p></div>
+<div class="balloon" rel="444"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v595/" target="_blank">V595</a> The 'vty' pointer was utilized before it was verified against nullptr. Check lines: 444, 445.</p></div>
+<div class="balloon" rel="975"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1037/" target="_blank">V1037</a> Two or more case-branches perform the same actions. Check lines: 975, 1009</p></div>
+<div class="balloon" rel="1001"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v595/" target="_blank">V595</a> The 'matched' pointer was utilized before it was verified against nullptr. Check lines: 1001, 1015.</p></div>
+<div class="balloon" rel="1621"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v536/" target="_blank">V536</a> Be advised that the utilized constant value is represented by an octal form. Oct: '\033', Dec: 27.</p></div>
+<div class="balloon" rel="2459"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v575/" target="_blank">V575</a> The potential null pointer is passed into 'strcpy' function. Inspect the first argument. Check lines: 2459, 2458.</p></div>
+<div class="balloon" rel="2468"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v575/" target="_blank">V575</a> The potential null pointer is passed into 'sprintf' function. Inspect the first argument. Check lines: 2468, 2467.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

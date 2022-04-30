@@ -1,0 +1,2453 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>isisd.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.5.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * IS-IS Rout(e)ing protocol - isisd.c</a>
+<a name="ln3"> *</a>
+<a name="ln4"> * Copyright (C) 2001,2002   Sampo Saaristo</a>
+<a name="ln5"> *                           Tampere University of Technology      </a>
+<a name="ln6"> *                           Institute of Communications Engineering</a>
+<a name="ln7"> *</a>
+<a name="ln8"> * This program is free software; you can redistribute it and/or modify it </a>
+<a name="ln9"> * under the terms of the GNU General Public Licenseas published by the Free </a>
+<a name="ln10"> * Software Foundation; either version 2 of the License, or (at your option) </a>
+<a name="ln11"> * any later version.</a>
+<a name="ln12"> *</a>
+<a name="ln13"> * This program is distributed in the hope that it will be useful,but WITHOUT </a>
+<a name="ln14"> * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or </a>
+<a name="ln15"> * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for </a>
+<a name="ln16"> * more details.</a>
+<a name="ln17"> </a>
+<a name="ln18"> * You should have received a copy of the GNU General Public License along </a>
+<a name="ln19"> * with this program; if not, write to the Free Software Foundation, Inc., </a>
+<a name="ln20"> * 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.</a>
+<a name="ln21"> */</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &lt;zebra.h&gt;</a>
+<a name="ln24"> </a>
+<a name="ln25">#include &quot;thread.h&quot;</a>
+<a name="ln26">#include &quot;vty.h&quot;</a>
+<a name="ln27">#include &quot;command.h&quot;</a>
+<a name="ln28">#include &quot;log.h&quot;</a>
+<a name="ln29">#include &quot;memory.h&quot;</a>
+<a name="ln30">#include &quot;time.h&quot;</a>
+<a name="ln31">#include &quot;linklist.h&quot;</a>
+<a name="ln32">#include &quot;if.h&quot;</a>
+<a name="ln33">#include &quot;hash.h&quot;</a>
+<a name="ln34">#include &quot;stream.h&quot;</a>
+<a name="ln35">#include &quot;prefix.h&quot;</a>
+<a name="ln36">#include &quot;table.h&quot;</a>
+<a name="ln37"> </a>
+<a name="ln38">#include &quot;isisd/dict.h&quot;</a>
+<a name="ln39">#include &quot;isisd/include-netbsd/iso.h&quot;</a>
+<a name="ln40">#include &quot;isisd/isis_constants.h&quot;</a>
+<a name="ln41">#include &quot;isisd/isis_common.h&quot;</a>
+<a name="ln42">#include &quot;isisd/isis_flags.h&quot;</a>
+<a name="ln43">#include &quot;isisd/isis_circuit.h&quot;</a>
+<a name="ln44">#include &quot;isisd/isis_csm.h&quot;</a>
+<a name="ln45">#include &quot;isisd/isisd.h&quot;</a>
+<a name="ln46">#include &quot;isisd/isis_dynhn.h&quot;</a>
+<a name="ln47">#include &quot;isisd/isis_adjacency.h&quot;</a>
+<a name="ln48">#include &quot;isisd/isis_pdu.h&quot;</a>
+<a name="ln49">#include &quot;isisd/isis_misc.h&quot;</a>
+<a name="ln50">#include &quot;isisd/isis_constants.h&quot;</a>
+<a name="ln51">#include &quot;isisd/isis_tlv.h&quot;</a>
+<a name="ln52">#include &quot;isisd/isis_lsp.h&quot;</a>
+<a name="ln53">#include &quot;isisd/isis_spf.h&quot;</a>
+<a name="ln54">#include &quot;isisd/isis_route.h&quot;</a>
+<a name="ln55">#include &quot;isisd/isis_zebra.h&quot;</a>
+<a name="ln56">#include &quot;isisd/isis_events.h&quot;</a>
+<a name="ln57">#include &quot;isisd/isis_te.h&quot;</a>
+<a name="ln58"> </a>
+<a name="ln59">#ifdef TOPOLOGY_GENERATE</a>
+<a name="ln60">#include &quot;spgrid.h&quot;</a>
+<a name="ln61">u_char DEFAULT_TOPOLOGY_BASEIS[6] = { 0xFE, 0xED, 0xFE, 0xED, 0x00, 0x00 };</a>
+<a name="ln62">#endif /* TOPOLOGY_GENERATE */</a>
+<a name="ln63"> </a>
+<a name="ln64">struct isis *isis = NULL;</a>
+<a name="ln65"> </a>
+<a name="ln66">/*</a>
+<a name="ln67"> * Prototypes.</a>
+<a name="ln68"> */</a>
+<a name="ln69">int isis_area_get(struct vty *, const char *);</a>
+<a name="ln70">int isis_area_destroy(struct vty *, const char *);</a>
+<a name="ln71">int area_net_title(struct vty *, const char *);</a>
+<a name="ln72">int area_clear_net_title(struct vty *, const char *);</a>
+<a name="ln73">int show_isis_interface_common(struct vty *, const char *ifname, char);</a>
+<a name="ln74">int show_isis_neighbor_common(struct vty *, const char *id, char);</a>
+<a name="ln75">int clear_isis_neighbor_common(struct vty *, const char *id);</a>
+<a name="ln76">int isis_config_write(struct vty *);</a>
+<a name="ln77"> </a>
+<a name="ln78"> </a>
+<a name="ln79"> </a>
+<a name="ln80">void</a>
+<a name="ln81">isis_new (unsigned long process_id)</a>
+<a name="ln82">{</a>
+<a name="ln83">  isis = XCALLOC (MTYPE_ISIS, sizeof (struct isis));</a>
+<a name="ln84">  /*</a>
+<a name="ln85">   * Default values</a>
+<a name="ln86">   */</a>
+<a name="ln87">  isis-&gt;max_area_addrs = 3;</a>
+<a name="ln88">  isis-&gt;process_id = process_id;</a>
+<a name="ln89">  isis-&gt;router_id = 0;</a>
+<a name="ln90">  isis-&gt;area_list = list_new ();</a>
+<a name="ln91">  isis-&gt;init_circ_list = list_new ();</a>
+<a name="ln92">  isis-&gt;uptime = time (NULL);</a>
+<a name="ln93">  isis-&gt;nexthops = list_new ();</a>
+<a name="ln94">#ifdef HAVE_IPV6</a>
+<a name="ln95">  isis-&gt;nexthops6 = list_new ();</a>
+<a name="ln96">#endif /* HAVE_IPV6 */</a>
+<a name="ln97">  dyn_cache_init ();</a>
+<a name="ln98">  /*</a>
+<a name="ln99">   * uncomment the next line for full debugs</a>
+<a name="ln100">   */</a>
+<a name="ln101">  /* isis-&gt;debugs = 0xFFFF; */</a>
+<a name="ln102">  isisMplsTE.status = disable;            /* Only support TE metric */</a>
+<a name="ln103">}</a>
+<a name="ln104"> </a>
+<a name="ln105">struct isis_area *</a>
+<a name="ln106">isis_area_create (const char *area_tag)</a>
+<a name="ln107">{</a>
+<a name="ln108">  struct isis_area *area;</a>
+<a name="ln109"> </a>
+<a name="ln110">  area = XCALLOC (MTYPE_ISIS_AREA, sizeof (struct isis_area));</a>
+<a name="ln111"> </a>
+<a name="ln112">  /*</a>
+<a name="ln113">   * The first instance is level-1-2 rest are level-1, unless otherwise</a>
+<a name="ln114">   * configured</a>
+<a name="ln115">   */</a>
+<a name="ln116">  if (listcount (isis-&gt;area_list) &gt; 0)</a>
+<a name="ln117">    area-&gt;is_type = IS_LEVEL_1;</a>
+<a name="ln118">  else</a>
+<a name="ln119">    area-&gt;is_type = IS_LEVEL_1_AND_2;</a>
+<a name="ln120"> </a>
+<a name="ln121">  /*</a>
+<a name="ln122">   * intialize the databases</a>
+<a name="ln123">   */</a>
+<a name="ln124">  if (area-&gt;is_type &amp; IS_LEVEL_1)</a>
+<a name="ln125">    {</a>
+<a name="ln126">      area-&gt;lspdb[0] = lsp_db_init ();</a>
+<a name="ln127">      area-&gt;route_table[0] = route_table_init ();</a>
+<a name="ln128">#ifdef HAVE_IPV6</a>
+<a name="ln129">      area-&gt;route_table6[0] = route_table_init ();</a>
+<a name="ln130">#endif /* HAVE_IPV6 */</a>
+<a name="ln131">    }</a>
+<a name="ln132">  if (area-&gt;is_type &amp; IS_LEVEL_2)</a>
+<a name="ln133">    {</a>
+<a name="ln134">      area-&gt;lspdb[1] = lsp_db_init ();</a>
+<a name="ln135">      area-&gt;route_table[1] = route_table_init ();</a>
+<a name="ln136">#ifdef HAVE_IPV6</a>
+<a name="ln137">      area-&gt;route_table6[1] = route_table_init ();</a>
+<a name="ln138">#endif /* HAVE_IPV6 */</a>
+<a name="ln139">    }</a>
+<a name="ln140"> </a>
+<a name="ln141">  spftree_area_init (area);</a>
+<a name="ln142"> </a>
+<a name="ln143">  area-&gt;circuit_list = list_new ();</a>
+<a name="ln144">  area-&gt;area_addrs = list_new ();</a>
+<a name="ln145">  THREAD_TIMER_ON (master, area-&gt;t_tick, lsp_tick, area, 1);</a>
+<a name="ln146">  flags_initialize (&amp;area-&gt;flags);</a>
+<a name="ln147"> </a>
+<a name="ln148">  /*</a>
+<a name="ln149">   * Default values</a>
+<a name="ln150">   */</a>
+<a name="ln151">  area-&gt;max_lsp_lifetime[0] = DEFAULT_LSP_LIFETIME;	/* 1200 */</a>
+<a name="ln152">  area-&gt;max_lsp_lifetime[1] = DEFAULT_LSP_LIFETIME;	/* 1200 */</a>
+<a name="ln153">  area-&gt;lsp_refresh[0] = DEFAULT_MAX_LSP_GEN_INTERVAL;	/* 900 */</a>
+<a name="ln154">  area-&gt;lsp_refresh[1] = DEFAULT_MAX_LSP_GEN_INTERVAL;	/* 900 */</a>
+<a name="ln155">  area-&gt;lsp_gen_interval[0] = DEFAULT_MIN_LSP_GEN_INTERVAL;</a>
+<a name="ln156">  area-&gt;lsp_gen_interval[1] = DEFAULT_MIN_LSP_GEN_INTERVAL;</a>
+<a name="ln157">  area-&gt;min_spf_interval[0] = MINIMUM_SPF_INTERVAL;</a>
+<a name="ln158">  area-&gt;min_spf_interval[1] = MINIMUM_SPF_INTERVAL;</a>
+<a name="ln159">  area-&gt;dynhostname = 1;</a>
+<a name="ln160">  area-&gt;oldmetric = 0;</a>
+<a name="ln161">  area-&gt;newmetric = 1;</a>
+<a name="ln162">  area-&gt;lsp_frag_threshold = 90;</a>
+<a name="ln163">  area-&gt;lsp_mtu = DEFAULT_LSP_MTU;</a>
+<a name="ln164">#ifdef TOPOLOGY_GENERATE</a>
+<a name="ln165">  memcpy (area-&gt;topology_baseis, DEFAULT_TOPOLOGY_BASEIS, ISIS_SYS_ID_LEN);</a>
+<a name="ln166">#endif /* TOPOLOGY_GENERATE */</a>
+<a name="ln167"> </a>
+<a name="ln168">  area-&gt;area_tag = strdup (area_tag);</a>
+<a name="ln169">  listnode_add (isis-&gt;area_list, area);</a>
+<a name="ln170">  area-&gt;isis = isis;</a>
+<a name="ln171"> </a>
+<a name="ln172">  return area;</a>
+<a name="ln173">}</a>
+<a name="ln174"> </a>
+<a name="ln175">struct isis_area *</a>
+<a name="ln176">isis_area_lookup (const char *area_tag)</a>
+<a name="ln177">{</a>
+<a name="ln178">  struct isis_area *area;</a>
+<a name="ln179">  struct listnode *node;</a>
+<a name="ln180"> </a>
+<a name="ln181">  for (ALL_LIST_ELEMENTS_RO (isis-&gt;area_list, node, area))</a>
+<a name="ln182">    if ((area-&gt;area_tag == NULL &amp;&amp; area_tag == NULL) ||</a>
+<a name="ln183">	(area-&gt;area_tag &amp;&amp; area_tag</a>
+<a name="ln184">	 &amp;&amp; strcmp (area-&gt;area_tag, area_tag) == 0))</a>
+<a name="ln185">    return area;</a>
+<a name="ln186"> </a>
+<a name="ln187">  return NULL;</a>
+<a name="ln188">}</a>
+<a name="ln189"> </a>
+<a name="ln190">int</a>
+<a name="ln191">isis_area_get (struct vty *vty, const char *area_tag)</a>
+<a name="ln192">{</a>
+<a name="ln193">  struct isis_area *area;</a>
+<a name="ln194"> </a>
+<a name="ln195">  area = isis_area_lookup (area_tag);</a>
+<a name="ln196"> </a>
+<a name="ln197">  if (area)</a>
+<a name="ln198">    {</a>
+<a name="ln199">      vty-&gt;node = ISIS_NODE;</a>
+<a name="ln200">      vty-&gt;index = area;</a>
+<a name="ln201">      return CMD_SUCCESS;</a>
+<a name="ln202">    }</a>
+<a name="ln203"> </a>
+<a name="ln204">  area = isis_area_create (area_tag);</a>
+<a name="ln205"> </a>
+<a name="ln206">  if (isis-&gt;debugs &amp; DEBUG_EVENTS)</a>
+<a name="ln207">    zlog_debug (&quot;New IS-IS area instance %s&quot;, area-&gt;area_tag);</a>
+<a name="ln208"> </a>
+<a name="ln209">  vty-&gt;node = ISIS_NODE;</a>
+<a name="ln210">  vty-&gt;index = area;</a>
+<a name="ln211"> </a>
+<a name="ln212">  return CMD_SUCCESS;</a>
+<a name="ln213">}</a>
+<a name="ln214"> </a>
+<a name="ln215">int</a>
+<a name="ln216">isis_area_destroy (struct vty *vty, const char *area_tag)</a>
+<a name="ln217">{</a>
+<a name="ln218">  struct isis_area *area;</a>
+<a name="ln219">  struct listnode *node, *nnode;</a>
+<a name="ln220">  struct isis_circuit *circuit;</a>
+<a name="ln221">  struct area_addr *addr;</a>
+<a name="ln222"> </a>
+<a name="ln223">  area = isis_area_lookup (area_tag);</a>
+<a name="ln224"> </a>
+<a name="ln225">  if (area == NULL)</a>
+<a name="ln226">    {</a>
+<a name="ln227">      vty_out (vty, &quot;Can't find ISIS instance %s&quot;, VTY_NEWLINE);</a>
+<a name="ln228">      return CMD_ERR_NO_MATCH;</a>
+<a name="ln229">    }</a>
+<a name="ln230"> </a>
+<a name="ln231">  if (area-&gt;circuit_list)</a>
+<a name="ln232">    {</a>
+<a name="ln233">      for (ALL_LIST_ELEMENTS (area-&gt;circuit_list, node, nnode, circuit))</a>
+<a name="ln234">        {</a>
+<a name="ln235">          circuit-&gt;ip_router = 0;</a>
+<a name="ln236">#ifdef HAVE_IPV6</a>
+<a name="ln237">          circuit-&gt;ipv6_router = 0;</a>
+<a name="ln238">#endif</a>
+<a name="ln239">          isis_csm_state_change (ISIS_DISABLE, circuit, area);</a>
+<a name="ln240">        }</a>
+<a name="ln241">      list_delete (area-&gt;circuit_list);</a>
+<a name="ln242">      area-&gt;circuit_list = NULL;</a>
+<a name="ln243">    }</a>
+<a name="ln244"> </a>
+<a name="ln245">  if (area-&gt;lspdb[0] != NULL)</a>
+<a name="ln246">    {</a>
+<a name="ln247">      lsp_db_destroy (area-&gt;lspdb[0]);</a>
+<a name="ln248">      area-&gt;lspdb[0] = NULL;</a>
+<a name="ln249">    }</a>
+<a name="ln250">  if (area-&gt;lspdb[1] != NULL)</a>
+<a name="ln251">    {</a>
+<a name="ln252">      lsp_db_destroy (area-&gt;lspdb[1]);</a>
+<a name="ln253">      area-&gt;lspdb[1] = NULL;</a>
+<a name="ln254">    }</a>
+<a name="ln255"> </a>
+<a name="ln256">  spftree_area_del (area);</a>
+<a name="ln257"> </a>
+<a name="ln258">  /* invalidate and validate would delete all routes from zebra */</a>
+<a name="ln259">  isis_route_invalidate (area);</a>
+<a name="ln260">  isis_route_validate (area);</a>
+<a name="ln261"> </a>
+<a name="ln262">  if (area-&gt;route_table[0])</a>
+<a name="ln263">    {</a>
+<a name="ln264">      route_table_finish (area-&gt;route_table[0]);</a>
+<a name="ln265">      area-&gt;route_table[0] = NULL;</a>
+<a name="ln266">    }</a>
+<a name="ln267">  if (area-&gt;route_table[1])</a>
+<a name="ln268">    {</a>
+<a name="ln269">      route_table_finish (area-&gt;route_table[1]);</a>
+<a name="ln270">      area-&gt;route_table[1] = NULL;</a>
+<a name="ln271">    }</a>
+<a name="ln272">#ifdef HAVE_IPV6</a>
+<a name="ln273">  if (area-&gt;route_table6[0])</a>
+<a name="ln274">    {</a>
+<a name="ln275">      route_table_finish (area-&gt;route_table6[0]);</a>
+<a name="ln276">      area-&gt;route_table6[0] = NULL;</a>
+<a name="ln277">    }</a>
+<a name="ln278">  if (area-&gt;route_table6[1])</a>
+<a name="ln279">    {</a>
+<a name="ln280">      route_table_finish (area-&gt;route_table6[1]);</a>
+<a name="ln281">      area-&gt;route_table6[1] = NULL;</a>
+<a name="ln282">    }</a>
+<a name="ln283">#endif /* HAVE_IPV6 */</a>
+<a name="ln284"> </a>
+<a name="ln285">  isis_redist_area_finish(area);</a>
+<a name="ln286"> </a>
+<a name="ln287">  for (ALL_LIST_ELEMENTS (area-&gt;area_addrs, node, nnode, addr))</a>
+<a name="ln288">    {</a>
+<a name="ln289">      list_delete_node (area-&gt;area_addrs, node);</a>
+<a name="ln290">      XFREE (MTYPE_ISIS_AREA_ADDR, addr);</a>
+<a name="ln291">    }</a>
+<a name="ln292">  area-&gt;area_addrs = NULL;</a>
+<a name="ln293"> </a>
+<a name="ln294">  THREAD_TIMER_OFF (area-&gt;t_tick);</a>
+<a name="ln295">  THREAD_TIMER_OFF (area-&gt;t_lsp_refresh[0]);</a>
+<a name="ln296">  THREAD_TIMER_OFF (area-&gt;t_lsp_refresh[1]);</a>
+<a name="ln297"> </a>
+<a name="ln298">  thread_cancel_event (master, area);</a>
+<a name="ln299"> </a>
+<a name="ln300">  listnode_delete (isis-&gt;area_list, area);</a>
+<a name="ln301"> </a>
+<a name="ln302">  free (area-&gt;area_tag);</a>
+<a name="ln303"> </a>
+<a name="ln304">  XFREE (MTYPE_ISIS_AREA, area);</a>
+<a name="ln305"> </a>
+<a name="ln306">  if (listcount (isis-&gt;area_list) == 0)</a>
+<a name="ln307">    {</a>
+<a name="ln308">      memset (isis-&gt;sysid, 0, ISIS_SYS_ID_LEN);</a>
+<a name="ln309">      isis-&gt;sysid_set = 0;</a>
+<a name="ln310">    }</a>
+<a name="ln311"> </a>
+<a name="ln312">  return CMD_SUCCESS;</a>
+<a name="ln313">}</a>
+<a name="ln314"> </a>
+<a name="ln315">int</a>
+<a name="ln316">area_net_title (struct vty *vty, const char *net_title)</a>
+<a name="ln317">{</a>
+<a name="ln318">  struct isis_area *area;</a>
+<a name="ln319">  struct area_addr *addr;</a>
+<a name="ln320">  struct area_addr *addrp;</a>
+<a name="ln321">  struct listnode *node;</a>
+<a name="ln322"> </a>
+<a name="ln323">  u_char buff[255];</a>
+<a name="ln324">  area = vty-&gt;index;</a>
+<a name="ln325"> </a>
+<a name="ln326">  if (!area)</a>
+<a name="ln327">    {</a>
+<a name="ln328">      vty_out (vty, &quot;Can't find ISIS instance %s&quot;, VTY_NEWLINE);</a>
+<a name="ln329">      return CMD_ERR_NO_MATCH;</a>
+<a name="ln330">    }</a>
+<a name="ln331"> </a>
+<a name="ln332">  /* We check that we are not over the maximal number of addresses */</a>
+<a name="ln333">  if (listcount (area-&gt;area_addrs) &gt;= isis-&gt;max_area_addrs)</a>
+<a name="ln334">    {</a>
+<a name="ln335">      vty_out (vty, &quot;Maximum of area addresses (%d) already reached %s&quot;,</a>
+<a name="ln336">	       isis-&gt;max_area_addrs, VTY_NEWLINE);</a>
+<a name="ln337">      return CMD_ERR_NOTHING_TODO;</a>
+<a name="ln338">    }</a>
+<a name="ln339"> </a>
+<a name="ln340">  addr = XMALLOC (MTYPE_ISIS_AREA_ADDR, sizeof (struct area_addr));</a>
+<a name="ln341">  addr-&gt;addr_len = dotformat2buff (buff, net_title);</a>
+<a name="ln342">  memcpy (addr-&gt;area_addr, buff, addr-&gt;addr_len);</a>
+<a name="ln343">#ifdef EXTREME_DEBUG</a>
+<a name="ln344">  zlog_debug (&quot;added area address %s for area %s (address length %d)&quot;,</a>
+<a name="ln345">	     net_title, area-&gt;area_tag, addr-&gt;addr_len);</a>
+<a name="ln346">#endif /* EXTREME_DEBUG */</a>
+<a name="ln347">  if (addr-&gt;addr_len &lt; 8 || addr-&gt;addr_len &gt; 20)</a>
+<a name="ln348">    {</a>
+<a name="ln349">      vty_out (vty, &quot;area address must be at least 8..20 octets long (%d)%s&quot;,</a>
+<a name="ln350">               addr-&gt;addr_len, VTY_NEWLINE);</a>
+<a name="ln351">      XFREE (MTYPE_ISIS_AREA_ADDR, addr);</a>
+<a name="ln352">      return CMD_ERR_AMBIGUOUS;</a>
+<a name="ln353">    }</a>
+<a name="ln354"> </a>
+<a name="ln355">  if (addr-&gt;area_addr[addr-&gt;addr_len-1] != 0)</a>
+<a name="ln356">    {</a>
+<a name="ln357">      vty_out (vty, &quot;nsel byte (last byte) in area address must be 0%s&quot;,</a>
+<a name="ln358">               VTY_NEWLINE);</a>
+<a name="ln359">      XFREE (MTYPE_ISIS_AREA_ADDR, addr);</a>
+<a name="ln360">      return CMD_ERR_AMBIGUOUS;</a>
+<a name="ln361">    }</a>
+<a name="ln362"> </a>
+<a name="ln363">  if (isis-&gt;sysid_set == 0)</a>
+<a name="ln364">    {</a>
+<a name="ln365">      /*</a>
+<a name="ln366">       * First area address - get the SystemID for this router</a>
+<a name="ln367">       */</a>
+<a name="ln368">      memcpy (isis-&gt;sysid, GETSYSID (addr), ISIS_SYS_ID_LEN);</a>
+<a name="ln369">      isis-&gt;sysid_set = 1;</a>
+<a name="ln370">      if (isis-&gt;debugs &amp; DEBUG_EVENTS)</a>
+<a name="ln371">	zlog_debug (&quot;Router has SystemID %s&quot;, sysid_print (isis-&gt;sysid));</a>
+<a name="ln372">    }</a>
+<a name="ln373">  else</a>
+<a name="ln374">    {</a>
+<a name="ln375">      /*</a>
+<a name="ln376">       * Check that the SystemID portions match</a>
+<a name="ln377">       */</a>
+<a name="ln378">      if (memcmp (isis-&gt;sysid, GETSYSID (addr), ISIS_SYS_ID_LEN))</a>
+<a name="ln379">	{</a>
+<a name="ln380">	  vty_out (vty,</a>
+<a name="ln381">		   &quot;System ID must not change when defining additional area&quot;</a>
+<a name="ln382">		   &quot; addresses%s&quot;, VTY_NEWLINE);</a>
+<a name="ln383">	  XFREE (MTYPE_ISIS_AREA_ADDR, addr);</a>
+<a name="ln384">	  return CMD_ERR_AMBIGUOUS;</a>
+<a name="ln385">	}</a>
+<a name="ln386"> </a>
+<a name="ln387">      /* now we see that we don't already have this address */</a>
+<a name="ln388">      for (ALL_LIST_ELEMENTS_RO (area-&gt;area_addrs, node, addrp))</a>
+<a name="ln389">	{</a>
+<a name="ln390">	  if ((addrp-&gt;addr_len + ISIS_SYS_ID_LEN + ISIS_NSEL_LEN) != (addr-&gt;addr_len))</a>
+<a name="ln391">	    continue;</a>
+<a name="ln392">	  if (!memcmp (addrp-&gt;area_addr, addr-&gt;area_addr, addr-&gt;addr_len))</a>
+<a name="ln393">	    {</a>
+<a name="ln394">	      XFREE (MTYPE_ISIS_AREA_ADDR, addr);</a>
+<a name="ln395">	      return CMD_SUCCESS;	/* silent fail */</a>
+<a name="ln396">	    }</a>
+<a name="ln397">	}</a>
+<a name="ln398">    }</a>
+<a name="ln399"> </a>
+<a name="ln400">  /*</a>
+<a name="ln401">   * Forget the systemID part of the address</a>
+<a name="ln402">   */</a>
+<a name="ln403">  addr-&gt;addr_len -= (ISIS_SYS_ID_LEN + ISIS_NSEL_LEN);</a>
+<a name="ln404">  listnode_add (area-&gt;area_addrs, addr);</a>
+<a name="ln405"> </a>
+<a name="ln406">  /* only now we can safely generate our LSPs for this area */</a>
+<a name="ln407">  if (listcount (area-&gt;area_addrs) &gt; 0)</a>
+<a name="ln408">    {</a>
+<a name="ln409">      if (area-&gt;is_type &amp; IS_LEVEL_1)</a>
+<a name="ln410">        lsp_generate (area, IS_LEVEL_1);</a>
+<a name="ln411">      if (area-&gt;is_type &amp; IS_LEVEL_2)</a>
+<a name="ln412">        lsp_generate (area, IS_LEVEL_2);</a>
+<a name="ln413">    }</a>
+<a name="ln414"> </a>
+<a name="ln415">  return CMD_SUCCESS;</a>
+<a name="ln416">}</a>
+<a name="ln417"> </a>
+<a name="ln418">int</a>
+<a name="ln419">area_clear_net_title (struct vty *vty, const char *net_title)</a>
+<a name="ln420">{</a>
+<a name="ln421">  struct isis_area *area;</a>
+<a name="ln422">  struct area_addr addr, *addrp = NULL;</a>
+<a name="ln423">  struct listnode *node;</a>
+<a name="ln424">  u_char buff[255];</a>
+<a name="ln425"> </a>
+<a name="ln426">  area = vty-&gt;index;</a>
+<a name="ln427">  if (!area)</a>
+<a name="ln428">    {</a>
+<a name="ln429">      vty_out (vty, &quot;Can't find ISIS instance %s&quot;, VTY_NEWLINE);</a>
+<a name="ln430">      return CMD_ERR_NO_MATCH;</a>
+<a name="ln431">    }</a>
+<a name="ln432"> </a>
+<a name="ln433">  addr.addr_len = dotformat2buff (buff, net_title);</a>
+<a name="ln434">  if (addr.addr_len &lt; 8 || addr.addr_len &gt; 20)</a>
+<a name="ln435">    {</a>
+<a name="ln436">      vty_out (vty, &quot;Unsupported area address length %d, should be 8...20 %s&quot;,</a>
+<a name="ln437">	       addr.addr_len, VTY_NEWLINE);</a>
+<a name="ln438">      return CMD_ERR_AMBIGUOUS;</a>
+<a name="ln439">    }</a>
+<a name="ln440"> </a>
+<a name="ln441">  memcpy (addr.area_addr, buff, (int) addr.addr_len);</a>
+<a name="ln442"> </a>
+<a name="ln443">  for (ALL_LIST_ELEMENTS_RO (area-&gt;area_addrs, node, addrp))</a>
+<a name="ln444">    if ((addrp-&gt;addr_len + ISIS_SYS_ID_LEN + 1) == addr.addr_len &amp;&amp;</a>
+<a name="ln445">	!memcmp (addrp-&gt;area_addr, addr.area_addr, addr.addr_len))</a>
+<a name="ln446">    break;</a>
+<a name="ln447"> </a>
+<a name="ln448">  if (!addrp)</a>
+<a name="ln449">    {</a>
+<a name="ln450">      vty_out (vty, &quot;No area address %s for area %s %s&quot;, net_title,</a>
+<a name="ln451">	       area-&gt;area_tag, VTY_NEWLINE);</a>
+<a name="ln452">      return CMD_ERR_NO_MATCH;</a>
+<a name="ln453">    }</a>
+<a name="ln454"> </a>
+<a name="ln455">  listnode_delete (area-&gt;area_addrs, addrp);</a>
+<a name="ln456">  XFREE (MTYPE_ISIS_AREA_ADDR, addrp);</a>
+<a name="ln457"> </a>
+<a name="ln458">  /*</a>
+<a name="ln459">   * Last area address - reset the SystemID for this router</a>
+<a name="ln460">   */</a>
+<a name="ln461">  if (listcount (area-&gt;area_addrs) == 0)</a>
+<a name="ln462">    {</a>
+<a name="ln463">      memset (isis-&gt;sysid, 0, ISIS_SYS_ID_LEN);</a>
+<a name="ln464">      isis-&gt;sysid_set = 0;</a>
+<a name="ln465">      if (isis-&gt;debugs &amp; DEBUG_EVENTS)</a>
+<a name="ln466">        zlog_debug (&quot;Router has no SystemID&quot;);</a>
+<a name="ln467">    }</a>
+<a name="ln468"> </a>
+<a name="ln469">  return CMD_SUCCESS;</a>
+<a name="ln470">}</a>
+<a name="ln471"> </a>
+<a name="ln472">/*</a>
+<a name="ln473"> * 'show isis interface' command</a>
+<a name="ln474"> */</a>
+<a name="ln475"> </a>
+<a name="ln476">int</a>
+<a name="ln477">show_isis_interface_common (struct vty *vty, const char *ifname, char detail)</a>
+<a name="ln478">{</a>
+<a name="ln479">  struct listnode *anode, *cnode;</a>
+<a name="ln480">  struct isis_area *area;</a>
+<a name="ln481">  struct isis_circuit *circuit;</a>
+<a name="ln482"> </a>
+<a name="ln483">  if (!isis)</a>
+<a name="ln484">    {</a>
+<a name="ln485">      vty_out (vty, &quot;IS-IS Routing Process not enabled%s&quot;, VTY_NEWLINE);</a>
+<a name="ln486">      return CMD_SUCCESS;</a>
+<a name="ln487">    }</a>
+<a name="ln488"> </a>
+<a name="ln489">  for (ALL_LIST_ELEMENTS_RO (isis-&gt;area_list, anode, area))</a>
+<a name="ln490">    {</a>
+<a name="ln491">      vty_out (vty, &quot;Area %s:%s&quot;, area-&gt;area_tag, VTY_NEWLINE);</a>
+<a name="ln492"> </a>
+<a name="ln493">      if (detail == ISIS_UI_LEVEL_BRIEF)</a>
+<a name="ln494">        vty_out (vty, &quot;  Interface   CircId   State    Type     Level%s&quot;,</a>
+<a name="ln495">                 VTY_NEWLINE);</a>
+<a name="ln496"> </a>
+<a name="ln497">      for (ALL_LIST_ELEMENTS_RO (area-&gt;circuit_list, cnode, circuit))</a>
+<a name="ln498">        if (!ifname)</a>
+<a name="ln499">          isis_circuit_print_vty (circuit, vty, detail);</a>
+<a name="ln500">        else if (strcmp(circuit-&gt;interface-&gt;name, ifname) == 0)</a>
+<a name="ln501">          isis_circuit_print_vty (circuit, vty, detail);</a>
+<a name="ln502">    }</a>
+<a name="ln503"> </a>
+<a name="ln504">  return CMD_SUCCESS;</a>
+<a name="ln505">}</a>
+<a name="ln506"> </a>
+<a name="ln507">DEFUN (show_isis_interface,</a>
+<a name="ln508">       show_isis_interface_cmd,</a>
+<a name="ln509">       &quot;show isis interface&quot;,</a>
+<a name="ln510">       SHOW_STR</a>
+<a name="ln511">       &quot;ISIS network information\n&quot;</a>
+<a name="ln512">       &quot;ISIS interface\n&quot;)</a>
+<a name="ln513">{</a>
+<a name="ln514">  return show_isis_interface_common (vty, NULL, ISIS_UI_LEVEL_BRIEF);</a>
+<a name="ln515">}</a>
+<a name="ln516"> </a>
+<a name="ln517">DEFUN (show_isis_interface_detail,</a>
+<a name="ln518">       show_isis_interface_detail_cmd,</a>
+<a name="ln519">       &quot;show isis interface detail&quot;,</a>
+<a name="ln520">       SHOW_STR</a>
+<a name="ln521">       &quot;ISIS network information\n&quot;</a>
+<a name="ln522">       &quot;ISIS interface\n&quot;</a>
+<a name="ln523">       &quot;show detailed information\n&quot;)</a>
+<a name="ln524">{</a>
+<a name="ln525">  return show_isis_interface_common (vty, NULL, ISIS_UI_LEVEL_DETAIL);</a>
+<a name="ln526">}</a>
+<a name="ln527"> </a>
+<a name="ln528">DEFUN (show_isis_interface_arg,</a>
+<a name="ln529">       show_isis_interface_arg_cmd,</a>
+<a name="ln530">       &quot;show isis interface WORD&quot;,</a>
+<a name="ln531">       SHOW_STR</a>
+<a name="ln532">       &quot;ISIS network information\n&quot;</a>
+<a name="ln533">       &quot;ISIS interface\n&quot;</a>
+<a name="ln534">       &quot;ISIS interface name\n&quot;)</a>
+<a name="ln535">{</a>
+<a name="ln536">  return show_isis_interface_common (vty, argv[0], ISIS_UI_LEVEL_DETAIL);</a>
+<a name="ln537">}</a>
+<a name="ln538"> </a>
+<a name="ln539">/*</a>
+<a name="ln540"> * 'show isis neighbor' command</a>
+<a name="ln541"> */</a>
+<a name="ln542"> </a>
+<a name="ln543">int</a>
+<a name="ln544">show_isis_neighbor_common (struct vty *vty, const char *id, char detail)</a>
+<a name="ln545">{</a>
+<a name="ln546">  struct listnode *anode, *cnode, *node;</a>
+<a name="ln547">  struct isis_area *area;</a>
+<a name="ln548">  struct isis_circuit *circuit;</a>
+<a name="ln549">  struct list *adjdb;</a>
+<a name="ln550">  struct isis_adjacency *adj;</a>
+<a name="ln551">  struct isis_dynhn *dynhn;</a>
+<a name="ln552">  u_char sysid[ISIS_SYS_ID_LEN];</a>
+<a name="ln553">  int i;</a>
+<a name="ln554"> </a>
+<a name="ln555">  if (!isis)</a>
+<a name="ln556">    {</a>
+<a name="ln557">      vty_out (vty, &quot;IS-IS Routing Process not enabled%s&quot;, VTY_NEWLINE);</a>
+<a name="ln558">      return CMD_SUCCESS;</a>
+<a name="ln559">    }</a>
+<a name="ln560"> </a>
+<a name="ln561">  memset (sysid, 0, ISIS_SYS_ID_LEN);</a>
+<a name="ln562">  if (id)</a>
+<a name="ln563">    {</a>
+<a name="ln564">      if (sysid2buff (sysid, id) == 0)</a>
+<a name="ln565">        {</a>
+<a name="ln566">          dynhn = dynhn_find_by_name (id);</a>
+<a name="ln567">          if (dynhn == NULL)</a>
+<a name="ln568">            {</a>
+<a name="ln569">              vty_out (vty, &quot;Invalid system id %s%s&quot;, id, VTY_NEWLINE);</a>
+<a name="ln570">              return CMD_SUCCESS;</a>
+<a name="ln571">            }</a>
+<a name="ln572">          memcpy (sysid, dynhn-&gt;id, ISIS_SYS_ID_LEN);</a>
+<a name="ln573">        }</a>
+<a name="ln574">    }</a>
+<a name="ln575"> </a>
+<a name="ln576">  for (ALL_LIST_ELEMENTS_RO (isis-&gt;area_list, anode, area))</a>
+<a name="ln577">    {</a>
+<a name="ln578">      vty_out (vty, &quot;Area %s:%s&quot;, area-&gt;area_tag, VTY_NEWLINE);</a>
+<a name="ln579"> </a>
+<a name="ln580">      if (detail == ISIS_UI_LEVEL_BRIEF)</a>
+<a name="ln581">        vty_out (vty, &quot;  System Id           Interface   L  State&quot;</a>
+<a name="ln582">                      &quot;        Holdtime SNPA%s&quot;, VTY_NEWLINE);</a>
+<a name="ln583"> </a>
+<a name="ln584">      for (ALL_LIST_ELEMENTS_RO (area-&gt;circuit_list, cnode, circuit))</a>
+<a name="ln585">        {</a>
+<a name="ln586">          if (circuit-&gt;circ_type == CIRCUIT_T_BROADCAST)</a>
+<a name="ln587">            {</a>
+<a name="ln588">              for (i = 0; i &lt; 2; i++)</a>
+<a name="ln589">                {</a>
+<a name="ln590">                  adjdb = circuit-&gt;u.bc.adjdb[i];</a>
+<a name="ln591">                  if (adjdb &amp;&amp; adjdb-&gt;count)</a>
+<a name="ln592">                    {</a>
+<a name="ln593">                      for (ALL_LIST_ELEMENTS_RO (adjdb, node, adj))</a>
+<a name="ln594">                        if (!id || !memcmp (adj-&gt;sysid, sysid,</a>
+<a name="ln595">                                            ISIS_SYS_ID_LEN))</a>
+<a name="ln596">                          isis_adj_print_vty (adj, vty, detail);</a>
+<a name="ln597">                    }</a>
+<a name="ln598">                }</a>
+<a name="ln599">            }</a>
+<a name="ln600">          else if (circuit-&gt;circ_type == CIRCUIT_T_P2P &amp;&amp;</a>
+<a name="ln601">                   circuit-&gt;u.p2p.neighbor)</a>
+<a name="ln602">            {</a>
+<a name="ln603">              adj = circuit-&gt;u.p2p.neighbor;</a>
+<a name="ln604">              if (!id || !memcmp (adj-&gt;sysid, sysid, ISIS_SYS_ID_LEN))</a>
+<a name="ln605">                isis_adj_print_vty (adj, vty, detail);</a>
+<a name="ln606">            }</a>
+<a name="ln607">        }</a>
+<a name="ln608">    }</a>
+<a name="ln609"> </a>
+<a name="ln610">  return CMD_SUCCESS;</a>
+<a name="ln611">}</a>
+<a name="ln612"> </a>
+<a name="ln613">/*</a>
+<a name="ln614"> * 'clear isis neighbor' command</a>
+<a name="ln615"> */</a>
+<a name="ln616">int</a>
+<a name="ln617">clear_isis_neighbor_common (struct vty *vty, const char *id)</a>
+<a name="ln618">{</a>
+<a name="ln619">  struct listnode *anode, *cnode, *cnextnode, *node, *nnode;</a>
+<a name="ln620">  struct isis_area *area;</a>
+<a name="ln621">  struct isis_circuit *circuit;</a>
+<a name="ln622">  struct list *adjdb;</a>
+<a name="ln623">  struct isis_adjacency *adj;</a>
+<a name="ln624">  struct isis_dynhn *dynhn;</a>
+<a name="ln625">  u_char sysid[ISIS_SYS_ID_LEN];</a>
+<a name="ln626">  int i;</a>
+<a name="ln627"> </a>
+<a name="ln628">  if (!isis)</a>
+<a name="ln629">    {</a>
+<a name="ln630">      vty_out (vty, &quot;IS-IS Routing Process not enabled%s&quot;, VTY_NEWLINE);</a>
+<a name="ln631">      return CMD_SUCCESS;</a>
+<a name="ln632">    }</a>
+<a name="ln633"> </a>
+<a name="ln634">  memset (sysid, 0, ISIS_SYS_ID_LEN);</a>
+<a name="ln635">  if (id)</a>
+<a name="ln636">    {</a>
+<a name="ln637">      if (sysid2buff (sysid, id) == 0)</a>
+<a name="ln638">        {</a>
+<a name="ln639">          dynhn = dynhn_find_by_name (id);</a>
+<a name="ln640">          if (dynhn == NULL)</a>
+<a name="ln641">            {</a>
+<a name="ln642">              vty_out (vty, &quot;Invalid system id %s%s&quot;, id, VTY_NEWLINE);</a>
+<a name="ln643">              return CMD_SUCCESS;</a>
+<a name="ln644">            }</a>
+<a name="ln645">          memcpy (sysid, dynhn-&gt;id, ISIS_SYS_ID_LEN);</a>
+<a name="ln646">        }</a>
+<a name="ln647">    }</a>
+<a name="ln648"> </a>
+<a name="ln649">  for (ALL_LIST_ELEMENTS_RO (isis-&gt;area_list, anode, area))</a>
+<a name="ln650">    {</a>
+<a name="ln651">      for (ALL_LIST_ELEMENTS (area-&gt;circuit_list, cnode, cnextnode, circuit))</a>
+<a name="ln652">        {</a>
+<a name="ln653">          if (circuit-&gt;circ_type == CIRCUIT_T_BROADCAST)</a>
+<a name="ln654">            {</a>
+<a name="ln655">              for (i = 0; i &lt; 2; i++)</a>
+<a name="ln656">                {</a>
+<a name="ln657">                  adjdb = circuit-&gt;u.bc.adjdb[i];</a>
+<a name="ln658">                  if (adjdb &amp;&amp; adjdb-&gt;count)</a>
+<a name="ln659">                    {</a>
+<a name="ln660">                      for (ALL_LIST_ELEMENTS (adjdb, node, nnode, adj))</a>
+<a name="ln661">                        if (!id || !memcmp (adj-&gt;sysid, sysid, ISIS_SYS_ID_LEN))</a>
+<a name="ln662">                          isis_adj_state_change (adj, ISIS_ADJ_DOWN,</a>
+<a name="ln663">                                                 &quot;clear user request&quot;);</a>
+<a name="ln664">                    }</a>
+<a name="ln665">                }</a>
+<a name="ln666">            }</a>
+<a name="ln667">          else if (circuit-&gt;circ_type == CIRCUIT_T_P2P &amp;&amp;</a>
+<a name="ln668">                   circuit-&gt;u.p2p.neighbor)</a>
+<a name="ln669">            {</a>
+<a name="ln670">              adj = circuit-&gt;u.p2p.neighbor;</a>
+<a name="ln671">              if (!id || !memcmp (adj-&gt;sysid, sysid, ISIS_SYS_ID_LEN))</a>
+<a name="ln672">                isis_adj_state_change (adj, ISIS_ADJ_DOWN,</a>
+<a name="ln673">                                       &quot;clear user request&quot;);</a>
+<a name="ln674">            }</a>
+<a name="ln675">        }</a>
+<a name="ln676">    }</a>
+<a name="ln677"> </a>
+<a name="ln678">  return CMD_SUCCESS;</a>
+<a name="ln679">}</a>
+<a name="ln680"> </a>
+<a name="ln681">DEFUN (show_isis_neighbor,</a>
+<a name="ln682">       show_isis_neighbor_cmd,</a>
+<a name="ln683">       &quot;show isis neighbor&quot;,</a>
+<a name="ln684">       SHOW_STR</a>
+<a name="ln685">       &quot;ISIS network information\n&quot;</a>
+<a name="ln686">       &quot;ISIS neighbor adjacencies\n&quot;)</a>
+<a name="ln687">{</a>
+<a name="ln688">  return show_isis_neighbor_common (vty, NULL, ISIS_UI_LEVEL_BRIEF);</a>
+<a name="ln689">}</a>
+<a name="ln690"> </a>
+<a name="ln691">DEFUN (show_isis_neighbor_detail,</a>
+<a name="ln692">       show_isis_neighbor_detail_cmd,</a>
+<a name="ln693">       &quot;show isis neighbor detail&quot;,</a>
+<a name="ln694">       SHOW_STR</a>
+<a name="ln695">       &quot;ISIS network information\n&quot;</a>
+<a name="ln696">       &quot;ISIS neighbor adjacencies\n&quot;</a>
+<a name="ln697">       &quot;show detailed information\n&quot;)</a>
+<a name="ln698">{</a>
+<a name="ln699">  return show_isis_neighbor_common (vty, NULL, ISIS_UI_LEVEL_DETAIL);</a>
+<a name="ln700">}</a>
+<a name="ln701"> </a>
+<a name="ln702">DEFUN (show_isis_neighbor_arg,</a>
+<a name="ln703">       show_isis_neighbor_arg_cmd,</a>
+<a name="ln704">       &quot;show isis neighbor WORD&quot;,</a>
+<a name="ln705">       SHOW_STR</a>
+<a name="ln706">       &quot;ISIS network information\n&quot;</a>
+<a name="ln707">       &quot;ISIS neighbor adjacencies\n&quot;</a>
+<a name="ln708">       &quot;System id\n&quot;)</a>
+<a name="ln709">{</a>
+<a name="ln710">  return show_isis_neighbor_common (vty, argv[0], ISIS_UI_LEVEL_DETAIL);</a>
+<a name="ln711">}</a>
+<a name="ln712"> </a>
+<a name="ln713">DEFUN (clear_isis_neighbor,</a>
+<a name="ln714">       clear_isis_neighbor_cmd,</a>
+<a name="ln715">       &quot;clear isis neighbor&quot;,</a>
+<a name="ln716">       CLEAR_STR</a>
+<a name="ln717">       &quot;Reset ISIS network information\n&quot;</a>
+<a name="ln718">       &quot;Reset ISIS neighbor adjacencies\n&quot;)</a>
+<a name="ln719">{</a>
+<a name="ln720">  return clear_isis_neighbor_common (vty, NULL);</a>
+<a name="ln721">}</a>
+<a name="ln722"> </a>
+<a name="ln723">DEFUN (clear_isis_neighbor_arg,</a>
+<a name="ln724">       clear_isis_neighbor_arg_cmd,</a>
+<a name="ln725">       &quot;clear isis neighbor WORD&quot;,</a>
+<a name="ln726">       CLEAR_STR</a>
+<a name="ln727">       &quot;ISIS network information\n&quot;</a>
+<a name="ln728">       &quot;ISIS neighbor adjacencies\n&quot;</a>
+<a name="ln729">       &quot;System id\n&quot;)</a>
+<a name="ln730">{</a>
+<a name="ln731">  return clear_isis_neighbor_common (vty, argv[0]);</a>
+<a name="ln732">}</a>
+<a name="ln733"> </a>
+<a name="ln734">/*</a>
+<a name="ln735"> * 'isis debug', 'show debugging'</a>
+<a name="ln736"> */</a>
+<a name="ln737">void</a>
+<a name="ln738">print_debug (struct vty *vty, int flags, int onoff)</a>
+<a name="ln739">{</a>
+<a name="ln740">  char onoffs[4];</a>
+<a name="ln741">  if (onoff)</a>
+<a name="ln742">    strcpy (onoffs, &quot;on&quot;);</a>
+<a name="ln743">  else</a>
+<a name="ln744">    strcpy (onoffs, &quot;off&quot;);</a>
+<a name="ln745"> </a>
+<a name="ln746">  if (flags &amp; DEBUG_ADJ_PACKETS)</a>
+<a name="ln747">    vty_out (vty, &quot;IS-IS Adjacency related packets debugging is %s%s&quot;, onoffs,</a>
+<a name="ln748">	     VTY_NEWLINE);</a>
+<a name="ln749">  if (flags &amp; DEBUG_CHECKSUM_ERRORS)</a>
+<a name="ln750">    vty_out (vty, &quot;IS-IS checksum errors debugging is %s%s&quot;, onoffs,</a>
+<a name="ln751">	     VTY_NEWLINE);</a>
+<a name="ln752">  if (flags &amp; DEBUG_LOCAL_UPDATES)</a>
+<a name="ln753">    vty_out (vty, &quot;IS-IS local updates debugging is %s%s&quot;, onoffs,</a>
+<a name="ln754">	     VTY_NEWLINE);</a>
+<a name="ln755">  if (flags &amp; DEBUG_PROTOCOL_ERRORS)</a>
+<a name="ln756">    vty_out (vty, &quot;IS-IS protocol errors debugging is %s%s&quot;, onoffs,</a>
+<a name="ln757">	     VTY_NEWLINE);</a>
+<a name="ln758">  if (flags &amp; DEBUG_SNP_PACKETS)</a>
+<a name="ln759">    vty_out (vty, &quot;IS-IS CSNP/PSNP packets debugging is %s%s&quot;, onoffs,</a>
+<a name="ln760">	     VTY_NEWLINE);</a>
+<a name="ln761">  if (flags &amp; DEBUG_SPF_EVENTS)</a>
+<a name="ln762">    vty_out (vty, &quot;IS-IS SPF events debugging is %s%s&quot;, onoffs, VTY_NEWLINE);</a>
+<a name="ln763">  if (flags &amp; DEBUG_SPF_STATS)</a>
+<a name="ln764">    vty_out (vty, &quot;IS-IS SPF Timing and Statistics Data debugging is %s%s&quot;,</a>
+<a name="ln765">	     onoffs, VTY_NEWLINE);</a>
+<a name="ln766">  if (flags &amp; DEBUG_SPF_TRIGGERS)</a>
+<a name="ln767">    vty_out (vty, &quot;IS-IS SPF triggering events debugging is %s%s&quot;, onoffs,</a>
+<a name="ln768">	     VTY_NEWLINE);</a>
+<a name="ln769">  if (flags &amp; DEBUG_UPDATE_PACKETS)</a>
+<a name="ln770">    vty_out (vty, &quot;IS-IS Update related packet debugging is %s%s&quot;, onoffs,</a>
+<a name="ln771">	     VTY_NEWLINE);</a>
+<a name="ln772">  if (flags &amp; DEBUG_RTE_EVENTS)</a>
+<a name="ln773">    vty_out (vty, &quot;IS-IS Route related debuggin is %s%s&quot;, onoffs,</a>
+<a name="ln774">	     VTY_NEWLINE);</a>
+<a name="ln775">  if (flags &amp; DEBUG_EVENTS)</a>
+<a name="ln776">    vty_out (vty, &quot;IS-IS Event debugging is %s%s&quot;, onoffs, VTY_NEWLINE);</a>
+<a name="ln777">  if (flags &amp; DEBUG_PACKET_DUMP)</a>
+<a name="ln778">    vty_out (vty, &quot;IS-IS Packet dump debugging is %s%s&quot;, onoffs, VTY_NEWLINE);</a>
+<a name="ln779">  if (flags &amp; DEBUG_LSP_GEN)</a>
+<a name="ln780">    vty_out (vty, &quot;IS-IS LSP generation debugging is %s%s&quot;, onoffs, VTY_NEWLINE);</a>
+<a name="ln781">  if (flags &amp; DEBUG_LSP_SCHED)</a>
+<a name="ln782">    vty_out (vty, &quot;IS-IS LSP scheduling debugging is %s%s&quot;, onoffs, VTY_NEWLINE);</a>
+<a name="ln783">}</a>
+<a name="ln784"> </a>
+<a name="ln785">DEFUN (show_debugging,</a>
+<a name="ln786">       show_debugging_isis_cmd,</a>
+<a name="ln787">       &quot;show debugging isis&quot;,</a>
+<a name="ln788">       SHOW_STR</a>
+<a name="ln789">       &quot;State of each debugging option\n&quot;)</a>
+<a name="ln790">{</a>
+<a name="ln791">  if (isis-&gt;debugs) {</a>
+<a name="ln792">      vty_out (vty, &quot;IS-IS:%s&quot;, VTY_NEWLINE);</a>
+<a name="ln793">      print_debug (vty, isis-&gt;debugs, 1);</a>
+<a name="ln794">  }</a>
+<a name="ln795">  return CMD_SUCCESS;</a>
+<a name="ln796">}</a>
+<a name="ln797"> </a>
+<a name="ln798">/* Debug node. */</a>
+<a name="ln799">static struct cmd_node debug_node = {</a>
+<a name="ln800">  DEBUG_NODE,</a>
+<a name="ln801">  &quot;&quot;,</a>
+<a name="ln802">  1</a>
+<a name="ln803">};</a>
+<a name="ln804"> </a>
+<a name="ln805">static int</a>
+<a name="ln806">config_write_debug (struct vty *vty)</a>
+<a name="ln807">{</a>
+<a name="ln808">  int write = 0;</a>
+<a name="ln809">  int flags = isis-&gt;debugs;</a>
+<a name="ln810"> </a>
+<a name="ln811">  if (flags &amp; DEBUG_ADJ_PACKETS)</a>
+<a name="ln812">    {</a>
+<a name="ln813">      vty_out (vty, &quot;debug isis adj-packets%s&quot;, VTY_NEWLINE);</a>
+<a name="ln814">      write++;</a>
+<a name="ln815">    }</a>
+<a name="ln816">  if (flags &amp; DEBUG_CHECKSUM_ERRORS)</a>
+<a name="ln817">    {</a>
+<a name="ln818">      vty_out (vty, &quot;debug isis checksum-errors%s&quot;, VTY_NEWLINE);</a>
+<a name="ln819">      write++;</a>
+<a name="ln820">    }</a>
+<a name="ln821">  if (flags &amp; DEBUG_LOCAL_UPDATES)</a>
+<a name="ln822">    {</a>
+<a name="ln823">      vty_out (vty, &quot;debug isis local-updates%s&quot;, VTY_NEWLINE);</a>
+<a name="ln824">      write++;</a>
+<a name="ln825">    }</a>
+<a name="ln826">  if (flags &amp; DEBUG_PROTOCOL_ERRORS)</a>
+<a name="ln827">    {</a>
+<a name="ln828">      vty_out (vty, &quot;debug isis protocol-errors%s&quot;, VTY_NEWLINE);</a>
+<a name="ln829">      write++;</a>
+<a name="ln830">    }</a>
+<a name="ln831">  if (flags &amp; DEBUG_SNP_PACKETS)</a>
+<a name="ln832">    {</a>
+<a name="ln833">      vty_out (vty, &quot;debug isis snp-packets%s&quot;, VTY_NEWLINE);</a>
+<a name="ln834">      write++;</a>
+<a name="ln835">    }</a>
+<a name="ln836">  if (flags &amp; DEBUG_SPF_EVENTS)</a>
+<a name="ln837">    {</a>
+<a name="ln838">      vty_out (vty, &quot;debug isis spf-events%s&quot;, VTY_NEWLINE);</a>
+<a name="ln839">      write++;</a>
+<a name="ln840">    }</a>
+<a name="ln841">  if (flags &amp; DEBUG_SPF_STATS)</a>
+<a name="ln842">    {</a>
+<a name="ln843">      vty_out (vty, &quot;debug isis spf-statistics%s&quot;, VTY_NEWLINE);</a>
+<a name="ln844">      write++;</a>
+<a name="ln845">    }</a>
+<a name="ln846">  if (flags &amp; DEBUG_SPF_TRIGGERS)</a>
+<a name="ln847">    {</a>
+<a name="ln848">      vty_out (vty, &quot;debug isis spf-triggers%s&quot;, VTY_NEWLINE);</a>
+<a name="ln849">      write++;</a>
+<a name="ln850">    }</a>
+<a name="ln851">  if (flags &amp; DEBUG_UPDATE_PACKETS)</a>
+<a name="ln852">    {</a>
+<a name="ln853">      vty_out (vty, &quot;debug isis update-packets%s&quot;, VTY_NEWLINE);</a>
+<a name="ln854">      write++;</a>
+<a name="ln855">    }</a>
+<a name="ln856">  if (flags &amp; DEBUG_RTE_EVENTS)</a>
+<a name="ln857">    {</a>
+<a name="ln858">      vty_out (vty, &quot;debug isis route-events%s&quot;, VTY_NEWLINE);</a>
+<a name="ln859">      write++;</a>
+<a name="ln860">    }</a>
+<a name="ln861">  if (flags &amp; DEBUG_EVENTS)</a>
+<a name="ln862">    {</a>
+<a name="ln863">      vty_out (vty, &quot;debug isis events%s&quot;, VTY_NEWLINE);</a>
+<a name="ln864">      write++;</a>
+<a name="ln865">    }</a>
+<a name="ln866">  if (flags &amp; DEBUG_PACKET_DUMP)</a>
+<a name="ln867">    {</a>
+<a name="ln868">      vty_out (vty, &quot;debug isis packet-dump%s&quot;, VTY_NEWLINE);</a>
+<a name="ln869">      write++;</a>
+<a name="ln870">    }</a>
+<a name="ln871">  if (flags &amp; DEBUG_LSP_GEN)</a>
+<a name="ln872">    {</a>
+<a name="ln873">      vty_out (vty, &quot;debug isis lsp-gen%s&quot;, VTY_NEWLINE);</a>
+<a name="ln874">      write++;</a>
+<a name="ln875">    }</a>
+<a name="ln876">  if (flags &amp; DEBUG_LSP_SCHED)</a>
+<a name="ln877">    {</a>
+<a name="ln878">      vty_out (vty, &quot;debug isis lsp-sched%s&quot;, VTY_NEWLINE);</a>
+<a name="ln879">      write++;</a>
+<a name="ln880">    }</a>
+<a name="ln881"> </a>
+<a name="ln882">  return write;</a>
+<a name="ln883">}</a>
+<a name="ln884"> </a>
+<a name="ln885">DEFUN (debug_isis_adj,</a>
+<a name="ln886">       debug_isis_adj_cmd,</a>
+<a name="ln887">       &quot;debug isis adj-packets&quot;,</a>
+<a name="ln888">       DEBUG_STR</a>
+<a name="ln889">       &quot;IS-IS information\n&quot;</a>
+<a name="ln890">       &quot;IS-IS Adjacency related packets\n&quot;)</a>
+<a name="ln891">{</a>
+<a name="ln892">  isis-&gt;debugs |= DEBUG_ADJ_PACKETS;</a>
+<a name="ln893">  print_debug (vty, DEBUG_ADJ_PACKETS, 1);</a>
+<a name="ln894"> </a>
+<a name="ln895">  return CMD_SUCCESS;</a>
+<a name="ln896">}</a>
+<a name="ln897"> </a>
+<a name="ln898">DEFUN (no_debug_isis_adj,</a>
+<a name="ln899">       no_debug_isis_adj_cmd,</a>
+<a name="ln900">       &quot;no debug isis adj-packets&quot;,</a>
+<a name="ln901">       UNDEBUG_STR</a>
+<a name="ln902">       &quot;IS-IS information\n&quot;</a>
+<a name="ln903">       &quot;IS-IS Adjacency related packets\n&quot;)</a>
+<a name="ln904">{</a>
+<a name="ln905">  isis-&gt;debugs &amp;= ~DEBUG_ADJ_PACKETS;</a>
+<a name="ln906">  print_debug (vty, DEBUG_ADJ_PACKETS, 0);</a>
+<a name="ln907"> </a>
+<a name="ln908">  return CMD_SUCCESS;</a>
+<a name="ln909">}</a>
+<a name="ln910"> </a>
+<a name="ln911">DEFUN (debug_isis_csum,</a>
+<a name="ln912">       debug_isis_csum_cmd,</a>
+<a name="ln913">       &quot;debug isis checksum-errors&quot;,</a>
+<a name="ln914">       DEBUG_STR</a>
+<a name="ln915">       &quot;IS-IS information\n&quot;</a>
+<a name="ln916">       &quot;IS-IS LSP checksum errors\n&quot;)</a>
+<a name="ln917">{</a>
+<a name="ln918">  isis-&gt;debugs |= DEBUG_CHECKSUM_ERRORS;</a>
+<a name="ln919">  print_debug (vty, DEBUG_CHECKSUM_ERRORS, 1);</a>
+<a name="ln920"> </a>
+<a name="ln921">  return CMD_SUCCESS;</a>
+<a name="ln922">}</a>
+<a name="ln923"> </a>
+<a name="ln924">DEFUN (no_debug_isis_csum,</a>
+<a name="ln925">       no_debug_isis_csum_cmd,</a>
+<a name="ln926">       &quot;no debug isis checksum-errors&quot;,</a>
+<a name="ln927">       UNDEBUG_STR</a>
+<a name="ln928">       &quot;IS-IS information\n&quot;</a>
+<a name="ln929">       &quot;IS-IS LSP checksum errors\n&quot;)</a>
+<a name="ln930">{</a>
+<a name="ln931">  isis-&gt;debugs &amp;= ~DEBUG_CHECKSUM_ERRORS;</a>
+<a name="ln932">  print_debug (vty, DEBUG_CHECKSUM_ERRORS, 0);</a>
+<a name="ln933"> </a>
+<a name="ln934">  return CMD_SUCCESS;</a>
+<a name="ln935">}</a>
+<a name="ln936"> </a>
+<a name="ln937">DEFUN (debug_isis_lupd,</a>
+<a name="ln938">       debug_isis_lupd_cmd,</a>
+<a name="ln939">       &quot;debug isis local-updates&quot;,</a>
+<a name="ln940">       DEBUG_STR</a>
+<a name="ln941">       &quot;IS-IS information\n&quot;</a>
+<a name="ln942">       &quot;IS-IS local update packets\n&quot;)</a>
+<a name="ln943">{</a>
+<a name="ln944">  isis-&gt;debugs |= DEBUG_LOCAL_UPDATES;</a>
+<a name="ln945">  print_debug (vty, DEBUG_LOCAL_UPDATES, 1);</a>
+<a name="ln946"> </a>
+<a name="ln947">  return CMD_SUCCESS;</a>
+<a name="ln948">}</a>
+<a name="ln949"> </a>
+<a name="ln950">DEFUN (no_debug_isis_lupd,</a>
+<a name="ln951">       no_debug_isis_lupd_cmd,</a>
+<a name="ln952">       &quot;no debug isis local-updates&quot;,</a>
+<a name="ln953">       UNDEBUG_STR</a>
+<a name="ln954">       &quot;IS-IS information\n&quot;</a>
+<a name="ln955">       &quot;IS-IS local update packets\n&quot;)</a>
+<a name="ln956">{</a>
+<a name="ln957">  isis-&gt;debugs &amp;= ~DEBUG_LOCAL_UPDATES;</a>
+<a name="ln958">  print_debug (vty, DEBUG_LOCAL_UPDATES, 0);</a>
+<a name="ln959"> </a>
+<a name="ln960">  return CMD_SUCCESS;</a>
+<a name="ln961">}</a>
+<a name="ln962"> </a>
+<a name="ln963">DEFUN (debug_isis_err,</a>
+<a name="ln964">       debug_isis_err_cmd,</a>
+<a name="ln965">       &quot;debug isis protocol-errors&quot;,</a>
+<a name="ln966">       DEBUG_STR</a>
+<a name="ln967">       &quot;IS-IS information\n&quot;</a>
+<a name="ln968">       &quot;IS-IS LSP protocol errors\n&quot;)</a>
+<a name="ln969">{</a>
+<a name="ln970">  isis-&gt;debugs |= DEBUG_PROTOCOL_ERRORS;</a>
+<a name="ln971">  print_debug (vty, DEBUG_PROTOCOL_ERRORS, 1);</a>
+<a name="ln972"> </a>
+<a name="ln973">  return CMD_SUCCESS;</a>
+<a name="ln974">}</a>
+<a name="ln975"> </a>
+<a name="ln976">DEFUN (no_debug_isis_err,</a>
+<a name="ln977">       no_debug_isis_err_cmd,</a>
+<a name="ln978">       &quot;no debug isis protocol-errors&quot;,</a>
+<a name="ln979">       UNDEBUG_STR</a>
+<a name="ln980">       &quot;IS-IS information\n&quot;</a>
+<a name="ln981">       &quot;IS-IS LSP protocol errors\n&quot;)</a>
+<a name="ln982">{</a>
+<a name="ln983">  isis-&gt;debugs &amp;= ~DEBUG_PROTOCOL_ERRORS;</a>
+<a name="ln984">  print_debug (vty, DEBUG_PROTOCOL_ERRORS, 0);</a>
+<a name="ln985"> </a>
+<a name="ln986">  return CMD_SUCCESS;</a>
+<a name="ln987">}</a>
+<a name="ln988"> </a>
+<a name="ln989">DEFUN (debug_isis_snp,</a>
+<a name="ln990">       debug_isis_snp_cmd,</a>
+<a name="ln991">       &quot;debug isis snp-packets&quot;,</a>
+<a name="ln992">       DEBUG_STR</a>
+<a name="ln993">       &quot;IS-IS information\n&quot;</a>
+<a name="ln994">       &quot;IS-IS CSNP/PSNP packets\n&quot;)</a>
+<a name="ln995">{</a>
+<a name="ln996">  isis-&gt;debugs |= DEBUG_SNP_PACKETS;</a>
+<a name="ln997">  print_debug (vty, DEBUG_SNP_PACKETS, 1);</a>
+<a name="ln998"> </a>
+<a name="ln999">  return CMD_SUCCESS;</a>
+<a name="ln1000">}</a>
+<a name="ln1001"> </a>
+<a name="ln1002">DEFUN (no_debug_isis_snp,</a>
+<a name="ln1003">       no_debug_isis_snp_cmd,</a>
+<a name="ln1004">       &quot;no debug isis snp-packets&quot;,</a>
+<a name="ln1005">       UNDEBUG_STR</a>
+<a name="ln1006">       &quot;IS-IS information\n&quot;</a>
+<a name="ln1007">       &quot;IS-IS CSNP/PSNP packets\n&quot;)</a>
+<a name="ln1008">{</a>
+<a name="ln1009">  isis-&gt;debugs &amp;= ~DEBUG_SNP_PACKETS;</a>
+<a name="ln1010">  print_debug (vty, DEBUG_SNP_PACKETS, 0);</a>
+<a name="ln1011"> </a>
+<a name="ln1012">  return CMD_SUCCESS;</a>
+<a name="ln1013">}</a>
+<a name="ln1014"> </a>
+<a name="ln1015">DEFUN (debug_isis_upd,</a>
+<a name="ln1016">       debug_isis_upd_cmd,</a>
+<a name="ln1017">       &quot;debug isis update-packets&quot;,</a>
+<a name="ln1018">       DEBUG_STR</a>
+<a name="ln1019">       &quot;IS-IS information\n&quot;</a>
+<a name="ln1020">       &quot;IS-IS Update related packets\n&quot;)</a>
+<a name="ln1021">{</a>
+<a name="ln1022">  isis-&gt;debugs |= DEBUG_UPDATE_PACKETS;</a>
+<a name="ln1023">  print_debug (vty, DEBUG_UPDATE_PACKETS, 1);</a>
+<a name="ln1024"> </a>
+<a name="ln1025">  return CMD_SUCCESS;</a>
+<a name="ln1026">}</a>
+<a name="ln1027"> </a>
+<a name="ln1028">DEFUN (no_debug_isis_upd,</a>
+<a name="ln1029">       no_debug_isis_upd_cmd,</a>
+<a name="ln1030">       &quot;no debug isis update-packets&quot;,</a>
+<a name="ln1031">       UNDEBUG_STR</a>
+<a name="ln1032">       &quot;IS-IS information\n&quot;</a>
+<a name="ln1033">       &quot;IS-IS Update related packets\n&quot;)</a>
+<a name="ln1034">{</a>
+<a name="ln1035">  isis-&gt;debugs &amp;= ~DEBUG_UPDATE_PACKETS;</a>
+<a name="ln1036">  print_debug (vty, DEBUG_UPDATE_PACKETS, 0);</a>
+<a name="ln1037"> </a>
+<a name="ln1038">  return CMD_SUCCESS;</a>
+<a name="ln1039">}</a>
+<a name="ln1040"> </a>
+<a name="ln1041">DEFUN (debug_isis_spfevents,</a>
+<a name="ln1042">       debug_isis_spfevents_cmd,</a>
+<a name="ln1043">       &quot;debug isis spf-events&quot;,</a>
+<a name="ln1044">       DEBUG_STR</a>
+<a name="ln1045">       &quot;IS-IS information\n&quot;</a>
+<a name="ln1046">       &quot;IS-IS Shortest Path First Events\n&quot;)</a>
+<a name="ln1047">{</a>
+<a name="ln1048">  isis-&gt;debugs |= DEBUG_SPF_EVENTS;</a>
+<a name="ln1049">  print_debug (vty, DEBUG_SPF_EVENTS, 1);</a>
+<a name="ln1050"> </a>
+<a name="ln1051">  return CMD_SUCCESS;</a>
+<a name="ln1052">}</a>
+<a name="ln1053"> </a>
+<a name="ln1054">DEFUN (no_debug_isis_spfevents,</a>
+<a name="ln1055">       no_debug_isis_spfevents_cmd,</a>
+<a name="ln1056">       &quot;no debug isis spf-events&quot;,</a>
+<a name="ln1057">       UNDEBUG_STR</a>
+<a name="ln1058">       &quot;IS-IS information\n&quot;</a>
+<a name="ln1059">       &quot;IS-IS Shortest Path First Events\n&quot;)</a>
+<a name="ln1060">{</a>
+<a name="ln1061">  isis-&gt;debugs &amp;= ~DEBUG_SPF_EVENTS;</a>
+<a name="ln1062">  print_debug (vty, DEBUG_SPF_EVENTS, 0);</a>
+<a name="ln1063"> </a>
+<a name="ln1064">  return CMD_SUCCESS;</a>
+<a name="ln1065">}</a>
+<a name="ln1066"> </a>
+<a name="ln1067">DEFUN (debug_isis_spfstats,</a>
+<a name="ln1068">       debug_isis_spfstats_cmd,</a>
+<a name="ln1069">       &quot;debug isis spf-statistics &quot;,</a>
+<a name="ln1070">       DEBUG_STR</a>
+<a name="ln1071">       &quot;IS-IS information\n&quot;</a>
+<a name="ln1072">       &quot;IS-IS SPF Timing and Statistic Data\n&quot;)</a>
+<a name="ln1073">{</a>
+<a name="ln1074">  isis-&gt;debugs |= DEBUG_SPF_STATS;</a>
+<a name="ln1075">  print_debug (vty, DEBUG_SPF_STATS, 1);</a>
+<a name="ln1076"> </a>
+<a name="ln1077">  return CMD_SUCCESS;</a>
+<a name="ln1078">}</a>
+<a name="ln1079"> </a>
+<a name="ln1080">DEFUN (no_debug_isis_spfstats,</a>
+<a name="ln1081">       no_debug_isis_spfstats_cmd,</a>
+<a name="ln1082">       &quot;no debug isis spf-statistics&quot;,</a>
+<a name="ln1083">       UNDEBUG_STR</a>
+<a name="ln1084">       &quot;IS-IS information\n&quot;</a>
+<a name="ln1085">       &quot;IS-IS SPF Timing and Statistic Data\n&quot;)</a>
+<a name="ln1086">{</a>
+<a name="ln1087">  isis-&gt;debugs &amp;= ~DEBUG_SPF_STATS;</a>
+<a name="ln1088">  print_debug (vty, DEBUG_SPF_STATS, 0);</a>
+<a name="ln1089"> </a>
+<a name="ln1090">  return CMD_SUCCESS;</a>
+<a name="ln1091">}</a>
+<a name="ln1092"> </a>
+<a name="ln1093">DEFUN (debug_isis_spftrigg,</a>
+<a name="ln1094">       debug_isis_spftrigg_cmd,</a>
+<a name="ln1095">       &quot;debug isis spf-triggers&quot;,</a>
+<a name="ln1096">       DEBUG_STR</a>
+<a name="ln1097">       &quot;IS-IS information\n&quot;</a>
+<a name="ln1098">       &quot;IS-IS SPF triggering events\n&quot;)</a>
+<a name="ln1099">{</a>
+<a name="ln1100">  isis-&gt;debugs |= DEBUG_SPF_TRIGGERS;</a>
+<a name="ln1101">  print_debug (vty, DEBUG_SPF_TRIGGERS, 1);</a>
+<a name="ln1102"> </a>
+<a name="ln1103">  return CMD_SUCCESS;</a>
+<a name="ln1104">}</a>
+<a name="ln1105"> </a>
+<a name="ln1106">DEFUN (no_debug_isis_spftrigg,</a>
+<a name="ln1107">       no_debug_isis_spftrigg_cmd,</a>
+<a name="ln1108">       &quot;no debug isis spf-triggers&quot;,</a>
+<a name="ln1109">       UNDEBUG_STR</a>
+<a name="ln1110">       &quot;IS-IS information\n&quot;</a>
+<a name="ln1111">       &quot;IS-IS SPF triggering events\n&quot;)</a>
+<a name="ln1112">{</a>
+<a name="ln1113">  isis-&gt;debugs &amp;= ~DEBUG_SPF_TRIGGERS;</a>
+<a name="ln1114">  print_debug (vty, DEBUG_SPF_TRIGGERS, 0);</a>
+<a name="ln1115"> </a>
+<a name="ln1116">  return CMD_SUCCESS;</a>
+<a name="ln1117">}</a>
+<a name="ln1118"> </a>
+<a name="ln1119">DEFUN (debug_isis_rtevents,</a>
+<a name="ln1120">       debug_isis_rtevents_cmd,</a>
+<a name="ln1121">       &quot;debug isis route-events&quot;,</a>
+<a name="ln1122">       DEBUG_STR</a>
+<a name="ln1123">       &quot;IS-IS information\n&quot;</a>
+<a name="ln1124">       &quot;IS-IS Route related events\n&quot;)</a>
+<a name="ln1125">{</a>
+<a name="ln1126">  isis-&gt;debugs |= DEBUG_RTE_EVENTS;</a>
+<a name="ln1127">  print_debug (vty, DEBUG_RTE_EVENTS, 1);</a>
+<a name="ln1128"> </a>
+<a name="ln1129">  return CMD_SUCCESS;</a>
+<a name="ln1130">}</a>
+<a name="ln1131"> </a>
+<a name="ln1132">DEFUN (no_debug_isis_rtevents,</a>
+<a name="ln1133">       no_debug_isis_rtevents_cmd,</a>
+<a name="ln1134">       &quot;no debug isis route-events&quot;,</a>
+<a name="ln1135">       UNDEBUG_STR</a>
+<a name="ln1136">       &quot;IS-IS information\n&quot;</a>
+<a name="ln1137">       &quot;IS-IS Route related events\n&quot;)</a>
+<a name="ln1138">{</a>
+<a name="ln1139">  isis-&gt;debugs &amp;= ~DEBUG_RTE_EVENTS;</a>
+<a name="ln1140">  print_debug (vty, DEBUG_RTE_EVENTS, 0);</a>
+<a name="ln1141"> </a>
+<a name="ln1142">  return CMD_SUCCESS;</a>
+<a name="ln1143">}</a>
+<a name="ln1144"> </a>
+<a name="ln1145">DEFUN (debug_isis_events,</a>
+<a name="ln1146">       debug_isis_events_cmd,</a>
+<a name="ln1147">       &quot;debug isis events&quot;,</a>
+<a name="ln1148">       DEBUG_STR</a>
+<a name="ln1149">       &quot;IS-IS information\n&quot;</a>
+<a name="ln1150">       &quot;IS-IS Events\n&quot;)</a>
+<a name="ln1151">{</a>
+<a name="ln1152">  isis-&gt;debugs |= DEBUG_EVENTS;</a>
+<a name="ln1153">  print_debug (vty, DEBUG_EVENTS, 1);</a>
+<a name="ln1154"> </a>
+<a name="ln1155">  return CMD_SUCCESS;</a>
+<a name="ln1156">}</a>
+<a name="ln1157"> </a>
+<a name="ln1158">DEFUN (no_debug_isis_events,</a>
+<a name="ln1159">       no_debug_isis_events_cmd,</a>
+<a name="ln1160">       &quot;no debug isis events&quot;,</a>
+<a name="ln1161">       UNDEBUG_STR</a>
+<a name="ln1162">       &quot;IS-IS information\n&quot;</a>
+<a name="ln1163">       &quot;IS-IS Events\n&quot;)</a>
+<a name="ln1164">{</a>
+<a name="ln1165">  isis-&gt;debugs &amp;= ~DEBUG_EVENTS;</a>
+<a name="ln1166">  print_debug (vty, DEBUG_EVENTS, 0);</a>
+<a name="ln1167"> </a>
+<a name="ln1168">  return CMD_SUCCESS;</a>
+<a name="ln1169">}</a>
+<a name="ln1170"> </a>
+<a name="ln1171">DEFUN (debug_isis_packet_dump,</a>
+<a name="ln1172">       debug_isis_packet_dump_cmd,</a>
+<a name="ln1173">       &quot;debug isis packet-dump&quot;,</a>
+<a name="ln1174">       DEBUG_STR</a>
+<a name="ln1175">       &quot;IS-IS information\n&quot;</a>
+<a name="ln1176">       &quot;IS-IS packet dump\n&quot;)</a>
+<a name="ln1177">{</a>
+<a name="ln1178">  isis-&gt;debugs |= DEBUG_PACKET_DUMP;</a>
+<a name="ln1179">  print_debug (vty, DEBUG_PACKET_DUMP, 1);</a>
+<a name="ln1180"> </a>
+<a name="ln1181">  return CMD_SUCCESS;</a>
+<a name="ln1182">}</a>
+<a name="ln1183"> </a>
+<a name="ln1184">DEFUN (no_debug_isis_packet_dump,</a>
+<a name="ln1185">       no_debug_isis_packet_dump_cmd,</a>
+<a name="ln1186">       &quot;no debug isis packet-dump&quot;,</a>
+<a name="ln1187">       UNDEBUG_STR</a>
+<a name="ln1188">       &quot;IS-IS information\n&quot;</a>
+<a name="ln1189">       &quot;IS-IS packet dump\n&quot;)</a>
+<a name="ln1190">{</a>
+<a name="ln1191">  isis-&gt;debugs &amp;= ~DEBUG_PACKET_DUMP;</a>
+<a name="ln1192">  print_debug (vty, DEBUG_PACKET_DUMP, 0);</a>
+<a name="ln1193"> </a>
+<a name="ln1194">  return CMD_SUCCESS;</a>
+<a name="ln1195">}</a>
+<a name="ln1196"> </a>
+<a name="ln1197">DEFUN (debug_isis_lsp_gen,</a>
+<a name="ln1198">       debug_isis_lsp_gen_cmd,</a>
+<a name="ln1199">       &quot;debug isis lsp-gen&quot;,</a>
+<a name="ln1200">       DEBUG_STR</a>
+<a name="ln1201">       &quot;IS-IS information\n&quot;</a>
+<a name="ln1202">       &quot;IS-IS generation of own LSPs\n&quot;)</a>
+<a name="ln1203">{</a>
+<a name="ln1204">  isis-&gt;debugs |= DEBUG_LSP_GEN;</a>
+<a name="ln1205">  print_debug (vty, DEBUG_LSP_GEN, 1);</a>
+<a name="ln1206"> </a>
+<a name="ln1207">  return CMD_SUCCESS;</a>
+<a name="ln1208">}</a>
+<a name="ln1209"> </a>
+<a name="ln1210">DEFUN (no_debug_isis_lsp_gen,</a>
+<a name="ln1211">       no_debug_isis_lsp_gen_cmd,</a>
+<a name="ln1212">       &quot;no debug isis lsp-gen&quot;,</a>
+<a name="ln1213">       UNDEBUG_STR</a>
+<a name="ln1214">       &quot;IS-IS information\n&quot;</a>
+<a name="ln1215">       &quot;IS-IS generation of own LSPs\n&quot;)</a>
+<a name="ln1216">{</a>
+<a name="ln1217">  isis-&gt;debugs &amp;= ~DEBUG_LSP_GEN;</a>
+<a name="ln1218">  print_debug (vty, DEBUG_LSP_GEN, 0);</a>
+<a name="ln1219"> </a>
+<a name="ln1220">  return CMD_SUCCESS;</a>
+<a name="ln1221">}</a>
+<a name="ln1222"> </a>
+<a name="ln1223">DEFUN (debug_isis_lsp_sched,</a>
+<a name="ln1224">       debug_isis_lsp_sched_cmd,</a>
+<a name="ln1225">       &quot;debug isis lsp-sched&quot;,</a>
+<a name="ln1226">       DEBUG_STR</a>
+<a name="ln1227">       &quot;IS-IS information\n&quot;</a>
+<a name="ln1228">       &quot;IS-IS scheduling of LSP generation\n&quot;)</a>
+<a name="ln1229">{</a>
+<a name="ln1230">  isis-&gt;debugs |= DEBUG_LSP_SCHED;</a>
+<a name="ln1231">  print_debug (vty, DEBUG_LSP_SCHED, 1);</a>
+<a name="ln1232"> </a>
+<a name="ln1233">  return CMD_SUCCESS;</a>
+<a name="ln1234">}</a>
+<a name="ln1235"> </a>
+<a name="ln1236">DEFUN (no_debug_isis_lsp_sched,</a>
+<a name="ln1237">       no_debug_isis_lsp_sched_cmd,</a>
+<a name="ln1238">       &quot;no debug isis lsp-gen&quot;,</a>
+<a name="ln1239">       UNDEBUG_STR</a>
+<a name="ln1240">       &quot;IS-IS information\n&quot;</a>
+<a name="ln1241">       &quot;IS-IS scheduling of LSP generation\n&quot;)</a>
+<a name="ln1242">{</a>
+<a name="ln1243">  isis-&gt;debugs &amp;= ~DEBUG_LSP_SCHED;</a>
+<a name="ln1244">  print_debug (vty, DEBUG_LSP_SCHED, 0);</a>
+<a name="ln1245"> </a>
+<a name="ln1246">  return CMD_SUCCESS;</a>
+<a name="ln1247">}</a>
+<a name="ln1248"> </a>
+<a name="ln1249">DEFUN (show_hostname,</a>
+<a name="ln1250">       show_hostname_cmd,</a>
+<a name="ln1251">       &quot;show isis hostname&quot;,</a>
+<a name="ln1252">       SHOW_STR</a>
+<a name="ln1253">       &quot;IS-IS information\n&quot;</a>
+<a name="ln1254">       &quot;IS-IS Dynamic hostname mapping\n&quot;)</a>
+<a name="ln1255">{</a>
+<a name="ln1256">  dynhn_print_all (vty);</a>
+<a name="ln1257"> </a>
+<a name="ln1258">  return CMD_SUCCESS;</a>
+<a name="ln1259">}</a>
+<a name="ln1260"> </a>
+<a name="ln1261">static void</a>
+<a name="ln1262">vty_out_timestr(struct vty *vty, time_t uptime)</a>
+<a name="ln1263">{</a>
+<a name="ln1264">  struct tm *tm;</a>
+<a name="ln1265">  time_t difftime = time (NULL);</a>
+<a name="ln1266">  difftime -= uptime;</a>
+<a name="ln1267">  tm = gmtime (&amp;difftime);</a>
+<a name="ln1268"> </a>
+<a name="ln1269">#define ONE_DAY_SECOND 60*60*24</a>
+<a name="ln1270">#define ONE_WEEK_SECOND 60*60*24*7</a>
+<a name="ln1271">  if (difftime &lt; ONE_DAY_SECOND)</a>
+<a name="ln1272">    vty_out (vty,  &quot;%02d:%02d:%02d&quot;, </a>
+<a name="ln1273">        tm-&gt;tm_hour, tm-&gt;tm_min, tm-&gt;tm_sec);</a>
+<a name="ln1274">  else if (difftime &lt; ONE_WEEK_SECOND)</a>
+<a name="ln1275">    vty_out (vty, &quot;%dd%02dh%02dm&quot;, </a>
+<a name="ln1276">        tm-&gt;tm_yday, tm-&gt;tm_hour, tm-&gt;tm_min);</a>
+<a name="ln1277">  else</a>
+<a name="ln1278">    vty_out (vty, &quot;%02dw%dd%02dh&quot;, </a>
+<a name="ln1279">        tm-&gt;tm_yday/7,</a>
+<a name="ln1280">        tm-&gt;tm_yday - ((tm-&gt;tm_yday/7) * 7), tm-&gt;tm_hour);</a>
+<a name="ln1281">  vty_out (vty, &quot; ago&quot;);</a>
+<a name="ln1282">}</a>
+<a name="ln1283"> </a>
+<a name="ln1284">DEFUN (show_isis_summary,</a>
+<a name="ln1285">       show_isis_summary_cmd,</a>
+<a name="ln1286">       &quot;show isis summary&quot;,</a>
+<a name="ln1287">       SHOW_STR &quot;IS-IS information\n&quot; &quot;IS-IS summary\n&quot;)</a>
+<a name="ln1288">{</a>
+<a name="ln1289">  struct listnode *node, *node2;</a>
+<a name="ln1290">  struct isis_area *area;</a>
+<a name="ln1291">  struct isis_spftree *spftree;</a>
+<a name="ln1292">  int level;</a>
+<a name="ln1293"> </a>
+<a name="ln1294">  if (isis == NULL)</a>
+<a name="ln1295">  {</a>
+<a name="ln1296">    vty_out (vty, &quot;ISIS is not running%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1297">    return CMD_SUCCESS;</a>
+<a name="ln1298">  }</a>
+<a name="ln1299"> </a>
+<a name="ln1300">  vty_out (vty, &quot;Process Id      : %ld%s&quot;, isis-&gt;process_id,</a>
+<a name="ln1301">      VTY_NEWLINE);</a>
+<a name="ln1302">  if (isis-&gt;sysid_set)</a>
+<a name="ln1303">    vty_out (vty, &quot;System Id       : %s%s&quot;, sysid_print (isis-&gt;sysid),</a>
+<a name="ln1304">        VTY_NEWLINE);</a>
+<a name="ln1305"> </a>
+<a name="ln1306">  vty_out (vty, &quot;Up time         : &quot;);</a>
+<a name="ln1307">  vty_out_timestr(vty, isis-&gt;uptime);</a>
+<a name="ln1308">  vty_out (vty, &quot;%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1309"> </a>
+<a name="ln1310">  if (isis-&gt;area_list)</a>
+<a name="ln1311">    vty_out (vty, &quot;Number of areas : %d%s&quot;, isis-&gt;area_list-&gt;count,</a>
+<a name="ln1312">        VTY_NEWLINE);</a>
+<a name="ln1313"> </a>
+<a name="ln1314">  for (ALL_LIST_ELEMENTS_RO (isis-&gt;area_list, node, area))</a>
+<a name="ln1315">  {</a>
+<a name="ln1316">    vty_out (vty, &quot;Area %s:%s&quot;, area-&gt;area_tag ? area-&gt;area_tag : &quot;null&quot;,</a>
+<a name="ln1317">        VTY_NEWLINE);</a>
+<a name="ln1318"> </a>
+<a name="ln1319">    if (listcount (area-&gt;area_addrs) &gt; 0)</a>
+<a name="ln1320">    {</a>
+<a name="ln1321">      struct area_addr *area_addr;</a>
+<a name="ln1322">      for (ALL_LIST_ELEMENTS_RO (area-&gt;area_addrs, node2, area_addr))</a>
+<a name="ln1323">      {</a>
+<a name="ln1324">        vty_out (vty, &quot;  Net: %s%s&quot;,</a>
+<a name="ln1325">            isonet_print (area_addr-&gt;area_addr,</a>
+<a name="ln1326">              area_addr-&gt;addr_len + ISIS_SYS_ID_LEN +</a>
+<a name="ln1327">              1), VTY_NEWLINE);</a>
+<a name="ln1328">      }</a>
+<a name="ln1329">    }</a>
+<a name="ln1330"> </a>
+<a name="ln1331">    for (level = ISIS_LEVEL1; level &lt;= ISIS_LEVELS; level++)</a>
+<a name="ln1332">    {</a>
+<a name="ln1333">      if ((area-&gt;is_type &amp; level) == 0)</a>
+<a name="ln1334">        continue;</a>
+<a name="ln1335"> </a>
+<a name="ln1336">      vty_out (vty, &quot;  Level-%d:%s&quot;, level, VTY_NEWLINE);</a>
+<a name="ln1337">      spftree = area-&gt;spftree[level - 1];</a>
+<a name="ln1338">      if (spftree-&gt;pending)</a>
+<a name="ln1339">        vty_out (vty, &quot;    IPv4 SPF: (pending)%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1340">      else</a>
+<a name="ln1341">        vty_out (vty, &quot;    IPv4 SPF:%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1342"> </a>
+<a name="ln1343">      vty_out (vty, &quot;      minimum interval  : %d%s&quot;,</a>
+<a name="ln1344">          area-&gt;min_spf_interval[level - 1], VTY_NEWLINE);</a>
+<a name="ln1345"> </a>
+<a name="ln1346">      vty_out (vty, &quot;      last run elapsed  : &quot;);</a>
+<a name="ln1347">      vty_out_timestr(vty, spftree-&gt;last_run_timestamp);</a>
+<a name="ln1348">      vty_out (vty, &quot;%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1349"> </a>
+<a name="ln1350">      vty_out (vty, &quot;      last run duration : %u usec%s&quot;,</a>
+<a name="ln1351">               (u_int32_t)spftree-&gt;last_run_duration, VTY_NEWLINE);</a>
+<a name="ln1352"> </a>
+<a name="ln1353">      vty_out (vty, &quot;      run count         : %d%s&quot;,</a>
+<a name="ln1354">          spftree-&gt;runcount, VTY_NEWLINE);</a>
+<a name="ln1355"> </a>
+<a name="ln1356">#ifdef HAVE_IPV6</a>
+<a name="ln1357">      spftree = area-&gt;spftree6[level - 1];</a>
+<a name="ln1358">      if (spftree-&gt;pending)</a>
+<a name="ln1359">        vty_out (vty, &quot;    IPv6 SPF: (pending)%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1360">      else</a>
+<a name="ln1361">        vty_out (vty, &quot;    IPv6 SPF:%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1362"> </a>
+<a name="ln1363">      vty_out (vty, &quot;      minimum interval  : %d%s&quot;,</a>
+<a name="ln1364">          area-&gt;min_spf_interval[level - 1], VTY_NEWLINE);</a>
+<a name="ln1365"> </a>
+<a name="ln1366">      vty_out (vty, &quot;      last run elapsed  : &quot;);</a>
+<a name="ln1367">      vty_out_timestr(vty, spftree-&gt;last_run_timestamp);</a>
+<a name="ln1368">      vty_out (vty, &quot;%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1369"> </a>
+<a name="ln1370">      vty_out (vty, &quot;      last run duration : %llu msec%s&quot;,</a>
+<a name="ln1371">               (unsigned long long)spftree-&gt;last_run_duration, VTY_NEWLINE);</a>
+<a name="ln1372"> </a>
+<a name="ln1373">      vty_out (vty, &quot;      run count         : %d%s&quot;,</a>
+<a name="ln1374">          spftree-&gt;runcount, VTY_NEWLINE);</a>
+<a name="ln1375">#endif</a>
+<a name="ln1376">    }</a>
+<a name="ln1377">  }</a>
+<a name="ln1378">  vty_out (vty, &quot;%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1379"> </a>
+<a name="ln1380">  return CMD_SUCCESS;</a>
+<a name="ln1381">}</a>
+<a name="ln1382"> </a>
+<a name="ln1383">/*</a>
+<a name="ln1384"> * This function supports following display options:</a>
+<a name="ln1385"> * [ show isis database [detail] ]</a>
+<a name="ln1386"> * [ show isis database &lt;sysid&gt; [detail] ]</a>
+<a name="ln1387"> * [ show isis database &lt;hostname&gt; [detail] ]</a>
+<a name="ln1388"> * [ show isis database &lt;sysid&gt;.&lt;pseudo-id&gt; [detail] ]</a>
+<a name="ln1389"> * [ show isis database &lt;hostname&gt;.&lt;pseudo-id&gt; [detail] ]</a>
+<a name="ln1390"> * [ show isis database &lt;sysid&gt;.&lt;pseudo-id&gt;-&lt;fragment-number&gt; [detail] ]</a>
+<a name="ln1391"> * [ show isis database &lt;hostname&gt;.&lt;pseudo-id&gt;-&lt;fragment-number&gt; [detail] ]</a>
+<a name="ln1392"> * [ show isis database detail &lt;sysid&gt; ]</a>
+<a name="ln1393"> * [ show isis database detail &lt;hostname&gt; ]</a>
+<a name="ln1394"> * [ show isis database detail &lt;sysid&gt;.&lt;pseudo-id&gt; ]</a>
+<a name="ln1395"> * [ show isis database detail &lt;hostname&gt;.&lt;pseudo-id&gt; ]</a>
+<a name="ln1396"> * [ show isis database detail &lt;sysid&gt;.&lt;pseudo-id&gt;-&lt;fragment-number&gt; ]</a>
+<a name="ln1397"> * [ show isis database detail &lt;hostname&gt;.&lt;pseudo-id&gt;-&lt;fragment-number&gt; ]</a>
+<a name="ln1398"> */</a>
+<a name="ln1399">static int</a>
+<a name="ln1400">show_isis_database (struct vty *vty, const char *argv, int ui_level)</a>
+<a name="ln1401">{</a>
+<a name="ln1402">  struct listnode *node;</a>
+<a name="ln1403">  struct isis_area *area;</a>
+<a name="ln1404">  struct isis_lsp *lsp;</a>
+<a name="ln1405">  struct isis_dynhn *dynhn;</a>
+<a name="ln1406">  const char *pos = argv;</a>
+<a name="ln1407">  u_char lspid[ISIS_SYS_ID_LEN+2];</a>
+<a name="ln1408">  char sysid[255];</a>
+<a name="ln1409">  u_char number[3];</a>
+<a name="ln1410">  int level, lsp_count;</a>
+<a name="ln1411"> </a>
+<a name="ln1412">  if (isis-&gt;area_list-&gt;count == 0)</a>
+<a name="ln1413">    return CMD_SUCCESS;</a>
+<a name="ln1414"> </a>
+<a name="ln1415">  memset (&amp;lspid, 0, ISIS_SYS_ID_LEN);</a>
+<a name="ln1416">  memset (&amp;sysid, 0, 255);</a>
+<a name="ln1417"> </a>
+<a name="ln1418">  /*</a>
+<a name="ln1419">   * extract fragment and pseudo id from the string argv</a>
+<a name="ln1420">   * in the forms:</a>
+<a name="ln1421">   * (a) &lt;systemid/hostname&gt;.&lt;pseudo-id&gt;-&lt;framenent&gt; or</a>
+<a name="ln1422">   * (b) &lt;systemid/hostname&gt;.&lt;pseudo-id&gt; or</a>
+<a name="ln1423">   * (c) &lt;systemid/hostname&gt; or</a>
+<a name="ln1424">   * Where systemid is in the form:</a>
+<a name="ln1425">   * xxxx.xxxx.xxxx</a>
+<a name="ln1426">   */</a>
+<a name="ln1427">  if (argv)</a>
+<a name="ln1428">     strncpy (sysid, argv, 254);</a>
+<a name="ln1429">  if (argv &amp;&amp; strlen (argv) &gt; 3)</a>
+<a name="ln1430">    {</a>
+<a name="ln1431">      pos = argv + strlen (argv) - 3;</a>
+<a name="ln1432">      if (strncmp (pos, &quot;-&quot;, 1) == 0)</a>
+<a name="ln1433">      {</a>
+<a name="ln1434">        memcpy (number, ++pos, 2);</a>
+<a name="ln1435">        lspid[ISIS_SYS_ID_LEN+1] = (u_char) strtol ((char *)number, NULL, 16);</a>
+<a name="ln1436">        pos -= 4;</a>
+<a name="ln1437">        if (strncmp (pos, &quot;.&quot;, 1) != 0)</a>
+<a name="ln1438">          return CMD_ERR_AMBIGUOUS;</a>
+<a name="ln1439">      }</a>
+<a name="ln1440">      if (strncmp (pos, &quot;.&quot;, 1) == 0)</a>
+<a name="ln1441">      {</a>
+<a name="ln1442">        memcpy (number, ++pos, 2);</a>
+<a name="ln1443">        lspid[ISIS_SYS_ID_LEN] = (u_char) strtol ((char *)number, NULL, 16);</a>
+<a name="ln1444">        sysid[pos - argv - 1] = '\0';</a>
+<a name="ln1445">      }</a>
+<a name="ln1446">    }</a>
+<a name="ln1447"> </a>
+<a name="ln1448">  for (ALL_LIST_ELEMENTS_RO (isis-&gt;area_list, node, area))</a>
+<a name="ln1449">    {</a>
+<a name="ln1450">      vty_out (vty, &quot;Area %s:%s&quot;, area-&gt;area_tag ? area-&gt;area_tag : &quot;null&quot;,</a>
+<a name="ln1451">               VTY_NEWLINE);</a>
+<a name="ln1452"> </a>
+<a name="ln1453">      for (level = 0; level &lt; ISIS_LEVELS; level++)</a>
+<a name="ln1454">        {</a>
+<a name="ln1455">          if (area-&gt;lspdb[level] &amp;&amp; dict_count (area-&gt;lspdb[level]) &gt; 0)</a>
+<a name="ln1456">            {</a>
+<a name="ln1457">              lsp = NULL;</a>
+<a name="ln1458">              if (argv != NULL)</a>
+<a name="ln1459">                {</a>
+<a name="ln1460">                  /*</a>
+<a name="ln1461">                   * Try to find the lsp-id if the argv string is in</a>
+<a name="ln1462">                   * the form hostname.&lt;pseudo-id&gt;-&lt;fragment&gt;</a>
+<a name="ln1463">                   */</a>
+<a name="ln1464">                  if (sysid2buff (lspid, sysid))</a>
+<a name="ln1465">                    {</a>
+<a name="ln1466">                      lsp = lsp_search (lspid, area-&gt;lspdb[level]);</a>
+<a name="ln1467">                    }</a>
+<a name="ln1468">                  else if ((dynhn = dynhn_find_by_name (sysid)))</a>
+<a name="ln1469">                    {</a>
+<a name="ln1470">                      memcpy (lspid, dynhn-&gt;id, ISIS_SYS_ID_LEN);</a>
+<a name="ln1471">                      lsp = lsp_search (lspid, area-&gt;lspdb[level]);</a>
+<a name="ln1472">                    }</a>
+<a name="ln1473">                  else if (strncmp(unix_hostname (), sysid, 15) == 0)</a>
+<a name="ln1474">                    {</a>
+<a name="ln1475">                      memcpy (lspid, isis-&gt;sysid, ISIS_SYS_ID_LEN);</a>
+<a name="ln1476">                      lsp = lsp_search (lspid, area-&gt;lspdb[level]);</a>
+<a name="ln1477">                    }</a>
+<a name="ln1478">                }</a>
+<a name="ln1479"> </a>
+<a name="ln1480">              if (lsp != NULL || argv == NULL)</a>
+<a name="ln1481">                {</a>
+<a name="ln1482">                  vty_out (vty, &quot;IS-IS Level-%d link-state database:%s&quot;,</a>
+<a name="ln1483">                           level + 1, VTY_NEWLINE);</a>
+<a name="ln1484"> </a>
+<a name="ln1485">                  /* print the title in all cases */</a>
+<a name="ln1486">                  vty_out (vty, &quot;LSP ID                  PduLen  &quot;</a>
+<a name="ln1487">                           &quot;SeqNumber   Chksum  Holdtime  ATT/P/OL%s&quot;,</a>
+<a name="ln1488">                           VTY_NEWLINE);</a>
+<a name="ln1489">                }</a>
+<a name="ln1490"> </a>
+<a name="ln1491">              if (lsp)</a>
+<a name="ln1492">                {</a>
+<a name="ln1493">                  if (ui_level == ISIS_UI_LEVEL_DETAIL)</a>
+<a name="ln1494">                    lsp_print_detail (lsp, vty, area-&gt;dynhostname);</a>
+<a name="ln1495">                  else</a>
+<a name="ln1496">                    lsp_print (lsp, vty, area-&gt;dynhostname);</a>
+<a name="ln1497">                }</a>
+<a name="ln1498">              else if (argv == NULL)</a>
+<a name="ln1499">                {</a>
+<a name="ln1500">                  lsp_count = lsp_print_all (vty, area-&gt;lspdb[level],</a>
+<a name="ln1501">                                             ui_level,</a>
+<a name="ln1502">                                             area-&gt;dynhostname);</a>
+<a name="ln1503"> </a>
+<a name="ln1504">                  vty_out (vty, &quot;    %u LSPs%s%s&quot;,</a>
+<a name="ln1505">                           lsp_count, VTY_NEWLINE, VTY_NEWLINE);</a>
+<a name="ln1506">                }</a>
+<a name="ln1507">            }</a>
+<a name="ln1508">        }</a>
+<a name="ln1509">    }</a>
+<a name="ln1510"> </a>
+<a name="ln1511">  return CMD_SUCCESS;</a>
+<a name="ln1512">}</a>
+<a name="ln1513"> </a>
+<a name="ln1514">DEFUN (show_database_brief,</a>
+<a name="ln1515">       show_database_cmd,</a>
+<a name="ln1516">       &quot;show isis database&quot;,</a>
+<a name="ln1517">       SHOW_STR</a>
+<a name="ln1518">       &quot;IS-IS information\n&quot;</a>
+<a name="ln1519">       &quot;IS-IS link state database\n&quot;)</a>
+<a name="ln1520">{</a>
+<a name="ln1521">  return show_isis_database (vty, NULL, ISIS_UI_LEVEL_BRIEF);</a>
+<a name="ln1522">}</a>
+<a name="ln1523"> </a>
+<a name="ln1524">DEFUN (show_database_lsp_brief,</a>
+<a name="ln1525">       show_database_arg_cmd,</a>
+<a name="ln1526">       &quot;show isis database WORD&quot;,</a>
+<a name="ln1527">       SHOW_STR</a>
+<a name="ln1528">       &quot;IS-IS information\n&quot;</a>
+<a name="ln1529">       &quot;IS-IS link state database\n&quot;</a>
+<a name="ln1530">       &quot;LSP ID\n&quot;)</a>
+<a name="ln1531">{</a>
+<a name="ln1532">  return show_isis_database (vty, argv[0], ISIS_UI_LEVEL_BRIEF);</a>
+<a name="ln1533">}</a>
+<a name="ln1534"> </a>
+<a name="ln1535">DEFUN (show_database_lsp_detail,</a>
+<a name="ln1536">       show_database_arg_detail_cmd,</a>
+<a name="ln1537">       &quot;show isis database WORD detail&quot;,</a>
+<a name="ln1538">       SHOW_STR</a>
+<a name="ln1539">       &quot;IS-IS information\n&quot;</a>
+<a name="ln1540">       &quot;IS-IS link state database\n&quot;</a>
+<a name="ln1541">       &quot;LSP ID\n&quot;</a>
+<a name="ln1542">       &quot;Detailed information\n&quot;)</a>
+<a name="ln1543">{</a>
+<a name="ln1544">  return show_isis_database (vty, argv[0], ISIS_UI_LEVEL_DETAIL);</a>
+<a name="ln1545">}</a>
+<a name="ln1546"> </a>
+<a name="ln1547">DEFUN (show_database_detail,</a>
+<a name="ln1548">       show_database_detail_cmd,</a>
+<a name="ln1549">       &quot;show isis database detail&quot;,</a>
+<a name="ln1550">       SHOW_STR</a>
+<a name="ln1551">       &quot;IS-IS information\n&quot;</a>
+<a name="ln1552">       &quot;IS-IS link state database\n&quot;)</a>
+<a name="ln1553">{</a>
+<a name="ln1554">  return show_isis_database (vty, NULL, ISIS_UI_LEVEL_DETAIL);</a>
+<a name="ln1555">}</a>
+<a name="ln1556"> </a>
+<a name="ln1557">DEFUN (show_database_detail_lsp,</a>
+<a name="ln1558">       show_database_detail_arg_cmd,</a>
+<a name="ln1559">       &quot;show isis database detail WORD&quot;,</a>
+<a name="ln1560">       SHOW_STR</a>
+<a name="ln1561">       &quot;IS-IS information\n&quot;</a>
+<a name="ln1562">       &quot;IS-IS link state database\n&quot;</a>
+<a name="ln1563">       &quot;Detailed information\n&quot;</a>
+<a name="ln1564">       &quot;LSP ID\n&quot;)</a>
+<a name="ln1565">{</a>
+<a name="ln1566">  return show_isis_database (vty, argv[0], ISIS_UI_LEVEL_DETAIL);</a>
+<a name="ln1567">}</a>
+<a name="ln1568"> </a>
+<a name="ln1569">/* </a>
+<a name="ln1570"> * 'router isis' command </a>
+<a name="ln1571"> */</a>
+<a name="ln1572">DEFUN (router_isis,</a>
+<a name="ln1573">       router_isis_cmd,</a>
+<a name="ln1574">       &quot;router isis WORD&quot;,</a>
+<a name="ln1575">       ROUTER_STR</a>
+<a name="ln1576">       &quot;ISO IS-IS\n&quot;</a>
+<a name="ln1577">       &quot;ISO Routing area tag&quot;)</a>
+<a name="ln1578">{</a>
+<a name="ln1579">  return isis_area_get (vty, argv[0]);</a>
+<a name="ln1580">}</a>
+<a name="ln1581"> </a>
+<a name="ln1582">/* </a>
+<a name="ln1583"> *'no router isis' command </a>
+<a name="ln1584"> */</a>
+<a name="ln1585">DEFUN (no_router_isis,</a>
+<a name="ln1586">       no_router_isis_cmd,</a>
+<a name="ln1587">       &quot;no router isis WORD&quot;,</a>
+<a name="ln1588">       &quot;no\n&quot; ROUTER_STR &quot;ISO IS-IS\n&quot; &quot;ISO Routing area tag&quot;)</a>
+<a name="ln1589">{</a>
+<a name="ln1590">  return isis_area_destroy (vty, argv[0]);</a>
+<a name="ln1591">}</a>
+<a name="ln1592"> </a>
+<a name="ln1593">/*</a>
+<a name="ln1594"> * 'net' command</a>
+<a name="ln1595"> */</a>
+<a name="ln1596">DEFUN (net,</a>
+<a name="ln1597">       net_cmd,</a>
+<a name="ln1598">       &quot;net WORD&quot;,</a>
+<a name="ln1599">       &quot;A Network Entity Title for this process (OSI only)\n&quot;</a>
+<a name="ln1600">       &quot;XX.XXXX. ... .XXX.XX  Network entity title (NET)\n&quot;)</a>
+<a name="ln1601">{</a>
+<a name="ln1602">  return area_net_title (vty, argv[0]);</a>
+<a name="ln1603">}</a>
+<a name="ln1604"> </a>
+<a name="ln1605">/*</a>
+<a name="ln1606"> * 'no net' command</a>
+<a name="ln1607"> */</a>
+<a name="ln1608">DEFUN (no_net,</a>
+<a name="ln1609">       no_net_cmd,</a>
+<a name="ln1610">       &quot;no net WORD&quot;,</a>
+<a name="ln1611">       NO_STR</a>
+<a name="ln1612">       &quot;A Network Entity Title for this process (OSI only)\n&quot;</a>
+<a name="ln1613">       &quot;XX.XXXX. ... .XXX.XX  Network entity title (NET)\n&quot;)</a>
+<a name="ln1614">{</a>
+<a name="ln1615">  return area_clear_net_title (vty, argv[0]);</a>
+<a name="ln1616">}</a>
+<a name="ln1617"> </a>
+<a name="ln1618">void isis_area_lsp_mtu_set(struct isis_area *area, unsigned int lsp_mtu)</a>
+<a name="ln1619">{</a>
+<a name="ln1620">  area-&gt;lsp_mtu = lsp_mtu;</a>
+<a name="ln1621">  lsp_regenerate_schedule(area, IS_LEVEL_1_AND_2, 1);</a>
+<a name="ln1622">}</a>
+<a name="ln1623"> </a>
+<a name="ln1624">static int</a>
+<a name="ln1625">isis_area_passwd_set(struct isis_area *area, int level, u_char passwd_type,</a>
+<a name="ln1626">		     const char *passwd, u_char snp_auth)</a>
+<a name="ln1627">{</a>
+<a name="ln1628">  struct isis_passwd *dest;</a>
+<a name="ln1629">  struct isis_passwd modified;</a>
+<a name="ln1630">  int len;</a>
+<a name="ln1631"> </a>
+<a name="ln1632">  assert((level == IS_LEVEL_1) || (level == IS_LEVEL_2));</a>
+<a name="ln1633">  dest = (level == IS_LEVEL_1) ? &amp;area-&gt;area_passwd : &amp;area-&gt;domain_passwd;</a>
+<a name="ln1634">  memset(&amp;modified, 0, sizeof(modified));</a>
+<a name="ln1635"> </a>
+<a name="ln1636">  if (passwd_type != ISIS_PASSWD_TYPE_UNUSED)</a>
+<a name="ln1637">    {</a>
+<a name="ln1638">      if (!passwd)</a>
+<a name="ln1639">        return -1;</a>
+<a name="ln1640"> </a>
+<a name="ln1641">      len = strlen(passwd);</a>
+<a name="ln1642">      if (len &gt; 254)</a>
+<a name="ln1643">        return -1;</a>
+<a name="ln1644"> </a>
+<a name="ln1645">      modified.len = len;</a>
+<a name="ln1646">      strncpy((char*)modified.passwd, passwd, 255);</a>
+<a name="ln1647">      modified.type = passwd_type;</a>
+<a name="ln1648">      modified.snp_auth = snp_auth;</a>
+<a name="ln1649">    }</a>
+<a name="ln1650"> </a>
+<a name="ln1651">  if (memcmp(&amp;modified, dest, sizeof(modified)))</a>
+<a name="ln1652">    {</a>
+<a name="ln1653">      memcpy(dest, &amp;modified, sizeof(modified));</a>
+<a name="ln1654">      lsp_regenerate_schedule(area, IS_LEVEL_1|IS_LEVEL_2, 1);</a>
+<a name="ln1655">    }</a>
+<a name="ln1656"> </a>
+<a name="ln1657">  return 0;</a>
+<a name="ln1658">}</a>
+<a name="ln1659"> </a>
+<a name="ln1660">int</a>
+<a name="ln1661">isis_area_passwd_unset (struct isis_area *area, int level)</a>
+<a name="ln1662">{</a>
+<a name="ln1663">  return isis_area_passwd_set (area, level, ISIS_PASSWD_TYPE_UNUSED, NULL, 0);</a>
+<a name="ln1664">}</a>
+<a name="ln1665"> </a>
+<a name="ln1666">int</a>
+<a name="ln1667">isis_area_passwd_cleartext_set (struct isis_area *area, int level,</a>
+<a name="ln1668">                                const char *passwd, u_char snp_auth)</a>
+<a name="ln1669">{</a>
+<a name="ln1670">  return isis_area_passwd_set (area, level, ISIS_PASSWD_TYPE_CLEARTXT,</a>
+<a name="ln1671">                               passwd, snp_auth);</a>
+<a name="ln1672">}</a>
+<a name="ln1673"> </a>
+<a name="ln1674">int</a>
+<a name="ln1675">isis_area_passwd_hmac_md5_set (struct isis_area *area, int level,</a>
+<a name="ln1676">                               const char *passwd, u_char snp_auth)</a>
+<a name="ln1677">{</a>
+<a name="ln1678">  return isis_area_passwd_set (area, level, ISIS_PASSWD_TYPE_HMAC_MD5,</a>
+<a name="ln1679">                               passwd, snp_auth);</a>
+<a name="ln1680">}</a>
+<a name="ln1681"> </a>
+<a name="ln1682">static void</a>
+<a name="ln1683">area_resign_level (struct isis_area *area, int level)</a>
+<a name="ln1684">{</a>
+<a name="ln1685">  if (area-&gt;lspdb[level - 1])</a>
+<a name="ln1686">    {</a>
+<a name="ln1687">      lsp_db_destroy (area-&gt;lspdb[level - 1]);</a>
+<a name="ln1688">      area-&gt;lspdb[level - 1] = NULL;</a>
+<a name="ln1689">    }</a>
+<a name="ln1690">  if (area-&gt;spftree[level - 1])</a>
+<a name="ln1691">    {</a>
+<a name="ln1692">      isis_spftree_del (area-&gt;spftree[level - 1]);</a>
+<a name="ln1693">      area-&gt;spftree[level - 1] = NULL;</a>
+<a name="ln1694">    }</a>
+<a name="ln1695">#ifdef HAVE_IPV6</a>
+<a name="ln1696">  if (area-&gt;spftree6[level - 1])</a>
+<a name="ln1697">    {</a>
+<a name="ln1698">      isis_spftree_del (area-&gt;spftree6[level - 1]);</a>
+<a name="ln1699">      area-&gt;spftree6[level - 1] = NULL;</a>
+<a name="ln1700">    }</a>
+<a name="ln1701">#endif</a>
+<a name="ln1702">  if (area-&gt;route_table[level - 1])</a>
+<a name="ln1703">    {</a>
+<a name="ln1704">      route_table_finish (area-&gt;route_table[level - 1]);</a>
+<a name="ln1705">      area-&gt;route_table[level - 1] = NULL;</a>
+<a name="ln1706">    }</a>
+<a name="ln1707">#ifdef HAVE_IPV6</a>
+<a name="ln1708">  if (area-&gt;route_table6[level - 1])</a>
+<a name="ln1709">    {</a>
+<a name="ln1710">      route_table_finish (area-&gt;route_table6[level - 1]);</a>
+<a name="ln1711">      area-&gt;route_table6[level - 1] = NULL;</a>
+<a name="ln1712">    }</a>
+<a name="ln1713">#endif /* HAVE_IPV6 */</a>
+<a name="ln1714"> </a>
+<a name="ln1715">  sched_debug(&quot;ISIS (%s): Resigned from L%d - canceling LSP regeneration timer.&quot;,</a>
+<a name="ln1716">              area-&gt;area_tag, level);</a>
+<a name="ln1717">  THREAD_TIMER_OFF (area-&gt;t_lsp_refresh[level - 1]);</a>
+<a name="ln1718">  area-&gt;lsp_regenerate_pending[level - 1] = 0;</a>
+<a name="ln1719">}</a>
+<a name="ln1720"> </a>
+<a name="ln1721">void</a>
+<a name="ln1722">isis_area_is_type_set(struct isis_area *area, int is_type)</a>
+<a name="ln1723">{</a>
+<a name="ln1724">  struct listnode *node;</a>
+<a name="ln1725">  struct isis_circuit *circuit;</a>
+<a name="ln1726"> </a>
+<a name="ln1727">  if (isis-&gt;debugs &amp; DEBUG_EVENTS)</a>
+<a name="ln1728">    zlog_debug (&quot;ISIS-Evt (%s) system type change %s -&gt; %s&quot;, area-&gt;area_tag,</a>
+<a name="ln1729">	       circuit_t2string (area-&gt;is_type), circuit_t2string (is_type));</a>
+<a name="ln1730"> </a>
+<a name="ln1731">  if (area-&gt;is_type == is_type)</a>
+<a name="ln1732">    return;			/* No change */</a>
+<a name="ln1733"> </a>
+<a name="ln1734">  switch (area-&gt;is_type)</a>
+<a name="ln1735">  {</a>
+<a name="ln1736">    case IS_LEVEL_1:</a>
+<a name="ln1737">      if (is_type == IS_LEVEL_2)</a>
+<a name="ln1738">        area_resign_level (area, IS_LEVEL_1);</a>
+<a name="ln1739"> </a>
+<a name="ln1740">      if (area-&gt;lspdb[1] == NULL)</a>
+<a name="ln1741">        area-&gt;lspdb[1] = lsp_db_init ();</a>
+<a name="ln1742">      if (area-&gt;route_table[1] == NULL)</a>
+<a name="ln1743">        area-&gt;route_table[1] = route_table_init ();</a>
+<a name="ln1744">#ifdef HAVE_IPV6</a>
+<a name="ln1745">      if (area-&gt;route_table6[1] == NULL)</a>
+<a name="ln1746">        area-&gt;route_table6[1] = route_table_init ();</a>
+<a name="ln1747">#endif /* HAVE_IPV6 */</a>
+<a name="ln1748">      break;</a>
+<a name="ln1749"> </a>
+<a name="ln1750">    case IS_LEVEL_1_AND_2:</a>
+<a name="ln1751">      if (is_type == IS_LEVEL_1)</a>
+<a name="ln1752">        area_resign_level (area, IS_LEVEL_2);</a>
+<a name="ln1753">      else</a>
+<a name="ln1754">        area_resign_level (area, IS_LEVEL_1);</a>
+<a name="ln1755">      break;</a>
+<a name="ln1756"> </a>
+<a name="ln1757">    case IS_LEVEL_2:</a>
+<a name="ln1758">      if (is_type == IS_LEVEL_1)</a>
+<a name="ln1759">        area_resign_level (area, IS_LEVEL_2);</a>
+<a name="ln1760"> </a>
+<a name="ln1761">      if (area-&gt;lspdb[0] == NULL)</a>
+<a name="ln1762">        area-&gt;lspdb[0] = lsp_db_init ();</a>
+<a name="ln1763">      if (area-&gt;route_table[0] == NULL)</a>
+<a name="ln1764">        area-&gt;route_table[0] = route_table_init ();</a>
+<a name="ln1765">#ifdef HAVE_IPV6</a>
+<a name="ln1766">      if (area-&gt;route_table6[0] == NULL)</a>
+<a name="ln1767">        area-&gt;route_table6[0] = route_table_init ();</a>
+<a name="ln1768">#endif /* HAVE_IPV6 */</a>
+<a name="ln1769">      break;</a>
+<a name="ln1770"> </a>
+<a name="ln1771">    default:</a>
+<a name="ln1772">      break;</a>
+<a name="ln1773">  }</a>
+<a name="ln1774"> </a>
+<a name="ln1775">  area-&gt;is_type = is_type;</a>
+<a name="ln1776"> </a>
+<a name="ln1777">  /* override circuit's is_type */</a>
+<a name="ln1778">  if (area-&gt;is_type != IS_LEVEL_1_AND_2)</a>
+<a name="ln1779">  {</a>
+<a name="ln1780">    for (ALL_LIST_ELEMENTS_RO (area-&gt;circuit_list, node, circuit))</a>
+<a name="ln1781">      isis_circuit_is_type_set (circuit, is_type);</a>
+<a name="ln1782">  }</a>
+<a name="ln1783"> </a>
+<a name="ln1784">  spftree_area_init (area);</a>
+<a name="ln1785"> </a>
+<a name="ln1786">  if (is_type &amp; IS_LEVEL_1)</a>
+<a name="ln1787">    lsp_generate (area, IS_LEVEL_1);</a>
+<a name="ln1788">  if (is_type &amp; IS_LEVEL_2)</a>
+<a name="ln1789">    lsp_generate (area, IS_LEVEL_2);</a>
+<a name="ln1790">  lsp_regenerate_schedule (area, IS_LEVEL_1 | IS_LEVEL_2, 1);</a>
+<a name="ln1791"> </a>
+<a name="ln1792">  return;</a>
+<a name="ln1793">}</a>
+<a name="ln1794"> </a>
+<a name="ln1795">void isis_area_metricstyle_set(struct isis_area *area, bool old_metric,</a>
+<a name="ln1796">			       bool new_metric)</a>
+<a name="ln1797">{</a>
+<a name="ln1798">  if (area-&gt;oldmetric != old_metric</a>
+<a name="ln1799">      || area-&gt;newmetric != new_metric)</a>
+<a name="ln1800">    {</a>
+<a name="ln1801">      area-&gt;oldmetric = old_metric;</a>
+<a name="ln1802">      area-&gt;newmetric = new_metric;</a>
+<a name="ln1803">      lsp_regenerate_schedule(area, IS_LEVEL_1 | IS_LEVEL_2, 1);</a>
+<a name="ln1804">    }</a>
+<a name="ln1805">}</a>
+<a name="ln1806"> </a>
+<a name="ln1807">void isis_area_overload_bit_set(struct isis_area *area, bool overload_bit)</a>
+<a name="ln1808">{</a>
+<a name="ln1809">  char new_overload_bit = overload_bit ? LSPBIT_OL : 0;</a>
+<a name="ln1810"> </a>
+<a name="ln1811">  if (new_overload_bit != area-&gt;overload_bit)</a>
+<a name="ln1812">    {</a>
+<a name="ln1813">      area-&gt;overload_bit = new_overload_bit;</a>
+<a name="ln1814">      lsp_regenerate_schedule(area, IS_LEVEL_1 | IS_LEVEL_2, 1);</a>
+<a name="ln1815">    }</a>
+<a name="ln1816">}</a>
+<a name="ln1817"> </a>
+<a name="ln1818">void isis_area_attached_bit_set(struct isis_area *area, bool attached_bit)</a>
+<a name="ln1819">{</a>
+<a name="ln1820">  char new_attached_bit = attached_bit ? LSPBIT_ATT : 0;</a>
+<a name="ln1821"> </a>
+<a name="ln1822">  if (new_attached_bit != area-&gt;attached_bit)</a>
+<a name="ln1823">    {</a>
+<a name="ln1824">      area-&gt;attached_bit = new_attached_bit;</a>
+<a name="ln1825">      lsp_regenerate_schedule(area, IS_LEVEL_1 | IS_LEVEL_2, 1);</a>
+<a name="ln1826">    }</a>
+<a name="ln1827">}</a>
+<a name="ln1828"> </a>
+<a name="ln1829">void isis_area_dynhostname_set(struct isis_area *area, bool dynhostname)</a>
+<a name="ln1830">{</a>
+<a name="ln1831">  if (area-&gt;dynhostname != dynhostname)</a>
+<a name="ln1832">    {</a>
+<a name="ln1833">      area-&gt;dynhostname = dynhostname;</a>
+<a name="ln1834">      lsp_regenerate_schedule(area, IS_LEVEL_1 | IS_LEVEL_2, 0);</a>
+<a name="ln1835">    }</a>
+<a name="ln1836">}</a>
+<a name="ln1837"> </a>
+<a name="ln1838">void</a>
+<a name="ln1839">isis_area_max_lsp_lifetime_set(struct isis_area *area, int level,</a>
+<a name="ln1840">			       uint16_t max_lsp_lifetime)</a>
+<a name="ln1841">{</a>
+<a name="ln1842">  assert((level == IS_LEVEL_1) || (level == IS_LEVEL_2));</a>
+<a name="ln1843"> </a>
+<a name="ln1844">  if (area-&gt;max_lsp_lifetime[level-1] == max_lsp_lifetime)</a>
+<a name="ln1845">    return;</a>
+<a name="ln1846"> </a>
+<a name="ln1847">  area-&gt;max_lsp_lifetime[level-1] = max_lsp_lifetime;</a>
+<a name="ln1848">  lsp_regenerate_schedule(area, level, 1);</a>
+<a name="ln1849">}</a>
+<a name="ln1850"> </a>
+<a name="ln1851">void</a>
+<a name="ln1852">isis_area_lsp_refresh_set(struct isis_area *area, int level,</a>
+<a name="ln1853">			  uint16_t lsp_refresh)</a>
+<a name="ln1854">{</a>
+<a name="ln1855">  assert((level == IS_LEVEL_1) || (level == IS_LEVEL_2));</a>
+<a name="ln1856"> </a>
+<a name="ln1857">  if (area-&gt;lsp_refresh[level-1] == lsp_refresh)</a>
+<a name="ln1858">    return;</a>
+<a name="ln1859"> </a>
+<a name="ln1860">  area-&gt;lsp_refresh[level-1] = lsp_refresh;</a>
+<a name="ln1861">  lsp_regenerate_schedule(area, level, 1);</a>
+<a name="ln1862">}</a>
+<a name="ln1863"> </a>
+<a name="ln1864">DEFUN (log_adj_changes,</a>
+<a name="ln1865">       log_adj_changes_cmd,</a>
+<a name="ln1866">       &quot;log-adjacency-changes&quot;,</a>
+<a name="ln1867">       &quot;Log changes in adjacency state\n&quot;)</a>
+<a name="ln1868">{</a>
+<a name="ln1869">  struct isis_area *area;</a>
+<a name="ln1870"> </a>
+<a name="ln1871">  area = vty-&gt;index;</a>
+<a name="ln1872">  assert (area);</a>
+<a name="ln1873"> </a>
+<a name="ln1874">  area-&gt;log_adj_changes = 1;</a>
+<a name="ln1875"> </a>
+<a name="ln1876">  return CMD_SUCCESS;</a>
+<a name="ln1877">}</a>
+<a name="ln1878"> </a>
+<a name="ln1879">DEFUN (no_log_adj_changes,</a>
+<a name="ln1880">       no_log_adj_changes_cmd,</a>
+<a name="ln1881">       &quot;no log-adjacency-changes&quot;,</a>
+<a name="ln1882">       &quot;Stop logging changes in adjacency state\n&quot;)</a>
+<a name="ln1883">{</a>
+<a name="ln1884">  struct isis_area *area;</a>
+<a name="ln1885"> </a>
+<a name="ln1886">  area = vty-&gt;index;</a>
+<a name="ln1887">  assert (area);</a>
+<a name="ln1888"> </a>
+<a name="ln1889">  area-&gt;log_adj_changes = 0;</a>
+<a name="ln1890"> </a>
+<a name="ln1891">  return CMD_SUCCESS;</a>
+<a name="ln1892">}</a>
+<a name="ln1893"> </a>
+<a name="ln1894">#ifdef TOPOLOGY_GENERATE</a>
+<a name="ln1895"> </a>
+<a name="ln1896">DEFUN (topology_generate_grid,</a>
+<a name="ln1897">       topology_generate_grid_cmd,</a>
+<a name="ln1898">       &quot;topology generate grid &lt;1-100&gt; &lt;1-100&gt; &lt;1-65000&gt; [param] [param] &quot;</a>
+<a name="ln1899">       &quot;[param]&quot;,</a>
+<a name="ln1900">       &quot;Topology generation for IS-IS\n&quot;</a>
+<a name="ln1901">       &quot;Topology generation\n&quot;</a>
+<a name="ln1902">       &quot;Grid topology\n&quot;</a>
+<a name="ln1903">       &quot;X parameter of the grid\n&quot;</a>
+<a name="ln1904">       &quot;Y parameter of the grid\n&quot;</a>
+<a name="ln1905">       &quot;Random seed\n&quot;</a>
+<a name="ln1906">       &quot;Optional param 1\n&quot;</a>
+<a name="ln1907">       &quot;Optional param 2\n&quot;</a>
+<a name="ln1908">       &quot;Optional param 3\n&quot;</a>
+<a name="ln1909">       &quot;Topology\n&quot;)</a>
+<a name="ln1910">{</a>
+<a name="ln1911">  struct isis_area *area;</a>
+<a name="ln1912"> </a>
+<a name="ln1913">  area = vty-&gt;index;</a>
+<a name="ln1914">  assert (area);</a>
+<a name="ln1915"> </a>
+<a name="ln1916">  if (!spgrid_check_params (vty, argc, argv))</a>
+<a name="ln1917">    {</a>
+<a name="ln1918">      if (area-&gt;topology)</a>
+<a name="ln1919">	list_delete (area-&gt;topology);</a>
+<a name="ln1920">      area-&gt;topology = list_new ();</a>
+<a name="ln1921">      memcpy (area-&gt;top_params, vty-&gt;buf, 200);</a>
+<a name="ln1922">      gen_spgrid_topology (vty, area-&gt;topology);</a>
+<a name="ln1923">      remove_topology_lsps (area);</a>
+<a name="ln1924">      generate_topology_lsps (area);</a>
+<a name="ln1925">      /* Regenerate L1 LSP to get two way connection to the generated</a>
+<a name="ln1926">       * topology. */</a>
+<a name="ln1927">      lsp_regenerate_schedule (area, IS_LEVEL_1 | IS_LEVEL_2, 1);</a>
+<a name="ln1928">    }</a>
+<a name="ln1929"> </a>
+<a name="ln1930">  return CMD_SUCCESS;</a>
+<a name="ln1931">}</a>
+<a name="ln1932"> </a>
+<a name="ln1933">DEFUN (show_isis_generated_topology,</a>
+<a name="ln1934">       show_isis_generated_topology_cmd,</a>
+<a name="ln1935">       &quot;show isis generated-topologies&quot;,</a>
+<a name="ln1936">       SHOW_STR</a>
+<a name="ln1937">       &quot;ISIS network information\n&quot;</a>
+<a name="ln1938">       &quot;Show generated topologies\n&quot;)</a>
+<a name="ln1939">{</a>
+<a name="ln1940">  struct isis_area *area;</a>
+<a name="ln1941">  struct listnode *node;</a>
+<a name="ln1942">  struct listnode *node2;</a>
+<a name="ln1943">  struct arc *arc;</a>
+<a name="ln1944"> </a>
+<a name="ln1945">  for (ALL_LIST_ELEMENTS_RO (isis-&gt;area_list, node, area))</a>
+<a name="ln1946">    {</a>
+<a name="ln1947">      if (!area-&gt;topology)</a>
+<a name="ln1948">	continue;</a>
+<a name="ln1949"> </a>
+<a name="ln1950">      vty_out (vty, &quot;Topology for isis area: %s%s&quot;, area-&gt;area_tag,</a>
+<a name="ln1951">	       VTY_NEWLINE);</a>
+<a name="ln1952">      vty_out (vty, &quot;From node     To node     Distance%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1953"> </a>
+<a name="ln1954">      for (ALL_LIST_ELEMENTS_RO (area-&gt;topology, node2, arc))</a>
+<a name="ln1955">	vty_out (vty, &quot;%9ld %11ld %12ld%s&quot;, arc-&gt;from_node, arc-&gt;to_node,</a>
+<a name="ln1956">		 arc-&gt;distance, VTY_NEWLINE);</a>
+<a name="ln1957">    }</a>
+<a name="ln1958">  return CMD_SUCCESS;</a>
+<a name="ln1959">}</a>
+<a name="ln1960"> </a>
+<a name="ln1961">/* Base IS for topology generation. */</a>
+<a name="ln1962">DEFUN (topology_baseis,</a>
+<a name="ln1963">       topology_baseis_cmd,</a>
+<a name="ln1964">       &quot;topology base-is WORD&quot;,</a>
+<a name="ln1965">       &quot;Topology generation for IS-IS\n&quot;</a>
+<a name="ln1966">       &quot;A Network IS Base for this topology\n&quot;</a>
+<a name="ln1967">       &quot;XXXX.XXXX.XXXX Network entity title (NET)\n&quot;)</a>
+<a name="ln1968">{</a>
+<a name="ln1969">  struct isis_area *area;</a>
+<a name="ln1970">  u_char buff[ISIS_SYS_ID_LEN];</a>
+<a name="ln1971"> </a>
+<a name="ln1972">  area = vty-&gt;index;</a>
+<a name="ln1973">  assert (area);</a>
+<a name="ln1974"> </a>
+<a name="ln1975">  if (sysid2buff (buff, argv[0]))</a>
+<a name="ln1976">    sysid2buff (area-&gt;topology_baseis, argv[0]);</a>
+<a name="ln1977"> </a>
+<a name="ln1978">  return CMD_SUCCESS;</a>
+<a name="ln1979">}</a>
+<a name="ln1980"> </a>
+<a name="ln1981">DEFUN (no_topology_baseis,</a>
+<a name="ln1982">       no_topology_baseis_cmd,</a>
+<a name="ln1983">       &quot;no topology base-is WORD&quot;,</a>
+<a name="ln1984">       NO_STR</a>
+<a name="ln1985">       &quot;Topology generation for IS-IS\n&quot;</a>
+<a name="ln1986">       &quot;A Network IS Base for this topology\n&quot;</a>
+<a name="ln1987">       &quot;XXXX.XXXX.XXXX Network entity title (NET)\n&quot;)</a>
+<a name="ln1988">{</a>
+<a name="ln1989">  struct isis_area *area;</a>
+<a name="ln1990"> </a>
+<a name="ln1991">  area = vty-&gt;index;</a>
+<a name="ln1992">  assert (area);</a>
+<a name="ln1993"> </a>
+<a name="ln1994">  memcpy (area-&gt;topology_baseis, DEFAULT_TOPOLOGY_BASEIS, ISIS_SYS_ID_LEN);</a>
+<a name="ln1995">  return CMD_SUCCESS;</a>
+<a name="ln1996">}</a>
+<a name="ln1997"> </a>
+<a name="ln1998">ALIAS (no_topology_baseis,</a>
+<a name="ln1999">       no_topology_baseis_noid_cmd,</a>
+<a name="ln2000">       &quot;no topology base-is&quot;,</a>
+<a name="ln2001">       NO_STR</a>
+<a name="ln2002">       &quot;Topology generation for IS-IS\n&quot;</a>
+<a name="ln2003">       &quot;A Network IS Base for this topology\n&quot;)</a>
+<a name="ln2004"> </a>
+<a name="ln2005">DEFUN (topology_basedynh,</a>
+<a name="ln2006">       topology_basedynh_cmd,</a>
+<a name="ln2007">       &quot;topology base-dynh WORD&quot;,</a>
+<a name="ln2008">       &quot;Topology generation for IS-IS\n&quot;</a>
+<a name="ln2009">       &quot;Dynamic hostname base for this topology\n&quot;</a>
+<a name="ln2010">       &quot;Dynamic hostname base\n&quot;)</a>
+<a name="ln2011">{</a>
+<a name="ln2012">  struct isis_area *area;</a>
+<a name="ln2013"> </a>
+<a name="ln2014">  area = vty-&gt;index;</a>
+<a name="ln2015">  assert (area);</a>
+<a name="ln2016"> </a>
+<a name="ln2017">  /* I hope that it's enough. */</a>
+<a name="ln2018">  area-&gt;topology_basedynh = strndup (argv[0], 16); </a>
+<a name="ln2019">  return CMD_SUCCESS;</a>
+<a name="ln2020">}</a>
+<a name="ln2021"> </a>
+<a name="ln2022">#endif /* TOPOLOGY_GENERATE */</a>
+<a name="ln2023"> </a>
+<a name="ln2024">/* IS-IS configuration write function */</a>
+<a name="ln2025">int</a>
+<a name="ln2026">isis_config_write (struct vty *vty)</a>
+<a name="ln2027">{</a>
+<a name="ln2028">  int write = 0;</a>
+<a name="ln2029"> </a>
+<a name="ln2030">  if (isis != NULL)</a>
+<a name="ln2031">    {</a>
+<a name="ln2032">      struct isis_area *area;</a>
+<a name="ln2033">      struct listnode *node, *node2;</a>
+<a name="ln2034"> </a>
+<a name="ln2035">      for (ALL_LIST_ELEMENTS_RO (isis-&gt;area_list, node, area))</a>
+<a name="ln2036">      {</a>
+<a name="ln2037">	/* ISIS - Area name */</a>
+<a name="ln2038">	vty_out (vty, &quot;router isis %s%s&quot;, area-&gt;area_tag, VTY_NEWLINE);</a>
+<a name="ln2039">	write++;</a>
+<a name="ln2040">	/* ISIS - Net */</a>
+<a name="ln2041">	if (listcount (area-&gt;area_addrs) &gt; 0)</a>
+<a name="ln2042">	  {</a>
+<a name="ln2043">	    struct area_addr *area_addr;</a>
+<a name="ln2044">	    for (ALL_LIST_ELEMENTS_RO (area-&gt;area_addrs, node2, area_addr))</a>
+<a name="ln2045">	      {</a>
+<a name="ln2046">		vty_out (vty, &quot; net %s%s&quot;,</a>
+<a name="ln2047">			 isonet_print (area_addr-&gt;area_addr,</a>
+<a name="ln2048">				       area_addr-&gt;addr_len + ISIS_SYS_ID_LEN +</a>
+<a name="ln2049">				       1), VTY_NEWLINE);</a>
+<a name="ln2050">		write++;</a>
+<a name="ln2051">	      }</a>
+<a name="ln2052">	  }</a>
+<a name="ln2053">	/* ISIS - Dynamic hostname - Defaults to true so only display if</a>
+<a name="ln2054">	 * false. */</a>
+<a name="ln2055">	if (!area-&gt;dynhostname)</a>
+<a name="ln2056">	  {</a>
+<a name="ln2057">	    vty_out (vty, &quot; no hostname dynamic%s&quot;, VTY_NEWLINE);</a>
+<a name="ln2058">	    write++;</a>
+<a name="ln2059">	  }</a>
+<a name="ln2060">	/* ISIS - Metric-Style - when true displays wide */</a>
+<a name="ln2061">	if (area-&gt;newmetric)</a>
+<a name="ln2062">	  {</a>
+<a name="ln2063">	    if (!area-&gt;oldmetric)</a>
+<a name="ln2064">	      vty_out (vty, &quot; metric-style wide%s&quot;, VTY_NEWLINE);</a>
+<a name="ln2065">	    else</a>
+<a name="ln2066">	      vty_out (vty, &quot; metric-style transition%s&quot;, VTY_NEWLINE);</a>
+<a name="ln2067">	    write++;</a>
+<a name="ln2068">	  }</a>
+<a name="ln2069">	else</a>
+<a name="ln2070">	  {</a>
+<a name="ln2071">	    vty_out (vty, &quot; metric-style narrow%s&quot;, VTY_NEWLINE);</a>
+<a name="ln2072">	    write++;</a>
+<a name="ln2073">	  }</a>
+<a name="ln2074">	/* ISIS - overload-bit */</a>
+<a name="ln2075">	if (area-&gt;overload_bit)</a>
+<a name="ln2076">	  {</a>
+<a name="ln2077">	    vty_out (vty, &quot; set-overload-bit%s&quot;, VTY_NEWLINE);</a>
+<a name="ln2078">	    write++;</a>
+<a name="ln2079">	  }</a>
+<a name="ln2080">	/* ISIS - Area is-type (level-1-2 is default) */</a>
+<a name="ln2081">	if (area-&gt;is_type == IS_LEVEL_1)</a>
+<a name="ln2082">	  {</a>
+<a name="ln2083">	    vty_out (vty, &quot; is-type level-1%s&quot;, VTY_NEWLINE);</a>
+<a name="ln2084">	    write++;</a>
+<a name="ln2085">	  }</a>
+<a name="ln2086">	else if (area-&gt;is_type == IS_LEVEL_2)</a>
+<a name="ln2087">	  {</a>
+<a name="ln2088">	    vty_out (vty, &quot; is-type level-2-only%s&quot;, VTY_NEWLINE);</a>
+<a name="ln2089">	    write++;</a>
+<a name="ln2090">	  }</a>
+<a name="ln2091">	write += isis_redist_config_write(vty, area, AF_INET);</a>
+<a name="ln2092">	write += isis_redist_config_write(vty, area, AF_INET6);</a>
+<a name="ln2093">	/* ISIS - Lsp generation interval */</a>
+<a name="ln2094">	if (area-&gt;lsp_gen_interval[0] == area-&gt;lsp_gen_interval[1])</a>
+<a name="ln2095">	  {</a>
+<a name="ln2096">	    if (area-&gt;lsp_gen_interval[0] != DEFAULT_MIN_LSP_GEN_INTERVAL)</a>
+<a name="ln2097">	      {</a>
+<a name="ln2098">		vty_out (vty, &quot; lsp-gen-interval %d%s&quot;,</a>
+<a name="ln2099">			 area-&gt;lsp_gen_interval[0], VTY_NEWLINE);</a>
+<a name="ln2100">		write++;</a>
+<a name="ln2101">	      }</a>
+<a name="ln2102">	  }</a>
+<a name="ln2103">	else</a>
+<a name="ln2104">	  {</a>
+<a name="ln2105">	    if (area-&gt;lsp_gen_interval[0] != DEFAULT_MIN_LSP_GEN_INTERVAL)</a>
+<a name="ln2106">	      {</a>
+<a name="ln2107">		vty_out (vty, &quot; lsp-gen-interval level-1 %d%s&quot;,</a>
+<a name="ln2108">			 area-&gt;lsp_gen_interval[0], VTY_NEWLINE);</a>
+<a name="ln2109">		write++;</a>
+<a name="ln2110">	      }</a>
+<a name="ln2111">	    if (area-&gt;lsp_gen_interval[1] != DEFAULT_MIN_LSP_GEN_INTERVAL)</a>
+<a name="ln2112">	      {</a>
+<a name="ln2113">		vty_out (vty, &quot; lsp-gen-interval level-2 %d%s&quot;,</a>
+<a name="ln2114">			 area-&gt;lsp_gen_interval[1], VTY_NEWLINE);</a>
+<a name="ln2115">		write++;</a>
+<a name="ln2116">	      }</a>
+<a name="ln2117">	  }</a>
+<a name="ln2118">	/* ISIS - LSP lifetime */</a>
+<a name="ln2119">	if (area-&gt;max_lsp_lifetime[0] == area-&gt;max_lsp_lifetime[1])</a>
+<a name="ln2120">	  {</a>
+<a name="ln2121">	    if (area-&gt;max_lsp_lifetime[0] != DEFAULT_LSP_LIFETIME)</a>
+<a name="ln2122">	      {</a>
+<a name="ln2123">		vty_out (vty, &quot; max-lsp-lifetime %u%s&quot;, area-&gt;max_lsp_lifetime[0],</a>
+<a name="ln2124">			 VTY_NEWLINE);</a>
+<a name="ln2125">		write++;</a>
+<a name="ln2126">	      }</a>
+<a name="ln2127">	  }</a>
+<a name="ln2128">	else</a>
+<a name="ln2129">	  {</a>
+<a name="ln2130">	    if (area-&gt;max_lsp_lifetime[0] != DEFAULT_LSP_LIFETIME)</a>
+<a name="ln2131">	      {</a>
+<a name="ln2132">		vty_out (vty, &quot; max-lsp-lifetime level-1 %u%s&quot;,</a>
+<a name="ln2133">			 area-&gt;max_lsp_lifetime[0], VTY_NEWLINE);</a>
+<a name="ln2134">		write++;</a>
+<a name="ln2135">	      }</a>
+<a name="ln2136">	    if (area-&gt;max_lsp_lifetime[1] != DEFAULT_LSP_LIFETIME)</a>
+<a name="ln2137">	      {</a>
+<a name="ln2138">		vty_out (vty, &quot; max-lsp-lifetime level-2 %u%s&quot;,</a>
+<a name="ln2139">			 area-&gt;max_lsp_lifetime[1], VTY_NEWLINE);</a>
+<a name="ln2140">		write++;</a>
+<a name="ln2141">	      }</a>
+<a name="ln2142">	  }</a>
+<a name="ln2143">	/* ISIS - LSP refresh interval */</a>
+<a name="ln2144">	if (area-&gt;lsp_refresh[0] == area-&gt;lsp_refresh[1])</a>
+<a name="ln2145">	  {</a>
+<a name="ln2146">	    if (area-&gt;lsp_refresh[0] != DEFAULT_MAX_LSP_GEN_INTERVAL)</a>
+<a name="ln2147">	      {</a>
+<a name="ln2148">		vty_out (vty, &quot; lsp-refresh-interval %u%s&quot;, area-&gt;lsp_refresh[0],</a>
+<a name="ln2149">			 VTY_NEWLINE);</a>
+<a name="ln2150">		write++;</a>
+<a name="ln2151">	      }</a>
+<a name="ln2152">	  }</a>
+<a name="ln2153">	else</a>
+<a name="ln2154">	  {</a>
+<a name="ln2155">	    if (area-&gt;lsp_refresh[0] != DEFAULT_MAX_LSP_GEN_INTERVAL)</a>
+<a name="ln2156">	      {</a>
+<a name="ln2157">		vty_out (vty, &quot; lsp-refresh-interval level-1 %u%s&quot;,</a>
+<a name="ln2158">			 area-&gt;lsp_refresh[0], VTY_NEWLINE);</a>
+<a name="ln2159">		write++;</a>
+<a name="ln2160">	      }</a>
+<a name="ln2161">	    if (area-&gt;lsp_refresh[1] != DEFAULT_MAX_LSP_GEN_INTERVAL)</a>
+<a name="ln2162">	      {</a>
+<a name="ln2163">		vty_out (vty, &quot; lsp-refresh-interval level-2 %u%s&quot;,</a>
+<a name="ln2164">			 area-&gt;lsp_refresh[1], VTY_NEWLINE);</a>
+<a name="ln2165">		write++;</a>
+<a name="ln2166">	      }</a>
+<a name="ln2167">	  }</a>
+<a name="ln2168">	if (area-&gt;lsp_mtu != DEFAULT_LSP_MTU)</a>
+<a name="ln2169">	  {</a>
+<a name="ln2170">	    vty_out(vty, &quot; lsp-mtu %u%s&quot;, area-&gt;lsp_mtu, VTY_NEWLINE);</a>
+<a name="ln2171">	    write++;</a>
+<a name="ln2172">	  }</a>
+<a name="ln2173"> </a>
+<a name="ln2174">	/* Minimum SPF interval. */</a>
+<a name="ln2175">	if (area-&gt;min_spf_interval[0] == area-&gt;min_spf_interval[1])</a>
+<a name="ln2176">	  {</a>
+<a name="ln2177">	    if (area-&gt;min_spf_interval[0] != MINIMUM_SPF_INTERVAL)</a>
+<a name="ln2178">	      {</a>
+<a name="ln2179">		vty_out (vty, &quot; spf-interval %d%s&quot;,</a>
+<a name="ln2180">			 area-&gt;min_spf_interval[0], VTY_NEWLINE);</a>
+<a name="ln2181">		write++;</a>
+<a name="ln2182">	      }</a>
+<a name="ln2183">	  }</a>
+<a name="ln2184">	else</a>
+<a name="ln2185">	  {</a>
+<a name="ln2186">	    if (area-&gt;min_spf_interval[0] != MINIMUM_SPF_INTERVAL)</a>
+<a name="ln2187">	      {</a>
+<a name="ln2188">		vty_out (vty, &quot; spf-interval level-1 %d%s&quot;,</a>
+<a name="ln2189">			 area-&gt;min_spf_interval[0], VTY_NEWLINE);</a>
+<a name="ln2190">		write++;</a>
+<a name="ln2191">	      }</a>
+<a name="ln2192">	    if (area-&gt;min_spf_interval[1] != MINIMUM_SPF_INTERVAL)</a>
+<a name="ln2193">	      {</a>
+<a name="ln2194">		vty_out (vty, &quot; spf-interval level-2 %d%s&quot;,</a>
+<a name="ln2195">			 area-&gt;min_spf_interval[1], VTY_NEWLINE);</a>
+<a name="ln2196">		write++;</a>
+<a name="ln2197">	      }</a>
+<a name="ln2198">	  }</a>
+<a name="ln2199">	/* Authentication passwords. */</a>
+<a name="ln2200">	if (area-&gt;area_passwd.type == ISIS_PASSWD_TYPE_HMAC_MD5)</a>
+<a name="ln2201">	  {</a>
+<a name="ln2202">	    vty_out(vty, &quot; area-password md5 %s&quot;, area-&gt;area_passwd.passwd);</a>
+<a name="ln2203">	    if (CHECK_FLAG(area-&gt;area_passwd.snp_auth, SNP_AUTH_SEND))</a>
+<a name="ln2204">	      {</a>
+<a name="ln2205">		vty_out(vty, &quot; authenticate snp &quot;);</a>
+<a name="ln2206">		if (CHECK_FLAG(area-&gt;area_passwd.snp_auth, SNP_AUTH_RECV))</a>
+<a name="ln2207">		  vty_out(vty, &quot;validate&quot;);</a>
+<a name="ln2208">		else</a>
+<a name="ln2209">		  vty_out(vty, &quot;send-only&quot;);</a>
+<a name="ln2210">	      }</a>
+<a name="ln2211">	    vty_out(vty, &quot;%s&quot;, VTY_NEWLINE);</a>
+<a name="ln2212">	    write++; </a>
+<a name="ln2213">	  }</a>
+<a name="ln2214">        else if (area-&gt;area_passwd.type == ISIS_PASSWD_TYPE_CLEARTXT)</a>
+<a name="ln2215">          {</a>
+<a name="ln2216">	    vty_out(vty, &quot; area-password clear %s&quot;, area-&gt;area_passwd.passwd);</a>
+<a name="ln2217">	    if (CHECK_FLAG(area-&gt;area_passwd.snp_auth, SNP_AUTH_SEND))</a>
+<a name="ln2218">	      {</a>
+<a name="ln2219">		vty_out(vty, &quot; authenticate snp &quot;);</a>
+<a name="ln2220">		if (CHECK_FLAG(area-&gt;area_passwd.snp_auth, SNP_AUTH_RECV))</a>
+<a name="ln2221">		  vty_out(vty, &quot;validate&quot;);</a>
+<a name="ln2222">		else</a>
+<a name="ln2223">		  vty_out(vty, &quot;send-only&quot;);</a>
+<a name="ln2224">	      }</a>
+<a name="ln2225">	    vty_out(vty, &quot;%s&quot;, VTY_NEWLINE);</a>
+<a name="ln2226">	    write++; </a>
+<a name="ln2227">          }</a>
+<a name="ln2228">	if (area-&gt;domain_passwd.type == ISIS_PASSWD_TYPE_HMAC_MD5)</a>
+<a name="ln2229">	  {</a>
+<a name="ln2230">            vty_out(vty, &quot; domain-password md5 %s&quot;,</a>
+<a name="ln2231">                    area-&gt;domain_passwd.passwd);</a>
+<a name="ln2232">	    if (CHECK_FLAG(area-&gt;domain_passwd.snp_auth, SNP_AUTH_SEND))</a>
+<a name="ln2233">	      {</a>
+<a name="ln2234">		vty_out(vty, &quot; authenticate snp &quot;);</a>
+<a name="ln2235">		if (CHECK_FLAG(area-&gt;domain_passwd.snp_auth, SNP_AUTH_RECV))</a>
+<a name="ln2236">		  vty_out(vty, &quot;validate&quot;);</a>
+<a name="ln2237">		else</a>
+<a name="ln2238">		  vty_out(vty, &quot;send-only&quot;);</a>
+<a name="ln2239">	      }</a>
+<a name="ln2240">	    vty_out(vty, &quot;%s&quot;, VTY_NEWLINE);</a>
+<a name="ln2241">	    write++;</a>
+<a name="ln2242">	  }</a>
+<a name="ln2243">        else if (area-&gt;domain_passwd.type == ISIS_PASSWD_TYPE_CLEARTXT)</a>
+<a name="ln2244">	  {</a>
+<a name="ln2245">	    vty_out(vty, &quot; domain-password clear %s&quot;,</a>
+<a name="ln2246">                    area-&gt;domain_passwd.passwd); </a>
+<a name="ln2247">	    if (CHECK_FLAG(area-&gt;domain_passwd.snp_auth, SNP_AUTH_SEND))</a>
+<a name="ln2248">	      {</a>
+<a name="ln2249">		vty_out(vty, &quot; authenticate snp &quot;);</a>
+<a name="ln2250">		if (CHECK_FLAG(area-&gt;domain_passwd.snp_auth, SNP_AUTH_RECV))</a>
+<a name="ln2251">		  vty_out(vty, &quot;validate&quot;);</a>
+<a name="ln2252">		else</a>
+<a name="ln2253">		  vty_out(vty, &quot;send-only&quot;);</a>
+<a name="ln2254">	      }</a>
+<a name="ln2255">	    vty_out(vty, &quot;%s&quot;, VTY_NEWLINE);</a>
+<a name="ln2256">	    write++;</a>
+<a name="ln2257">	  }</a>
+<a name="ln2258"> </a>
+<a name="ln2259">	if (area-&gt;log_adj_changes)</a>
+<a name="ln2260">	  {</a>
+<a name="ln2261">	    vty_out (vty, &quot; log-adjacency-changes%s&quot;, VTY_NEWLINE);</a>
+<a name="ln2262">	    write++;</a>
+<a name="ln2263">	  }</a>
+<a name="ln2264"> </a>
+<a name="ln2265">#ifdef TOPOLOGY_GENERATE</a>
+<a name="ln2266">	if (memcmp (area-&gt;topology_baseis, DEFAULT_TOPOLOGY_BASEIS,</a>
+<a name="ln2267">		    ISIS_SYS_ID_LEN))</a>
+<a name="ln2268">	  {</a>
+<a name="ln2269">	    vty_out (vty, &quot; topology base-is %s%s&quot;,</a>
+<a name="ln2270">		     sysid_print ((u_char *)area-&gt;topology_baseis), VTY_NEWLINE);</a>
+<a name="ln2271">	    write++;</a>
+<a name="ln2272">	  }</a>
+<a name="ln2273">	if (area-&gt;topology_basedynh)</a>
+<a name="ln2274">	  {</a>
+<a name="ln2275">	    vty_out (vty, &quot; topology base-dynh %s%s&quot;,</a>
+<a name="ln2276">		     area-&gt;topology_basedynh, VTY_NEWLINE);</a>
+<a name="ln2277">	    write++;</a>
+<a name="ln2278">	  }</a>
+<a name="ln2279">	/* We save the whole command line here. */</a>
+<a name="ln2280">	if (strlen(area-&gt;top_params))</a>
+<a name="ln2281">	  {</a>
+<a name="ln2282">	    vty_out (vty, &quot; %s%s&quot;, area-&gt;top_params, VTY_NEWLINE);</a>
+<a name="ln2283">	    write++;</a>
+<a name="ln2284">	  }</a>
+<a name="ln2285">#endif /* TOPOLOGY_GENERATE */</a>
+<a name="ln2286"> </a>
+<a name="ln2287">      }</a>
+<a name="ln2288">    isis_mpls_te_config_write_router(vty);</a>
+<a name="ln2289">    }</a>
+<a name="ln2290"> </a>
+<a name="ln2291">  return write;</a>
+<a name="ln2292">}</a>
+<a name="ln2293"> </a>
+<a name="ln2294">struct cmd_node isis_node = {</a>
+<a name="ln2295">  ISIS_NODE,</a>
+<a name="ln2296">  &quot;%s(config-router)# &quot;,</a>
+<a name="ln2297">  1</a>
+<a name="ln2298">};</a>
+<a name="ln2299"> </a>
+<a name="ln2300">void</a>
+<a name="ln2301">isis_init ()</a>
+<a name="ln2302">{</a>
+<a name="ln2303">  /* Install IS-IS top node */</a>
+<a name="ln2304">  install_node (&amp;isis_node, isis_config_write);</a>
+<a name="ln2305"> </a>
+<a name="ln2306">  install_element (VIEW_NODE, &amp;show_isis_summary_cmd);</a>
+<a name="ln2307"> </a>
+<a name="ln2308">  install_element (VIEW_NODE, &amp;show_isis_interface_cmd);</a>
+<a name="ln2309">  install_element (VIEW_NODE, &amp;show_isis_interface_detail_cmd);</a>
+<a name="ln2310">  install_element (VIEW_NODE, &amp;show_isis_interface_arg_cmd);</a>
+<a name="ln2311"> </a>
+<a name="ln2312">  install_element (VIEW_NODE, &amp;show_isis_neighbor_cmd);</a>
+<a name="ln2313">  install_element (VIEW_NODE, &amp;show_isis_neighbor_detail_cmd);</a>
+<a name="ln2314">  install_element (VIEW_NODE, &amp;show_isis_neighbor_arg_cmd);</a>
+<a name="ln2315">  install_element (VIEW_NODE, &amp;clear_isis_neighbor_cmd);</a>
+<a name="ln2316">  install_element (VIEW_NODE, &amp;clear_isis_neighbor_arg_cmd);</a>
+<a name="ln2317"> </a>
+<a name="ln2318">  install_element (VIEW_NODE, &amp;show_hostname_cmd);</a>
+<a name="ln2319">  install_element (VIEW_NODE, &amp;show_database_cmd);</a>
+<a name="ln2320">  install_element (VIEW_NODE, &amp;show_database_arg_cmd);</a>
+<a name="ln2321">  install_element (VIEW_NODE, &amp;show_database_arg_detail_cmd);</a>
+<a name="ln2322">  install_element (VIEW_NODE, &amp;show_database_detail_cmd);</a>
+<a name="ln2323">  install_element (VIEW_NODE, &amp;show_database_detail_arg_cmd);</a>
+<a name="ln2324"> </a>
+<a name="ln2325">  install_element (ENABLE_NODE, &amp;show_debugging_isis_cmd);</a>
+<a name="ln2326"> </a>
+<a name="ln2327">  install_node (&amp;debug_node, config_write_debug);</a>
+<a name="ln2328"> </a>
+<a name="ln2329">  install_element (ENABLE_NODE, &amp;debug_isis_adj_cmd);</a>
+<a name="ln2330">  install_element (ENABLE_NODE, &amp;no_debug_isis_adj_cmd);</a>
+<a name="ln2331">  install_element (ENABLE_NODE, &amp;debug_isis_csum_cmd);</a>
+<a name="ln2332">  install_element (ENABLE_NODE, &amp;no_debug_isis_csum_cmd);</a>
+<a name="ln2333">  install_element (ENABLE_NODE, &amp;debug_isis_lupd_cmd);</a>
+<a name="ln2334">  install_element (ENABLE_NODE, &amp;no_debug_isis_lupd_cmd);</a>
+<a name="ln2335">  install_element (ENABLE_NODE, &amp;debug_isis_err_cmd);</a>
+<a name="ln2336">  install_element (ENABLE_NODE, &amp;no_debug_isis_err_cmd);</a>
+<a name="ln2337">  install_element (ENABLE_NODE, &amp;debug_isis_snp_cmd);</a>
+<a name="ln2338">  install_element (ENABLE_NODE, &amp;no_debug_isis_snp_cmd);</a>
+<a name="ln2339">  install_element (ENABLE_NODE, &amp;debug_isis_upd_cmd);</a>
+<a name="ln2340">  install_element (ENABLE_NODE, &amp;no_debug_isis_upd_cmd);</a>
+<a name="ln2341">  install_element (ENABLE_NODE, &amp;debug_isis_spfevents_cmd);</a>
+<a name="ln2342">  install_element (ENABLE_NODE, &amp;no_debug_isis_spfevents_cmd);</a>
+<a name="ln2343">  install_element (ENABLE_NODE, &amp;debug_isis_spfstats_cmd);</a>
+<a name="ln2344">  install_element (ENABLE_NODE, &amp;no_debug_isis_spfstats_cmd);</a>
+<a name="ln2345">  install_element (ENABLE_NODE, &amp;debug_isis_spftrigg_cmd);</a>
+<a name="ln2346">  install_element (ENABLE_NODE, &amp;no_debug_isis_spftrigg_cmd);</a>
+<a name="ln2347">  install_element (ENABLE_NODE, &amp;debug_isis_rtevents_cmd);</a>
+<a name="ln2348">  install_element (ENABLE_NODE, &amp;no_debug_isis_rtevents_cmd);</a>
+<a name="ln2349">  install_element (ENABLE_NODE, &amp;debug_isis_events_cmd);</a>
+<a name="ln2350">  install_element (ENABLE_NODE, &amp;no_debug_isis_events_cmd);</a>
+<a name="ln2351">  install_element (ENABLE_NODE, &amp;debug_isis_packet_dump_cmd);</a>
+<a name="ln2352">  install_element (ENABLE_NODE, &amp;no_debug_isis_packet_dump_cmd);</a>
+<a name="ln2353">  install_element (ENABLE_NODE, &amp;debug_isis_lsp_gen_cmd);</a>
+<a name="ln2354">  install_element (ENABLE_NODE, &amp;no_debug_isis_lsp_gen_cmd);</a>
+<a name="ln2355">  install_element (ENABLE_NODE, &amp;debug_isis_lsp_sched_cmd);</a>
+<a name="ln2356">  install_element (ENABLE_NODE, &amp;no_debug_isis_lsp_sched_cmd);</a>
+<a name="ln2357"> </a>
+<a name="ln2358">  install_element (CONFIG_NODE, &amp;debug_isis_adj_cmd);</a>
+<a name="ln2359">  install_element (CONFIG_NODE, &amp;no_debug_isis_adj_cmd);</a>
+<a name="ln2360">  install_element (CONFIG_NODE, &amp;debug_isis_csum_cmd);</a>
+<a name="ln2361">  install_element (CONFIG_NODE, &amp;no_debug_isis_csum_cmd);</a>
+<a name="ln2362">  install_element (CONFIG_NODE, &amp;debug_isis_lupd_cmd);</a>
+<a name="ln2363">  install_element (CONFIG_NODE, &amp;no_debug_isis_lupd_cmd);</a>
+<a name="ln2364">  install_element (CONFIG_NODE, &amp;debug_isis_err_cmd);</a>
+<a name="ln2365">  install_element (CONFIG_NODE, &amp;no_debug_isis_err_cmd);</a>
+<a name="ln2366">  install_element (CONFIG_NODE, &amp;debug_isis_snp_cmd);</a>
+<a name="ln2367">  install_element (CONFIG_NODE, &amp;no_debug_isis_snp_cmd);</a>
+<a name="ln2368">  install_element (CONFIG_NODE, &amp;debug_isis_upd_cmd);</a>
+<a name="ln2369">  install_element (CONFIG_NODE, &amp;no_debug_isis_upd_cmd);</a>
+<a name="ln2370">  install_element (CONFIG_NODE, &amp;debug_isis_spfevents_cmd);</a>
+<a name="ln2371">  install_element (CONFIG_NODE, &amp;no_debug_isis_spfevents_cmd);</a>
+<a name="ln2372">  install_element (CONFIG_NODE, &amp;debug_isis_spfstats_cmd);</a>
+<a name="ln2373">  install_element (CONFIG_NODE, &amp;no_debug_isis_spfstats_cmd);</a>
+<a name="ln2374">  install_element (CONFIG_NODE, &amp;debug_isis_spftrigg_cmd);</a>
+<a name="ln2375">  install_element (CONFIG_NODE, &amp;no_debug_isis_spftrigg_cmd);</a>
+<a name="ln2376">  install_element (CONFIG_NODE, &amp;debug_isis_rtevents_cmd);</a>
+<a name="ln2377">  install_element (CONFIG_NODE, &amp;no_debug_isis_rtevents_cmd);</a>
+<a name="ln2378">  install_element (CONFIG_NODE, &amp;debug_isis_events_cmd);</a>
+<a name="ln2379">  install_element (CONFIG_NODE, &amp;no_debug_isis_events_cmd);</a>
+<a name="ln2380">  install_element (CONFIG_NODE, &amp;debug_isis_packet_dump_cmd);</a>
+<a name="ln2381">  install_element (CONFIG_NODE, &amp;no_debug_isis_packet_dump_cmd);</a>
+<a name="ln2382">  install_element (CONFIG_NODE, &amp;debug_isis_lsp_gen_cmd);</a>
+<a name="ln2383">  install_element (CONFIG_NODE, &amp;no_debug_isis_lsp_gen_cmd);</a>
+<a name="ln2384">  install_element (CONFIG_NODE, &amp;debug_isis_lsp_sched_cmd);</a>
+<a name="ln2385">  install_element (CONFIG_NODE, &amp;no_debug_isis_lsp_sched_cmd);</a>
+<a name="ln2386"> </a>
+<a name="ln2387">  install_element (CONFIG_NODE, &amp;router_isis_cmd);</a>
+<a name="ln2388">  install_element (CONFIG_NODE, &amp;no_router_isis_cmd);</a>
+<a name="ln2389"> </a>
+<a name="ln2390">  install_default (ISIS_NODE);</a>
+<a name="ln2391"> </a>
+<a name="ln2392">  install_element (ISIS_NODE, &amp;net_cmd);</a>
+<a name="ln2393">  install_element (ISIS_NODE, &amp;no_net_cmd);</a>
+<a name="ln2394"> </a>
+<a name="ln2395">  install_element (ISIS_NODE, &amp;log_adj_changes_cmd);</a>
+<a name="ln2396">  install_element (ISIS_NODE, &amp;no_log_adj_changes_cmd);</a>
+<a name="ln2397"> </a>
+<a name="ln2398">#ifdef TOPOLOGY_GENERATE</a>
+<a name="ln2399">  install_element (ISIS_NODE, &amp;topology_generate_grid_cmd);</a>
+<a name="ln2400">  install_element (ISIS_NODE, &amp;topology_baseis_cmd);</a>
+<a name="ln2401">  install_element (ISIS_NODE, &amp;topology_basedynh_cmd);</a>
+<a name="ln2402">  install_element (ISIS_NODE, &amp;no_topology_baseis_cmd);</a>
+<a name="ln2403">  install_element (ISIS_NODE, &amp;no_topology_baseis_noid_cmd);</a>
+<a name="ln2404">  install_element (VIEW_NODE, &amp;show_isis_generated_topology_cmd);</a>
+<a name="ln2405">#endif /* TOPOLOGY_GENERATE */</a>
+<a name="ln2406">}</a>
+
+</code></pre>
+<div class="balloon" rel="15"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1042/" target="_blank">V1042</a> This file is marked with copyleft license, which requires you to open the derived source code.</p></div>
+<div class="balloon" rel="1415"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v512/" target="_blank">V512</a> A call of the 'memset' function will lead to underflow of the buffer '& lspid'.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

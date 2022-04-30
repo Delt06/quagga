@@ -1,0 +1,330 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>rip_debug.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.5.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/* RIP debug routines</a>
+<a name="ln2"> * Copyright (C) 1999 Kunihiro Ishiguro &lt;kunihiro@zebra.org&gt;</a>
+<a name="ln3"> *</a>
+<a name="ln4"> * This file is part of GNU Zebra.</a>
+<a name="ln5"> *</a>
+<a name="ln6"> * GNU Zebra is free software; you can redistribute it and/or modify it</a>
+<a name="ln7"> * under the terms of the GNU General Public License as published by the</a>
+<a name="ln8"> * Free Software Foundation; either version 2, or (at your option) any</a>
+<a name="ln9"> * later version.</a>
+<a name="ln10"> *</a>
+<a name="ln11"> * GNU Zebra is distributed in the hope that it will be useful, but</a>
+<a name="ln12"> * WITHOUT ANY WARRANTY; without even the implied warranty of</a>
+<a name="ln13"> * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU</a>
+<a name="ln14"> * General Public License for more details.</a>
+<a name="ln15"> *</a>
+<a name="ln16"> * You should have received a copy of the GNU General Public License</a>
+<a name="ln17"> * along with GNU Zebra; see the file COPYING.  If not, write to the Free</a>
+<a name="ln18"> * Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA</a>
+<a name="ln19"> * 02111-1307, USA.  </a>
+<a name="ln20"> */</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &lt;zebra.h&gt;</a>
+<a name="ln23">#include &quot;command.h&quot;</a>
+<a name="ln24">#include &quot;ripd/rip_debug.h&quot;</a>
+<a name="ln25"> </a>
+<a name="ln26">/* For debug statement. */</a>
+<a name="ln27">unsigned long rip_debug_event = 0;</a>
+<a name="ln28">unsigned long rip_debug_packet = 0;</a>
+<a name="ln29">unsigned long rip_debug_zebra = 0;</a>
+<a name="ln30"> </a>
+<a name="ln31">DEFUN (show_debugging_rip,</a>
+<a name="ln32">       show_debugging_rip_cmd,</a>
+<a name="ln33">       &quot;show debugging rip&quot;,</a>
+<a name="ln34">       SHOW_STR</a>
+<a name="ln35">       DEBUG_STR</a>
+<a name="ln36">       RIP_STR)</a>
+<a name="ln37">{</a>
+<a name="ln38">  vty_out (vty, &quot;RIP debugging status:%s&quot;, VTY_NEWLINE);</a>
+<a name="ln39"> </a>
+<a name="ln40">  if (IS_RIP_DEBUG_EVENT)</a>
+<a name="ln41">    vty_out (vty, &quot;  RIP event debugging is on%s&quot;, VTY_NEWLINE);</a>
+<a name="ln42"> </a>
+<a name="ln43">  if (IS_RIP_DEBUG_PACKET)</a>
+<a name="ln44">    {</a>
+<a name="ln45">      if (IS_RIP_DEBUG_SEND &amp;&amp; IS_RIP_DEBUG_RECV)</a>
+<a name="ln46">	{</a>
+<a name="ln47">	  vty_out (vty, &quot;  RIP packet debugging is on%s&quot;,</a>
+<a name="ln48">		   VTY_NEWLINE);</a>
+<a name="ln49">	}</a>
+<a name="ln50">      else</a>
+<a name="ln51">	{</a>
+<a name="ln52">	  if (IS_RIP_DEBUG_SEND)</a>
+<a name="ln53">	    vty_out (vty, &quot;  RIP packet send debugging is on%s&quot;,</a>
+<a name="ln54">		     VTY_NEWLINE);</a>
+<a name="ln55">	  else</a>
+<a name="ln56">	    vty_out (vty, &quot;  RIP packet receive debugging is on%s&quot;,</a>
+<a name="ln57">		     VTY_NEWLINE);</a>
+<a name="ln58">	}</a>
+<a name="ln59">    }</a>
+<a name="ln60"> </a>
+<a name="ln61">  if (IS_RIP_DEBUG_ZEBRA)</a>
+<a name="ln62">    vty_out (vty, &quot;  RIP zebra debugging is on%s&quot;, VTY_NEWLINE);</a>
+<a name="ln63"> </a>
+<a name="ln64">  return CMD_SUCCESS;</a>
+<a name="ln65">}</a>
+<a name="ln66"> </a>
+<a name="ln67">DEFUN (debug_rip_events,</a>
+<a name="ln68">       debug_rip_events_cmd,</a>
+<a name="ln69">       &quot;debug rip events&quot;,</a>
+<a name="ln70">       DEBUG_STR</a>
+<a name="ln71">       RIP_STR</a>
+<a name="ln72">       &quot;RIP events\n&quot;)</a>
+<a name="ln73">{</a>
+<a name="ln74">  rip_debug_event = RIP_DEBUG_EVENT;</a>
+<a name="ln75">  return CMD_WARNING;</a>
+<a name="ln76">}</a>
+<a name="ln77"> </a>
+<a name="ln78">DEFUN (debug_rip_packet,</a>
+<a name="ln79">       debug_rip_packet_cmd,</a>
+<a name="ln80">       &quot;debug rip packet&quot;,</a>
+<a name="ln81">       DEBUG_STR</a>
+<a name="ln82">       RIP_STR</a>
+<a name="ln83">       &quot;RIP packet\n&quot;)</a>
+<a name="ln84">{</a>
+<a name="ln85">  rip_debug_packet = RIP_DEBUG_PACKET;</a>
+<a name="ln86">  rip_debug_packet |= RIP_DEBUG_SEND;</a>
+<a name="ln87">  rip_debug_packet |= RIP_DEBUG_RECV;</a>
+<a name="ln88">  return CMD_SUCCESS;</a>
+<a name="ln89">}</a>
+<a name="ln90"> </a>
+<a name="ln91">DEFUN (debug_rip_packet_direct,</a>
+<a name="ln92">       debug_rip_packet_direct_cmd,</a>
+<a name="ln93">       &quot;debug rip packet (recv|send)&quot;,</a>
+<a name="ln94">       DEBUG_STR</a>
+<a name="ln95">       RIP_STR</a>
+<a name="ln96">       &quot;RIP packet\n&quot;</a>
+<a name="ln97">       &quot;RIP receive packet\n&quot;</a>
+<a name="ln98">       &quot;RIP send packet\n&quot;)</a>
+<a name="ln99">{</a>
+<a name="ln100">  rip_debug_packet |= RIP_DEBUG_PACKET;</a>
+<a name="ln101">  if (strncmp (&quot;send&quot;, argv[0], strlen (argv[0])) == 0)</a>
+<a name="ln102">    rip_debug_packet |= RIP_DEBUG_SEND;</a>
+<a name="ln103">  if (strncmp (&quot;recv&quot;, argv[0], strlen (argv[0])) == 0)</a>
+<a name="ln104">    rip_debug_packet |= RIP_DEBUG_RECV;</a>
+<a name="ln105">  return CMD_SUCCESS;</a>
+<a name="ln106">}</a>
+<a name="ln107"> </a>
+<a name="ln108">/* N.B. the &quot;detail&quot; modifier is a no-op.  we leave this command</a>
+<a name="ln109">   for legacy compatibility. */</a>
+<a name="ln110">DEFUN_DEPRECATED (debug_rip_packet_detail,</a>
+<a name="ln111">       debug_rip_packet_detail_cmd,</a>
+<a name="ln112">       &quot;debug rip packet (recv|send) detail&quot;,</a>
+<a name="ln113">       DEBUG_STR</a>
+<a name="ln114">       RIP_STR</a>
+<a name="ln115">       &quot;RIP packet\n&quot;</a>
+<a name="ln116">       &quot;RIP receive packet\n&quot;</a>
+<a name="ln117">       &quot;RIP send packet\n&quot;</a>
+<a name="ln118">       &quot;Detailed information display\n&quot;)</a>
+<a name="ln119">{</a>
+<a name="ln120">  rip_debug_packet |= RIP_DEBUG_PACKET;</a>
+<a name="ln121">  if (strncmp (&quot;send&quot;, argv[0], strlen (argv[0])) == 0)</a>
+<a name="ln122">    rip_debug_packet |= RIP_DEBUG_SEND;</a>
+<a name="ln123">  if (strncmp (&quot;recv&quot;, argv[0], strlen (argv[0])) == 0)</a>
+<a name="ln124">    rip_debug_packet |= RIP_DEBUG_RECV;</a>
+<a name="ln125">  return CMD_SUCCESS;</a>
+<a name="ln126">}</a>
+<a name="ln127"> </a>
+<a name="ln128">DEFUN (debug_rip_zebra,</a>
+<a name="ln129">       debug_rip_zebra_cmd,</a>
+<a name="ln130">       &quot;debug rip zebra&quot;,</a>
+<a name="ln131">       DEBUG_STR</a>
+<a name="ln132">       RIP_STR</a>
+<a name="ln133">       &quot;RIP and ZEBRA communication\n&quot;)</a>
+<a name="ln134">{</a>
+<a name="ln135">  rip_debug_zebra = RIP_DEBUG_ZEBRA;</a>
+<a name="ln136">  return CMD_WARNING;</a>
+<a name="ln137">}</a>
+<a name="ln138"> </a>
+<a name="ln139">DEFUN (no_debug_rip_events,</a>
+<a name="ln140">       no_debug_rip_events_cmd,</a>
+<a name="ln141">       &quot;no debug rip events&quot;,</a>
+<a name="ln142">       NO_STR</a>
+<a name="ln143">       DEBUG_STR</a>
+<a name="ln144">       RIP_STR</a>
+<a name="ln145">       &quot;RIP events\n&quot;)</a>
+<a name="ln146">{</a>
+<a name="ln147">  rip_debug_event = 0;</a>
+<a name="ln148">  return CMD_SUCCESS;</a>
+<a name="ln149">}</a>
+<a name="ln150"> </a>
+<a name="ln151">DEFUN (no_debug_rip_packet,</a>
+<a name="ln152">       no_debug_rip_packet_cmd,</a>
+<a name="ln153">       &quot;no debug rip packet&quot;,</a>
+<a name="ln154">       NO_STR</a>
+<a name="ln155">       DEBUG_STR</a>
+<a name="ln156">       RIP_STR</a>
+<a name="ln157">       &quot;RIP packet\n&quot;)</a>
+<a name="ln158">{</a>
+<a name="ln159">  rip_debug_packet = 0;</a>
+<a name="ln160">  return CMD_SUCCESS;</a>
+<a name="ln161">}</a>
+<a name="ln162"> </a>
+<a name="ln163">DEFUN (no_debug_rip_packet_direct,</a>
+<a name="ln164">       no_debug_rip_packet_direct_cmd,</a>
+<a name="ln165">       &quot;no debug rip packet (recv|send)&quot;,</a>
+<a name="ln166">       NO_STR</a>
+<a name="ln167">       DEBUG_STR</a>
+<a name="ln168">       RIP_STR</a>
+<a name="ln169">       &quot;RIP packet\n&quot;</a>
+<a name="ln170">       &quot;RIP option set for receive packet\n&quot;</a>
+<a name="ln171">       &quot;RIP option set for send packet\n&quot;)</a>
+<a name="ln172">{</a>
+<a name="ln173">  if (strncmp (&quot;send&quot;, argv[0], strlen (argv[0])) == 0)</a>
+<a name="ln174">    {</a>
+<a name="ln175">      if (IS_RIP_DEBUG_RECV)</a>
+<a name="ln176">       rip_debug_packet &amp;= ~RIP_DEBUG_SEND;</a>
+<a name="ln177">      else</a>
+<a name="ln178">       rip_debug_packet = 0;</a>
+<a name="ln179">    }</a>
+<a name="ln180">  else if (strncmp (&quot;recv&quot;, argv[0], strlen (argv[0])) == 0)</a>
+<a name="ln181">    {</a>
+<a name="ln182">      if (IS_RIP_DEBUG_SEND)</a>
+<a name="ln183">       rip_debug_packet &amp;= ~RIP_DEBUG_RECV;</a>
+<a name="ln184">      else</a>
+<a name="ln185">       rip_debug_packet = 0;</a>
+<a name="ln186">    }</a>
+<a name="ln187">  return CMD_SUCCESS;</a>
+<a name="ln188">}</a>
+<a name="ln189"> </a>
+<a name="ln190">DEFUN (no_debug_rip_zebra,</a>
+<a name="ln191">       no_debug_rip_zebra_cmd,</a>
+<a name="ln192">       &quot;no debug rip zebra&quot;,</a>
+<a name="ln193">       NO_STR</a>
+<a name="ln194">       DEBUG_STR</a>
+<a name="ln195">       RIP_STR</a>
+<a name="ln196">       &quot;RIP and ZEBRA communication\n&quot;)</a>
+<a name="ln197">{</a>
+<a name="ln198">  rip_debug_zebra = 0;</a>
+<a name="ln199">  return CMD_WARNING;</a>
+<a name="ln200">}</a>
+<a name="ln201"> </a>
+<a name="ln202">/* Debug node. */</a>
+<a name="ln203">static struct cmd_node debug_node =</a>
+<a name="ln204">{</a>
+<a name="ln205">  DEBUG_NODE,</a>
+<a name="ln206">  &quot;&quot;,				/* Debug node has no interface. */</a>
+<a name="ln207">  1</a>
+<a name="ln208">};</a>
+<a name="ln209"> </a>
+<a name="ln210">static int</a>
+<a name="ln211">config_write_debug (struct vty *vty)</a>
+<a name="ln212">{</a>
+<a name="ln213">  int write = 0;</a>
+<a name="ln214"> </a>
+<a name="ln215">  if (IS_RIP_DEBUG_EVENT)</a>
+<a name="ln216">    {</a>
+<a name="ln217">      vty_out (vty, &quot;debug rip events%s&quot;, VTY_NEWLINE);</a>
+<a name="ln218">      write++;</a>
+<a name="ln219">    }</a>
+<a name="ln220">  if (IS_RIP_DEBUG_PACKET)</a>
+<a name="ln221">    {</a>
+<a name="ln222">      if (IS_RIP_DEBUG_SEND &amp;&amp; IS_RIP_DEBUG_RECV)</a>
+<a name="ln223">	{</a>
+<a name="ln224">	  vty_out (vty, &quot;debug rip packet%s&quot;,</a>
+<a name="ln225">		   VTY_NEWLINE);</a>
+<a name="ln226">	  write++;</a>
+<a name="ln227">	}</a>
+<a name="ln228">      else</a>
+<a name="ln229">	{</a>
+<a name="ln230">	  if (IS_RIP_DEBUG_SEND)</a>
+<a name="ln231">	    vty_out (vty, &quot;debug rip packet send%s&quot;,</a>
+<a name="ln232">		     VTY_NEWLINE);</a>
+<a name="ln233">	  else</a>
+<a name="ln234">	    vty_out (vty, &quot;debug rip packet recv%s&quot;,</a>
+<a name="ln235">		     VTY_NEWLINE);</a>
+<a name="ln236">	  write++;</a>
+<a name="ln237">	}</a>
+<a name="ln238">    }</a>
+<a name="ln239">  if (IS_RIP_DEBUG_ZEBRA)</a>
+<a name="ln240">    {</a>
+<a name="ln241">      vty_out (vty, &quot;debug rip zebra%s&quot;, VTY_NEWLINE);</a>
+<a name="ln242">      write++;</a>
+<a name="ln243">    }</a>
+<a name="ln244">  return write;</a>
+<a name="ln245">}</a>
+<a name="ln246"> </a>
+<a name="ln247">void</a>
+<a name="ln248">rip_debug_reset (void)</a>
+<a name="ln249">{</a>
+<a name="ln250">  rip_debug_event = 0;</a>
+<a name="ln251">  rip_debug_packet = 0;</a>
+<a name="ln252">  rip_debug_zebra = 0;</a>
+<a name="ln253">}</a>
+<a name="ln254"> </a>
+<a name="ln255">void</a>
+<a name="ln256">rip_debug_init (void)</a>
+<a name="ln257">{</a>
+<a name="ln258">  rip_debug_event = 0;</a>
+<a name="ln259">  rip_debug_packet = 0;</a>
+<a name="ln260">  rip_debug_zebra = 0;</a>
+<a name="ln261"> </a>
+<a name="ln262">  install_node (&amp;debug_node, config_write_debug);</a>
+<a name="ln263"> </a>
+<a name="ln264">  install_element (ENABLE_NODE, &amp;show_debugging_rip_cmd);</a>
+<a name="ln265">  install_element (ENABLE_NODE, &amp;debug_rip_events_cmd);</a>
+<a name="ln266">  install_element (ENABLE_NODE, &amp;debug_rip_packet_cmd);</a>
+<a name="ln267">  install_element (ENABLE_NODE, &amp;debug_rip_packet_direct_cmd);</a>
+<a name="ln268">  install_element (ENABLE_NODE, &amp;debug_rip_packet_detail_cmd);</a>
+<a name="ln269">  install_element (ENABLE_NODE, &amp;debug_rip_zebra_cmd);</a>
+<a name="ln270">  install_element (ENABLE_NODE, &amp;no_debug_rip_events_cmd);</a>
+<a name="ln271">  install_element (ENABLE_NODE, &amp;no_debug_rip_packet_cmd);</a>
+<a name="ln272">  install_element (ENABLE_NODE, &amp;no_debug_rip_packet_direct_cmd);</a>
+<a name="ln273">  install_element (ENABLE_NODE, &amp;no_debug_rip_zebra_cmd);</a>
+<a name="ln274"> </a>
+<a name="ln275">  install_element (CONFIG_NODE, &amp;debug_rip_events_cmd);</a>
+<a name="ln276">  install_element (CONFIG_NODE, &amp;debug_rip_packet_cmd);</a>
+<a name="ln277">  install_element (CONFIG_NODE, &amp;debug_rip_packet_direct_cmd);</a>
+<a name="ln278">  install_element (CONFIG_NODE, &amp;debug_rip_packet_detail_cmd);</a>
+<a name="ln279">  install_element (CONFIG_NODE, &amp;debug_rip_zebra_cmd);</a>
+<a name="ln280">  install_element (CONFIG_NODE, &amp;no_debug_rip_events_cmd);</a>
+<a name="ln281">  install_element (CONFIG_NODE, &amp;no_debug_rip_packet_cmd);</a>
+<a name="ln282">  install_element (CONFIG_NODE, &amp;no_debug_rip_packet_direct_cmd);</a>
+<a name="ln283">  install_element (CONFIG_NODE, &amp;no_debug_rip_zebra_cmd);</a>
+<a name="ln284">}</a>
+
+</code></pre>
+<div class="balloon" rel="7"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1042/" target="_blank">V1042</a> This file is marked with copyleft license, which requires you to open the derived source code.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

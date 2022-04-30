@@ -1,0 +1,306 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>pim_rpf.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.5.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2">  PIM for Quagga</a>
+<a name="ln3">  Copyright (C) 2008  Everton da Silva Marques</a>
+<a name="ln4"> </a>
+<a name="ln5">  This program is free software; you can redistribute it and/or modify</a>
+<a name="ln6">  it under the terms of the GNU General Public License as published by</a>
+<a name="ln7">  the Free Software Foundation; either version 2 of the License, or</a>
+<a name="ln8">  (at your option) any later version.</a>
+<a name="ln9"> </a>
+<a name="ln10">  This program is distributed in the hope that it will be useful, but</a>
+<a name="ln11">  WITHOUT ANY WARRANTY; without even the implied warranty of</a>
+<a name="ln12">  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU</a>
+<a name="ln13">  General Public License for more details.</a>
+<a name="ln14">  </a>
+<a name="ln15">  You should have received a copy of the GNU General Public License</a>
+<a name="ln16">  along with this program; see the file COPYING; if not, write to the</a>
+<a name="ln17">  Free Software Foundation, Inc., 51 Franklin St, Fifth Floor, Boston,</a>
+<a name="ln18">  MA 02110-1301 USA</a>
+<a name="ln19">  </a>
+<a name="ln20">  $QuaggaId: $Format:%an, %ai, %h$ $</a>
+<a name="ln21">*/</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &lt;zebra.h&gt;</a>
+<a name="ln24"> </a>
+<a name="ln25">#include &quot;log.h&quot;</a>
+<a name="ln26">#include &quot;prefix.h&quot;</a>
+<a name="ln27">#include &quot;memory.h&quot;</a>
+<a name="ln28"> </a>
+<a name="ln29">#include &quot;pimd.h&quot;</a>
+<a name="ln30">#include &quot;pim_rpf.h&quot;</a>
+<a name="ln31">#include &quot;pim_pim.h&quot;</a>
+<a name="ln32">#include &quot;pim_str.h&quot;</a>
+<a name="ln33">#include &quot;pim_iface.h&quot;</a>
+<a name="ln34">#include &quot;pim_zlookup.h&quot;</a>
+<a name="ln35">#include &quot;pim_ifchannel.h&quot;</a>
+<a name="ln36"> </a>
+<a name="ln37">static struct in_addr pim_rpf_find_rpf_addr(struct pim_upstream *up);</a>
+<a name="ln38"> </a>
+<a name="ln39">int pim_nexthop_lookup(struct pim_nexthop *nexthop,</a>
+<a name="ln40">		       struct in_addr addr)</a>
+<a name="ln41">{</a>
+<a name="ln42">  struct pim_zlookup_nexthop nexthop_tab[PIM_NEXTHOP_IFINDEX_TAB_SIZE];</a>
+<a name="ln43">  int num_ifindex;</a>
+<a name="ln44">  struct interface *ifp;</a>
+<a name="ln45">  int first_ifindex;</a>
+<a name="ln46"> </a>
+<a name="ln47">  num_ifindex = zclient_lookup_nexthop(qpim_zclient_lookup, nexthop_tab,</a>
+<a name="ln48">				       PIM_NEXTHOP_IFINDEX_TAB_SIZE,</a>
+<a name="ln49">				       addr, PIM_NEXTHOP_LOOKUP_MAX);</a>
+<a name="ln50">  if (num_ifindex &lt; 1) {</a>
+<a name="ln51">    char addr_str[100];</a>
+<a name="ln52">    pim_inet4_dump(&quot;&lt;addr?&gt;&quot;, addr, addr_str, sizeof(addr_str));</a>
+<a name="ln53">    zlog_warn(&quot;%s %s: could not find nexthop ifindex for address %s&quot;,</a>
+<a name="ln54">	      __FILE__, __PRETTY_FUNCTION__,</a>
+<a name="ln55">	      addr_str);</a>
+<a name="ln56">    return -1;</a>
+<a name="ln57">  }</a>
+<a name="ln58"> </a>
+<a name="ln59">  first_ifindex = nexthop_tab[0].ifindex;</a>
+<a name="ln60"> </a>
+<a name="ln61">  if (num_ifindex &gt; 1) {</a>
+<a name="ln62">    char addr_str[100];</a>
+<a name="ln63">    pim_inet4_dump(&quot;&lt;addr?&gt;&quot;, addr, addr_str, sizeof(addr_str));</a>
+<a name="ln64">    zlog_info(&quot;%s %s: FIXME ignoring multiple nexthop ifindex'es num_ifindex=%d for address %s (using only ifindex=%d)&quot;,</a>
+<a name="ln65">	      __FILE__, __PRETTY_FUNCTION__,</a>
+<a name="ln66">	      num_ifindex, addr_str, first_ifindex);</a>
+<a name="ln67">    /* debug warning only, do not return */</a>
+<a name="ln68">  }</a>
+<a name="ln69"> </a>
+<a name="ln70">  ifp = if_lookup_by_index(first_ifindex);</a>
+<a name="ln71">  if (!ifp) {</a>
+<a name="ln72">    char addr_str[100];</a>
+<a name="ln73">    pim_inet4_dump(&quot;&lt;addr?&gt;&quot;, addr, addr_str, sizeof(addr_str));</a>
+<a name="ln74">    zlog_warn(&quot;%s %s: could not find interface for ifindex %d (address %s)&quot;,</a>
+<a name="ln75">	      __FILE__, __PRETTY_FUNCTION__,</a>
+<a name="ln76">	      first_ifindex, addr_str);</a>
+<a name="ln77">    return -2;</a>
+<a name="ln78">  }</a>
+<a name="ln79"> </a>
+<a name="ln80">  if (!ifp-&gt;info) {</a>
+<a name="ln81">    char addr_str[100];</a>
+<a name="ln82">    pim_inet4_dump(&quot;&lt;addr?&gt;&quot;, addr, addr_str, sizeof(addr_str));</a>
+<a name="ln83">    zlog_warn(&quot;%s: multicast not enabled on input interface %s (ifindex=%d, RPF for source %s)&quot;,</a>
+<a name="ln84">	      __PRETTY_FUNCTION__,</a>
+<a name="ln85">	      ifp-&gt;name, first_ifindex, addr_str);</a>
+<a name="ln86">    /* debug warning only, do not return */</a>
+<a name="ln87">  }</a>
+<a name="ln88"> </a>
+<a name="ln89">  if (PIM_DEBUG_PIM_TRACE) {</a>
+<a name="ln90">    char nexthop_str[100];</a>
+<a name="ln91">    char addr_str[100];</a>
+<a name="ln92">    pim_inet4_dump(&quot;&lt;nexthop?&gt;&quot;, nexthop_tab[0].nexthop_addr, nexthop_str, sizeof(nexthop_str));</a>
+<a name="ln93">    pim_inet4_dump(&quot;&lt;addr?&gt;&quot;, addr, addr_str, sizeof(addr_str));</a>
+<a name="ln94">    zlog_debug(&quot;%s %s: found nexthop %s for address %s: interface %s ifindex=%d metric=%d pref=%d&quot;,</a>
+<a name="ln95">	       __FILE__, __PRETTY_FUNCTION__,</a>
+<a name="ln96">	       nexthop_str, addr_str,</a>
+<a name="ln97">	       ifp-&gt;name, first_ifindex,</a>
+<a name="ln98">	       nexthop_tab[0].route_metric,</a>
+<a name="ln99">	       nexthop_tab[0].protocol_distance);</a>
+<a name="ln100">  }</a>
+<a name="ln101"> </a>
+<a name="ln102">  /* update nextop data */</a>
+<a name="ln103">  nexthop-&gt;interface              = ifp;</a>
+<a name="ln104">  nexthop-&gt;mrib_nexthop_addr      = nexthop_tab[0].nexthop_addr;</a>
+<a name="ln105">  nexthop-&gt;mrib_metric_preference = nexthop_tab[0].protocol_distance;</a>
+<a name="ln106">  nexthop-&gt;mrib_route_metric      = nexthop_tab[0].route_metric;</a>
+<a name="ln107"> </a>
+<a name="ln108">  return 0;</a>
+<a name="ln109">}</a>
+<a name="ln110"> </a>
+<a name="ln111">static int nexthop_mismatch(const struct pim_nexthop *nh1,</a>
+<a name="ln112">			    const struct pim_nexthop *nh2)</a>
+<a name="ln113">{</a>
+<a name="ln114">  return (nh1-&gt;interface != nh2-&gt;interface) </a>
+<a name="ln115">    ||</a>
+<a name="ln116">    (nh1-&gt;mrib_nexthop_addr.s_addr != nh2-&gt;mrib_nexthop_addr.s_addr)</a>
+<a name="ln117">    ||</a>
+<a name="ln118">    (nh1-&gt;mrib_metric_preference != nh2-&gt;mrib_metric_preference)</a>
+<a name="ln119">    ||</a>
+<a name="ln120">    (nh1-&gt;mrib_route_metric != nh2-&gt;mrib_route_metric);</a>
+<a name="ln121">}</a>
+<a name="ln122"> </a>
+<a name="ln123">enum pim_rpf_result pim_rpf_update(struct pim_upstream *up,</a>
+<a name="ln124">				   struct pim_rpf *old_rpf)</a>
+<a name="ln125">{</a>
+<a name="ln126">  struct pim_nexthop  save_nexthop;</a>
+<a name="ln127">  struct pim_rpf	  save_rpf;</a>
+<a name="ln128">  struct pim_rpf     *rpf = &amp;up-&gt;rpf;</a>
+<a name="ln129"> </a>
+<a name="ln130">  save_nexthop  = rpf-&gt;source_nexthop; /* detect change in pim_nexthop */</a>
+<a name="ln131">  save_rpf = up-&gt;rpf;</a>
+<a name="ln132"> </a>
+<a name="ln133">  if (pim_nexthop_lookup(&amp;rpf-&gt;source_nexthop,</a>
+<a name="ln134">			 up-&gt;source_addr)) {</a>
+<a name="ln135">    return PIM_RPF_FAILURE;</a>
+<a name="ln136">  }</a>
+<a name="ln137"> </a>
+<a name="ln138">  rpf-&gt;rpf_addr = pim_rpf_find_rpf_addr(up);</a>
+<a name="ln139">  if (PIM_INADDR_IS_ANY(rpf-&gt;rpf_addr) &amp;&amp; PIM_DEBUG_PIM_EVENTS) {</a>
+<a name="ln140">    /* RPF'(S,G) not found */</a>
+<a name="ln141">    char src_str[100];</a>
+<a name="ln142">    char grp_str[100];</a>
+<a name="ln143">    pim_inet4_dump(&quot;&lt;src?&gt;&quot;, up-&gt;source_addr, src_str, sizeof(src_str));</a>
+<a name="ln144">    pim_inet4_dump(&quot;&lt;grp?&gt;&quot;, up-&gt;group_addr, grp_str, sizeof(grp_str));</a>
+<a name="ln145">    zlog_debug(&quot;%s %s: RPF'(%s,%s) not found: won't send join upstream&quot;,</a>
+<a name="ln146">	       __FILE__, __PRETTY_FUNCTION__,</a>
+<a name="ln147">	       src_str, grp_str);</a>
+<a name="ln148">    /* warning only */</a>
+<a name="ln149">  }</a>
+<a name="ln150"> </a>
+<a name="ln151">  /* detect change in pim_nexthop */</a>
+<a name="ln152">  if (nexthop_mismatch(&amp;rpf-&gt;source_nexthop, &amp;save_nexthop)) {</a>
+<a name="ln153"> </a>
+<a name="ln154">    if (PIM_DEBUG_PIM_EVENTS) {</a>
+<a name="ln155">      char src_str[100];</a>
+<a name="ln156">      char grp_str[100];</a>
+<a name="ln157">      char nhaddr_str[100];</a>
+<a name="ln158">      pim_inet4_dump(&quot;&lt;src?&gt;&quot;, up-&gt;source_addr, src_str, sizeof(src_str));</a>
+<a name="ln159">      pim_inet4_dump(&quot;&lt;grp?&gt;&quot;, up-&gt;group_addr, grp_str, sizeof(grp_str));</a>
+<a name="ln160">      pim_inet4_dump(&quot;&lt;addr?&gt;&quot;, rpf-&gt;source_nexthop.mrib_nexthop_addr, nhaddr_str, sizeof(nhaddr_str));</a>
+<a name="ln161">      zlog_debug(&quot;%s %s: (S,G)=(%s,%s) source nexthop now is: interface=%s address=%s pref=%d metric=%d&quot;,</a>
+<a name="ln162">		 __FILE__, __PRETTY_FUNCTION__,</a>
+<a name="ln163">		 src_str, grp_str,</a>
+<a name="ln164">		 rpf-&gt;source_nexthop.interface ? rpf-&gt;source_nexthop.interface-&gt;name : &quot;&lt;ifname?&gt;&quot;,</a>
+<a name="ln165">		 nhaddr_str,</a>
+<a name="ln166">		 rpf-&gt;source_nexthop.mrib_metric_preference,</a>
+<a name="ln167">		 rpf-&gt;source_nexthop.mrib_route_metric);</a>
+<a name="ln168">      /* warning only */</a>
+<a name="ln169">    }</a>
+<a name="ln170"> </a>
+<a name="ln171">    pim_upstream_update_join_desired(up);</a>
+<a name="ln172">    pim_upstream_update_could_assert(up);</a>
+<a name="ln173">    pim_upstream_update_my_assert_metric(up);</a>
+<a name="ln174">  }</a>
+<a name="ln175"> </a>
+<a name="ln176">  /* detect change in RPF_interface(S) */</a>
+<a name="ln177">  if (save_nexthop.interface != rpf-&gt;source_nexthop.interface) {</a>
+<a name="ln178"> </a>
+<a name="ln179">    if (PIM_DEBUG_PIM_EVENTS) {</a>
+<a name="ln180">      char src_str[100];</a>
+<a name="ln181">      char grp_str[100];</a>
+<a name="ln182">      pim_inet4_dump(&quot;&lt;src?&gt;&quot;, up-&gt;source_addr, src_str, sizeof(src_str));</a>
+<a name="ln183">      pim_inet4_dump(&quot;&lt;grp?&gt;&quot;, up-&gt;group_addr, grp_str, sizeof(grp_str));</a>
+<a name="ln184">      zlog_debug(&quot;%s %s: (S,G)=(%s,%s) RPF_interface(S) changed from %s to %s&quot;,</a>
+<a name="ln185">		 __FILE__, __PRETTY_FUNCTION__,</a>
+<a name="ln186">		 src_str, grp_str,</a>
+<a name="ln187">		 save_nexthop.interface ? save_nexthop.interface-&gt;name : &quot;&lt;oldif?&gt;&quot;,</a>
+<a name="ln188">		 rpf-&gt;source_nexthop.interface ? rpf-&gt;source_nexthop.interface-&gt;name : &quot;&lt;newif?&gt;&quot;);</a>
+<a name="ln189">      /* warning only */</a>
+<a name="ln190">    }</a>
+<a name="ln191"> </a>
+<a name="ln192">    pim_upstream_rpf_interface_changed(up, save_nexthop.interface);</a>
+<a name="ln193">  }</a>
+<a name="ln194"> </a>
+<a name="ln195">  /* detect change in RPF'(S,G) */</a>
+<a name="ln196">  if (save_rpf.rpf_addr.s_addr != rpf-&gt;rpf_addr.s_addr) {</a>
+<a name="ln197"> </a>
+<a name="ln198">    /* return old rpf to caller ? */</a>
+<a name="ln199">    if (old_rpf)</a>
+<a name="ln200">      *old_rpf = save_rpf;</a>
+<a name="ln201"> </a>
+<a name="ln202">    return PIM_RPF_CHANGED;</a>
+<a name="ln203">  }</a>
+<a name="ln204"> </a>
+<a name="ln205">  return PIM_RPF_OK;</a>
+<a name="ln206">}</a>
+<a name="ln207"> </a>
+<a name="ln208">/*</a>
+<a name="ln209">  RFC 4601: 4.1.6.  State Summarization Macros</a>
+<a name="ln210"> </a>
+<a name="ln211">     neighbor RPF'(S,G) {</a>
+<a name="ln212">         if ( I_Am_Assert_Loser(S, G, RPF_interface(S) )) {</a>
+<a name="ln213">              return AssertWinner(S, G, RPF_interface(S) )</a>
+<a name="ln214">         } else {</a>
+<a name="ln215">              return NBR( RPF_interface(S), MRIB.next_hop( S ) )</a>
+<a name="ln216">         }</a>
+<a name="ln217">     }</a>
+<a name="ln218"> </a>
+<a name="ln219">  RPF'(*,G) and RPF'(S,G) indicate the neighbor from which data</a>
+<a name="ln220">  packets should be coming and to which joins should be sent on the RP</a>
+<a name="ln221">  tree and SPT, respectively.</a>
+<a name="ln222">*/</a>
+<a name="ln223">static struct in_addr pim_rpf_find_rpf_addr(struct pim_upstream *up)</a>
+<a name="ln224">{</a>
+<a name="ln225">  struct pim_ifchannel *rpf_ch;</a>
+<a name="ln226">  struct pim_neighbor *neigh;</a>
+<a name="ln227">  struct in_addr rpf_addr;</a>
+<a name="ln228"> </a>
+<a name="ln229">  if (!up-&gt;rpf.source_nexthop.interface) {</a>
+<a name="ln230">    char src_str[100];</a>
+<a name="ln231">    char grp_str[100];</a>
+<a name="ln232">    pim_inet4_dump(&quot;&lt;src?&gt;&quot;, up-&gt;source_addr, src_str, sizeof(src_str));</a>
+<a name="ln233">    pim_inet4_dump(&quot;&lt;grp?&gt;&quot;, up-&gt;group_addr, grp_str, sizeof(grp_str));</a>
+<a name="ln234">    zlog_warn(&quot;%s: missing RPF interface for upstream (S,G)=(%s,%s)&quot;,</a>
+<a name="ln235">	      __PRETTY_FUNCTION__,</a>
+<a name="ln236">	      src_str, grp_str);</a>
+<a name="ln237"> </a>
+<a name="ln238">    rpf_addr.s_addr = PIM_NET_INADDR_ANY;</a>
+<a name="ln239">    return rpf_addr;</a>
+<a name="ln240">  }</a>
+<a name="ln241"> </a>
+<a name="ln242">  rpf_ch = pim_ifchannel_find(up-&gt;rpf.source_nexthop.interface,</a>
+<a name="ln243">			      up-&gt;source_addr, up-&gt;group_addr);</a>
+<a name="ln244">  if (rpf_ch) {</a>
+<a name="ln245">    if (rpf_ch-&gt;ifassert_state == PIM_IFASSERT_I_AM_LOSER) {</a>
+<a name="ln246">      return rpf_ch-&gt;ifassert_winner;</a>
+<a name="ln247">    }</a>
+<a name="ln248">  }</a>
+<a name="ln249"> </a>
+<a name="ln250">  /* return NBR( RPF_interface(S), MRIB.next_hop( S ) ) */</a>
+<a name="ln251"> </a>
+<a name="ln252">  neigh = pim_if_find_neighbor(up-&gt;rpf.source_nexthop.interface,</a>
+<a name="ln253">			       up-&gt;rpf.source_nexthop.mrib_nexthop_addr);</a>
+<a name="ln254">  if (neigh)</a>
+<a name="ln255">    rpf_addr = neigh-&gt;source_addr;</a>
+<a name="ln256">  else</a>
+<a name="ln257">    rpf_addr.s_addr = PIM_NET_INADDR_ANY;</a>
+<a name="ln258"> </a>
+<a name="ln259">  return rpf_addr;</a>
+<a name="ln260">}</a>
+
+</code></pre>
+<div class="balloon" rel="6"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1042/" target="_blank">V1042</a> This file is marked with copyleft license, which requires you to open the derived source code.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

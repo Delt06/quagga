@@ -1,0 +1,2223 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>ospf_opaque.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.5.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * This is an implementation of rfc2370.</a>
+<a name="ln3"> * Copyright (C) 2001 KDD R&amp;D Laboratories, Inc.</a>
+<a name="ln4"> * http://www.kddlabs.co.jp/</a>
+<a name="ln5"> *</a>
+<a name="ln6"> * This file is part of GNU Zebra.</a>
+<a name="ln7"> *</a>
+<a name="ln8"> * GNU Zebra is free software; you can redistribute it and/or modify it</a>
+<a name="ln9"> * under the terms of the GNU General Public License as published by the</a>
+<a name="ln10"> * Free Software Foundation; either version 2, or (at your option) any</a>
+<a name="ln11"> * later version.</a>
+<a name="ln12"> * </a>
+<a name="ln13"> * GNU Zebra is distributed in the hope that it will be useful, but</a>
+<a name="ln14"> * WITHOUT ANY WARRANTY; without even the implied warranty of</a>
+<a name="ln15"> * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU</a>
+<a name="ln16"> * General Public License for more details.</a>
+<a name="ln17"> *</a>
+<a name="ln18"> * You should have received a copy of the GNU General Public License</a>
+<a name="ln19"> * along with GNU Zebra; see the file COPYING.  If not, write to the Free</a>
+<a name="ln20"> * Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA</a>
+<a name="ln21"> * 02111-1307, USA.</a>
+<a name="ln22"> */</a>
+<a name="ln23"> </a>
+<a name="ln24">/***** MTYPE definitions are not reflected to &quot;memory.h&quot; yet. *****/</a>
+<a name="ln25">#define MTYPE_OSPF_OPAQUE_FUNCTAB	MTYPE_TMP</a>
+<a name="ln26">#define MTYPE_OPAQUE_INFO_PER_TYPE	MTYPE_TMP</a>
+<a name="ln27">#define MTYPE_OPAQUE_INFO_PER_ID	MTYPE_TMP</a>
+<a name="ln28"> </a>
+<a name="ln29">#include &lt;zebra.h&gt;</a>
+<a name="ln30"> </a>
+<a name="ln31">#include &quot;linklist.h&quot;</a>
+<a name="ln32">#include &quot;prefix.h&quot;</a>
+<a name="ln33">#include &quot;if.h&quot;</a>
+<a name="ln34">#include &quot;table.h&quot;</a>
+<a name="ln35">#include &quot;memory.h&quot;</a>
+<a name="ln36">#include &quot;command.h&quot;</a>
+<a name="ln37">#include &quot;vty.h&quot;</a>
+<a name="ln38">#include &quot;stream.h&quot;</a>
+<a name="ln39">#include &quot;log.h&quot;</a>
+<a name="ln40">#include &quot;thread.h&quot;</a>
+<a name="ln41">#include &quot;hash.h&quot;</a>
+<a name="ln42">#include &quot;sockunion.h&quot;		/* for inet_aton() */</a>
+<a name="ln43"> </a>
+<a name="ln44">#include &quot;ospfd/ospfd.h&quot;</a>
+<a name="ln45">#include &quot;ospfd/ospf_interface.h&quot;</a>
+<a name="ln46">#include &quot;ospfd/ospf_ism.h&quot;</a>
+<a name="ln47">#include &quot;ospfd/ospf_asbr.h&quot;</a>
+<a name="ln48">#include &quot;ospfd/ospf_lsa.h&quot;</a>
+<a name="ln49">#include &quot;ospfd/ospf_lsdb.h&quot;</a>
+<a name="ln50">#include &quot;ospfd/ospf_neighbor.h&quot;</a>
+<a name="ln51">#include &quot;ospfd/ospf_nsm.h&quot;</a>
+<a name="ln52">#include &quot;ospfd/ospf_flood.h&quot;</a>
+<a name="ln53">#include &quot;ospfd/ospf_packet.h&quot;</a>
+<a name="ln54">#include &quot;ospfd/ospf_spf.h&quot;</a>
+<a name="ln55">#include &quot;ospfd/ospf_dump.h&quot;</a>
+<a name="ln56">#include &quot;ospfd/ospf_route.h&quot;</a>
+<a name="ln57">#include &quot;ospfd/ospf_ase.h&quot;</a>
+<a name="ln58">#include &quot;ospfd/ospf_zebra.h&quot;</a>
+<a name="ln59"> </a>
+<a name="ln60">/*------------------------------------------------------------------------*</a>
+<a name="ln61"> * Followings are initialize/terminate functions for Opaque-LSAs handling.</a>
+<a name="ln62"> *------------------------------------------------------------------------*/</a>
+<a name="ln63"> </a>
+<a name="ln64">#include &quot;ospfd/ospf_te.h&quot;</a>
+<a name="ln65">#include &quot;ospfd/ospf_ri.h&quot;</a>
+<a name="ln66"> </a>
+<a name="ln67">#ifdef SUPPORT_OSPF_API</a>
+<a name="ln68">int ospf_apiserver_init (void);</a>
+<a name="ln69">void ospf_apiserver_term (void); </a>
+<a name="ln70">/* Init apiserver? It's disabled by default. */</a>
+<a name="ln71">int ospf_apiserver_enable;</a>
+<a name="ln72">#endif /* SUPPORT_OSPF_API */</a>
+<a name="ln73"> </a>
+<a name="ln74">static void ospf_opaque_register_vty (void);</a>
+<a name="ln75">static void ospf_opaque_funclist_init (void);</a>
+<a name="ln76">static void ospf_opaque_funclist_term (void);</a>
+<a name="ln77">static void free_opaque_info_per_type (void *val);</a>
+<a name="ln78">static void free_opaque_info_per_id (void *val);</a>
+<a name="ln79">static int ospf_opaque_lsa_install_hook (struct ospf_lsa *lsa);</a>
+<a name="ln80">static int ospf_opaque_lsa_delete_hook (struct ospf_lsa *lsa);</a>
+<a name="ln81"> </a>
+<a name="ln82">void</a>
+<a name="ln83">ospf_opaque_init (void)</a>
+<a name="ln84">{</a>
+<a name="ln85">  ospf_opaque_register_vty ();</a>
+<a name="ln86">  ospf_opaque_funclist_init ();</a>
+<a name="ln87"> </a>
+<a name="ln88">  if (ospf_mpls_te_init () != 0)</a>
+<a name="ln89">    exit (1);</a>
+<a name="ln90"> </a>
+<a name="ln91">  if (ospf_router_info_init () != 0)</a>
+<a name="ln92">    exit (1);</a>
+<a name="ln93"> </a>
+<a name="ln94">#ifdef SUPPORT_OSPF_API</a>
+<a name="ln95">  if ((ospf_apiserver_enable) &amp;&amp; (ospf_apiserver_init () != 0))</a>
+<a name="ln96">    exit (1);</a>
+<a name="ln97">#endif /* SUPPORT_OSPF_API */</a>
+<a name="ln98"> </a>
+<a name="ln99">  return;</a>
+<a name="ln100">}</a>
+<a name="ln101"> </a>
+<a name="ln102">void</a>
+<a name="ln103">ospf_opaque_term (void)</a>
+<a name="ln104">{</a>
+<a name="ln105">  ospf_mpls_te_term ();</a>
+<a name="ln106"> </a>
+<a name="ln107">  ospf_router_info_term ();</a>
+<a name="ln108"> </a>
+<a name="ln109">#ifdef SUPPORT_OSPF_API</a>
+<a name="ln110">  ospf_apiserver_term ();</a>
+<a name="ln111">#endif /* SUPPORT_OSPF_API */</a>
+<a name="ln112"> </a>
+<a name="ln113">  ospf_opaque_funclist_term ();</a>
+<a name="ln114">  return;</a>
+<a name="ln115">}</a>
+<a name="ln116"> </a>
+<a name="ln117">int</a>
+<a name="ln118">ospf_opaque_type9_lsa_init (struct ospf_interface *oi)</a>
+<a name="ln119">{</a>
+<a name="ln120">  if (oi-&gt;opaque_lsa_self != NULL)</a>
+<a name="ln121">    list_delete (oi-&gt;opaque_lsa_self);</a>
+<a name="ln122"> </a>
+<a name="ln123">  oi-&gt;opaque_lsa_self = list_new ();</a>
+<a name="ln124">  oi-&gt;opaque_lsa_self-&gt;del = free_opaque_info_per_type;</a>
+<a name="ln125">  oi-&gt;t_opaque_lsa_self = NULL;</a>
+<a name="ln126">  return 0;</a>
+<a name="ln127">}</a>
+<a name="ln128"> </a>
+<a name="ln129">void</a>
+<a name="ln130">ospf_opaque_type9_lsa_term (struct ospf_interface *oi)</a>
+<a name="ln131">{</a>
+<a name="ln132">  OSPF_TIMER_OFF (oi-&gt;t_opaque_lsa_self);</a>
+<a name="ln133">  if (oi-&gt;opaque_lsa_self != NULL)</a>
+<a name="ln134">    list_delete (oi-&gt;opaque_lsa_self);</a>
+<a name="ln135">  oi-&gt;opaque_lsa_self = NULL;</a>
+<a name="ln136">  return;</a>
+<a name="ln137">}</a>
+<a name="ln138"> </a>
+<a name="ln139">int</a>
+<a name="ln140">ospf_opaque_type10_lsa_init (struct ospf_area *area)</a>
+<a name="ln141">{</a>
+<a name="ln142">  if (area-&gt;opaque_lsa_self != NULL)</a>
+<a name="ln143">    list_delete (area-&gt;opaque_lsa_self);</a>
+<a name="ln144"> </a>
+<a name="ln145">  area-&gt;opaque_lsa_self = list_new ();</a>
+<a name="ln146">  area-&gt;opaque_lsa_self-&gt;del = free_opaque_info_per_type;</a>
+<a name="ln147">  area-&gt;t_opaque_lsa_self = NULL;</a>
+<a name="ln148"> </a>
+<a name="ln149">#ifdef MONITOR_LSDB_CHANGE</a>
+<a name="ln150">  area-&gt;lsdb-&gt;new_lsa_hook = ospf_opaque_lsa_install_hook;</a>
+<a name="ln151">  area-&gt;lsdb-&gt;del_lsa_hook = ospf_opaque_lsa_delete_hook;</a>
+<a name="ln152">#endif /* MONITOR_LSDB_CHANGE */</a>
+<a name="ln153">  return 0;</a>
+<a name="ln154">}</a>
+<a name="ln155"> </a>
+<a name="ln156">void</a>
+<a name="ln157">ospf_opaque_type10_lsa_term (struct ospf_area *area)</a>
+<a name="ln158">{</a>
+<a name="ln159">#ifdef MONITOR_LSDB_CHANGE</a>
+<a name="ln160">  area-&gt;lsdb-&gt;new_lsa_hook = </a>
+<a name="ln161">  area-&gt;lsdb-&gt;del_lsa_hook = NULL;</a>
+<a name="ln162">#endif /* MONITOR_LSDB_CHANGE */</a>
+<a name="ln163"> </a>
+<a name="ln164">  OSPF_TIMER_OFF (area-&gt;t_opaque_lsa_self);</a>
+<a name="ln165">  if (area-&gt;opaque_lsa_self != NULL)</a>
+<a name="ln166">    list_delete (area-&gt;opaque_lsa_self);</a>
+<a name="ln167">  area-&gt;opaque_lsa_self = NULL;</a>
+<a name="ln168">  return;</a>
+<a name="ln169">}</a>
+<a name="ln170"> </a>
+<a name="ln171">int</a>
+<a name="ln172">ospf_opaque_type11_lsa_init (struct ospf *top)</a>
+<a name="ln173">{</a>
+<a name="ln174">  if (top-&gt;opaque_lsa_self != NULL)</a>
+<a name="ln175">    list_delete (top-&gt;opaque_lsa_self);</a>
+<a name="ln176"> </a>
+<a name="ln177">  top-&gt;opaque_lsa_self = list_new ();</a>
+<a name="ln178">  top-&gt;opaque_lsa_self-&gt;del = free_opaque_info_per_type;</a>
+<a name="ln179">  top-&gt;t_opaque_lsa_self = NULL;</a>
+<a name="ln180"> </a>
+<a name="ln181">#ifdef MONITOR_LSDB_CHANGE</a>
+<a name="ln182">  top-&gt;lsdb-&gt;new_lsa_hook = ospf_opaque_lsa_install_hook;</a>
+<a name="ln183">  top-&gt;lsdb-&gt;del_lsa_hook = ospf_opaque_lsa_delete_hook;</a>
+<a name="ln184">#endif /* MONITOR_LSDB_CHANGE */</a>
+<a name="ln185">  return 0;</a>
+<a name="ln186">}</a>
+<a name="ln187"> </a>
+<a name="ln188">void</a>
+<a name="ln189">ospf_opaque_type11_lsa_term (struct ospf *top)</a>
+<a name="ln190">{</a>
+<a name="ln191">#ifdef MONITOR_LSDB_CHANGE</a>
+<a name="ln192">  top-&gt;lsdb-&gt;new_lsa_hook = </a>
+<a name="ln193">  top-&gt;lsdb-&gt;del_lsa_hook = NULL;</a>
+<a name="ln194">#endif /* MONITOR_LSDB_CHANGE */</a>
+<a name="ln195"> </a>
+<a name="ln196">  OSPF_TIMER_OFF (top-&gt;t_opaque_lsa_self);</a>
+<a name="ln197">  if (top-&gt;opaque_lsa_self != NULL)</a>
+<a name="ln198">    list_delete (top-&gt;opaque_lsa_self);</a>
+<a name="ln199">  top-&gt;opaque_lsa_self = NULL;</a>
+<a name="ln200">  return;</a>
+<a name="ln201">}</a>
+<a name="ln202"> </a>
+<a name="ln203">static const char *</a>
+<a name="ln204">ospf_opaque_type_name (u_char opaque_type)</a>
+<a name="ln205">{</a>
+<a name="ln206">  const char *name = &quot;Unknown&quot;;</a>
+<a name="ln207"> </a>
+<a name="ln208">  switch (opaque_type)</a>
+<a name="ln209">    {</a>
+<a name="ln210">    case OPAQUE_TYPE_WILDCARD: /* This is a special assignment! */</a>
+<a name="ln211">      name = &quot;Wildcard&quot;;</a>
+<a name="ln212">      break;</a>
+<a name="ln213">    case OPAQUE_TYPE_TRAFFIC_ENGINEERING_LSA:</a>
+<a name="ln214">      name = &quot;Traffic Engineering LSA&quot;;</a>
+<a name="ln215">      break;</a>
+<a name="ln216">    case OPAQUE_TYPE_SYCAMORE_OPTICAL_TOPOLOGY_DESC:</a>
+<a name="ln217">      name = &quot;Sycamore optical topology description&quot;;</a>
+<a name="ln218">      break;</a>
+<a name="ln219">    case OPAQUE_TYPE_GRACE_LSA:</a>
+<a name="ln220">      name = &quot;Grace-LSA&quot;;</a>
+<a name="ln221">      break;</a>
+<a name="ln222">    case OPAQUE_TYPE_INTER_AS_LSA:</a>
+<a name="ln223">      name = &quot;Inter-AS TE-v2 LSA&quot;;</a>
+<a name="ln224">      break;</a>
+<a name="ln225">    case OPAQUE_TYPE_ROUTER_INFORMATION_LSA:</a>
+<a name="ln226">      name = &quot;Router Information LSA&quot;;</a>
+<a name="ln227">      break;</a>
+<a name="ln228">    default:</a>
+<a name="ln229">      if (OPAQUE_TYPE_RANGE_UNASSIGNED (opaque_type))</a>
+<a name="ln230">        name = &quot;Unassigned&quot;;</a>
+<a name="ln231">      else</a>
+<a name="ln232">        {</a>
+<a name="ln233">          u_int32_t bigger_range = opaque_type;</a>
+<a name="ln234">          /*</a>
+<a name="ln235">           * Get around type-limits warning: comparison is always true due to limited range of data type</a>
+<a name="ln236">           */</a>
+<a name="ln237">          if (OPAQUE_TYPE_RANGE_RESERVED (bigger_range))</a>
+<a name="ln238">            name = &quot;Private/Experimental&quot;;</a>
+<a name="ln239">        }</a>
+<a name="ln240">      break;</a>
+<a name="ln241">    }</a>
+<a name="ln242">  return name;</a>
+<a name="ln243">}</a>
+<a name="ln244"> </a>
+<a name="ln245">/*------------------------------------------------------------------------*</a>
+<a name="ln246"> * Followings are management functions to store user specified callbacks.</a>
+<a name="ln247"> *------------------------------------------------------------------------*/</a>
+<a name="ln248"> </a>
+<a name="ln249">struct opaque_info_per_type; /* Forward declaration. */</a>
+<a name="ln250"> </a>
+<a name="ln251">struct ospf_opaque_functab</a>
+<a name="ln252">{</a>
+<a name="ln253">  u_char opaque_type;</a>
+<a name="ln254">  struct opaque_info_per_type *oipt;</a>
+<a name="ln255"> </a>
+<a name="ln256">  int (* new_if_hook)(struct interface *ifp);</a>
+<a name="ln257">  int (* del_if_hook)(struct interface *ifp);</a>
+<a name="ln258">  void (* ism_change_hook)(struct ospf_interface *oi, int old_status);</a>
+<a name="ln259">  void (* nsm_change_hook)(struct ospf_neighbor *nbr, int old_status);</a>
+<a name="ln260">  void (* config_write_router)(struct vty *vty);</a>
+<a name="ln261">  void (* config_write_if    )(struct vty *vty, struct interface *ifp);</a>
+<a name="ln262">  void (* config_write_debug )(struct vty *vty);</a>
+<a name="ln263">  void (* show_opaque_info   )(struct vty *vty, struct ospf_lsa *lsa);</a>
+<a name="ln264">  int  (* lsa_originator)(void *arg);</a>
+<a name="ln265">  struct ospf_lsa *(* lsa_refresher )(struct ospf_lsa *lsa);</a>
+<a name="ln266">  int (* new_lsa_hook)(struct ospf_lsa *lsa);</a>
+<a name="ln267">  int (* del_lsa_hook)(struct ospf_lsa *lsa);</a>
+<a name="ln268">};</a>
+<a name="ln269"> </a>
+<a name="ln270">/* Handle LSA-9/10/11 altogether. */</a>
+<a name="ln271">static struct list *ospf_opaque_wildcard_funclist;</a>
+<a name="ln272">static struct list *ospf_opaque_type9_funclist;</a>
+<a name="ln273">static struct list *ospf_opaque_type10_funclist;</a>
+<a name="ln274">static struct list *ospf_opaque_type11_funclist;</a>
+<a name="ln275"> </a>
+<a name="ln276">static void</a>
+<a name="ln277">ospf_opaque_del_functab (void *val)</a>
+<a name="ln278">{</a>
+<a name="ln279">  XFREE (MTYPE_OSPF_OPAQUE_FUNCTAB, val);</a>
+<a name="ln280">  return;</a>
+<a name="ln281">}</a>
+<a name="ln282"> </a>
+<a name="ln283">static void</a>
+<a name="ln284">ospf_opaque_funclist_init (void)</a>
+<a name="ln285">{</a>
+<a name="ln286">  struct list *funclist;</a>
+<a name="ln287"> </a>
+<a name="ln288">  funclist = ospf_opaque_wildcard_funclist = list_new ();</a>
+<a name="ln289">  funclist-&gt;del = ospf_opaque_del_functab;</a>
+<a name="ln290"> </a>
+<a name="ln291">  funclist = ospf_opaque_type9_funclist  = list_new ();</a>
+<a name="ln292">  funclist-&gt;del = ospf_opaque_del_functab;</a>
+<a name="ln293"> </a>
+<a name="ln294">  funclist = ospf_opaque_type10_funclist = list_new ();</a>
+<a name="ln295">  funclist-&gt;del = ospf_opaque_del_functab;</a>
+<a name="ln296"> </a>
+<a name="ln297">  funclist = ospf_opaque_type11_funclist = list_new ();</a>
+<a name="ln298">  funclist-&gt;del = ospf_opaque_del_functab;</a>
+<a name="ln299">  return;</a>
+<a name="ln300">}</a>
+<a name="ln301"> </a>
+<a name="ln302">static void</a>
+<a name="ln303">ospf_opaque_funclist_term (void)</a>
+<a name="ln304">{</a>
+<a name="ln305">  struct list *funclist;</a>
+<a name="ln306"> </a>
+<a name="ln307">  funclist = ospf_opaque_wildcard_funclist;</a>
+<a name="ln308">  list_delete (funclist);</a>
+<a name="ln309"> </a>
+<a name="ln310">  funclist = ospf_opaque_type9_funclist;</a>
+<a name="ln311">  list_delete (funclist);</a>
+<a name="ln312"> </a>
+<a name="ln313">  funclist = ospf_opaque_type10_funclist;</a>
+<a name="ln314">  list_delete (funclist);</a>
+<a name="ln315"> </a>
+<a name="ln316">  funclist = ospf_opaque_type11_funclist;</a>
+<a name="ln317">  list_delete (funclist);</a>
+<a name="ln318">  return;</a>
+<a name="ln319">}</a>
+<a name="ln320"> </a>
+<a name="ln321">static struct list *</a>
+<a name="ln322">ospf_get_opaque_funclist (u_char lsa_type)</a>
+<a name="ln323">{</a>
+<a name="ln324">  struct list *funclist = NULL;</a>
+<a name="ln325"> </a>
+<a name="ln326">  switch (lsa_type)</a>
+<a name="ln327">    {</a>
+<a name="ln328">    case OPAQUE_TYPE_WILDCARD:</a>
+<a name="ln329">      /* XXX</a>
+<a name="ln330">       * This is an ugly trick to handle type-9/10/11 LSA altogether.</a>
+<a name="ln331">       * Yes, &quot;OPAQUE_TYPE_WILDCARD (value 0)&quot; is not an LSA-type, nor</a>
+<a name="ln332">       * an officially assigned opaque-type.</a>
+<a name="ln333">       * Though it is possible that the value might be officially used</a>
+<a name="ln334">       * in the future, we use it internally as a special label, for now.</a>
+<a name="ln335">       */</a>
+<a name="ln336">      funclist = ospf_opaque_wildcard_funclist;</a>
+<a name="ln337">      break;</a>
+<a name="ln338">    case OSPF_OPAQUE_LINK_LSA:</a>
+<a name="ln339">      funclist = ospf_opaque_type9_funclist;</a>
+<a name="ln340">      break;</a>
+<a name="ln341">    case OSPF_OPAQUE_AREA_LSA:</a>
+<a name="ln342">      funclist = ospf_opaque_type10_funclist;</a>
+<a name="ln343">      break;</a>
+<a name="ln344">    case OSPF_OPAQUE_AS_LSA:</a>
+<a name="ln345">      funclist = ospf_opaque_type11_funclist;</a>
+<a name="ln346">      break;</a>
+<a name="ln347">    default:</a>
+<a name="ln348">      zlog_warn (&quot;ospf_get_opaque_funclist: Unexpected LSA-type(%u)&quot;, lsa_type);</a>
+<a name="ln349">      break;</a>
+<a name="ln350">    }</a>
+<a name="ln351">  return funclist;</a>
+<a name="ln352">}</a>
+<a name="ln353"> </a>
+<a name="ln354">/* XXX: such a huge argument list can /not/ be healthy... */</a>
+<a name="ln355">int</a>
+<a name="ln356">ospf_register_opaque_functab (</a>
+<a name="ln357">  u_char lsa_type,</a>
+<a name="ln358">  u_char opaque_type,</a>
+<a name="ln359">  int (* new_if_hook)(struct interface *ifp),</a>
+<a name="ln360">  int (* del_if_hook)(struct interface *ifp),</a>
+<a name="ln361">  void (* ism_change_hook)(struct ospf_interface *oi, int old_status),</a>
+<a name="ln362">  void (* nsm_change_hook)(struct ospf_neighbor *nbr, int old_status),</a>
+<a name="ln363">  void (* config_write_router)(struct vty *vty),</a>
+<a name="ln364">  void (* config_write_if    )(struct vty *vty, struct interface *ifp),</a>
+<a name="ln365">  void (* config_write_debug )(struct vty *vty),</a>
+<a name="ln366">  void (* show_opaque_info   )(struct vty *vty, struct ospf_lsa *lsa),</a>
+<a name="ln367">  int  (* lsa_originator)(void *arg),</a>
+<a name="ln368">  struct ospf_lsa *(* lsa_refresher )(struct ospf_lsa *lsa),</a>
+<a name="ln369">  int (* new_lsa_hook)(struct ospf_lsa *lsa),</a>
+<a name="ln370">  int (* del_lsa_hook)(struct ospf_lsa *lsa))</a>
+<a name="ln371">{</a>
+<a name="ln372">  struct list *funclist;</a>
+<a name="ln373">  struct ospf_opaque_functab *new;</a>
+<a name="ln374">  int rc = -1;</a>
+<a name="ln375"> </a>
+<a name="ln376">  if ((funclist = ospf_get_opaque_funclist (lsa_type)) == NULL)</a>
+<a name="ln377">    {</a>
+<a name="ln378">      zlog_warn (&quot;ospf_register_opaque_functab: Cannot get funclist&quot;</a>
+<a name="ln379">                 &quot; for Type-%u LSAs?&quot;,</a>
+<a name="ln380">                 lsa_type);</a>
+<a name="ln381">      goto out;</a>
+<a name="ln382">    }</a>
+<a name="ln383">  else</a>
+<a name="ln384">    {</a>
+<a name="ln385">      struct listnode *node, *nnode;</a>
+<a name="ln386">      struct ospf_opaque_functab *functab;</a>
+<a name="ln387">      </a>
+<a name="ln388">      for (ALL_LIST_ELEMENTS (funclist, node, nnode, functab))</a>
+<a name="ln389">        if (functab-&gt;opaque_type == opaque_type)</a>
+<a name="ln390">          {</a>
+<a name="ln391">            zlog_warn (&quot;ospf_register_opaque_functab: Duplicated entry?:&quot;</a>
+<a name="ln392">                       &quot; lsa_type(%u), opaque_type(%u)&quot;, </a>
+<a name="ln393">                       lsa_type, opaque_type);</a>
+<a name="ln394">            goto out;</a>
+<a name="ln395">          }</a>
+<a name="ln396">    }</a>
+<a name="ln397"> </a>
+<a name="ln398">  if ((new = XCALLOC (MTYPE_OSPF_OPAQUE_FUNCTAB,</a>
+<a name="ln399">		      sizeof (struct ospf_opaque_functab))) == NULL)</a>
+<a name="ln400">    {</a>
+<a name="ln401">      zlog_warn (&quot;ospf_register_opaque_functab: XMALLOC: %s&quot;,</a>
+<a name="ln402">                 safe_strerror (errno));</a>
+<a name="ln403">      goto out;</a>
+<a name="ln404">    }</a>
+<a name="ln405"> </a>
+<a name="ln406">  new-&gt;opaque_type    = opaque_type;</a>
+<a name="ln407">  new-&gt;oipt           = NULL;</a>
+<a name="ln408">  new-&gt;new_if_hook    = new_if_hook;</a>
+<a name="ln409">  new-&gt;del_if_hook    = del_if_hook;</a>
+<a name="ln410">  new-&gt;ism_change_hook     = ism_change_hook;</a>
+<a name="ln411">  new-&gt;nsm_change_hook     = nsm_change_hook;</a>
+<a name="ln412">  new-&gt;config_write_router = config_write_router;</a>
+<a name="ln413">  new-&gt;config_write_if     = config_write_if;</a>
+<a name="ln414">  new-&gt;config_write_debug  = config_write_debug;</a>
+<a name="ln415">  new-&gt;show_opaque_info    = show_opaque_info;</a>
+<a name="ln416">  new-&gt;lsa_originator = lsa_originator;</a>
+<a name="ln417">  new-&gt;lsa_refresher  = lsa_refresher;</a>
+<a name="ln418">  new-&gt;new_lsa_hook   = new_lsa_hook;</a>
+<a name="ln419">  new-&gt;del_lsa_hook   = del_lsa_hook;</a>
+<a name="ln420"> </a>
+<a name="ln421">  listnode_add (funclist, new);</a>
+<a name="ln422">  rc = 0;</a>
+<a name="ln423"> </a>
+<a name="ln424">out:</a>
+<a name="ln425">  return rc;</a>
+<a name="ln426">}</a>
+<a name="ln427"> </a>
+<a name="ln428">void</a>
+<a name="ln429">ospf_delete_opaque_functab (u_char lsa_type, u_char opaque_type)</a>
+<a name="ln430">{</a>
+<a name="ln431">  struct list *funclist;</a>
+<a name="ln432">  struct listnode *node, *nnode;</a>
+<a name="ln433">  struct ospf_opaque_functab *functab;</a>
+<a name="ln434"> </a>
+<a name="ln435">  if ((funclist = ospf_get_opaque_funclist (lsa_type)) != NULL)</a>
+<a name="ln436">    for (ALL_LIST_ELEMENTS (funclist, node, nnode, functab))</a>
+<a name="ln437">      {</a>
+<a name="ln438">        if (functab-&gt;opaque_type == opaque_type)</a>
+<a name="ln439">          {</a>
+<a name="ln440">            /* Cleanup internal control information, if it still remains. */</a>
+<a name="ln441">            if (functab-&gt;oipt != NULL)</a>
+<a name="ln442">              free_opaque_info_per_type (functab-&gt;oipt);</a>
+<a name="ln443"> </a>
+<a name="ln444">            /* Dequeue listnode entry from the list. */</a>
+<a name="ln445">            listnode_delete (funclist, functab);</a>
+<a name="ln446"> </a>
+<a name="ln447">            /* Avoid misjudgement in the next lookup. */</a>
+<a name="ln448">            if (listcount (funclist) == 0)</a>
+<a name="ln449">              funclist-&gt;head = funclist-&gt;tail = NULL;</a>
+<a name="ln450"> </a>
+<a name="ln451">            XFREE (MTYPE_OSPF_OPAQUE_FUNCTAB, functab);</a>
+<a name="ln452">            break;</a>
+<a name="ln453">	  }</a>
+<a name="ln454">      }</a>
+<a name="ln455"> </a>
+<a name="ln456">  return;</a>
+<a name="ln457">}</a>
+<a name="ln458"> </a>
+<a name="ln459">static struct ospf_opaque_functab *</a>
+<a name="ln460">ospf_opaque_functab_lookup (struct ospf_lsa *lsa)</a>
+<a name="ln461">{</a>
+<a name="ln462">  struct list *funclist;</a>
+<a name="ln463">  struct listnode *node;</a>
+<a name="ln464">  struct ospf_opaque_functab *functab;</a>
+<a name="ln465">  u_char key = GET_OPAQUE_TYPE (ntohl (lsa-&gt;data-&gt;id.s_addr));</a>
+<a name="ln466"> </a>
+<a name="ln467">  if ((funclist = ospf_get_opaque_funclist (lsa-&gt;data-&gt;type)) != NULL)</a>
+<a name="ln468">    for (ALL_LIST_ELEMENTS_RO (funclist, node, functab))</a>
+<a name="ln469">      if (functab-&gt;opaque_type == key)</a>
+<a name="ln470">        return functab;</a>
+<a name="ln471"> </a>
+<a name="ln472">  return NULL;</a>
+<a name="ln473">}</a>
+<a name="ln474"> </a>
+<a name="ln475">/*------------------------------------------------------------------------*</a>
+<a name="ln476"> * Followings are management functions for self-originated LSA entries.</a>
+<a name="ln477"> *------------------------------------------------------------------------*/</a>
+<a name="ln478"> </a>
+<a name="ln479">/*</a>
+<a name="ln480"> * Opaque-LSA control information per opaque-type.</a>
+<a name="ln481"> * Single Opaque-Type may have multiple instances; each of them will be</a>
+<a name="ln482"> * identified by their opaque-id.</a>
+<a name="ln483"> */</a>
+<a name="ln484">struct opaque_info_per_type</a>
+<a name="ln485">{</a>
+<a name="ln486">  u_char lsa_type;</a>
+<a name="ln487">  u_char opaque_type;</a>
+<a name="ln488"> </a>
+<a name="ln489">  enum { PROC_NORMAL, PROC_SUSPEND } status;</a>
+<a name="ln490"> </a>
+<a name="ln491">  /*</a>
+<a name="ln492">   * Thread for (re-)origination scheduling for this opaque-type.</a>
+<a name="ln493">   *</a>
+<a name="ln494">   * Initial origination of Opaque-LSAs is controlled by generic</a>
+<a name="ln495">   * Opaque-LSA handling module so that same opaque-type entries are</a>
+<a name="ln496">   * called all at once when certain conditions are met.</a>
+<a name="ln497">   * However, there might be cases that some Opaque-LSA clients need</a>
+<a name="ln498">   * to (re-)originate their own Opaque-LSAs out-of-sync with others.</a>
+<a name="ln499">   * This thread is prepared for that specific purpose.</a>
+<a name="ln500">   */</a>
+<a name="ln501">  struct thread *t_opaque_lsa_self;</a>
+<a name="ln502"> </a>
+<a name="ln503">  /*</a>
+<a name="ln504">   * Backpointer to an &quot;owner&quot; which is LSA-type dependent.</a>
+<a name="ln505">   *   type-9:  struct ospf_interface</a>
+<a name="ln506">   *   type-10: struct ospf_area</a>
+<a name="ln507">   *   type-11: struct ospf</a>
+<a name="ln508">   */</a>
+<a name="ln509">  void *owner;</a>
+<a name="ln510"> </a>
+<a name="ln511">  /* Collection of callback functions for this opaque-type. */</a>
+<a name="ln512">  struct ospf_opaque_functab *functab;</a>
+<a name="ln513"> </a>
+<a name="ln514">  /* List of Opaque-LSA control informations per opaque-id. */</a>
+<a name="ln515">  struct list *id_list;</a>
+<a name="ln516">};</a>
+<a name="ln517"> </a>
+<a name="ln518">/* Opaque-LSA control information per opaque-id. */</a>
+<a name="ln519">struct opaque_info_per_id</a>
+<a name="ln520">{</a>
+<a name="ln521">  u_int32_t opaque_id;</a>
+<a name="ln522"> </a>
+<a name="ln523">  /* Thread for refresh/flush scheduling for this opaque-type/id. */</a>
+<a name="ln524">  struct thread *t_opaque_lsa_self;</a>
+<a name="ln525"> </a>
+<a name="ln526">  /* Backpointer to Opaque-LSA control information per opaque-type. */</a>
+<a name="ln527">  struct opaque_info_per_type *opqctl_type;</a>
+<a name="ln528"> </a>
+<a name="ln529">  /* Here comes an actual Opaque-LSA entry for this opaque-type/id. */</a>
+<a name="ln530">  struct ospf_lsa *lsa;</a>
+<a name="ln531">};</a>
+<a name="ln532"> </a>
+<a name="ln533">static struct opaque_info_per_type *register_opaque_info_per_type (struct ospf_opaque_functab *functab, struct ospf_lsa *new);</a>
+<a name="ln534">static struct opaque_info_per_type *lookup_opaque_info_by_type (struct ospf_lsa *lsa);</a>
+<a name="ln535">static struct opaque_info_per_id *register_opaque_info_per_id (struct opaque_info_per_type *oipt, struct ospf_lsa *new);</a>
+<a name="ln536">static struct opaque_info_per_id *lookup_opaque_info_by_id (struct opaque_info_per_type *oipt, struct ospf_lsa *lsa);</a>
+<a name="ln537">static struct opaque_info_per_id *register_opaque_lsa (struct ospf_lsa *new);</a>
+<a name="ln538"> </a>
+<a name="ln539"> </a>
+<a name="ln540">static struct opaque_info_per_type *</a>
+<a name="ln541">register_opaque_info_per_type (struct ospf_opaque_functab *functab,</a>
+<a name="ln542">                               struct ospf_lsa *new)</a>
+<a name="ln543">{</a>
+<a name="ln544">  struct ospf *top;</a>
+<a name="ln545">  struct opaque_info_per_type *oipt;</a>
+<a name="ln546"> </a>
+<a name="ln547">  if ((oipt = XCALLOC (MTYPE_OPAQUE_INFO_PER_TYPE,</a>
+<a name="ln548">		       sizeof (struct opaque_info_per_type))) == NULL)</a>
+<a name="ln549">    {</a>
+<a name="ln550">      zlog_warn (&quot;register_opaque_info_per_type: XMALLOC: %s&quot;, safe_strerror (errno));</a>
+<a name="ln551">      goto out;</a>
+<a name="ln552">    }</a>
+<a name="ln553"> </a>
+<a name="ln554">  switch (new-&gt;data-&gt;type)</a>
+<a name="ln555">    {</a>
+<a name="ln556">    case OSPF_OPAQUE_LINK_LSA:</a>
+<a name="ln557">      oipt-&gt;owner = new-&gt;oi;</a>
+<a name="ln558">      listnode_add (new-&gt;oi-&gt;opaque_lsa_self, oipt);</a>
+<a name="ln559">      break;</a>
+<a name="ln560">    case OSPF_OPAQUE_AREA_LSA:</a>
+<a name="ln561">      oipt-&gt;owner = new-&gt;area;</a>
+<a name="ln562">      listnode_add (new-&gt;area-&gt;opaque_lsa_self, oipt);</a>
+<a name="ln563">      break;</a>
+<a name="ln564">    case OSPF_OPAQUE_AS_LSA:</a>
+<a name="ln565">      top = ospf_lookup ();</a>
+<a name="ln566">      if (new-&gt;area != NULL &amp;&amp; (top = new-&gt;area-&gt;ospf) == NULL)</a>
+<a name="ln567">        {</a>
+<a name="ln568">          free_opaque_info_per_type ((void *) oipt);</a>
+<a name="ln569">          oipt = NULL;</a>
+<a name="ln570">          goto out; /* This case may not exist. */</a>
+<a name="ln571">        }</a>
+<a name="ln572">      oipt-&gt;owner = top;</a>
+<a name="ln573">      listnode_add (top-&gt;opaque_lsa_self, oipt);</a>
+<a name="ln574">      break;</a>
+<a name="ln575">    default:</a>
+<a name="ln576">      zlog_warn (&quot;register_opaque_info_per_type: Unexpected LSA-type(%u)&quot;, new-&gt;data-&gt;type);</a>
+<a name="ln577">      free_opaque_info_per_type ((void *) oipt);</a>
+<a name="ln578">      oipt = NULL;</a>
+<a name="ln579">      goto out; /* This case may not exist. */</a>
+<a name="ln580">    }</a>
+<a name="ln581"> </a>
+<a name="ln582">  oipt-&gt;lsa_type = new-&gt;data-&gt;type;</a>
+<a name="ln583">  oipt-&gt;opaque_type = GET_OPAQUE_TYPE (ntohl (new-&gt;data-&gt;id.s_addr));</a>
+<a name="ln584">  oipt-&gt;status = PROC_NORMAL;</a>
+<a name="ln585">  oipt-&gt;t_opaque_lsa_self = NULL;</a>
+<a name="ln586">  oipt-&gt;functab = functab;</a>
+<a name="ln587">  functab-&gt;oipt = oipt;</a>
+<a name="ln588">  oipt-&gt;id_list = list_new ();</a>
+<a name="ln589">  oipt-&gt;id_list-&gt;del = free_opaque_info_per_id;</a>
+<a name="ln590"> </a>
+<a name="ln591">out:</a>
+<a name="ln592">  return oipt;</a>
+<a name="ln593">}</a>
+<a name="ln594"> </a>
+<a name="ln595">static void</a>
+<a name="ln596">free_opaque_info_per_type (void *val)</a>
+<a name="ln597">{</a>
+<a name="ln598">  struct opaque_info_per_type *oipt = (struct opaque_info_per_type *) val;</a>
+<a name="ln599">  struct opaque_info_per_id *oipi;</a>
+<a name="ln600">  struct ospf_lsa *lsa;</a>
+<a name="ln601">  struct listnode *node, *nnode;</a>
+<a name="ln602"> </a>
+<a name="ln603">  /* Control information per opaque-id may still exist. */</a>
+<a name="ln604">  for (ALL_LIST_ELEMENTS (oipt-&gt;id_list, node, nnode, oipi))</a>
+<a name="ln605">    {</a>
+<a name="ln606">      if ((lsa = oipi-&gt;lsa) == NULL)</a>
+<a name="ln607">        continue;</a>
+<a name="ln608">      if (IS_LSA_MAXAGE (lsa))</a>
+<a name="ln609">        continue;</a>
+<a name="ln610">      ospf_opaque_lsa_flush_schedule (lsa);</a>
+<a name="ln611">    }</a>
+<a name="ln612"> </a>
+<a name="ln613">  /* Remove &quot;oipt&quot; from its owner's self-originated LSA list. */</a>
+<a name="ln614">  switch (oipt-&gt;lsa_type)</a>
+<a name="ln615">    {</a>
+<a name="ln616">    case OSPF_OPAQUE_LINK_LSA:</a>
+<a name="ln617">      {</a>
+<a name="ln618">        struct ospf_interface *oi = (struct ospf_interface *)(oipt-&gt;owner);</a>
+<a name="ln619">        listnode_delete (oi-&gt;opaque_lsa_self, oipt);</a>
+<a name="ln620">        break;</a>
+<a name="ln621">      }</a>
+<a name="ln622">    case OSPF_OPAQUE_AREA_LSA:</a>
+<a name="ln623">      {</a>
+<a name="ln624">        struct ospf_area *area = (struct ospf_area *)(oipt-&gt;owner);</a>
+<a name="ln625">        listnode_delete (area-&gt;opaque_lsa_self, oipt);</a>
+<a name="ln626">        break;</a>
+<a name="ln627">      }</a>
+<a name="ln628">    case OSPF_OPAQUE_AS_LSA:</a>
+<a name="ln629">      {</a>
+<a name="ln630">        struct ospf *top = (struct ospf *)(oipt-&gt;owner);</a>
+<a name="ln631">        listnode_delete (top-&gt;opaque_lsa_self, oipt);</a>
+<a name="ln632">        break;</a>
+<a name="ln633">      }</a>
+<a name="ln634">    default:</a>
+<a name="ln635">      zlog_warn (&quot;free_opaque_info_per_type: Unexpected LSA-type(%u)&quot;, oipt-&gt;lsa_type);</a>
+<a name="ln636">      break; /* This case may not exist. */</a>
+<a name="ln637">    }</a>
+<a name="ln638"> </a>
+<a name="ln639">  OSPF_TIMER_OFF (oipt-&gt;t_opaque_lsa_self);</a>
+<a name="ln640">  list_delete (oipt-&gt;id_list);</a>
+<a name="ln641">  XFREE (MTYPE_OPAQUE_INFO_PER_TYPE, oipt);</a>
+<a name="ln642">  return;</a>
+<a name="ln643">}</a>
+<a name="ln644"> </a>
+<a name="ln645">static struct opaque_info_per_type *</a>
+<a name="ln646">lookup_opaque_info_by_type (struct ospf_lsa *lsa)</a>
+<a name="ln647">{</a>
+<a name="ln648">  struct ospf *top;</a>
+<a name="ln649">  struct ospf_area *area;</a>
+<a name="ln650">  struct ospf_interface *oi;</a>
+<a name="ln651">  struct list *listtop = NULL;</a>
+<a name="ln652">  struct listnode *node, *nnode;</a>
+<a name="ln653">  struct opaque_info_per_type *oipt = NULL;</a>
+<a name="ln654">  u_char key = GET_OPAQUE_TYPE (ntohl (lsa-&gt;data-&gt;id.s_addr));</a>
+<a name="ln655"> </a>
+<a name="ln656">  switch (lsa-&gt;data-&gt;type)</a>
+<a name="ln657">    {</a>
+<a name="ln658">    case OSPF_OPAQUE_LINK_LSA:</a>
+<a name="ln659">      if ((oi = lsa-&gt;oi) != NULL)</a>
+<a name="ln660">        listtop = oi-&gt;opaque_lsa_self;</a>
+<a name="ln661">      else</a>
+<a name="ln662">        zlog_warn (&quot;Type-9 Opaque-LSA: Reference to OI is missing?&quot;);</a>
+<a name="ln663">      break;</a>
+<a name="ln664">    case OSPF_OPAQUE_AREA_LSA:</a>
+<a name="ln665">      if ((area = lsa-&gt;area) != NULL)</a>
+<a name="ln666">        listtop = area-&gt;opaque_lsa_self;</a>
+<a name="ln667">      else</a>
+<a name="ln668">        zlog_warn (&quot;Type-10 Opaque-LSA: Reference to AREA is missing?&quot;);</a>
+<a name="ln669">      break;</a>
+<a name="ln670">    case OSPF_OPAQUE_AS_LSA:</a>
+<a name="ln671">      top = ospf_lookup ();</a>
+<a name="ln672">      if ((area = lsa-&gt;area) != NULL &amp;&amp; (top = area-&gt;ospf) == NULL)</a>
+<a name="ln673">        {</a>
+<a name="ln674">          zlog_warn (&quot;Type-11 Opaque-LSA: Reference to OSPF is missing?&quot;);</a>
+<a name="ln675">          break; /* Unlikely to happen. */</a>
+<a name="ln676">        }</a>
+<a name="ln677">      listtop = top-&gt;opaque_lsa_self;</a>
+<a name="ln678">      break;</a>
+<a name="ln679">    default:</a>
+<a name="ln680">      zlog_warn (&quot;lookup_opaque_info_by_type: Unexpected LSA-type(%u)&quot;, lsa-&gt;data-&gt;type);</a>
+<a name="ln681">      break;</a>
+<a name="ln682">    }</a>
+<a name="ln683"> </a>
+<a name="ln684">  if (listtop != NULL)</a>
+<a name="ln685">    for (ALL_LIST_ELEMENTS (listtop, node, nnode, oipt))</a>
+<a name="ln686">      if (oipt-&gt;opaque_type == key)</a>
+<a name="ln687">        return oipt;</a>
+<a name="ln688"> </a>
+<a name="ln689">  return NULL;</a>
+<a name="ln690">}</a>
+<a name="ln691"> </a>
+<a name="ln692">static struct opaque_info_per_id *</a>
+<a name="ln693">register_opaque_info_per_id (struct opaque_info_per_type *oipt,</a>
+<a name="ln694">                             struct ospf_lsa *new)</a>
+<a name="ln695">{</a>
+<a name="ln696">  struct opaque_info_per_id *oipi;</a>
+<a name="ln697"> </a>
+<a name="ln698">  if ((oipi = XCALLOC (MTYPE_OPAQUE_INFO_PER_ID,</a>
+<a name="ln699">		       sizeof (struct opaque_info_per_id))) == NULL)</a>
+<a name="ln700">    {</a>
+<a name="ln701">      zlog_warn (&quot;register_opaque_info_per_id: XMALLOC: %s&quot;, safe_strerror (errno));</a>
+<a name="ln702">      goto out;</a>
+<a name="ln703">    }</a>
+<a name="ln704">  oipi-&gt;opaque_id = GET_OPAQUE_ID (ntohl (new-&gt;data-&gt;id.s_addr));</a>
+<a name="ln705">  oipi-&gt;t_opaque_lsa_self = NULL;</a>
+<a name="ln706">  oipi-&gt;opqctl_type = oipt;</a>
+<a name="ln707">  oipi-&gt;lsa = ospf_lsa_lock (new);</a>
+<a name="ln708"> </a>
+<a name="ln709">  listnode_add (oipt-&gt;id_list, oipi);</a>
+<a name="ln710"> </a>
+<a name="ln711">out:</a>
+<a name="ln712">  return oipi;</a>
+<a name="ln713">}</a>
+<a name="ln714"> </a>
+<a name="ln715">static void</a>
+<a name="ln716">free_opaque_info_per_id (void *val)</a>
+<a name="ln717">{</a>
+<a name="ln718">  struct opaque_info_per_id *oipi = (struct opaque_info_per_id *) val;</a>
+<a name="ln719"> </a>
+<a name="ln720">  OSPF_TIMER_OFF (oipi-&gt;t_opaque_lsa_self);</a>
+<a name="ln721">  if (oipi-&gt;lsa != NULL)</a>
+<a name="ln722">    ospf_lsa_unlock (&amp;oipi-&gt;lsa);</a>
+<a name="ln723">  XFREE (MTYPE_OPAQUE_INFO_PER_ID, oipi);</a>
+<a name="ln724">  return;</a>
+<a name="ln725">}</a>
+<a name="ln726"> </a>
+<a name="ln727">static struct opaque_info_per_id *</a>
+<a name="ln728">lookup_opaque_info_by_id (struct opaque_info_per_type *oipt,</a>
+<a name="ln729">                          struct ospf_lsa *lsa)</a>
+<a name="ln730">{</a>
+<a name="ln731">  struct listnode *node, *nnode;</a>
+<a name="ln732">  struct opaque_info_per_id   *oipi;</a>
+<a name="ln733">  u_int32_t key = GET_OPAQUE_ID (ntohl (lsa-&gt;data-&gt;id.s_addr));</a>
+<a name="ln734"> </a>
+<a name="ln735">  for (ALL_LIST_ELEMENTS (oipt-&gt;id_list, node, nnode, oipi))</a>
+<a name="ln736">    if (oipi-&gt;opaque_id == key)</a>
+<a name="ln737">      return oipi;</a>
+<a name="ln738"> </a>
+<a name="ln739">  return NULL;</a>
+<a name="ln740">}</a>
+<a name="ln741"> </a>
+<a name="ln742">static struct opaque_info_per_id *</a>
+<a name="ln743">register_opaque_lsa (struct ospf_lsa *new)</a>
+<a name="ln744">{</a>
+<a name="ln745">  struct ospf_opaque_functab *functab;</a>
+<a name="ln746">  struct opaque_info_per_type *oipt;</a>
+<a name="ln747">  struct opaque_info_per_id *oipi = NULL;</a>
+<a name="ln748"> </a>
+<a name="ln749">  if ((functab = ospf_opaque_functab_lookup (new)) == NULL)</a>
+<a name="ln750">    goto out;</a>
+<a name="ln751"> </a>
+<a name="ln752">  if ((oipt = lookup_opaque_info_by_type (new)) == NULL</a>
+<a name="ln753">  &amp;&amp;  (oipt = register_opaque_info_per_type (functab, new)) == NULL)</a>
+<a name="ln754">    goto out;</a>
+<a name="ln755"> </a>
+<a name="ln756">  if ((oipi = register_opaque_info_per_id (oipt, new)) == NULL)</a>
+<a name="ln757">    goto out;</a>
+<a name="ln758"> </a>
+<a name="ln759">out:</a>
+<a name="ln760">  return oipi;</a>
+<a name="ln761">}</a>
+<a name="ln762"> </a>
+<a name="ln763">/*------------------------------------------------------------------------*</a>
+<a name="ln764"> * Followings are (vty) configuration functions for Opaque-LSAs handling.</a>
+<a name="ln765"> *------------------------------------------------------------------------*/</a>
+<a name="ln766"> </a>
+<a name="ln767">DEFUN (capability_opaque,</a>
+<a name="ln768">       capability_opaque_cmd,</a>
+<a name="ln769">       &quot;capability opaque&quot;,</a>
+<a name="ln770">       &quot;Enable specific OSPF feature\n&quot;</a>
+<a name="ln771">       &quot;Opaque LSA\n&quot;)</a>
+<a name="ln772">{</a>
+<a name="ln773">  struct ospf *ospf = (struct ospf *) vty-&gt;index;</a>
+<a name="ln774"> </a>
+<a name="ln775">  /* Turn on the &quot;master switch&quot; of opaque-lsa capability. */</a>
+<a name="ln776">  if (!CHECK_FLAG (ospf-&gt;config, OSPF_OPAQUE_CAPABLE))</a>
+<a name="ln777">    {</a>
+<a name="ln778">      if (IS_DEBUG_OSPF_EVENT)</a>
+<a name="ln779">        zlog_debug (&quot;Opaque capability: OFF -&gt; ON&quot;);</a>
+<a name="ln780"> </a>
+<a name="ln781">      SET_FLAG (ospf-&gt;config, OSPF_OPAQUE_CAPABLE);</a>
+<a name="ln782">      ospf_renegotiate_optional_capabilities (ospf);</a>
+<a name="ln783">    }</a>
+<a name="ln784">  return CMD_SUCCESS;</a>
+<a name="ln785">}</a>
+<a name="ln786"> </a>
+<a name="ln787">ALIAS (capability_opaque,</a>
+<a name="ln788">       ospf_opaque_capable_cmd,</a>
+<a name="ln789">       &quot;ospf opaque-lsa&quot;,</a>
+<a name="ln790">       &quot;OSPF specific commands\n&quot;</a>
+<a name="ln791">       &quot;Enable the Opaque-LSA capability (rfc2370)\n&quot;)</a>
+<a name="ln792"> </a>
+<a name="ln793">DEFUN (no_capability_opaque,</a>
+<a name="ln794">       no_capability_opaque_cmd,</a>
+<a name="ln795">       &quot;no capability opaque&quot;,</a>
+<a name="ln796">       NO_STR</a>
+<a name="ln797">       &quot;Enable specific OSPF feature\n&quot;</a>
+<a name="ln798">       &quot;Opaque LSA\n&quot;)</a>
+<a name="ln799">{</a>
+<a name="ln800">  struct ospf *ospf = (struct ospf *) vty-&gt;index;</a>
+<a name="ln801"> </a>
+<a name="ln802">  /* Turn off the &quot;master switch&quot; of opaque-lsa capability. */</a>
+<a name="ln803">  if (CHECK_FLAG (ospf-&gt;config, OSPF_OPAQUE_CAPABLE))</a>
+<a name="ln804">    {</a>
+<a name="ln805">      if (IS_DEBUG_OSPF_EVENT)</a>
+<a name="ln806">        zlog_debug (&quot;Opaque capability: ON -&gt; OFF&quot;);</a>
+<a name="ln807"> </a>
+<a name="ln808">      UNSET_FLAG (ospf-&gt;config, OSPF_OPAQUE_CAPABLE);</a>
+<a name="ln809">      ospf_renegotiate_optional_capabilities (ospf);</a>
+<a name="ln810">    }</a>
+<a name="ln811">  return CMD_SUCCESS;</a>
+<a name="ln812">}</a>
+<a name="ln813"> </a>
+<a name="ln814">ALIAS (no_capability_opaque,</a>
+<a name="ln815">       no_ospf_opaque_capable_cmd,</a>
+<a name="ln816">       &quot;no ospf opaque-lsa&quot;,</a>
+<a name="ln817">       NO_STR</a>
+<a name="ln818">       &quot;OSPF specific commands\n&quot;</a>
+<a name="ln819">       &quot;Disable the Opaque-LSA capability (rfc2370)\n&quot;)</a>
+<a name="ln820"> </a>
+<a name="ln821">static void</a>
+<a name="ln822">ospf_opaque_register_vty (void)</a>
+<a name="ln823">{</a>
+<a name="ln824">  install_element (OSPF_NODE, &amp;capability_opaque_cmd);</a>
+<a name="ln825">  install_element (OSPF_NODE, &amp;no_capability_opaque_cmd);</a>
+<a name="ln826">  install_element (OSPF_NODE, &amp;ospf_opaque_capable_cmd);</a>
+<a name="ln827">  install_element (OSPF_NODE, &amp;no_ospf_opaque_capable_cmd);</a>
+<a name="ln828">  return;</a>
+<a name="ln829">}</a>
+<a name="ln830"> </a>
+<a name="ln831">/*------------------------------------------------------------------------*</a>
+<a name="ln832"> * Followings are collection of user-registered function callers.</a>
+<a name="ln833"> *------------------------------------------------------------------------*/</a>
+<a name="ln834"> </a>
+<a name="ln835">static int</a>
+<a name="ln836">opaque_lsa_new_if_callback (struct list *funclist, struct interface *ifp)</a>
+<a name="ln837">{</a>
+<a name="ln838">  struct listnode *node, *nnode;</a>
+<a name="ln839">  struct ospf_opaque_functab *functab;</a>
+<a name="ln840">  int rc = -1;</a>
+<a name="ln841"> </a>
+<a name="ln842">  for (ALL_LIST_ELEMENTS (funclist, node, nnode, functab))</a>
+<a name="ln843">    if (functab-&gt;new_if_hook != NULL)</a>
+<a name="ln844">      if ((* functab-&gt;new_if_hook)(ifp) != 0)</a>
+<a name="ln845">        goto out;</a>
+<a name="ln846">  rc = 0;</a>
+<a name="ln847">out:</a>
+<a name="ln848">  return rc;</a>
+<a name="ln849">}</a>
+<a name="ln850"> </a>
+<a name="ln851">static int</a>
+<a name="ln852">opaque_lsa_del_if_callback (struct list *funclist, struct interface *ifp)</a>
+<a name="ln853">{</a>
+<a name="ln854">  struct listnode *node, *nnode;</a>
+<a name="ln855">  struct ospf_opaque_functab *functab;</a>
+<a name="ln856">  int rc = -1;</a>
+<a name="ln857"> </a>
+<a name="ln858">  for (ALL_LIST_ELEMENTS (funclist, node, nnode, functab))</a>
+<a name="ln859">    if (functab-&gt;del_if_hook != NULL)</a>
+<a name="ln860">      if ((* functab-&gt;del_if_hook)(ifp) != 0)</a>
+<a name="ln861">        goto out;</a>
+<a name="ln862">  rc = 0;</a>
+<a name="ln863">out:</a>
+<a name="ln864">  return rc;</a>
+<a name="ln865">}</a>
+<a name="ln866"> </a>
+<a name="ln867">static void</a>
+<a name="ln868">opaque_lsa_ism_change_callback (struct list *funclist,</a>
+<a name="ln869">                                struct ospf_interface *oi, int old_status)</a>
+<a name="ln870">{</a>
+<a name="ln871">  struct listnode *node, *nnode;</a>
+<a name="ln872">  struct ospf_opaque_functab *functab;</a>
+<a name="ln873"> </a>
+<a name="ln874">  for (ALL_LIST_ELEMENTS (funclist, node, nnode, functab))</a>
+<a name="ln875">    if (functab-&gt;ism_change_hook != NULL)</a>
+<a name="ln876">      (* functab-&gt;ism_change_hook)(oi, old_status);</a>
+<a name="ln877"> </a>
+<a name="ln878">  return;</a>
+<a name="ln879">}</a>
+<a name="ln880"> </a>
+<a name="ln881">static void</a>
+<a name="ln882">opaque_lsa_nsm_change_callback (struct list *funclist,</a>
+<a name="ln883">                                struct ospf_neighbor *nbr, int old_status)</a>
+<a name="ln884">{</a>
+<a name="ln885">  struct listnode *node, *nnode;</a>
+<a name="ln886">  struct ospf_opaque_functab *functab;</a>
+<a name="ln887"> </a>
+<a name="ln888">  for (ALL_LIST_ELEMENTS (funclist, node, nnode, functab))</a>
+<a name="ln889">    if (functab-&gt;nsm_change_hook != NULL)</a>
+<a name="ln890">      (* functab-&gt;nsm_change_hook)(nbr, old_status);</a>
+<a name="ln891">  return;</a>
+<a name="ln892">}</a>
+<a name="ln893"> </a>
+<a name="ln894">static void</a>
+<a name="ln895">opaque_lsa_config_write_router_callback (struct list *funclist, </a>
+<a name="ln896">                                         struct vty *vty)</a>
+<a name="ln897">{</a>
+<a name="ln898">  struct listnode *node, *nnode;</a>
+<a name="ln899">  struct ospf_opaque_functab *functab;</a>
+<a name="ln900"> </a>
+<a name="ln901">  for (ALL_LIST_ELEMENTS (funclist, node, nnode, functab))</a>
+<a name="ln902">    if (functab-&gt;config_write_router != NULL)</a>
+<a name="ln903">      (* functab-&gt;config_write_router)(vty);</a>
+<a name="ln904">  return;</a>
+<a name="ln905">}</a>
+<a name="ln906"> </a>
+<a name="ln907">static void</a>
+<a name="ln908">opaque_lsa_config_write_if_callback (struct list *funclist,</a>
+<a name="ln909">                                     struct vty *vty, struct interface *ifp)</a>
+<a name="ln910">{</a>
+<a name="ln911">  struct listnode *node, *nnode;</a>
+<a name="ln912">  struct ospf_opaque_functab *functab;</a>
+<a name="ln913"> </a>
+<a name="ln914">  for (ALL_LIST_ELEMENTS (funclist, node, nnode, functab))</a>
+<a name="ln915">    if (functab-&gt;config_write_if != NULL)</a>
+<a name="ln916">      (* functab-&gt;config_write_if)(vty, ifp);</a>
+<a name="ln917">  return;</a>
+<a name="ln918">}</a>
+<a name="ln919"> </a>
+<a name="ln920">static void</a>
+<a name="ln921">opaque_lsa_config_write_debug_callback (struct list *funclist, struct vty *vty)</a>
+<a name="ln922">{</a>
+<a name="ln923">  struct listnode *node, *nnode;</a>
+<a name="ln924">  struct ospf_opaque_functab *functab;</a>
+<a name="ln925"> </a>
+<a name="ln926">  for (ALL_LIST_ELEMENTS (funclist, node, nnode, functab))</a>
+<a name="ln927">    if (functab-&gt;config_write_debug != NULL)</a>
+<a name="ln928">      (* functab-&gt;config_write_debug)(vty);</a>
+<a name="ln929">  return;</a>
+<a name="ln930">}</a>
+<a name="ln931"> </a>
+<a name="ln932">static int</a>
+<a name="ln933">opaque_lsa_originate_callback (struct list *funclist, void *lsa_type_dependent)</a>
+<a name="ln934">{</a>
+<a name="ln935">  struct listnode *node, *nnode;</a>
+<a name="ln936">  struct ospf_opaque_functab *functab;</a>
+<a name="ln937">  int rc = -1;</a>
+<a name="ln938"> </a>
+<a name="ln939">  for (ALL_LIST_ELEMENTS (funclist, node, nnode, functab))</a>
+<a name="ln940">    if (functab-&gt;lsa_originator != NULL)</a>
+<a name="ln941">      if ((* functab-&gt;lsa_originator)(lsa_type_dependent) != 0)</a>
+<a name="ln942">         goto out;</a>
+<a name="ln943">  rc = 0;</a>
+<a name="ln944">out:</a>
+<a name="ln945">  return rc;</a>
+<a name="ln946">}</a>
+<a name="ln947"> </a>
+<a name="ln948">static int</a>
+<a name="ln949">new_lsa_callback (struct list *funclist, struct ospf_lsa *lsa)</a>
+<a name="ln950">{</a>
+<a name="ln951">  struct listnode *node, *nnode;</a>
+<a name="ln952">  struct ospf_opaque_functab *functab;</a>
+<a name="ln953">  int rc = -1;</a>
+<a name="ln954"> </a>
+<a name="ln955">  /* This function handles ALL types of LSAs, not only opaque ones. */</a>
+<a name="ln956">  for (ALL_LIST_ELEMENTS (funclist, node, nnode, functab))</a>
+<a name="ln957">    if (functab-&gt;new_lsa_hook != NULL)</a>
+<a name="ln958">      if ((* functab-&gt;new_lsa_hook)(lsa) != 0)</a>
+<a name="ln959">        goto out;</a>
+<a name="ln960">  rc = 0;</a>
+<a name="ln961">out:</a>
+<a name="ln962">  return rc;</a>
+<a name="ln963">}</a>
+<a name="ln964"> </a>
+<a name="ln965">static int</a>
+<a name="ln966">del_lsa_callback (struct list *funclist, struct ospf_lsa *lsa)</a>
+<a name="ln967">{</a>
+<a name="ln968">  struct listnode *node, *nnode;</a>
+<a name="ln969">  struct ospf_opaque_functab *functab;</a>
+<a name="ln970">  int rc = -1;</a>
+<a name="ln971"> </a>
+<a name="ln972">  /* This function handles ALL types of LSAs, not only opaque ones. */</a>
+<a name="ln973">  for (ALL_LIST_ELEMENTS (funclist, node, nnode, functab))</a>
+<a name="ln974">    if (functab-&gt;del_lsa_hook != NULL)</a>
+<a name="ln975">      if ((* functab-&gt;del_lsa_hook)(lsa) != 0)</a>
+<a name="ln976">        goto out;</a>
+<a name="ln977">  rc = 0;</a>
+<a name="ln978">out:</a>
+<a name="ln979">  return rc;</a>
+<a name="ln980">}</a>
+<a name="ln981"> </a>
+<a name="ln982">/*------------------------------------------------------------------------*</a>
+<a name="ln983"> * Followings are glue functions to call Opaque-LSA specific processing.</a>
+<a name="ln984"> *------------------------------------------------------------------------*/</a>
+<a name="ln985"> </a>
+<a name="ln986">int</a>
+<a name="ln987">ospf_opaque_new_if (struct interface *ifp)</a>
+<a name="ln988">{</a>
+<a name="ln989">  struct list *funclist;</a>
+<a name="ln990">  int rc = -1;</a>
+<a name="ln991"> </a>
+<a name="ln992">  funclist = ospf_opaque_wildcard_funclist;</a>
+<a name="ln993">  if (opaque_lsa_new_if_callback (funclist, ifp) != 0)</a>
+<a name="ln994">    goto out;</a>
+<a name="ln995"> </a>
+<a name="ln996">  funclist = ospf_opaque_type9_funclist;</a>
+<a name="ln997">  if (opaque_lsa_new_if_callback (funclist, ifp) != 0)</a>
+<a name="ln998">    goto out;</a>
+<a name="ln999"> </a>
+<a name="ln1000">  funclist = ospf_opaque_type10_funclist;</a>
+<a name="ln1001">  if (opaque_lsa_new_if_callback (funclist, ifp) != 0)</a>
+<a name="ln1002">    goto out;</a>
+<a name="ln1003"> </a>
+<a name="ln1004">  funclist = ospf_opaque_type11_funclist;</a>
+<a name="ln1005">  if (opaque_lsa_new_if_callback (funclist, ifp) != 0)</a>
+<a name="ln1006">    goto out;</a>
+<a name="ln1007"> </a>
+<a name="ln1008">  rc = 0;</a>
+<a name="ln1009">out:</a>
+<a name="ln1010">  return rc;</a>
+<a name="ln1011">}</a>
+<a name="ln1012"> </a>
+<a name="ln1013">int</a>
+<a name="ln1014">ospf_opaque_del_if (struct interface *ifp)</a>
+<a name="ln1015">{</a>
+<a name="ln1016">  struct list *funclist;</a>
+<a name="ln1017">  int rc = -1;</a>
+<a name="ln1018"> </a>
+<a name="ln1019">  funclist = ospf_opaque_wildcard_funclist;</a>
+<a name="ln1020">  if (opaque_lsa_del_if_callback (funclist, ifp) != 0)</a>
+<a name="ln1021">    goto out;</a>
+<a name="ln1022"> </a>
+<a name="ln1023">  funclist = ospf_opaque_type9_funclist;</a>
+<a name="ln1024">  if (opaque_lsa_del_if_callback (funclist, ifp) != 0)</a>
+<a name="ln1025">    goto out;</a>
+<a name="ln1026"> </a>
+<a name="ln1027">  funclist = ospf_opaque_type10_funclist;</a>
+<a name="ln1028">  if (opaque_lsa_del_if_callback (funclist, ifp) != 0)</a>
+<a name="ln1029">    goto out;</a>
+<a name="ln1030"> </a>
+<a name="ln1031">  funclist = ospf_opaque_type11_funclist;</a>
+<a name="ln1032">  if (opaque_lsa_del_if_callback (funclist, ifp) != 0)</a>
+<a name="ln1033">    goto out;</a>
+<a name="ln1034"> </a>
+<a name="ln1035">  rc = 0;</a>
+<a name="ln1036">out:</a>
+<a name="ln1037">  return rc;</a>
+<a name="ln1038">}</a>
+<a name="ln1039"> </a>
+<a name="ln1040">void</a>
+<a name="ln1041">ospf_opaque_ism_change (struct ospf_interface *oi, int old_status)</a>
+<a name="ln1042">{</a>
+<a name="ln1043">  struct list *funclist;</a>
+<a name="ln1044"> </a>
+<a name="ln1045">  funclist = ospf_opaque_wildcard_funclist;</a>
+<a name="ln1046">  opaque_lsa_ism_change_callback (funclist, oi, old_status);</a>
+<a name="ln1047"> </a>
+<a name="ln1048">  funclist = ospf_opaque_type9_funclist;</a>
+<a name="ln1049">  opaque_lsa_ism_change_callback (funclist, oi, old_status);</a>
+<a name="ln1050"> </a>
+<a name="ln1051">  funclist = ospf_opaque_type10_funclist;</a>
+<a name="ln1052">  opaque_lsa_ism_change_callback (funclist, oi, old_status);</a>
+<a name="ln1053"> </a>
+<a name="ln1054">  funclist = ospf_opaque_type11_funclist;</a>
+<a name="ln1055">  opaque_lsa_ism_change_callback (funclist, oi, old_status);</a>
+<a name="ln1056"> </a>
+<a name="ln1057">  return;</a>
+<a name="ln1058">}</a>
+<a name="ln1059"> </a>
+<a name="ln1060">void</a>
+<a name="ln1061">ospf_opaque_nsm_change (struct ospf_neighbor *nbr, int old_state)</a>
+<a name="ln1062">{</a>
+<a name="ln1063">  struct ospf *top;</a>
+<a name="ln1064">  struct list *funclist;</a>
+<a name="ln1065"> </a>
+<a name="ln1066">  if ((top = oi_to_top (nbr-&gt;oi)) == NULL)</a>
+<a name="ln1067">    goto out;</a>
+<a name="ln1068"> </a>
+<a name="ln1069">  if (old_state != NSM_Full &amp;&amp; nbr-&gt;state == NSM_Full)</a>
+<a name="ln1070">    {</a>
+<a name="ln1071">      if (CHECK_FLAG (nbr-&gt;options, OSPF_OPTION_O))</a>
+<a name="ln1072">        {</a>
+<a name="ln1073">          if (! CHECK_FLAG (top-&gt;opaque, OPAQUE_OPERATION_READY_BIT))</a>
+<a name="ln1074">            {</a>
+<a name="ln1075">              if (IS_DEBUG_OSPF_EVENT)</a>
+<a name="ln1076">                zlog_debug (&quot;Opaque-LSA: Now get operational!&quot;);</a>
+<a name="ln1077"> </a>
+<a name="ln1078">              SET_FLAG (top-&gt;opaque, OPAQUE_OPERATION_READY_BIT);</a>
+<a name="ln1079">            }</a>
+<a name="ln1080"> </a>
+<a name="ln1081">          ospf_opaque_lsa_originate_schedule (nbr-&gt;oi, NULL);</a>
+<a name="ln1082">        }</a>
+<a name="ln1083">    }</a>
+<a name="ln1084">  else</a>
+<a name="ln1085">  if (old_state == NSM_Full &amp;&amp; nbr-&gt;state != NSM_Full)</a>
+<a name="ln1086">    {</a>
+<a name="ln1087">#ifdef NOTYET</a>
+<a name="ln1088">      /*</a>
+<a name="ln1089">       * If no more opaque-capable full-state neighbor remains in the</a>
+<a name="ln1090">       * flooding scope which corresponds to Opaque-LSA type, periodic</a>
+<a name="ln1091">       * LS flooding should be stopped.</a>
+<a name="ln1092">       */</a>
+<a name="ln1093">#endif /* NOTYET */</a>
+<a name="ln1094">      ;</a>
+<a name="ln1095">    }</a>
+<a name="ln1096"> </a>
+<a name="ln1097">  funclist = ospf_opaque_wildcard_funclist;</a>
+<a name="ln1098">  opaque_lsa_nsm_change_callback (funclist, nbr, old_state);</a>
+<a name="ln1099"> </a>
+<a name="ln1100">  funclist = ospf_opaque_type9_funclist;</a>
+<a name="ln1101">  opaque_lsa_nsm_change_callback (funclist, nbr, old_state);</a>
+<a name="ln1102"> </a>
+<a name="ln1103">  funclist = ospf_opaque_type10_funclist;</a>
+<a name="ln1104">  opaque_lsa_nsm_change_callback (funclist, nbr, old_state);</a>
+<a name="ln1105"> </a>
+<a name="ln1106">  funclist = ospf_opaque_type11_funclist;</a>
+<a name="ln1107">  opaque_lsa_nsm_change_callback (funclist, nbr, old_state);</a>
+<a name="ln1108"> </a>
+<a name="ln1109">out:</a>
+<a name="ln1110">  return;</a>
+<a name="ln1111">}</a>
+<a name="ln1112"> </a>
+<a name="ln1113">void</a>
+<a name="ln1114">ospf_opaque_config_write_router (struct vty *vty, struct ospf *ospf)</a>
+<a name="ln1115">{</a>
+<a name="ln1116">  struct list *funclist;</a>
+<a name="ln1117"> </a>
+<a name="ln1118">  if (CHECK_FLAG (ospf-&gt;config, OSPF_OPAQUE_CAPABLE))</a>
+<a name="ln1119">    vty_out (vty, &quot; capability opaque%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1120"> </a>
+<a name="ln1121">  funclist = ospf_opaque_wildcard_funclist;</a>
+<a name="ln1122">  opaque_lsa_config_write_router_callback (funclist, vty);</a>
+<a name="ln1123"> </a>
+<a name="ln1124">  funclist = ospf_opaque_type9_funclist;</a>
+<a name="ln1125">  opaque_lsa_config_write_router_callback (funclist, vty);</a>
+<a name="ln1126"> </a>
+<a name="ln1127">  funclist = ospf_opaque_type10_funclist;</a>
+<a name="ln1128">  opaque_lsa_config_write_router_callback (funclist, vty);</a>
+<a name="ln1129"> </a>
+<a name="ln1130">  funclist = ospf_opaque_type11_funclist;</a>
+<a name="ln1131">  opaque_lsa_config_write_router_callback (funclist, vty);</a>
+<a name="ln1132"> </a>
+<a name="ln1133">  return;</a>
+<a name="ln1134">}</a>
+<a name="ln1135"> </a>
+<a name="ln1136">void</a>
+<a name="ln1137">ospf_opaque_config_write_if (struct vty *vty, struct interface *ifp)</a>
+<a name="ln1138">{</a>
+<a name="ln1139">  struct list *funclist;</a>
+<a name="ln1140"> </a>
+<a name="ln1141">  funclist = ospf_opaque_wildcard_funclist;</a>
+<a name="ln1142">  opaque_lsa_config_write_if_callback (funclist, vty, ifp);</a>
+<a name="ln1143"> </a>
+<a name="ln1144">  funclist = ospf_opaque_type9_funclist;</a>
+<a name="ln1145">  opaque_lsa_config_write_if_callback (funclist, vty, ifp);</a>
+<a name="ln1146"> </a>
+<a name="ln1147">  funclist = ospf_opaque_type10_funclist;</a>
+<a name="ln1148">  opaque_lsa_config_write_if_callback (funclist, vty, ifp);</a>
+<a name="ln1149"> </a>
+<a name="ln1150">  funclist = ospf_opaque_type11_funclist;</a>
+<a name="ln1151">  opaque_lsa_config_write_if_callback (funclist, vty, ifp);</a>
+<a name="ln1152"> </a>
+<a name="ln1153">  return;</a>
+<a name="ln1154">}</a>
+<a name="ln1155"> </a>
+<a name="ln1156">void</a>
+<a name="ln1157">ospf_opaque_config_write_debug (struct vty *vty)</a>
+<a name="ln1158">{</a>
+<a name="ln1159">  struct list *funclist;</a>
+<a name="ln1160"> </a>
+<a name="ln1161">  funclist = ospf_opaque_wildcard_funclist;</a>
+<a name="ln1162">  opaque_lsa_config_write_debug_callback (funclist, vty);</a>
+<a name="ln1163"> </a>
+<a name="ln1164">  funclist = ospf_opaque_type9_funclist;</a>
+<a name="ln1165">  opaque_lsa_config_write_debug_callback (funclist, vty);</a>
+<a name="ln1166"> </a>
+<a name="ln1167">  funclist = ospf_opaque_type10_funclist;</a>
+<a name="ln1168">  opaque_lsa_config_write_debug_callback (funclist, vty);</a>
+<a name="ln1169"> </a>
+<a name="ln1170">  funclist = ospf_opaque_type11_funclist;</a>
+<a name="ln1171">  opaque_lsa_config_write_debug_callback (funclist, vty);</a>
+<a name="ln1172"> </a>
+<a name="ln1173">  return;</a>
+<a name="ln1174">}</a>
+<a name="ln1175"> </a>
+<a name="ln1176">void</a>
+<a name="ln1177">show_opaque_info_detail (struct vty *vty, struct ospf_lsa *lsa)</a>
+<a name="ln1178">{</a>
+<a name="ln1179">  struct lsa_header *lsah = (struct lsa_header *) lsa-&gt;data;</a>
+<a name="ln1180">  u_int32_t lsid = ntohl (lsah-&gt;id.s_addr);</a>
+<a name="ln1181">  u_char    opaque_type = GET_OPAQUE_TYPE (lsid);</a>
+<a name="ln1182">  u_int32_t opaque_id = GET_OPAQUE_ID (lsid);</a>
+<a name="ln1183">  struct ospf_opaque_functab *functab;</a>
+<a name="ln1184"> </a>
+<a name="ln1185">  /* Switch output functionality by vty address. */</a>
+<a name="ln1186">  if (vty != NULL)</a>
+<a name="ln1187">    {</a>
+<a name="ln1188">      vty_out (vty, &quot;  Opaque-Type %u (%s)%s&quot;, opaque_type,</a>
+<a name="ln1189">	       ospf_opaque_type_name (opaque_type), VTY_NEWLINE);</a>
+<a name="ln1190">      vty_out (vty, &quot;  Opaque-ID   0x%x%s&quot;, opaque_id, VTY_NEWLINE);</a>
+<a name="ln1191"> </a>
+<a name="ln1192">      vty_out (vty, &quot;  Opaque-Info: %u octets of data%s%s&quot;,</a>
+<a name="ln1193">               ntohs (lsah-&gt;length) - OSPF_LSA_HEADER_SIZE,</a>
+<a name="ln1194">               VALID_OPAQUE_INFO_LEN(lsah) ? &quot;&quot; : &quot;(Invalid length?)&quot;,</a>
+<a name="ln1195">               VTY_NEWLINE);</a>
+<a name="ln1196">    }</a>
+<a name="ln1197">  else</a>
+<a name="ln1198">    {</a>
+<a name="ln1199">      zlog_debug (&quot;    Opaque-Type %u (%s)&quot;, opaque_type,</a>
+<a name="ln1200">		 ospf_opaque_type_name (opaque_type));</a>
+<a name="ln1201">      zlog_debug (&quot;    Opaque-ID   0x%x&quot;, opaque_id);</a>
+<a name="ln1202"> </a>
+<a name="ln1203">      zlog_debug (&quot;    Opaque-Info: %u octets of data%s&quot;,</a>
+<a name="ln1204">               ntohs (lsah-&gt;length) - OSPF_LSA_HEADER_SIZE,</a>
+<a name="ln1205">               VALID_OPAQUE_INFO_LEN(lsah) ? &quot;&quot; : &quot;(Invalid length?)&quot;);</a>
+<a name="ln1206">    }</a>
+<a name="ln1207"> </a>
+<a name="ln1208">  /* Call individual output functions. */</a>
+<a name="ln1209">  if ((functab = ospf_opaque_functab_lookup (lsa)) != NULL)</a>
+<a name="ln1210">    if (functab-&gt;show_opaque_info != NULL)</a>
+<a name="ln1211">      (* functab-&gt;show_opaque_info)(vty, lsa);</a>
+<a name="ln1212"> </a>
+<a name="ln1213">  return;</a>
+<a name="ln1214">}</a>
+<a name="ln1215"> </a>
+<a name="ln1216">void</a>
+<a name="ln1217">ospf_opaque_lsa_dump (struct stream *s, u_int16_t length)</a>
+<a name="ln1218">{</a>
+<a name="ln1219">  struct ospf_lsa lsa;</a>
+<a name="ln1220"> </a>
+<a name="ln1221">  lsa.data = (struct lsa_header *) STREAM_PNT (s);</a>
+<a name="ln1222">  show_opaque_info_detail (NULL, &amp;lsa);</a>
+<a name="ln1223">  return;</a>
+<a name="ln1224">}</a>
+<a name="ln1225"> </a>
+<a name="ln1226">static int</a>
+<a name="ln1227">ospf_opaque_lsa_install_hook (struct ospf_lsa *lsa)</a>
+<a name="ln1228">{</a>
+<a name="ln1229">  struct list *funclist;</a>
+<a name="ln1230">  int rc = -1;</a>
+<a name="ln1231"> </a>
+<a name="ln1232">  /*</a>
+<a name="ln1233">   * Some Opaque-LSA user may want to monitor every LSA installation</a>
+<a name="ln1234">   * into the LSDB, regardless with target LSA type.</a>
+<a name="ln1235">   */</a>
+<a name="ln1236">  funclist = ospf_opaque_wildcard_funclist;</a>
+<a name="ln1237">  if (new_lsa_callback (funclist, lsa) != 0)</a>
+<a name="ln1238">    goto out;</a>
+<a name="ln1239"> </a>
+<a name="ln1240">  funclist = ospf_opaque_type9_funclist;</a>
+<a name="ln1241">  if (new_lsa_callback (funclist, lsa) != 0)</a>
+<a name="ln1242">    goto out;</a>
+<a name="ln1243"> </a>
+<a name="ln1244">  funclist = ospf_opaque_type10_funclist;</a>
+<a name="ln1245">  if (new_lsa_callback (funclist, lsa) != 0)</a>
+<a name="ln1246">    goto out;</a>
+<a name="ln1247"> </a>
+<a name="ln1248">  funclist = ospf_opaque_type11_funclist;</a>
+<a name="ln1249">  if (new_lsa_callback (funclist, lsa) != 0)</a>
+<a name="ln1250">    goto out;</a>
+<a name="ln1251"> </a>
+<a name="ln1252">  rc = 0;</a>
+<a name="ln1253">out:</a>
+<a name="ln1254">  return rc;</a>
+<a name="ln1255">}</a>
+<a name="ln1256"> </a>
+<a name="ln1257">static int</a>
+<a name="ln1258">ospf_opaque_lsa_delete_hook (struct ospf_lsa *lsa)</a>
+<a name="ln1259">{</a>
+<a name="ln1260">  struct list *funclist;</a>
+<a name="ln1261">  int rc = -1;</a>
+<a name="ln1262"> </a>
+<a name="ln1263">  /*</a>
+<a name="ln1264">   * Some Opaque-LSA user may want to monitor every LSA deletion</a>
+<a name="ln1265">   * from the LSDB, regardless with target LSA type.</a>
+<a name="ln1266">   */</a>
+<a name="ln1267">  funclist = ospf_opaque_wildcard_funclist;</a>
+<a name="ln1268">  if (del_lsa_callback (funclist, lsa) != 0)</a>
+<a name="ln1269">    goto out;</a>
+<a name="ln1270"> </a>
+<a name="ln1271">  funclist = ospf_opaque_type9_funclist;</a>
+<a name="ln1272">  if (del_lsa_callback (funclist, lsa) != 0)</a>
+<a name="ln1273">    goto out;</a>
+<a name="ln1274"> </a>
+<a name="ln1275">  funclist = ospf_opaque_type10_funclist;</a>
+<a name="ln1276">  if (del_lsa_callback (funclist, lsa) != 0)</a>
+<a name="ln1277">    goto out;</a>
+<a name="ln1278"> </a>
+<a name="ln1279">  funclist = ospf_opaque_type11_funclist;</a>
+<a name="ln1280">  if (del_lsa_callback (funclist, lsa) != 0)</a>
+<a name="ln1281">    goto out;</a>
+<a name="ln1282"> </a>
+<a name="ln1283">  rc = 0;</a>
+<a name="ln1284">out:</a>
+<a name="ln1285">  return rc;</a>
+<a name="ln1286">}</a>
+<a name="ln1287"> </a>
+<a name="ln1288">/*------------------------------------------------------------------------*</a>
+<a name="ln1289"> * Followings are Opaque-LSA origination/refresh management functions.</a>
+<a name="ln1290"> *------------------------------------------------------------------------*/</a>
+<a name="ln1291"> </a>
+<a name="ln1292">static int ospf_opaque_type9_lsa_originate (struct thread *t);</a>
+<a name="ln1293">static int ospf_opaque_type10_lsa_originate (struct thread *t);</a>
+<a name="ln1294">static int ospf_opaque_type11_lsa_originate (struct thread *t);</a>
+<a name="ln1295">static void ospf_opaque_lsa_reoriginate_resume (struct list *listtop, void *arg);</a>
+<a name="ln1296"> </a>
+<a name="ln1297">void</a>
+<a name="ln1298">ospf_opaque_lsa_originate_schedule (struct ospf_interface *oi, int *delay0)</a>
+<a name="ln1299">{</a>
+<a name="ln1300">  struct ospf *top;</a>
+<a name="ln1301">  struct ospf_area *area;</a>
+<a name="ln1302">  struct listnode *node, *nnode;</a>
+<a name="ln1303">  struct opaque_info_per_type *oipt;</a>
+<a name="ln1304">  int delay = 0;</a>
+<a name="ln1305"> </a>
+<a name="ln1306">  if ((top = oi_to_top (oi)) == NULL || (area = oi-&gt;area) == NULL)</a>
+<a name="ln1307">    {</a>
+<a name="ln1308">      zlog_warn (&quot;ospf_opaque_lsa_originate_schedule: Invalid argument?&quot;);</a>
+<a name="ln1309">      goto out;</a>
+<a name="ln1310">    }</a>
+<a name="ln1311"> </a>
+<a name="ln1312">  /* It may not a right time to schedule origination now. */</a>
+<a name="ln1313">  if (! CHECK_FLAG (top-&gt;opaque, OPAQUE_OPERATION_READY_BIT))</a>
+<a name="ln1314">    {</a>
+<a name="ln1315">      if (IS_DEBUG_OSPF_EVENT)</a>
+<a name="ln1316">        zlog_debug (&quot;ospf_opaque_lsa_originate_schedule: Not operational.&quot;);</a>
+<a name="ln1317">      goto out; /* This is not an error. */</a>
+<a name="ln1318">    }</a>
+<a name="ln1319">  </a>
+<a name="ln1320">  if (delay0 != NULL)</a>
+<a name="ln1321">    delay = *delay0;</a>
+<a name="ln1322"> </a>
+<a name="ln1323">  /*</a>
+<a name="ln1324">   * There might be some entries that have been waiting for triggering</a>
+<a name="ln1325">   * of per opaque-type re-origination get resumed.</a>
+<a name="ln1326">   */</a>
+<a name="ln1327">  ospf_opaque_lsa_reoriginate_resume (  oi-&gt;opaque_lsa_self, (void *)   oi);</a>
+<a name="ln1328">  ospf_opaque_lsa_reoriginate_resume (area-&gt;opaque_lsa_self, (void *) area);</a>
+<a name="ln1329">  ospf_opaque_lsa_reoriginate_resume ( top-&gt;opaque_lsa_self, (void *)  top);</a>
+<a name="ln1330"> </a>
+<a name="ln1331">  /*</a>
+<a name="ln1332">   * Now, schedule origination of all Opaque-LSAs per opaque-type.</a>
+<a name="ln1333">   */</a>
+<a name="ln1334">  if (! list_isempty (ospf_opaque_type9_funclist)</a>
+<a name="ln1335">  &amp;&amp;    list_isempty (oi-&gt;opaque_lsa_self)</a>
+<a name="ln1336">  &amp;&amp;    oi-&gt;t_opaque_lsa_self == NULL)</a>
+<a name="ln1337">    {</a>
+<a name="ln1338">      if (IS_DEBUG_OSPF_EVENT)</a>
+<a name="ln1339">        zlog_debug (&quot;Schedule Type-9 Opaque-LSA origination in %d ms later.&quot;, delay);</a>
+<a name="ln1340">      oi-&gt;t_opaque_lsa_self =</a>
+<a name="ln1341">	thread_add_timer_msec (master, ospf_opaque_type9_lsa_originate, oi, delay);</a>
+<a name="ln1342">      delay += top-&gt;min_ls_interval;</a>
+<a name="ln1343">    }</a>
+<a name="ln1344"> </a>
+<a name="ln1345">  if (! list_isempty (ospf_opaque_type10_funclist)</a>
+<a name="ln1346">  &amp;&amp;    list_isempty (area-&gt;opaque_lsa_self)</a>
+<a name="ln1347">  &amp;&amp;    area-&gt;t_opaque_lsa_self == NULL)</a>
+<a name="ln1348">    {</a>
+<a name="ln1349">      /*</a>
+<a name="ln1350">       * One AREA may contain multiple OIs, but above 2nd and 3rd</a>
+<a name="ln1351">       * conditions prevent from scheduling the originate function</a>
+<a name="ln1352">       * again and again.</a>
+<a name="ln1353">       */</a>
+<a name="ln1354">      if (IS_DEBUG_OSPF_EVENT)</a>
+<a name="ln1355">        zlog_debug (&quot;Schedule Type-10 Opaque-LSA origination in %d ms later.&quot;, delay);</a>
+<a name="ln1356">      area-&gt;t_opaque_lsa_self =</a>
+<a name="ln1357">        thread_add_timer_msec (master, ospf_opaque_type10_lsa_originate,</a>
+<a name="ln1358">                          area, delay);</a>
+<a name="ln1359">      delay += top-&gt;min_ls_interval;</a>
+<a name="ln1360">    }</a>
+<a name="ln1361"> </a>
+<a name="ln1362">  if (! list_isempty (ospf_opaque_type11_funclist)</a>
+<a name="ln1363">  &amp;&amp;    list_isempty (top-&gt;opaque_lsa_self)</a>
+<a name="ln1364">  &amp;&amp;    top-&gt;t_opaque_lsa_self == NULL)</a>
+<a name="ln1365">    {</a>
+<a name="ln1366">      /*</a>
+<a name="ln1367">       * One OSPF may contain multiple AREAs, but above 2nd and 3rd</a>
+<a name="ln1368">       * conditions prevent from scheduling the originate function</a>
+<a name="ln1369">       * again and again.</a>
+<a name="ln1370">       */</a>
+<a name="ln1371">      if (IS_DEBUG_OSPF_EVENT)</a>
+<a name="ln1372">        zlog_debug (&quot;Schedule Type-11 Opaque-LSA origination in %d ms later.&quot;, delay);</a>
+<a name="ln1373">      top-&gt;t_opaque_lsa_self =</a>
+<a name="ln1374">        thread_add_timer_msec (master, ospf_opaque_type11_lsa_originate,</a>
+<a name="ln1375">                          top, delay);</a>
+<a name="ln1376">      delay += top-&gt;min_ls_interval;</a>
+<a name="ln1377">    }</a>
+<a name="ln1378"> </a>
+<a name="ln1379">  /*</a>
+<a name="ln1380">   * Following section treats a special situation that this node's</a>
+<a name="ln1381">   * opaque capability has changed as &quot;ON -&gt; OFF -&gt; ON&quot;.</a>
+<a name="ln1382">   */</a>
+<a name="ln1383">  if (! list_isempty (ospf_opaque_type9_funclist)</a>
+<a name="ln1384">  &amp;&amp;  ! list_isempty (oi-&gt;opaque_lsa_self))</a>
+<a name="ln1385">    {</a>
+<a name="ln1386">      for (ALL_LIST_ELEMENTS (oi-&gt;opaque_lsa_self, node, nnode, oipt))</a>
+<a name="ln1387">        {</a>
+<a name="ln1388">	  /* </a>
+<a name="ln1389">	   * removed the test for</a>
+<a name="ln1390">	   *   (! list_isempty (oipt-&gt;id_list))   * Handler is already active. *</a>
+<a name="ln1391">           * because opaque cababilities ON -&gt; OFF -&gt; ON result in list_isempty (oipt-&gt;id_list)</a>
+<a name="ln1392">	   * not being empty.</a>
+<a name="ln1393">	   */</a>
+<a name="ln1394">          if (oipt-&gt;t_opaque_lsa_self != NULL /* Waiting for a thread call. */</a>
+<a name="ln1395">              || oipt-&gt;status == PROC_SUSPEND)   /* Cannot originate now. */</a>
+<a name="ln1396">              continue;</a>
+<a name="ln1397"> </a>
+<a name="ln1398">          ospf_opaque_lsa_reoriginate_schedule ((void *) oi,</a>
+<a name="ln1399">            OSPF_OPAQUE_LINK_LSA, oipt-&gt;opaque_type);</a>
+<a name="ln1400">        }</a>
+<a name="ln1401">    }</a>
+<a name="ln1402"> </a>
+<a name="ln1403">  if (! list_isempty (ospf_opaque_type10_funclist)</a>
+<a name="ln1404">  &amp;&amp;  ! list_isempty (area-&gt;opaque_lsa_self))</a>
+<a name="ln1405">    {</a>
+<a name="ln1406">      for (ALL_LIST_ELEMENTS (area-&gt;opaque_lsa_self, node, nnode, oipt))</a>
+<a name="ln1407">        {</a>
+<a name="ln1408">	  /* </a>
+<a name="ln1409">	   * removed the test for</a>
+<a name="ln1410">	   *   (! list_isempty (oipt-&gt;id_list))   * Handler is already active. *</a>
+<a name="ln1411">           * because opaque cababilities ON -&gt; OFF -&gt; ON result in list_isempty (oipt-&gt;id_list)</a>
+<a name="ln1412">	   * not being empty.</a>
+<a name="ln1413">	   */</a>
+<a name="ln1414">          if (oipt-&gt;t_opaque_lsa_self != NULL /* Waiting for a thread call. */</a>
+<a name="ln1415">              || oipt-&gt;status == PROC_SUSPEND)   /* Cannot originate now. */</a>
+<a name="ln1416">            continue;</a>
+<a name="ln1417"> </a>
+<a name="ln1418">          ospf_opaque_lsa_reoriginate_schedule ((void *) area,</a>
+<a name="ln1419">            OSPF_OPAQUE_AREA_LSA, oipt-&gt;opaque_type);</a>
+<a name="ln1420">        }</a>
+<a name="ln1421">    }</a>
+<a name="ln1422"> </a>
+<a name="ln1423">  if (! list_isempty (ospf_opaque_type11_funclist)</a>
+<a name="ln1424">  &amp;&amp;  ! list_isempty (top-&gt;opaque_lsa_self))</a>
+<a name="ln1425">    {</a>
+<a name="ln1426">      for (ALL_LIST_ELEMENTS (top-&gt;opaque_lsa_self, node, nnode, oipt))</a>
+<a name="ln1427">        {</a>
+<a name="ln1428">	  /* </a>
+<a name="ln1429">	   * removed the test for</a>
+<a name="ln1430">	   *   (! list_isempty (oipt-&gt;id_list))   * Handler is already active. *</a>
+<a name="ln1431">           * because opaque cababilities ON -&gt; OFF -&gt; ON result in list_isempty (oipt-&gt;id_list)</a>
+<a name="ln1432">	   * not being empty.</a>
+<a name="ln1433">	   */</a>
+<a name="ln1434">          if (oipt-&gt;t_opaque_lsa_self != NULL /* Waiting for a thread call. */</a>
+<a name="ln1435">              || oipt-&gt;status == PROC_SUSPEND)   /* Cannot originate now. */</a>
+<a name="ln1436">            continue;</a>
+<a name="ln1437"> </a>
+<a name="ln1438">          ospf_opaque_lsa_reoriginate_schedule ((void *) top,</a>
+<a name="ln1439">            OSPF_OPAQUE_AS_LSA, oipt-&gt;opaque_type);</a>
+<a name="ln1440">        }</a>
+<a name="ln1441">    }</a>
+<a name="ln1442"> </a>
+<a name="ln1443">  if (delay0 != NULL)</a>
+<a name="ln1444">    *delay0 = delay;</a>
+<a name="ln1445"> </a>
+<a name="ln1446">out:</a>
+<a name="ln1447">  return;</a>
+<a name="ln1448">}</a>
+<a name="ln1449"> </a>
+<a name="ln1450">static int</a>
+<a name="ln1451">ospf_opaque_type9_lsa_originate (struct thread *t)</a>
+<a name="ln1452">{</a>
+<a name="ln1453">  struct ospf_interface *oi;</a>
+<a name="ln1454">  int rc;</a>
+<a name="ln1455"> </a>
+<a name="ln1456">  oi = THREAD_ARG (t);</a>
+<a name="ln1457">  oi-&gt;t_opaque_lsa_self = NULL;</a>
+<a name="ln1458"> </a>
+<a name="ln1459">  if (IS_DEBUG_OSPF_EVENT)</a>
+<a name="ln1460">    zlog_debug (&quot;Timer[Type9-LSA]: Originate Opaque-LSAs for OI %s&quot;,</a>
+<a name="ln1461">                IF_NAME (oi));</a>
+<a name="ln1462"> </a>
+<a name="ln1463">  rc = opaque_lsa_originate_callback (ospf_opaque_type9_funclist, oi);</a>
+<a name="ln1464"> </a>
+<a name="ln1465">  return rc;</a>
+<a name="ln1466">}</a>
+<a name="ln1467"> </a>
+<a name="ln1468">static int</a>
+<a name="ln1469">ospf_opaque_type10_lsa_originate (struct thread *t)</a>
+<a name="ln1470">{</a>
+<a name="ln1471">  struct ospf_area *area;</a>
+<a name="ln1472">  int rc;</a>
+<a name="ln1473"> </a>
+<a name="ln1474">  area = THREAD_ARG (t);</a>
+<a name="ln1475">  area-&gt;t_opaque_lsa_self = NULL;</a>
+<a name="ln1476"> </a>
+<a name="ln1477">  if (IS_DEBUG_OSPF_EVENT)</a>
+<a name="ln1478">    zlog_debug (&quot;Timer[Type10-LSA]: Originate Opaque-LSAs for Area %s&quot;,</a>
+<a name="ln1479">                inet_ntoa (area-&gt;area_id));</a>
+<a name="ln1480"> </a>
+<a name="ln1481">  rc = opaque_lsa_originate_callback (ospf_opaque_type10_funclist, area);</a>
+<a name="ln1482"> </a>
+<a name="ln1483">  return rc;</a>
+<a name="ln1484">}</a>
+<a name="ln1485"> </a>
+<a name="ln1486">static int</a>
+<a name="ln1487">ospf_opaque_type11_lsa_originate (struct thread *t)</a>
+<a name="ln1488">{</a>
+<a name="ln1489">  struct ospf *top;</a>
+<a name="ln1490">  int rc;</a>
+<a name="ln1491"> </a>
+<a name="ln1492">  top = THREAD_ARG (t);</a>
+<a name="ln1493">  top-&gt;t_opaque_lsa_self = NULL;</a>
+<a name="ln1494"> </a>
+<a name="ln1495">  if (IS_DEBUG_OSPF_EVENT)</a>
+<a name="ln1496">    zlog_debug (&quot;Timer[Type11-LSA]: Originate AS-External Opaque-LSAs&quot;);</a>
+<a name="ln1497"> </a>
+<a name="ln1498">  rc = opaque_lsa_originate_callback (ospf_opaque_type11_funclist, top);</a>
+<a name="ln1499"> </a>
+<a name="ln1500">  return rc;</a>
+<a name="ln1501">}</a>
+<a name="ln1502"> </a>
+<a name="ln1503">static void</a>
+<a name="ln1504">ospf_opaque_lsa_reoriginate_resume (struct list *listtop, void *arg)</a>
+<a name="ln1505">{</a>
+<a name="ln1506">  struct listnode *node, *nnode;</a>
+<a name="ln1507">  struct opaque_info_per_type *oipt;</a>
+<a name="ln1508">  struct ospf_opaque_functab *functab;</a>
+<a name="ln1509"> </a>
+<a name="ln1510">  if (listtop == NULL)</a>
+<a name="ln1511">    goto out;</a>
+<a name="ln1512"> </a>
+<a name="ln1513">  /*</a>
+<a name="ln1514">   * Pickup oipt entries those which in SUSPEND status, and give</a>
+<a name="ln1515">   * them a chance to start re-origination now.</a>
+<a name="ln1516">   */</a>
+<a name="ln1517">  for (ALL_LIST_ELEMENTS (listtop, node, nnode, oipt))</a>
+<a name="ln1518">    {</a>
+<a name="ln1519">      if (oipt-&gt;status != PROC_SUSPEND)</a>
+<a name="ln1520">          continue;</a>
+<a name="ln1521"> </a>
+<a name="ln1522">      oipt-&gt;status = PROC_NORMAL;</a>
+<a name="ln1523"> </a>
+<a name="ln1524">      if ((functab = oipt-&gt;functab) == NULL</a>
+<a name="ln1525">          || functab-&gt;lsa_originator  == NULL)</a>
+<a name="ln1526">        continue;</a>
+<a name="ln1527"> </a>
+<a name="ln1528">      if ((* functab-&gt;lsa_originator)(arg) != 0)</a>
+<a name="ln1529">        {</a>
+<a name="ln1530">          zlog_warn (&quot;ospf_opaque_lsa_reoriginate_resume: Failed (opaque-type=%u)&quot;, oipt-&gt;opaque_type);</a>
+<a name="ln1531">          continue;</a>
+<a name="ln1532">        }</a>
+<a name="ln1533">    }</a>
+<a name="ln1534"> </a>
+<a name="ln1535">out:</a>
+<a name="ln1536">  return;</a>
+<a name="ln1537">}</a>
+<a name="ln1538"> </a>
+<a name="ln1539">struct ospf_lsa *</a>
+<a name="ln1540">ospf_opaque_lsa_install (struct ospf_lsa *lsa, int rt_recalc)</a>
+<a name="ln1541">{</a>
+<a name="ln1542">  struct ospf_lsa *new = NULL;</a>
+<a name="ln1543">  struct opaque_info_per_type *oipt;</a>
+<a name="ln1544">  struct opaque_info_per_id *oipi;</a>
+<a name="ln1545">  struct ospf *top;</a>
+<a name="ln1546"> </a>
+<a name="ln1547">  /* Don't take &quot;rt_recalc&quot; into consideration for now. *//* XXX */</a>
+<a name="ln1548"> </a>
+<a name="ln1549">  if (! IS_LSA_SELF (lsa))</a>
+<a name="ln1550">    {</a>
+<a name="ln1551">      new = lsa; /* Don't touch this LSA. */</a>
+<a name="ln1552">      goto out;</a>
+<a name="ln1553">    }</a>
+<a name="ln1554"> </a>
+<a name="ln1555">  if (IS_DEBUG_OSPF (lsa, LSA_INSTALL))</a>
+<a name="ln1556">    zlog_debug (&quot;Install Type-%u Opaque-LSA: [opaque-type=%u, opaque-id=%x]&quot;, lsa-&gt;data-&gt;type, GET_OPAQUE_TYPE (ntohl (lsa-&gt;data-&gt;id.s_addr)), GET_OPAQUE_ID (ntohl (lsa-&gt;data-&gt;id.s_addr)));</a>
+<a name="ln1557"> </a>
+<a name="ln1558">  /* Replace the existing lsa with the new one. */</a>
+<a name="ln1559">  if ((oipt = lookup_opaque_info_by_type (lsa)) != NULL</a>
+<a name="ln1560">      &amp;&amp; (oipi = lookup_opaque_info_by_id (oipt, lsa)) != NULL)</a>
+<a name="ln1561">    {</a>
+<a name="ln1562">      ospf_lsa_unlock (&amp;oipi-&gt;lsa);</a>
+<a name="ln1563">      oipi-&gt;lsa = ospf_lsa_lock (lsa);</a>
+<a name="ln1564">    }</a>
+<a name="ln1565">  /* Register the new lsa entry and get its control info. */</a>
+<a name="ln1566">  else</a>
+<a name="ln1567">  if ((oipi = register_opaque_lsa (lsa)) == NULL)</a>
+<a name="ln1568">    {</a>
+<a name="ln1569">      zlog_warn (&quot;ospf_opaque_lsa_install: register_opaque_lsa() ?&quot;);</a>
+<a name="ln1570">      goto out;</a>
+<a name="ln1571">    }</a>
+<a name="ln1572"> </a>
+<a name="ln1573">  /*</a>
+<a name="ln1574">   * Make use of a common mechanism (ospf_lsa_refresh_walker)</a>
+<a name="ln1575">   * for periodic refresh of self-originated Opaque-LSAs.</a>
+<a name="ln1576">   */</a>
+<a name="ln1577">  switch (lsa-&gt;data-&gt;type)</a>
+<a name="ln1578">    {</a>
+<a name="ln1579">    case OSPF_OPAQUE_LINK_LSA:</a>
+<a name="ln1580">      if ((top = oi_to_top (lsa-&gt;oi)) == NULL)</a>
+<a name="ln1581">        {</a>
+<a name="ln1582">          /* Above conditions must have passed. */</a>
+<a name="ln1583">          zlog_warn (&quot;ospf_opaque_lsa_install: Sonmething wrong?&quot;);</a>
+<a name="ln1584">          goto out;</a>
+<a name="ln1585">        }</a>
+<a name="ln1586">      break;</a>
+<a name="ln1587">    case OSPF_OPAQUE_AREA_LSA:</a>
+<a name="ln1588">      if (lsa-&gt;area == NULL || (top = lsa-&gt;area-&gt;ospf) == NULL)</a>
+<a name="ln1589">        {</a>
+<a name="ln1590">          /* Above conditions must have passed. */</a>
+<a name="ln1591">          zlog_warn (&quot;ospf_opaque_lsa_install: Sonmething wrong?&quot;);</a>
+<a name="ln1592">          goto out;</a>
+<a name="ln1593">        }</a>
+<a name="ln1594">      break;</a>
+<a name="ln1595">    case OSPF_OPAQUE_AS_LSA:</a>
+<a name="ln1596">      top = ospf_lookup ();</a>
+<a name="ln1597">      if (lsa-&gt;area != NULL &amp;&amp; (top = lsa-&gt;area-&gt;ospf) == NULL)</a>
+<a name="ln1598">        {</a>
+<a name="ln1599">          /* Above conditions must have passed. */</a>
+<a name="ln1600">          zlog_warn (&quot;ospf_opaque_lsa_install: Sonmething wrong?&quot;);</a>
+<a name="ln1601">          goto out;</a>
+<a name="ln1602">        }</a>
+<a name="ln1603">      break;</a>
+<a name="ln1604">    default:</a>
+<a name="ln1605">      zlog_warn (&quot;ospf_opaque_lsa_install: Unexpected LSA-type(%u)&quot;, lsa-&gt;data-&gt;type);</a>
+<a name="ln1606">      goto out;</a>
+<a name="ln1607">    }</a>
+<a name="ln1608"> </a>
+<a name="ln1609">  ospf_refresher_register_lsa (top, lsa);</a>
+<a name="ln1610">  new = lsa;</a>
+<a name="ln1611"> </a>
+<a name="ln1612">out:</a>
+<a name="ln1613">  return new;</a>
+<a name="ln1614">}</a>
+<a name="ln1615"> </a>
+<a name="ln1616">struct ospf_lsa *</a>
+<a name="ln1617">ospf_opaque_lsa_refresh (struct ospf_lsa *lsa)</a>
+<a name="ln1618">{</a>
+<a name="ln1619">  struct ospf *ospf;</a>
+<a name="ln1620">  struct ospf_opaque_functab *functab;</a>
+<a name="ln1621">  struct ospf_lsa *new = NULL;</a>
+<a name="ln1622">  </a>
+<a name="ln1623">  ospf = ospf_lookup ();</a>
+<a name="ln1624"> </a>
+<a name="ln1625">  if ((functab = ospf_opaque_functab_lookup (lsa)) == NULL</a>
+<a name="ln1626">      || functab-&gt;lsa_refresher == NULL)</a>
+<a name="ln1627">    {</a>
+<a name="ln1628">      /*</a>
+<a name="ln1629">       * Though this LSA seems to have originated on this node, the</a>
+<a name="ln1630">       * handling module for this &quot;lsa-type and opaque-type&quot; was</a>
+<a name="ln1631">       * already deleted sometime ago.</a>
+<a name="ln1632">       * Anyway, this node still has a responsibility to flush this</a>
+<a name="ln1633">       * LSA from the routing domain.</a>
+<a name="ln1634">       */</a>
+<a name="ln1635">      if (IS_DEBUG_OSPF_EVENT)</a>
+<a name="ln1636">        zlog_debug (&quot;LSA[Type%d:%s]: Flush stray Opaque-LSA&quot;, lsa-&gt;data-&gt;type, inet_ntoa (lsa-&gt;data-&gt;id));</a>
+<a name="ln1637"> </a>
+<a name="ln1638">      lsa-&gt;data-&gt;ls_age = htons (OSPF_LSA_MAXAGE);</a>
+<a name="ln1639">      ospf_lsa_flush (ospf, lsa);</a>
+<a name="ln1640">    }</a>
+<a name="ln1641">  else</a>
+<a name="ln1642">    new = (* functab-&gt;lsa_refresher)(lsa);</a>
+<a name="ln1643"> </a>
+<a name="ln1644">  return new;</a>
+<a name="ln1645">}</a>
+<a name="ln1646"> </a>
+<a name="ln1647">/*------------------------------------------------------------------------*</a>
+<a name="ln1648"> * Followings are re-origination/refresh/flush operations of Opaque-LSAs,</a>
+<a name="ln1649"> * triggered by external interventions (vty session, signaling, etc).</a>
+<a name="ln1650"> *------------------------------------------------------------------------*/</a>
+<a name="ln1651"> </a>
+<a name="ln1652">#define OSPF_OPAQUE_TIMER_ON(T,F,L,V) \</a>
+<a name="ln1653">      if (!(T)) \</a>
+<a name="ln1654">        (T) = thread_add_timer_msec (master, (F), (L), (V))</a>
+<a name="ln1655"> </a>
+<a name="ln1656">static struct ospf_lsa *pseudo_lsa (struct ospf_interface *oi, struct ospf_area *area, u_char lsa_type, u_char opaque_type);</a>
+<a name="ln1657">static int ospf_opaque_type9_lsa_reoriginate_timer (struct thread *t);</a>
+<a name="ln1658">static int ospf_opaque_type10_lsa_reoriginate_timer (struct thread *t);</a>
+<a name="ln1659">static int ospf_opaque_type11_lsa_reoriginate_timer (struct thread *t);</a>
+<a name="ln1660">static int ospf_opaque_lsa_refresh_timer (struct thread *t);</a>
+<a name="ln1661"> </a>
+<a name="ln1662">void</a>
+<a name="ln1663">ospf_opaque_lsa_reoriginate_schedule (void *lsa_type_dependent,</a>
+<a name="ln1664">                                      u_char lsa_type, u_char opaque_type)</a>
+<a name="ln1665">{</a>
+<a name="ln1666">  struct ospf *top;</a>
+<a name="ln1667">  struct ospf_area dummy, *area = NULL;</a>
+<a name="ln1668">  struct ospf_interface *oi = NULL;</a>
+<a name="ln1669"> </a>
+<a name="ln1670">  struct ospf_lsa *lsa;</a>
+<a name="ln1671">  struct opaque_info_per_type *oipt;</a>
+<a name="ln1672">  int (*func) (struct thread * t) = NULL;</a>
+<a name="ln1673">  int delay;</a>
+<a name="ln1674"> </a>
+<a name="ln1675">  switch (lsa_type)</a>
+<a name="ln1676">    {</a>
+<a name="ln1677">    case OSPF_OPAQUE_LINK_LSA:</a>
+<a name="ln1678">      if ((oi = (struct ospf_interface *) lsa_type_dependent) == NULL)</a>
+<a name="ln1679">        {</a>
+<a name="ln1680">          zlog_warn (&quot;ospf_opaque_lsa_reoriginate_schedule:&quot;</a>
+<a name="ln1681">                     &quot; Type-9 Opaque-LSA: Invalid parameter?&quot;);</a>
+<a name="ln1682">          goto out;</a>
+<a name="ln1683">        }</a>
+<a name="ln1684">      if ((top = oi_to_top (oi)) == NULL)</a>
+<a name="ln1685">        {</a>
+<a name="ln1686">          zlog_warn (&quot;ospf_opaque_lsa_reoriginate_schedule: OI(%s) -&gt; TOP?&quot;,</a>
+<a name="ln1687">                     IF_NAME (oi));</a>
+<a name="ln1688">          goto out;</a>
+<a name="ln1689">        }</a>
+<a name="ln1690">      if (!list_isempty (ospf_opaque_type9_funclist)</a>
+<a name="ln1691">          &amp;&amp; list_isempty (oi-&gt;opaque_lsa_self)</a>
+<a name="ln1692">          &amp;&amp; oi-&gt;t_opaque_lsa_self != NULL)</a>
+<a name="ln1693">        {</a>
+<a name="ln1694">          zlog_warn (&quot;Type-9 Opaque-LSA (opaque_type=%u):&quot;</a>
+<a name="ln1695">                     &quot; Common origination for OI(%s) has already started&quot;,</a>
+<a name="ln1696">                     opaque_type, IF_NAME (oi));</a>
+<a name="ln1697">          goto out;</a>
+<a name="ln1698">        }</a>
+<a name="ln1699">      func = ospf_opaque_type9_lsa_reoriginate_timer;</a>
+<a name="ln1700">      break;</a>
+<a name="ln1701">    case OSPF_OPAQUE_AREA_LSA:</a>
+<a name="ln1702">      if ((area = (struct ospf_area *) lsa_type_dependent) == NULL)</a>
+<a name="ln1703">        {</a>
+<a name="ln1704">          zlog_warn (&quot;ospf_opaque_lsa_reoriginate_schedule:&quot;</a>
+<a name="ln1705">                     &quot; Type-10 Opaque-LSA: Invalid parameter?&quot;);</a>
+<a name="ln1706">          goto out;</a>
+<a name="ln1707">        }</a>
+<a name="ln1708">      if ((top = area-&gt;ospf) == NULL)</a>
+<a name="ln1709">        {</a>
+<a name="ln1710">          zlog_warn (&quot;ospf_opaque_lsa_reoriginate_schedule:&quot;</a>
+<a name="ln1711">                     &quot; AREA(%s) -&gt; TOP?&quot;, inet_ntoa (area-&gt;area_id));</a>
+<a name="ln1712">          goto out;</a>
+<a name="ln1713">        }</a>
+<a name="ln1714">      if (!list_isempty (ospf_opaque_type10_funclist)</a>
+<a name="ln1715">          &amp;&amp; list_isempty (area-&gt;opaque_lsa_self)</a>
+<a name="ln1716">          &amp;&amp; area-&gt;t_opaque_lsa_self != NULL)</a>
+<a name="ln1717">        {</a>
+<a name="ln1718">          zlog_warn (&quot;Type-10 Opaque-LSA (opaque_type=%u):&quot;</a>
+<a name="ln1719">                     &quot; Common origination for AREA(%s) has already started&quot;,</a>
+<a name="ln1720">                     opaque_type, inet_ntoa (area-&gt;area_id));</a>
+<a name="ln1721">          goto out;</a>
+<a name="ln1722">        }</a>
+<a name="ln1723">      func = ospf_opaque_type10_lsa_reoriginate_timer;</a>
+<a name="ln1724">      break;</a>
+<a name="ln1725">    case OSPF_OPAQUE_AS_LSA:</a>
+<a name="ln1726">      if ((top = (struct ospf *) lsa_type_dependent) == NULL)</a>
+<a name="ln1727">        {</a>
+<a name="ln1728">          zlog_warn (&quot;ospf_opaque_lsa_reoriginate_schedule:&quot;</a>
+<a name="ln1729">                     &quot; Type-11 Opaque-LSA: Invalid parameter?&quot;);</a>
+<a name="ln1730">          goto out;</a>
+<a name="ln1731">        }</a>
+<a name="ln1732">      if (!list_isempty (ospf_opaque_type11_funclist)</a>
+<a name="ln1733">          &amp;&amp; list_isempty (top-&gt;opaque_lsa_self)</a>
+<a name="ln1734">          &amp;&amp; top-&gt;t_opaque_lsa_self != NULL)</a>
+<a name="ln1735">        {</a>
+<a name="ln1736">          zlog_warn (&quot;Type-11 Opaque-LSA (opaque_type=%u):&quot;</a>
+<a name="ln1737">                     &quot; Common origination has already started&quot;, opaque_type);</a>
+<a name="ln1738">          goto out;</a>
+<a name="ln1739">        }</a>
+<a name="ln1740"> </a>
+<a name="ln1741">      /* Fake &quot;area&quot; to pass &quot;ospf&quot; to a lookup function later. */</a>
+<a name="ln1742">      dummy.ospf = top;</a>
+<a name="ln1743">      area = &amp;dummy;</a>
+<a name="ln1744"> </a>
+<a name="ln1745">      func = ospf_opaque_type11_lsa_reoriginate_timer;</a>
+<a name="ln1746">      break;</a>
+<a name="ln1747">    default:</a>
+<a name="ln1748">      zlog_warn (&quot;ospf_opaque_lsa_reoriginate_schedule:&quot;</a>
+<a name="ln1749">                 &quot; Unexpected LSA-type(%u)&quot;,</a>
+<a name="ln1750">                 lsa_type);</a>
+<a name="ln1751">      goto out;</a>
+<a name="ln1752">    }</a>
+<a name="ln1753"> </a>
+<a name="ln1754">  /* It may not a right time to schedule reorigination now. */</a>
+<a name="ln1755">  if (!CHECK_FLAG (top-&gt;opaque, OPAQUE_OPERATION_READY_BIT))</a>
+<a name="ln1756">    {</a>
+<a name="ln1757">      if (IS_DEBUG_OSPF_EVENT)</a>
+<a name="ln1758">        zlog_debug (&quot;ospf_opaque_lsa_reoriginate_schedule: Not operational.&quot;);</a>
+<a name="ln1759">      goto out;                 /* This is not an error. */</a>
+<a name="ln1760">    }</a>
+<a name="ln1761">  </a>
+<a name="ln1762">  /* Generate a dummy lsa to be passed for a lookup function. */</a>
+<a name="ln1763">  lsa = pseudo_lsa (oi, area, lsa_type, opaque_type);</a>
+<a name="ln1764"> </a>
+<a name="ln1765">  if ((oipt = lookup_opaque_info_by_type (lsa)) == NULL)</a>
+<a name="ln1766">    {</a>
+<a name="ln1767">      struct ospf_opaque_functab *functab;</a>
+<a name="ln1768">      if ((functab = ospf_opaque_functab_lookup (lsa)) == NULL)</a>
+<a name="ln1769">        {</a>
+<a name="ln1770">          zlog_warn (&quot;ospf_opaque_lsa_reoriginate_schedule:&quot;</a>
+<a name="ln1771">                     &quot; No associated function?: lsa_type(%u),&quot;</a>
+<a name="ln1772">                     &quot; opaque_type(%u)&quot;,</a>
+<a name="ln1773">                     lsa_type, opaque_type);</a>
+<a name="ln1774">          goto out;</a>
+<a name="ln1775">        }</a>
+<a name="ln1776">      if ((oipt = register_opaque_info_per_type (functab, lsa)) == NULL)</a>
+<a name="ln1777">        {</a>
+<a name="ln1778">          zlog_warn (&quot;ospf_opaque_lsa_reoriginate_schedule:&quot;</a>
+<a name="ln1779">                     &quot; Cannot get a control info?: lsa_type(%u),&quot;</a>
+<a name="ln1780">                     &quot; opaque_type(%u)&quot;,</a>
+<a name="ln1781">                     lsa_type, opaque_type);</a>
+<a name="ln1782">          goto out;</a>
+<a name="ln1783">        }</a>
+<a name="ln1784">    }</a>
+<a name="ln1785"> </a>
+<a name="ln1786">  if (oipt-&gt;t_opaque_lsa_self != NULL)</a>
+<a name="ln1787">    {</a>
+<a name="ln1788">      if (IS_DEBUG_OSPF_EVENT)</a>
+<a name="ln1789">        zlog_debug (&quot;Type-%u Opaque-LSA has already scheduled to&quot;</a>
+<a name="ln1790">                   &quot; RE-ORIGINATE: [opaque-type=%u]&quot;,</a>
+<a name="ln1791">                   lsa_type, GET_OPAQUE_TYPE (ntohl (lsa-&gt;data-&gt;id.s_addr)));</a>
+<a name="ln1792">      goto out;</a>
+<a name="ln1793">    }</a>
+<a name="ln1794"> </a>
+<a name="ln1795">  /*</a>
+<a name="ln1796">   * Different from initial origination time, in which various conditions</a>
+<a name="ln1797">   * (opaque capability, neighbor status etc) are assured by caller of</a>
+<a name="ln1798">   * the originating function &quot;ospf_opaque_lsa_originate_schedule ()&quot;,</a>
+<a name="ln1799">   * it is highly possible that these conditions might not be satisfied</a>
+<a name="ln1800">   * at the time of re-origination function is to be called.</a>
+<a name="ln1801">   */</a>
+<a name="ln1802">  delay = top-&gt;min_ls_interval; /* XXX */</a>
+<a name="ln1803"> </a>
+<a name="ln1804">  if (IS_DEBUG_OSPF_EVENT)</a>
+<a name="ln1805">    zlog_debug (&quot;Schedule Type-%u Opaque-LSA to RE-ORIGINATE in %d&quot;</a>
+<a name="ln1806">               &quot; ms later: [opaque-type=%u]&quot;,</a>
+<a name="ln1807">               lsa_type, delay, </a>
+<a name="ln1808">               GET_OPAQUE_TYPE (ntohl (lsa-&gt;data-&gt;id.s_addr)));</a>
+<a name="ln1809"> </a>
+<a name="ln1810">  OSPF_OPAQUE_TIMER_ON (oipt-&gt;t_opaque_lsa_self, func, oipt, delay);</a>
+<a name="ln1811"> </a>
+<a name="ln1812">out:</a>
+<a name="ln1813">  return;</a>
+<a name="ln1814">}</a>
+<a name="ln1815"> </a>
+<a name="ln1816">static struct ospf_lsa *</a>
+<a name="ln1817">pseudo_lsa (struct ospf_interface *oi, struct ospf_area *area,</a>
+<a name="ln1818">            u_char lsa_type, u_char opaque_type)</a>
+<a name="ln1819">{</a>
+<a name="ln1820">  static struct ospf_lsa lsa = { 0 };</a>
+<a name="ln1821">  static struct lsa_header lsah = { 0 };</a>
+<a name="ln1822">  u_int32_t tmp;</a>
+<a name="ln1823"> </a>
+<a name="ln1824">  lsa.oi   = oi;</a>
+<a name="ln1825">  lsa.area = area;</a>
+<a name="ln1826">  lsa.data = &amp;lsah;</a>
+<a name="ln1827"> </a>
+<a name="ln1828">  lsah.type = lsa_type;</a>
+<a name="ln1829">  tmp = SET_OPAQUE_LSID (opaque_type, 0); /* Opaque-ID is unused here. */</a>
+<a name="ln1830">  lsah.id.s_addr = htonl (tmp);</a>
+<a name="ln1831"> </a>
+<a name="ln1832">  return &amp;lsa;</a>
+<a name="ln1833">}</a>
+<a name="ln1834"> </a>
+<a name="ln1835">static int</a>
+<a name="ln1836">ospf_opaque_type9_lsa_reoriginate_timer (struct thread *t)</a>
+<a name="ln1837">{</a>
+<a name="ln1838">  struct opaque_info_per_type *oipt;</a>
+<a name="ln1839">  struct ospf_opaque_functab *functab;</a>
+<a name="ln1840">  struct ospf *top;</a>
+<a name="ln1841">  struct ospf_interface *oi;</a>
+<a name="ln1842">  int rc = -1;</a>
+<a name="ln1843"> </a>
+<a name="ln1844">  oipt = THREAD_ARG (t);</a>
+<a name="ln1845">  oipt-&gt;t_opaque_lsa_self = NULL;</a>
+<a name="ln1846"> </a>
+<a name="ln1847">  if ((functab = oipt-&gt;functab) == NULL</a>
+<a name="ln1848">  ||   functab-&gt;lsa_originator == NULL)</a>
+<a name="ln1849">    {</a>
+<a name="ln1850">      zlog_warn (&quot;ospf_opaque_type9_lsa_reoriginate_timer: No associated function?&quot;);</a>
+<a name="ln1851">      goto out;</a>
+<a name="ln1852">    }</a>
+<a name="ln1853"> </a>
+<a name="ln1854">  oi = (struct ospf_interface *) oipt-&gt;owner;</a>
+<a name="ln1855">  if ((top = oi_to_top (oi)) == NULL)</a>
+<a name="ln1856">    {</a>
+<a name="ln1857">      zlog_warn (&quot;ospf_opaque_type9_lsa_reoriginate_timer: Something wrong?&quot;);</a>
+<a name="ln1858">      goto out;</a>
+<a name="ln1859">    }</a>
+<a name="ln1860"> </a>
+<a name="ln1861">  if (! CHECK_FLAG (top-&gt;config, OSPF_OPAQUE_CAPABLE)</a>
+<a name="ln1862">  ||  ! ospf_if_is_enable (oi)</a>
+<a name="ln1863">  ||    ospf_nbr_count_opaque_capable (oi) == 0)</a>
+<a name="ln1864">    {</a>
+<a name="ln1865">      if (IS_DEBUG_OSPF_EVENT)</a>
+<a name="ln1866">        zlog_debug (&quot;Suspend re-origination of Type-9 Opaque-LSAs (opaque-type=%u) for a while...&quot;, oipt-&gt;opaque_type);</a>
+<a name="ln1867">    </a>
+<a name="ln1868">      oipt-&gt;status = PROC_SUSPEND;</a>
+<a name="ln1869">      rc = 0;</a>
+<a name="ln1870">      goto out;</a>
+<a name="ln1871">    }</a>
+<a name="ln1872"> </a>
+<a name="ln1873">  if (IS_DEBUG_OSPF_EVENT)</a>
+<a name="ln1874">    zlog_debug (&quot;Timer[Type9-LSA]: Re-originate Opaque-LSAs (opaque-type=%u) for OI (%s)&quot;, oipt-&gt;opaque_type, IF_NAME (oi));</a>
+<a name="ln1875"> </a>
+<a name="ln1876">  rc = (* functab-&gt;lsa_originator)(oi);</a>
+<a name="ln1877">out:</a>
+<a name="ln1878">  return rc;</a>
+<a name="ln1879">}</a>
+<a name="ln1880"> </a>
+<a name="ln1881">static int</a>
+<a name="ln1882">ospf_opaque_type10_lsa_reoriginate_timer (struct thread *t)</a>
+<a name="ln1883">{</a>
+<a name="ln1884">  struct opaque_info_per_type *oipt;</a>
+<a name="ln1885">  struct ospf_opaque_functab *functab;</a>
+<a name="ln1886">  struct listnode *node, *nnode;</a>
+<a name="ln1887">  struct ospf *top;</a>
+<a name="ln1888">  struct ospf_area *area;</a>
+<a name="ln1889">  struct ospf_interface *oi;</a>
+<a name="ln1890">  int n, rc = -1;</a>
+<a name="ln1891"> </a>
+<a name="ln1892">  oipt = THREAD_ARG (t);</a>
+<a name="ln1893">  oipt-&gt;t_opaque_lsa_self = NULL;</a>
+<a name="ln1894"> </a>
+<a name="ln1895">  if ((functab = oipt-&gt;functab) == NULL</a>
+<a name="ln1896">  ||   functab-&gt;lsa_originator == NULL)</a>
+<a name="ln1897">    {</a>
+<a name="ln1898">      zlog_warn (&quot;ospf_opaque_type10_lsa_reoriginate_timer: No associated function?&quot;);</a>
+<a name="ln1899">      goto out;</a>
+<a name="ln1900">    }</a>
+<a name="ln1901"> </a>
+<a name="ln1902">  area = (struct ospf_area *) oipt-&gt;owner;</a>
+<a name="ln1903">  if (area == NULL || (top = area-&gt;ospf) == NULL)</a>
+<a name="ln1904">    {</a>
+<a name="ln1905">      zlog_warn (&quot;ospf_opaque_type10_lsa_reoriginate_timer: Something wrong?&quot;);</a>
+<a name="ln1906">      goto out;</a>
+<a name="ln1907">    }</a>
+<a name="ln1908"> </a>
+<a name="ln1909">  /* There must be at least one &quot;opaque-capable, full-state&quot; neighbor. */</a>
+<a name="ln1910">  n = 0;</a>
+<a name="ln1911">  for (ALL_LIST_ELEMENTS (area-&gt;oiflist, node, nnode, oi))</a>
+<a name="ln1912">    {</a>
+<a name="ln1913">      if ((n = ospf_nbr_count_opaque_capable (oi)) &gt; 0)</a>
+<a name="ln1914">        break;</a>
+<a name="ln1915">    }</a>
+<a name="ln1916"> </a>
+<a name="ln1917">  if (n == 0 || ! CHECK_FLAG (top-&gt;config, OSPF_OPAQUE_CAPABLE))</a>
+<a name="ln1918">    {</a>
+<a name="ln1919">      if (IS_DEBUG_OSPF_EVENT)</a>
+<a name="ln1920">        zlog_debug (&quot;Suspend re-origination of Type-10 Opaque-LSAs&quot;</a>
+<a name="ln1921">                   &quot; (opaque-type=%u) for a while...&quot;, </a>
+<a name="ln1922">                   oipt-&gt;opaque_type);</a>
+<a name="ln1923"> </a>
+<a name="ln1924">      oipt-&gt;status = PROC_SUSPEND;</a>
+<a name="ln1925">      rc = 0;</a>
+<a name="ln1926">      goto out;</a>
+<a name="ln1927">    }</a>
+<a name="ln1928"> </a>
+<a name="ln1929">  if (IS_DEBUG_OSPF_EVENT)</a>
+<a name="ln1930">    zlog_debug (&quot;Timer[Type10-LSA]: Re-originate Opaque-LSAs&quot;</a>
+<a name="ln1931">               &quot; (opaque-type=%u) for Area %s&quot;, </a>
+<a name="ln1932">               oipt-&gt;opaque_type, inet_ntoa (area-&gt;area_id));</a>
+<a name="ln1933"> </a>
+<a name="ln1934">  rc = (* functab-&gt;lsa_originator)(area);</a>
+<a name="ln1935">out:</a>
+<a name="ln1936">  return rc;</a>
+<a name="ln1937">}</a>
+<a name="ln1938"> </a>
+<a name="ln1939">static int</a>
+<a name="ln1940">ospf_opaque_type11_lsa_reoriginate_timer (struct thread *t)</a>
+<a name="ln1941">{</a>
+<a name="ln1942">  struct opaque_info_per_type *oipt;</a>
+<a name="ln1943">  struct ospf_opaque_functab *functab;</a>
+<a name="ln1944">  struct ospf *top;</a>
+<a name="ln1945">  int rc = -1;</a>
+<a name="ln1946"> </a>
+<a name="ln1947">  oipt = THREAD_ARG (t);</a>
+<a name="ln1948">  oipt-&gt;t_opaque_lsa_self = NULL;</a>
+<a name="ln1949"> </a>
+<a name="ln1950">  if ((functab = oipt-&gt;functab) == NULL</a>
+<a name="ln1951">      || functab-&gt;lsa_originator == NULL)</a>
+<a name="ln1952">    {</a>
+<a name="ln1953">      zlog_warn (&quot;ospf_opaque_type11_lsa_reoriginate_timer:&quot;</a>
+<a name="ln1954">                 &quot; No associated function?&quot;);</a>
+<a name="ln1955">      goto out;</a>
+<a name="ln1956">    }</a>
+<a name="ln1957"> </a>
+<a name="ln1958">  if ((top = (struct ospf *) oipt-&gt;owner) == NULL)</a>
+<a name="ln1959">    {</a>
+<a name="ln1960">      zlog_warn (&quot;ospf_opaque_type11_lsa_reoriginate_timer: Something wrong?&quot;);</a>
+<a name="ln1961">      goto out;</a>
+<a name="ln1962">    }</a>
+<a name="ln1963"> </a>
+<a name="ln1964">  if (! CHECK_FLAG (top-&gt;config, OSPF_OPAQUE_CAPABLE))</a>
+<a name="ln1965">    {</a>
+<a name="ln1966">      if (IS_DEBUG_OSPF_EVENT)</a>
+<a name="ln1967">        zlog_debug (&quot;Suspend re-origination of Type-11 Opaque-LSAs (opaque-type=%u) for a while...&quot;, oipt-&gt;opaque_type);</a>
+<a name="ln1968">    </a>
+<a name="ln1969">      oipt-&gt;status = PROC_SUSPEND;</a>
+<a name="ln1970">      rc = 0;</a>
+<a name="ln1971">      goto out;</a>
+<a name="ln1972">    }</a>
+<a name="ln1973"> </a>
+<a name="ln1974">  if (IS_DEBUG_OSPF_EVENT)</a>
+<a name="ln1975">    zlog_debug (&quot;Timer[Type11-LSA]: Re-originate Opaque-LSAs (opaque-type=%u).&quot;, oipt-&gt;opaque_type);</a>
+<a name="ln1976"> </a>
+<a name="ln1977">  rc = (* functab-&gt;lsa_originator)(top);</a>
+<a name="ln1978">out:</a>
+<a name="ln1979">  return rc;</a>
+<a name="ln1980">}</a>
+<a name="ln1981"> </a>
+<a name="ln1982">void</a>
+<a name="ln1983">ospf_opaque_lsa_refresh_schedule (struct ospf_lsa *lsa0)</a>
+<a name="ln1984">{</a>
+<a name="ln1985">  struct opaque_info_per_type *oipt;</a>
+<a name="ln1986">  struct opaque_info_per_id *oipi;</a>
+<a name="ln1987">  struct ospf_lsa *lsa;</a>
+<a name="ln1988">  struct ospf *top;</a>
+<a name="ln1989">  int delay;</a>
+<a name="ln1990"> </a>
+<a name="ln1991">  if ((oipt = lookup_opaque_info_by_type (lsa0)) == NULL</a>
+<a name="ln1992">  ||  (oipi = lookup_opaque_info_by_id (oipt, lsa0)) == NULL)</a>
+<a name="ln1993">    {</a>
+<a name="ln1994">      zlog_warn (&quot;ospf_opaque_lsa_refresh_schedule: Invalid parameter?&quot;);</a>
+<a name="ln1995">      goto out;</a>
+<a name="ln1996">    }</a>
+<a name="ln1997"> </a>
+<a name="ln1998">  /* Given &quot;lsa0&quot; and current &quot;oipi-&gt;lsa&quot; may different, but harmless. */</a>
+<a name="ln1999">  if ((lsa = oipi-&gt;lsa) == NULL)</a>
+<a name="ln2000">    {</a>
+<a name="ln2001">      zlog_warn (&quot;ospf_opaque_lsa_refresh_schedule: Something wrong?&quot;);</a>
+<a name="ln2002">      goto out;</a>
+<a name="ln2003">    }</a>
+<a name="ln2004"> </a>
+<a name="ln2005">  if (oipi-&gt;t_opaque_lsa_self != NULL)</a>
+<a name="ln2006">    {</a>
+<a name="ln2007">      if (IS_DEBUG_OSPF_EVENT)</a>
+<a name="ln2008">        zlog_debug (&quot;Type-%u Opaque-LSA has already scheduled to REFRESH: [opaque-type=%u, opaque-id=%x]&quot;, lsa-&gt;data-&gt;type, GET_OPAQUE_TYPE (ntohl (lsa-&gt;data-&gt;id.s_addr)), GET_OPAQUE_ID (ntohl (lsa-&gt;data-&gt;id.s_addr)));</a>
+<a name="ln2009">      goto out;</a>
+<a name="ln2010">    }</a>
+<a name="ln2011"> </a>
+<a name="ln2012">  /* Delete this lsa from neighbor retransmit-list. */</a>
+<a name="ln2013">  switch (lsa-&gt;data-&gt;type)</a>
+<a name="ln2014">    {</a>
+<a name="ln2015">    case OSPF_OPAQUE_LINK_LSA:</a>
+<a name="ln2016">    case OSPF_OPAQUE_AREA_LSA:</a>
+<a name="ln2017">      ospf_ls_retransmit_delete_nbr_area (lsa-&gt;area, lsa);</a>
+<a name="ln2018">      break;</a>
+<a name="ln2019">    case OSPF_OPAQUE_AS_LSA:</a>
+<a name="ln2020">      top = ospf_lookup ();</a>
+<a name="ln2021">      if ((lsa0-&gt;area != NULL) &amp;&amp; (lsa0-&gt;area-&gt;ospf != NULL))</a>
+<a name="ln2022">        top = lsa0-&gt;area-&gt;ospf;</a>
+<a name="ln2023">      ospf_ls_retransmit_delete_nbr_as (top, lsa);</a>
+<a name="ln2024">      break;</a>
+<a name="ln2025">    default:</a>
+<a name="ln2026">      zlog_warn (&quot;ospf_opaque_lsa_refresh_schedule: Unexpected LSA-type(%u)&quot;, lsa-&gt;data-&gt;type);</a>
+<a name="ln2027">      goto out;</a>
+<a name="ln2028">    }</a>
+<a name="ln2029"> </a>
+<a name="ln2030">  delay = ospf_lsa_refresh_delay (lsa);</a>
+<a name="ln2031"> </a>
+<a name="ln2032">  if (IS_DEBUG_OSPF_EVENT)</a>
+<a name="ln2033">    zlog_debug (&quot;Schedule Type-%u Opaque-LSA to REFRESH in %d sec later: [opaque-type=%u, opaque-id=%x]&quot;, lsa-&gt;data-&gt;type, delay, GET_OPAQUE_TYPE (ntohl (lsa-&gt;data-&gt;id.s_addr)), GET_OPAQUE_ID (ntohl (lsa-&gt;data-&gt;id.s_addr)));</a>
+<a name="ln2034"> </a>
+<a name="ln2035">  OSPF_OPAQUE_TIMER_ON (oipi-&gt;t_opaque_lsa_self,</a>
+<a name="ln2036">                        ospf_opaque_lsa_refresh_timer, oipi, delay * 1000);</a>
+<a name="ln2037">out:</a>
+<a name="ln2038">  return;</a>
+<a name="ln2039">}</a>
+<a name="ln2040"> </a>
+<a name="ln2041">static int</a>
+<a name="ln2042">ospf_opaque_lsa_refresh_timer (struct thread *t)</a>
+<a name="ln2043">{</a>
+<a name="ln2044">  struct opaque_info_per_id *oipi;</a>
+<a name="ln2045">  struct ospf_opaque_functab *functab;</a>
+<a name="ln2046">  struct ospf_lsa *lsa;</a>
+<a name="ln2047"> </a>
+<a name="ln2048">  if (IS_DEBUG_OSPF_EVENT)</a>
+<a name="ln2049">    zlog_debug (&quot;Timer[Opaque-LSA]: (Opaque-LSA Refresh expire)&quot;);</a>
+<a name="ln2050"> </a>
+<a name="ln2051">  oipi = THREAD_ARG (t);</a>
+<a name="ln2052">  oipi-&gt;t_opaque_lsa_self = NULL;</a>
+<a name="ln2053"> </a>
+<a name="ln2054">  if ((lsa = oipi-&gt;lsa) != NULL)</a>
+<a name="ln2055">    if ((functab = oipi-&gt;opqctl_type-&gt;functab) != NULL)</a>
+<a name="ln2056">      if (functab-&gt;lsa_refresher != NULL)</a>
+<a name="ln2057">        (* functab-&gt;lsa_refresher)(lsa);</a>
+<a name="ln2058"> </a>
+<a name="ln2059">  return 0;</a>
+<a name="ln2060">}</a>
+<a name="ln2061"> </a>
+<a name="ln2062">void</a>
+<a name="ln2063">ospf_opaque_lsa_flush_schedule (struct ospf_lsa *lsa0)</a>
+<a name="ln2064">{</a>
+<a name="ln2065">  struct opaque_info_per_type *oipt;</a>
+<a name="ln2066">  struct opaque_info_per_id *oipi;</a>
+<a name="ln2067">  struct ospf_lsa *lsa;</a>
+<a name="ln2068">  struct ospf *top;</a>
+<a name="ln2069"> </a>
+<a name="ln2070">  top = ospf_lookup ();</a>
+<a name="ln2071"> </a>
+<a name="ln2072">  if ((oipt = lookup_opaque_info_by_type (lsa0)) == NULL</a>
+<a name="ln2073">  ||  (oipi = lookup_opaque_info_by_id (oipt, lsa0)) == NULL)</a>
+<a name="ln2074">    {</a>
+<a name="ln2075">      zlog_warn (&quot;ospf_opaque_lsa_flush_schedule: Invalid parameter?&quot;);</a>
+<a name="ln2076">      goto out;</a>
+<a name="ln2077">    }</a>
+<a name="ln2078"> </a>
+<a name="ln2079">  /* Given &quot;lsa0&quot; and current &quot;oipi-&gt;lsa&quot; may different, but harmless. */</a>
+<a name="ln2080">  if ((lsa = oipi-&gt;lsa) == NULL)</a>
+<a name="ln2081">    {</a>
+<a name="ln2082">      zlog_warn (&quot;ospf_opaque_lsa_flush_schedule: Something wrong?&quot;);</a>
+<a name="ln2083">      goto out;</a>
+<a name="ln2084">    }</a>
+<a name="ln2085"> </a>
+<a name="ln2086">  /* Delete this lsa from neighbor retransmit-list. */</a>
+<a name="ln2087">  switch (lsa-&gt;data-&gt;type)</a>
+<a name="ln2088">    {</a>
+<a name="ln2089">    case OSPF_OPAQUE_LINK_LSA:</a>
+<a name="ln2090">    case OSPF_OPAQUE_AREA_LSA:</a>
+<a name="ln2091">      ospf_ls_retransmit_delete_nbr_area (lsa-&gt;area, lsa);</a>
+<a name="ln2092">      break;</a>
+<a name="ln2093">    case OSPF_OPAQUE_AS_LSA:</a>
+<a name="ln2094">      if ((lsa0-&gt;area != NULL) &amp;&amp; (lsa0-&gt;area-&gt;ospf != NULL))</a>
+<a name="ln2095">        top = lsa0-&gt;area-&gt;ospf;</a>
+<a name="ln2096">      ospf_ls_retransmit_delete_nbr_as (top, lsa);</a>
+<a name="ln2097">      break;</a>
+<a name="ln2098">    default:</a>
+<a name="ln2099">      zlog_warn (&quot;ospf_opaque_lsa_flush_schedule: Unexpected LSA-type(%u)&quot;, lsa-&gt;data-&gt;type);</a>
+<a name="ln2100">      goto out;</a>
+<a name="ln2101">    }</a>
+<a name="ln2102"> </a>
+<a name="ln2103">  /* Dequeue listnode entry from the list. */</a>
+<a name="ln2104">  listnode_delete (oipt-&gt;id_list, oipi);</a>
+<a name="ln2105"> </a>
+<a name="ln2106">  /* Avoid misjudgement in the next lookup. */</a>
+<a name="ln2107">  if (listcount (oipt-&gt;id_list) == 0)</a>
+<a name="ln2108">    oipt-&gt;id_list-&gt;head = oipt-&gt;id_list-&gt;tail = NULL;</a>
+<a name="ln2109"> </a>
+<a name="ln2110">  /* Disassociate internal control information with the given lsa. */</a>
+<a name="ln2111">  free_opaque_info_per_id ((void *) oipi);</a>
+<a name="ln2112"> </a>
+<a name="ln2113">  /* Force given lsa's age to MaxAge. */</a>
+<a name="ln2114">  lsa-&gt;data-&gt;ls_age = htons (OSPF_LSA_MAXAGE);</a>
+<a name="ln2115"> </a>
+<a name="ln2116">  if (IS_DEBUG_OSPF_EVENT)</a>
+<a name="ln2117">    zlog_debug (&quot;Schedule Type-%u Opaque-LSA to FLUSH: [opaque-type=%u, opaque-id=%x]&quot;, lsa-&gt;data-&gt;type, GET_OPAQUE_TYPE (ntohl (lsa-&gt;data-&gt;id.s_addr)), GET_OPAQUE_ID (ntohl (lsa-&gt;data-&gt;id.s_addr)));</a>
+<a name="ln2118"> </a>
+<a name="ln2119">  /* This lsa will be flushed and removed eventually. */</a>
+<a name="ln2120">  ospf_lsa_flush (top, lsa);</a>
+<a name="ln2121"> </a>
+<a name="ln2122">out:</a>
+<a name="ln2123">  return;</a>
+<a name="ln2124">}</a>
+<a name="ln2125"> </a>
+<a name="ln2126">void</a>
+<a name="ln2127">ospf_opaque_self_originated_lsa_received (struct ospf_neighbor *nbr, </a>
+<a name="ln2128">                                          struct ospf_lsa *lsa)</a>
+<a name="ln2129">{</a>
+<a name="ln2130">  struct ospf *top;</a>
+<a name="ln2131">  </a>
+<a name="ln2132">  if ((top = oi_to_top (nbr-&gt;oi)) == NULL)</a>
+<a name="ln2133">    return;</a>
+<a name="ln2134"> </a>
+<a name="ln2135">  /*</a>
+<a name="ln2136">   * Since these LSA entries are not yet installed into corresponding</a>
+<a name="ln2137">   * LSDB, just flush them without calling ospf_ls_maxage() afterward.</a>
+<a name="ln2138">   */</a>
+<a name="ln2139">  lsa-&gt;data-&gt;ls_age = htons (OSPF_LSA_MAXAGE);</a>
+<a name="ln2140">  switch (lsa-&gt;data-&gt;type)</a>
+<a name="ln2141">    {</a>
+<a name="ln2142">    case OSPF_OPAQUE_LINK_LSA:</a>
+<a name="ln2143">      ospf_flood_through_area (nbr-&gt;oi-&gt;area, NULL/*inbr*/, lsa);</a>
+<a name="ln2144">      break;</a>
+<a name="ln2145">    case OSPF_OPAQUE_AREA_LSA:</a>
+<a name="ln2146">      ospf_flood_through_area (nbr-&gt;oi-&gt;area, NULL/*inbr*/, lsa);</a>
+<a name="ln2147">      break;</a>
+<a name="ln2148">    case OSPF_OPAQUE_AS_LSA:</a>
+<a name="ln2149">      ospf_flood_through_as (top, NULL/*inbr*/, lsa);</a>
+<a name="ln2150">      break;</a>
+<a name="ln2151">    default:</a>
+<a name="ln2152">      zlog_warn (&quot;ospf_opaque_self_originated_lsa_received: Unexpected LSA-type(%u)&quot;, lsa-&gt;data-&gt;type);</a>
+<a name="ln2153">      return;</a>
+<a name="ln2154">    }</a>
+<a name="ln2155">  ospf_lsa_discard (lsa); /* List &quot;lsas&quot; will be deleted by caller. */  </a>
+<a name="ln2156">}</a>
+<a name="ln2157"> </a>
+<a name="ln2158">/*------------------------------------------------------------------------*</a>
+<a name="ln2159"> * Followings are util functions; probably be used by Opaque-LSAs only...</a>
+<a name="ln2160"> *------------------------------------------------------------------------*/</a>
+<a name="ln2161"> </a>
+<a name="ln2162">struct ospf *</a>
+<a name="ln2163">oi_to_top (struct ospf_interface *oi)</a>
+<a name="ln2164">{</a>
+<a name="ln2165">  struct ospf *top = NULL;</a>
+<a name="ln2166">  struct ospf_area *area;</a>
+<a name="ln2167"> </a>
+<a name="ln2168">  if (oi == NULL || (area = oi-&gt;area) == NULL || (top = area-&gt;ospf) == NULL)</a>
+<a name="ln2169">    zlog_warn (&quot;Broken relationship for \&quot;OI -&gt; AREA -&gt; OSPF\&quot;?&quot;);</a>
+<a name="ln2170"> </a>
+<a name="ln2171">  return top;</a>
+<a name="ln2172">}</a>
+<a name="ln2173"> </a>
+
+</code></pre>
+<div class="balloon" rel="9"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1042/" target="_blank">V1042</a> This file is marked with copyleft license, which requires you to open the derived source code.</p></div>
+<div class="balloon" rel="2143"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1037/" target="_blank">V1037</a> Two or more case-branches perform the same actions. Check lines: 2143, 2146</p></div>
+<div class="balloon" rel="1463"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1031/" target="_blank">V1031</a> The 'opaque_lsa_originate_callback' function is not declared. Passing data to or from this function can be affected.</p></div>
+<div class="balloon" rel="1481"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1031/" target="_blank">V1031</a> The 'opaque_lsa_originate_callback' function is not declared. Passing data to or from this function can be affected.</p></div>
+<div class="balloon" rel="1498"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1031/" target="_blank">V1031</a> The 'opaque_lsa_originate_callback' function is not declared. Passing data to or from this function can be affected.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

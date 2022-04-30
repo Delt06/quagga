@@ -1,0 +1,361 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>agentx.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.5.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/* SNMP support</a>
+<a name="ln2"> * Copyright (C) 2012 Vincent Bernat &lt;bernat@luffy.cx&gt;</a>
+<a name="ln3"> *</a>
+<a name="ln4"> * This file is part of GNU Zebra.</a>
+<a name="ln5"> *</a>
+<a name="ln6"> * GNU Zebra is free software; you can redistribute it and/or modify it</a>
+<a name="ln7"> * under the terms of the GNU General Public License as published by the</a>
+<a name="ln8"> * Free Software Foundation; either version 2, or (at your option) any</a>
+<a name="ln9"> * later version.</a>
+<a name="ln10"> *</a>
+<a name="ln11"> * GNU Zebra is distributed in the hope that it will be useful, but</a>
+<a name="ln12"> * WITHOUT ANY WARRANTY; without even the implied warranty of</a>
+<a name="ln13"> * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU</a>
+<a name="ln14"> * General Public License for more details.</a>
+<a name="ln15"> *</a>
+<a name="ln16"> * You should have received a copy of the GNU General Public License</a>
+<a name="ln17"> * along with GNU Zebra; see the file COPYING.  If not, write to the Free</a>
+<a name="ln18"> * Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA</a>
+<a name="ln19"> * 02111-1307, USA.  </a>
+<a name="ln20"> */</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &lt;zebra.h&gt;</a>
+<a name="ln23"> </a>
+<a name="ln24">#if defined HAVE_SNMP &amp;&amp; defined SNMP_AGENTX</a>
+<a name="ln25">#include &lt;net-snmp/net-snmp-config.h&gt;</a>
+<a name="ln26">#include &lt;net-snmp/net-snmp-includes.h&gt;</a>
+<a name="ln27">#include &lt;net-snmp/agent/net-snmp-agent-includes.h&gt;</a>
+<a name="ln28">#include &lt;net-snmp/agent/snmp_vars.h&gt;</a>
+<a name="ln29"> </a>
+<a name="ln30">#include &quot;command.h&quot;</a>
+<a name="ln31">#include &quot;smux.h&quot;</a>
+<a name="ln32"> </a>
+<a name="ln33">static int agentx_enabled = 0;</a>
+<a name="ln34"> </a>
+<a name="ln35">static struct thread_master *agentx_tm;</a>
+<a name="ln36">static struct thread *timeout_thr = NULL;</a>
+<a name="ln37">static struct list *events = NULL;</a>
+<a name="ln38"> </a>
+<a name="ln39">static void agentx_events_update(void);</a>
+<a name="ln40"> </a>
+<a name="ln41">static int</a>
+<a name="ln42">agentx_timeout(struct thread *t)</a>
+<a name="ln43">{</a>
+<a name="ln44">  timeout_thr = NULL;</a>
+<a name="ln45"> </a>
+<a name="ln46">  snmp_timeout ();</a>
+<a name="ln47">  run_alarms ();</a>
+<a name="ln48">  netsnmp_check_outstanding_agent_requests ();</a>
+<a name="ln49">  agentx_events_update ();</a>
+<a name="ln50">  return 0;</a>
+<a name="ln51">}</a>
+<a name="ln52"> </a>
+<a name="ln53">static int</a>
+<a name="ln54">agentx_read(struct thread *t)</a>
+<a name="ln55">{</a>
+<a name="ln56">  fd_set fds;</a>
+<a name="ln57">  struct listnode *ln = THREAD_ARG (t);</a>
+<a name="ln58">  list_delete_node (events, ln);</a>
+<a name="ln59"> </a>
+<a name="ln60">  FD_ZERO (&amp;fds);</a>
+<a name="ln61">  FD_SET (THREAD_FD (t), &amp;fds);</a>
+<a name="ln62">  snmp_read (&amp;fds);</a>
+<a name="ln63"> </a>
+<a name="ln64">  netsnmp_check_outstanding_agent_requests ();</a>
+<a name="ln65">  agentx_events_update ();</a>
+<a name="ln66">  return 0;</a>
+<a name="ln67">}</a>
+<a name="ln68"> </a>
+<a name="ln69">static void</a>
+<a name="ln70">agentx_events_update(void)</a>
+<a name="ln71">{</a>
+<a name="ln72">  int maxfd = 0;</a>
+<a name="ln73">  int block = 1;</a>
+<a name="ln74">  struct timeval timeout = { .tv_sec = 0, .tv_usec = 0 };</a>
+<a name="ln75">  fd_set fds;</a>
+<a name="ln76">  struct listnode *ln;</a>
+<a name="ln77">  struct thread *thr;</a>
+<a name="ln78">  int fd, thr_fd;</a>
+<a name="ln79"> </a>
+<a name="ln80">  THREAD_OFF (timeout_thr);</a>
+<a name="ln81"> </a>
+<a name="ln82">  FD_ZERO (&amp;fds);</a>
+<a name="ln83">  snmp_select_info (&amp;maxfd, &amp;fds, &amp;timeout, &amp;block);</a>
+<a name="ln84"> </a>
+<a name="ln85">  if (!block)</a>
+<a name="ln86">    timeout_thr = thread_add_timer_tv (agentx_tm, agentx_timeout, NULL, &amp;timeout);</a>
+<a name="ln87"> </a>
+<a name="ln88">  ln = listhead (events);</a>
+<a name="ln89">  thr = ln ? listgetdata (ln) : NULL;</a>
+<a name="ln90">  thr_fd = thr ? THREAD_FD (thr) : -1;</a>
+<a name="ln91"> </a>
+<a name="ln92">  /* &quot;two-pointer&quot; / two-list simultaneous iteration</a>
+<a name="ln93">   * ln/thr/thr_fd point to the next existing event listener to hit while</a>
+<a name="ln94">   * fd counts to catch up */</a>
+<a name="ln95">  for (fd = 0; fd &lt; maxfd; fd++)</a>
+<a name="ln96">    {</a>
+<a name="ln97">      /* caught up */</a>
+<a name="ln98">      if (thr_fd == fd)</a>
+<a name="ln99">        {</a>
+<a name="ln100">          struct listnode *nextln = listnextnode (ln);</a>
+<a name="ln101">          if (!FD_ISSET (fd, &amp;fds))</a>
+<a name="ln102">            {</a>
+<a name="ln103">              thread_cancel (thr);</a>
+<a name="ln104">              list_delete_node (events, ln);</a>
+<a name="ln105">            }</a>
+<a name="ln106">          ln = nextln;</a>
+<a name="ln107">          thr = ln ? listgetdata (ln) : NULL;</a>
+<a name="ln108">          thr_fd = thr ? THREAD_FD (thr) : -1;</a>
+<a name="ln109">        }</a>
+<a name="ln110">      /* need listener, but haven't hit one where it would be */</a>
+<a name="ln111">      else if (FD_ISSET (fd, &amp;fds))</a>
+<a name="ln112">        {</a>
+<a name="ln113">          struct listnode *newln;</a>
+<a name="ln114">          thr = thread_add_read (agentx_tm, agentx_read, NULL, fd);</a>
+<a name="ln115">          newln = listnode_add_before (events, ln, thr);</a>
+<a name="ln116">          thr-&gt;arg = newln;</a>
+<a name="ln117">        }</a>
+<a name="ln118">    }</a>
+<a name="ln119"> </a>
+<a name="ln120">  /* leftover event listeners at this point have fd &gt; maxfd, delete them */</a>
+<a name="ln121">  while (ln)</a>
+<a name="ln122">    {</a>
+<a name="ln123">      struct listnode *nextln = listnextnode (ln);</a>
+<a name="ln124">      thread_cancel (listgetdata (ln));</a>
+<a name="ln125">      list_delete_node (events, ln);</a>
+<a name="ln126">      ln = nextln;</a>
+<a name="ln127">    }</a>
+<a name="ln128">}</a>
+<a name="ln129"> </a>
+<a name="ln130">/* AgentX node. */</a>
+<a name="ln131">static struct cmd_node agentx_node =</a>
+<a name="ln132">{</a>
+<a name="ln133">  SMUX_NODE,</a>
+<a name="ln134">  &quot;&quot;                            /* AgentX has no interface. */</a>
+<a name="ln135">};</a>
+<a name="ln136"> </a>
+<a name="ln137">/* Logging NetSNMP messages */</a>
+<a name="ln138">static int</a>
+<a name="ln139">agentx_log_callback(int major, int minor,</a>
+<a name="ln140">		    void *serverarg, void *clientarg)</a>
+<a name="ln141">{</a>
+<a name="ln142">  struct snmp_log_message *slm = (struct snmp_log_message *)serverarg;</a>
+<a name="ln143">  char *msg = strdup (slm-&gt;msg);</a>
+<a name="ln144">  if (msg) msg[strlen(msg)-1] = '\0';</a>
+<a name="ln145">  switch (slm-&gt;priority)</a>
+<a name="ln146">    {</a>
+<a name="ln147">    case LOG_EMERG:   zlog_err   (&quot;snmp[emerg]: %s&quot;,   msg?msg:slm-&gt;msg); break;</a>
+<a name="ln148">    case LOG_ALERT:   zlog_err   (&quot;snmp[alert]: %s&quot;,   msg?msg:slm-&gt;msg); break;</a>
+<a name="ln149">    case LOG_CRIT:    zlog_err   (&quot;snmp[crit]: %s&quot;,    msg?msg:slm-&gt;msg); break;</a>
+<a name="ln150">    case LOG_ERR:     zlog_err   (&quot;snmp[err]: %s&quot;,     msg?msg:slm-&gt;msg); break;</a>
+<a name="ln151">    case LOG_WARNING: zlog_warn  (&quot;snmp[warning]: %s&quot;, msg?msg:slm-&gt;msg); break;</a>
+<a name="ln152">    case LOG_NOTICE:  zlog_notice(&quot;snmp[notice]: %s&quot;,  msg?msg:slm-&gt;msg); break;</a>
+<a name="ln153">    case LOG_INFO:    zlog_info  (&quot;snmp[info]: %s&quot;,    msg?msg:slm-&gt;msg); break;</a>
+<a name="ln154">    case LOG_DEBUG:   zlog_debug (&quot;snmp[debug]: %s&quot;,   msg?msg:slm-&gt;msg); break;</a>
+<a name="ln155">    }</a>
+<a name="ln156">  free(msg);</a>
+<a name="ln157">  return SNMP_ERR_NOERROR;</a>
+<a name="ln158">}</a>
+<a name="ln159"> </a>
+<a name="ln160">static int</a>
+<a name="ln161">config_write_agentx (struct vty *vty)</a>
+<a name="ln162">{</a>
+<a name="ln163">  if (agentx_enabled)</a>
+<a name="ln164">      vty_out (vty, &quot;agentx%s&quot;, VTY_NEWLINE);</a>
+<a name="ln165">  return 0;</a>
+<a name="ln166">}</a>
+<a name="ln167"> </a>
+<a name="ln168">DEFUN (agentx_enable,</a>
+<a name="ln169">       agentx_enable_cmd,</a>
+<a name="ln170">       &quot;agentx&quot;,</a>
+<a name="ln171">       &quot;SNMP AgentX protocol settings\n&quot;</a>
+<a name="ln172">       &quot;SNMP AgentX settings\n&quot;)</a>
+<a name="ln173">{</a>
+<a name="ln174">  if (!agentx_enabled)</a>
+<a name="ln175">    {</a>
+<a name="ln176">      init_snmp(&quot;quagga&quot;);</a>
+<a name="ln177">      events = list_new();</a>
+<a name="ln178">      agentx_events_update ();</a>
+<a name="ln179">      agentx_enabled = 1;</a>
+<a name="ln180">      return CMD_SUCCESS;</a>
+<a name="ln181">    }</a>
+<a name="ln182">  vty_out (vty, &quot;SNMP AgentX already enabled%s&quot;, VTY_NEWLINE);</a>
+<a name="ln183">  return CMD_WARNING;</a>
+<a name="ln184">}</a>
+<a name="ln185"> </a>
+<a name="ln186">DEFUN (no_agentx,</a>
+<a name="ln187">       no_agentx_cmd,</a>
+<a name="ln188">       &quot;no agentx&quot;,</a>
+<a name="ln189">       NO_STR</a>
+<a name="ln190">       &quot;SNMP AgentX protocol settings\n&quot;</a>
+<a name="ln191">       &quot;SNMP AgentX settings\n&quot;)</a>
+<a name="ln192">{</a>
+<a name="ln193">  if (!agentx_enabled) return CMD_SUCCESS;</a>
+<a name="ln194">  vty_out (vty, &quot;SNMP AgentX support cannot be disabled once enabled%s&quot;, VTY_NEWLINE);</a>
+<a name="ln195">  return CMD_WARNING;</a>
+<a name="ln196">}</a>
+<a name="ln197"> </a>
+<a name="ln198">void</a>
+<a name="ln199">smux_init (struct thread_master *tm)</a>
+<a name="ln200">{</a>
+<a name="ln201">  agentx_tm = tm;</a>
+<a name="ln202"> </a>
+<a name="ln203">  netsnmp_enable_subagent ();</a>
+<a name="ln204">  snmp_disable_log ();</a>
+<a name="ln205">  snmp_enable_calllog ();</a>
+<a name="ln206">  snmp_register_callback (SNMP_CALLBACK_LIBRARY,</a>
+<a name="ln207">			  SNMP_CALLBACK_LOGGING,</a>
+<a name="ln208">			  agentx_log_callback,</a>
+<a name="ln209">			  NULL);</a>
+<a name="ln210">  init_agent (&quot;quagga&quot;);</a>
+<a name="ln211"> </a>
+<a name="ln212">  install_node (&amp;agentx_node, config_write_agentx);</a>
+<a name="ln213">  install_element (CONFIG_NODE, &amp;agentx_enable_cmd);</a>
+<a name="ln214">  install_element (CONFIG_NODE, &amp;no_agentx_cmd);</a>
+<a name="ln215">}</a>
+<a name="ln216"> </a>
+<a name="ln217">void</a>
+<a name="ln218">smux_register_mib (const char *descr, struct variable *var, </a>
+<a name="ln219">		   size_t width, int num,</a>
+<a name="ln220">		   oid name[], size_t namelen)</a>
+<a name="ln221">{</a>
+<a name="ln222">  register_mib (descr, var, width, num, name, namelen);</a>
+<a name="ln223">}</a>
+<a name="ln224"> </a>
+<a name="ln225">int</a>
+<a name="ln226">smux_trap (struct variable *vp, size_t vp_len,</a>
+<a name="ln227">	   const oid *ename, size_t enamelen,</a>
+<a name="ln228">	   const oid *name, size_t namelen,</a>
+<a name="ln229">	   const oid *iname, size_t inamelen,</a>
+<a name="ln230">	   const struct trap_object *trapobj, size_t trapobjlen,</a>
+<a name="ln231">	   u_char sptrap)</a>
+<a name="ln232">{</a>
+<a name="ln233">  oid objid_snmptrap[] = { 1, 3, 6, 1, 6, 3, 1, 1, 4, 1, 0 };</a>
+<a name="ln234">  size_t objid_snmptrap_len = sizeof objid_snmptrap / sizeof (oid);</a>
+<a name="ln235">  oid notification_oid[MAX_OID_LEN];</a>
+<a name="ln236">  size_t notification_oid_len;</a>
+<a name="ln237">  unsigned int i;</a>
+<a name="ln238"> </a>
+<a name="ln239">  netsnmp_variable_list *notification_vars = NULL;</a>
+<a name="ln240">  if (!agentx_enabled) return 0;</a>
+<a name="ln241"> </a>
+<a name="ln242">  /* snmpTrapOID */</a>
+<a name="ln243">  oid_copy (notification_oid, ename, enamelen);</a>
+<a name="ln244">  notification_oid[enamelen] = sptrap;</a>
+<a name="ln245">  notification_oid_len = enamelen + 1;</a>
+<a name="ln246">  snmp_varlist_add_variable (&amp;notification_vars,</a>
+<a name="ln247">			     objid_snmptrap, objid_snmptrap_len,</a>
+<a name="ln248">			     ASN_OBJECT_ID,</a>
+<a name="ln249">			     (u_char *) notification_oid,</a>
+<a name="ln250">			     notification_oid_len * sizeof(oid));</a>
+<a name="ln251"> </a>
+<a name="ln252">  /* Provided bindings */</a>
+<a name="ln253">  for (i = 0; i &lt; trapobjlen; i++)</a>
+<a name="ln254">    {</a>
+<a name="ln255">      unsigned int j;</a>
+<a name="ln256">      oid oid[MAX_OID_LEN];</a>
+<a name="ln257">      size_t oid_len, onamelen;</a>
+<a name="ln258">      u_char *val;</a>
+<a name="ln259">      size_t val_len;</a>
+<a name="ln260">      WriteMethod *wm = NULL;</a>
+<a name="ln261">      struct variable cvp;</a>
+<a name="ln262"> </a>
+<a name="ln263">      /* Make OID. */</a>
+<a name="ln264">      if (trapobj[i].namelen &gt; 0)</a>
+<a name="ln265">        {</a>
+<a name="ln266">	  /* Columnar object */</a>
+<a name="ln267">	  onamelen = trapobj[i].namelen;</a>
+<a name="ln268">	  oid_copy (oid, name, namelen);</a>
+<a name="ln269">	  oid_copy (oid + namelen, trapobj[i].name, onamelen);</a>
+<a name="ln270">	  oid_copy (oid + namelen + onamelen, iname, inamelen);</a>
+<a name="ln271">	  oid_len = namelen + onamelen + inamelen;</a>
+<a name="ln272">        }</a>
+<a name="ln273">      else</a>
+<a name="ln274">        {</a>
+<a name="ln275">	  /* Scalar object */</a>
+<a name="ln276">	  onamelen = trapobj[i].namelen * (-1);</a>
+<a name="ln277">	  oid_copy (oid, name, namelen);</a>
+<a name="ln278">	  oid_copy (oid + namelen, trapobj[i].name, onamelen);</a>
+<a name="ln279">	  oid[onamelen + namelen] = 0;</a>
+<a name="ln280">	  oid_len = namelen + onamelen + 1;</a>
+<a name="ln281">        }</a>
+<a name="ln282"> </a>
+<a name="ln283">      /* Locate the appropriate function and type in the MIB registry. */</a>
+<a name="ln284">      for (j = 0; j &lt; vp_len; j++)</a>
+<a name="ln285">	{</a>
+<a name="ln286">	  if (oid_compare (trapobj[i].name, onamelen, vp[j].name, vp[j].namelen) != 0)</a>
+<a name="ln287">	    continue;</a>
+<a name="ln288">	  /* We found the appropriate variable in the MIB registry. */</a>
+<a name="ln289">	  oid_copy(cvp.name, name, namelen);</a>
+<a name="ln290">	  oid_copy(cvp.name + namelen, vp[j].name, vp[j].namelen);</a>
+<a name="ln291">	  cvp.namelen = namelen + vp[j].namelen;</a>
+<a name="ln292">	  cvp.type = vp[j].type;</a>
+<a name="ln293">	  cvp.magic = vp[j].magic;</a>
+<a name="ln294">	  cvp.acl = vp[j].acl;</a>
+<a name="ln295">	  cvp.findVar = vp[j].findVar;</a>
+<a name="ln296">	  /* Grab the result. */</a>
+<a name="ln297">	  val = cvp.findVar (&amp;cvp, oid, &amp;oid_len, 1, &amp;val_len, &amp;wm);</a>
+<a name="ln298">	  if (!val) break;</a>
+<a name="ln299">	  snmp_varlist_add_variable (&amp;notification_vars,</a>
+<a name="ln300">				     oid, oid_len,</a>
+<a name="ln301">				     vp[j].type,</a>
+<a name="ln302">				     val,</a>
+<a name="ln303">				     val_len);</a>
+<a name="ln304">	  break;</a>
+<a name="ln305">	}</a>
+<a name="ln306">    }</a>
+<a name="ln307"> </a>
+<a name="ln308"> </a>
+<a name="ln309">  send_v2trap (notification_vars);</a>
+<a name="ln310">  snmp_free_varbind (notification_vars);</a>
+<a name="ln311">  agentx_events_update ();</a>
+<a name="ln312">  return 1;</a>
+<a name="ln313">}</a>
+<a name="ln314"> </a>
+<a name="ln315">#endif /* HAVE_SNMP */</a>
+
+</code></pre>
+<div class="balloon" rel="7"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1042/" target="_blank">V1042</a> This file is marked with copyleft license, which requires you to open the derived source code.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

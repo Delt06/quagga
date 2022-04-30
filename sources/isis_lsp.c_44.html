@@ -1,0 +1,3121 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>isis_lsp.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.5.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * IS-IS Rout(e)ing protocol - isis_lsp.c</a>
+<a name="ln3"> *                             LSP processing</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * Copyright (C) 2001,2002   Sampo Saaristo</a>
+<a name="ln6"> *                           Tampere University of Technology      </a>
+<a name="ln7"> *                           Institute of Communications Engineering</a>
+<a name="ln8"> * Copyright (C) 2013-2015   Christian Franke &lt;chris@opensourcerouting.org&gt;</a>
+<a name="ln9"> *</a>
+<a name="ln10"> * This program is free software; you can redistribute it and/or modify it </a>
+<a name="ln11"> * under the terms of the GNU General Public License as published by the Free </a>
+<a name="ln12"> * Software Foundation; either version 2 of the License, or (at your option) </a>
+<a name="ln13"> * any later version.</a>
+<a name="ln14"> *</a>
+<a name="ln15"> * This program is distributed in the hope that it will be useful,but WITHOUT </a>
+<a name="ln16"> * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or </a>
+<a name="ln17"> * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for </a>
+<a name="ln18"> * more details.</a>
+<a name="ln19"> </a>
+<a name="ln20"> * You should have received a copy of the GNU General Public License along </a>
+<a name="ln21"> * with this program; if not, write to the Free Software Foundation, Inc., </a>
+<a name="ln22"> * 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.</a>
+<a name="ln23"> */</a>
+<a name="ln24"> </a>
+<a name="ln25">#include &lt;zebra.h&gt;</a>
+<a name="ln26"> </a>
+<a name="ln27">#include &quot;linklist.h&quot;</a>
+<a name="ln28">#include &quot;thread.h&quot;</a>
+<a name="ln29">#include &quot;vty.h&quot;</a>
+<a name="ln30">#include &quot;stream.h&quot;</a>
+<a name="ln31">#include &quot;memory.h&quot;</a>
+<a name="ln32">#include &quot;log.h&quot;</a>
+<a name="ln33">#include &quot;prefix.h&quot;</a>
+<a name="ln34">#include &quot;command.h&quot;</a>
+<a name="ln35">#include &quot;hash.h&quot;</a>
+<a name="ln36">#include &quot;if.h&quot;</a>
+<a name="ln37">#include &quot;checksum.h&quot;</a>
+<a name="ln38">#include &quot;md5.h&quot;</a>
+<a name="ln39">#include &quot;table.h&quot;</a>
+<a name="ln40"> </a>
+<a name="ln41">#include &quot;isisd/dict.h&quot;</a>
+<a name="ln42">#include &quot;isisd/isis_constants.h&quot;</a>
+<a name="ln43">#include &quot;isisd/isis_common.h&quot;</a>
+<a name="ln44">#include &quot;isisd/isis_flags.h&quot;</a>
+<a name="ln45">#include &quot;isisd/isis_circuit.h&quot;</a>
+<a name="ln46">#include &quot;isisd/isisd.h&quot;</a>
+<a name="ln47">#include &quot;isisd/isis_tlv.h&quot;</a>
+<a name="ln48">#include &quot;isisd/isis_lsp.h&quot;</a>
+<a name="ln49">#include &quot;isisd/isis_pdu.h&quot;</a>
+<a name="ln50">#include &quot;isisd/isis_dynhn.h&quot;</a>
+<a name="ln51">#include &quot;isisd/isis_misc.h&quot;</a>
+<a name="ln52">#include &quot;isisd/isis_csm.h&quot;</a>
+<a name="ln53">#include &quot;isisd/isis_adjacency.h&quot;</a>
+<a name="ln54">#include &quot;isisd/isis_spf.h&quot;</a>
+<a name="ln55">#include &quot;isisd/isis_te.h&quot;</a>
+<a name="ln56"> </a>
+<a name="ln57">#ifdef TOPOLOGY_GENERATE</a>
+<a name="ln58">#include &quot;spgrid.h&quot;</a>
+<a name="ln59">#endif</a>
+<a name="ln60"> </a>
+<a name="ln61">/* staticly assigned vars for printing purposes */</a>
+<a name="ln62">char lsp_bits_string[200];     /* FIXME: enough ? */</a>
+<a name="ln63"> </a>
+<a name="ln64">static int lsp_l1_refresh (struct thread *thread);</a>
+<a name="ln65">static int lsp_l2_refresh (struct thread *thread);</a>
+<a name="ln66">static int lsp_l1_refresh_pseudo (struct thread *thread);</a>
+<a name="ln67">static int lsp_l2_refresh_pseudo (struct thread *thread);</a>
+<a name="ln68"> </a>
+<a name="ln69">int</a>
+<a name="ln70">lsp_id_cmp (u_char * id1, u_char * id2)</a>
+<a name="ln71">{</a>
+<a name="ln72">  return memcmp (id1, id2, ISIS_SYS_ID_LEN + 2);</a>
+<a name="ln73">}</a>
+<a name="ln74"> </a>
+<a name="ln75">dict_t *</a>
+<a name="ln76">lsp_db_init (void)</a>
+<a name="ln77">{</a>
+<a name="ln78">  dict_t *dict;</a>
+<a name="ln79"> </a>
+<a name="ln80">  dict = dict_create (DICTCOUNT_T_MAX, (dict_comp_t) lsp_id_cmp);</a>
+<a name="ln81"> </a>
+<a name="ln82">  return dict;</a>
+<a name="ln83">}</a>
+<a name="ln84"> </a>
+<a name="ln85">struct isis_lsp *</a>
+<a name="ln86">lsp_search (u_char * id, dict_t * lspdb)</a>
+<a name="ln87">{</a>
+<a name="ln88">  dnode_t *node;</a>
+<a name="ln89"> </a>
+<a name="ln90">#ifdef EXTREME_DEBUG</a>
+<a name="ln91">  dnode_t *dn;</a>
+<a name="ln92"> </a>
+<a name="ln93">  zlog_debug (&quot;searching db&quot;);</a>
+<a name="ln94">  for (dn = dict_first (lspdb); dn; dn = dict_next (lspdb, dn))</a>
+<a name="ln95">    {</a>
+<a name="ln96">      zlog_debug (&quot;%s\t%pX&quot;, rawlspid_print ((u_char *) dnode_getkey (dn)),</a>
+<a name="ln97">		  dnode_get (dn));</a>
+<a name="ln98">    }</a>
+<a name="ln99">#endif /* EXTREME DEBUG */</a>
+<a name="ln100"> </a>
+<a name="ln101">  node = dict_lookup (lspdb, id);</a>
+<a name="ln102"> </a>
+<a name="ln103">  if (node)</a>
+<a name="ln104">    return (struct isis_lsp *) dnode_get (node);</a>
+<a name="ln105"> </a>
+<a name="ln106">  return NULL;</a>
+<a name="ln107">}</a>
+<a name="ln108"> </a>
+<a name="ln109">static void</a>
+<a name="ln110">lsp_clear_data (struct isis_lsp *lsp)</a>
+<a name="ln111">{</a>
+<a name="ln112">  if (!lsp)</a>
+<a name="ln113">    return;</a>
+<a name="ln114"> </a>
+<a name="ln115">  if (lsp-&gt;tlv_data.hostname)</a>
+<a name="ln116">    isis_dynhn_remove (lsp-&gt;lsp_header-&gt;lsp_id);</a>
+<a name="ln117"> </a>
+<a name="ln118">  if (lsp-&gt;own_lsp)</a>
+<a name="ln119">    {</a>
+<a name="ln120">      if (lsp-&gt;tlv_data.nlpids)</a>
+<a name="ln121">        XFREE (MTYPE_ISIS_TLV, lsp-&gt;tlv_data.nlpids);</a>
+<a name="ln122">      if (lsp-&gt;tlv_data.hostname)</a>
+<a name="ln123">        XFREE (MTYPE_ISIS_TLV, lsp-&gt;tlv_data.hostname);</a>
+<a name="ln124">      if (lsp-&gt;tlv_data.router_id)</a>
+<a name="ln125">        XFREE (MTYPE_ISIS_TLV, lsp-&gt;tlv_data.router_id);</a>
+<a name="ln126">    }</a>
+<a name="ln127"> </a>
+<a name="ln128">  free_tlvs (&amp;lsp-&gt;tlv_data);</a>
+<a name="ln129">}</a>
+<a name="ln130"> </a>
+<a name="ln131">static void</a>
+<a name="ln132">lsp_destroy (struct isis_lsp *lsp)</a>
+<a name="ln133">{</a>
+<a name="ln134">  struct listnode *cnode, *lnode, *lnnode;</a>
+<a name="ln135">  struct isis_lsp *lsp_in_list;</a>
+<a name="ln136">  struct isis_circuit *circuit;</a>
+<a name="ln137"> </a>
+<a name="ln138">  if (!lsp)</a>
+<a name="ln139">    return;</a>
+<a name="ln140"> </a>
+<a name="ln141">  if (lsp-&gt;area-&gt;circuit_list) {</a>
+<a name="ln142">    for (ALL_LIST_ELEMENTS_RO (lsp-&gt;area-&gt;circuit_list, cnode, circuit))</a>
+<a name="ln143">      {</a>
+<a name="ln144">        if (circuit-&gt;lsp_queue == NULL)</a>
+<a name="ln145">          continue;</a>
+<a name="ln146">        for (ALL_LIST_ELEMENTS (circuit-&gt;lsp_queue, lnode, lnnode, lsp_in_list))</a>
+<a name="ln147">          if (lsp_in_list == lsp)</a>
+<a name="ln148">            list_delete_node(circuit-&gt;lsp_queue, lnode);</a>
+<a name="ln149">      }</a>
+<a name="ln150">  }</a>
+<a name="ln151">  ISIS_FLAGS_CLEAR_ALL (lsp-&gt;SSNflags);</a>
+<a name="ln152">  ISIS_FLAGS_CLEAR_ALL (lsp-&gt;SRMflags);</a>
+<a name="ln153"> </a>
+<a name="ln154">  lsp_clear_data (lsp);</a>
+<a name="ln155"> </a>
+<a name="ln156">  if (LSP_FRAGMENT (lsp-&gt;lsp_header-&gt;lsp_id) == 0 &amp;&amp; lsp-&gt;lspu.frags)</a>
+<a name="ln157">    {</a>
+<a name="ln158">      list_delete (lsp-&gt;lspu.frags);</a>
+<a name="ln159">      lsp-&gt;lspu.frags = NULL;</a>
+<a name="ln160">    }</a>
+<a name="ln161"> </a>
+<a name="ln162">  isis_spf_schedule (lsp-&gt;area, lsp-&gt;level);</a>
+<a name="ln163">#ifdef HAVE_IPV6</a>
+<a name="ln164">  isis_spf_schedule6 (lsp-&gt;area, lsp-&gt;level);</a>
+<a name="ln165">#endif</a>
+<a name="ln166"> </a>
+<a name="ln167">  if (lsp-&gt;pdu)</a>
+<a name="ln168">    stream_free (lsp-&gt;pdu);</a>
+<a name="ln169">  XFREE (MTYPE_ISIS_LSP, lsp);</a>
+<a name="ln170">}</a>
+<a name="ln171"> </a>
+<a name="ln172">void</a>
+<a name="ln173">lsp_db_destroy (dict_t * lspdb)</a>
+<a name="ln174">{</a>
+<a name="ln175">  dnode_t *dnode, *next;</a>
+<a name="ln176">  struct isis_lsp *lsp;</a>
+<a name="ln177"> </a>
+<a name="ln178">  dnode = dict_first (lspdb);</a>
+<a name="ln179">  while (dnode)</a>
+<a name="ln180">    {</a>
+<a name="ln181">      next = dict_next (lspdb, dnode);</a>
+<a name="ln182">      lsp = dnode_get (dnode);</a>
+<a name="ln183">      lsp_destroy (lsp);</a>
+<a name="ln184">      dict_delete_free (lspdb, dnode);</a>
+<a name="ln185">      dnode = next;</a>
+<a name="ln186">    }</a>
+<a name="ln187"> </a>
+<a name="ln188">  dict_free (lspdb);</a>
+<a name="ln189"> </a>
+<a name="ln190">  return;</a>
+<a name="ln191">}</a>
+<a name="ln192"> </a>
+<a name="ln193">/*</a>
+<a name="ln194"> * Remove all the frags belonging to the given lsp</a>
+<a name="ln195"> */</a>
+<a name="ln196">static void</a>
+<a name="ln197">lsp_remove_frags (struct list *frags, dict_t * lspdb)</a>
+<a name="ln198">{</a>
+<a name="ln199">  dnode_t *dnode;</a>
+<a name="ln200">  struct listnode *lnode, *lnnode;</a>
+<a name="ln201">  struct isis_lsp *lsp;</a>
+<a name="ln202"> </a>
+<a name="ln203">  for (ALL_LIST_ELEMENTS (frags, lnode, lnnode, lsp))</a>
+<a name="ln204">    {</a>
+<a name="ln205">      dnode = dict_lookup (lspdb, lsp-&gt;lsp_header-&gt;lsp_id);</a>
+<a name="ln206">      lsp_destroy (lsp);</a>
+<a name="ln207">      dnode_destroy (dict_delete (lspdb, dnode));</a>
+<a name="ln208">    }</a>
+<a name="ln209"> </a>
+<a name="ln210">  list_delete_all_node (frags);</a>
+<a name="ln211"> </a>
+<a name="ln212">  return;</a>
+<a name="ln213">}</a>
+<a name="ln214"> </a>
+<a name="ln215">void</a>
+<a name="ln216">lsp_search_and_destroy (u_char * id, dict_t * lspdb)</a>
+<a name="ln217">{</a>
+<a name="ln218">  dnode_t *node;</a>
+<a name="ln219">  struct isis_lsp *lsp;</a>
+<a name="ln220"> </a>
+<a name="ln221">  node = dict_lookup (lspdb, id);</a>
+<a name="ln222">  if (node)</a>
+<a name="ln223">    {</a>
+<a name="ln224">      node = dict_delete (lspdb, node);</a>
+<a name="ln225">      lsp = dnode_get (node);</a>
+<a name="ln226">      /*</a>
+<a name="ln227">       * If this is a zero lsp, remove all the frags now </a>
+<a name="ln228">       */</a>
+<a name="ln229">      if (LSP_FRAGMENT (lsp-&gt;lsp_header-&gt;lsp_id) == 0)</a>
+<a name="ln230">	{</a>
+<a name="ln231">	  if (lsp-&gt;lspu.frags)</a>
+<a name="ln232">	    lsp_remove_frags (lsp-&gt;lspu.frags, lspdb);</a>
+<a name="ln233">	}</a>
+<a name="ln234">      else</a>
+<a name="ln235">	{</a>
+<a name="ln236">	  /* </a>
+<a name="ln237">	   * else just remove this frag, from the zero lsps' frag list</a>
+<a name="ln238">	   */</a>
+<a name="ln239">	  if (lsp-&gt;lspu.zero_lsp &amp;&amp; lsp-&gt;lspu.zero_lsp-&gt;lspu.frags)</a>
+<a name="ln240">	    listnode_delete (lsp-&gt;lspu.zero_lsp-&gt;lspu.frags, lsp);</a>
+<a name="ln241">	}</a>
+<a name="ln242">      lsp_destroy (lsp);</a>
+<a name="ln243">      dnode_destroy (node);</a>
+<a name="ln244">    }</a>
+<a name="ln245">}</a>
+<a name="ln246"> </a>
+<a name="ln247">/*</a>
+<a name="ln248"> * Compares a LSP to given values</a>
+<a name="ln249"> * Params are given in net order</a>
+<a name="ln250"> */</a>
+<a name="ln251">int</a>
+<a name="ln252">lsp_compare (char *areatag, struct isis_lsp *lsp, u_int32_t seq_num,</a>
+<a name="ln253">	     u_int16_t checksum, u_int16_t rem_lifetime)</a>
+<a name="ln254">{</a>
+<a name="ln255">  /* no point in double ntohl on seqnum */</a>
+<a name="ln256">  if (lsp-&gt;lsp_header-&gt;seq_num == seq_num &amp;&amp;</a>
+<a name="ln257">      lsp-&gt;lsp_header-&gt;checksum == checksum &amp;&amp;</a>
+<a name="ln258">      /*comparing with 0, no need to do ntohl */</a>
+<a name="ln259">      ((lsp-&gt;lsp_header-&gt;rem_lifetime == 0 &amp;&amp; rem_lifetime == 0) ||</a>
+<a name="ln260">       (lsp-&gt;lsp_header-&gt;rem_lifetime != 0 &amp;&amp; rem_lifetime != 0)))</a>
+<a name="ln261">    {</a>
+<a name="ln262">      if (isis-&gt;debugs &amp; DEBUG_SNP_PACKETS)</a>
+<a name="ln263">	{</a>
+<a name="ln264">	  zlog_debug (&quot;ISIS-Snp (%s): Compare LSP %s seq 0x%08x, cksum 0x%04x,&quot;</a>
+<a name="ln265">		      &quot; lifetime %us&quot;,</a>
+<a name="ln266">		      areatag,</a>
+<a name="ln267">		      rawlspid_print (lsp-&gt;lsp_header-&gt;lsp_id),</a>
+<a name="ln268">		      ntohl (lsp-&gt;lsp_header-&gt;seq_num),</a>
+<a name="ln269">		      ntohs (lsp-&gt;lsp_header-&gt;checksum),</a>
+<a name="ln270">		      ntohs (lsp-&gt;lsp_header-&gt;rem_lifetime));</a>
+<a name="ln271">	  zlog_debug (&quot;ISIS-Snp (%s):         is equal to ours seq 0x%08x,&quot;</a>
+<a name="ln272">		      &quot; cksum 0x%04x, lifetime %us&quot;,</a>
+<a name="ln273">		      areatag,</a>
+<a name="ln274">		      ntohl (seq_num), ntohs (checksum), ntohs (rem_lifetime));</a>
+<a name="ln275">	}</a>
+<a name="ln276">      return LSP_EQUAL;</a>
+<a name="ln277">    }</a>
+<a name="ln278"> </a>
+<a name="ln279">  /*</a>
+<a name="ln280">   * LSPs with identical checksums should only be treated as newer if:</a>
+<a name="ln281">   * a) The current LSP has a remaining lifetime != 0 and the other LSP has a</a>
+<a name="ln282">   *    remaining lifetime == 0. In this case, we should participate in the purge</a>
+<a name="ln283">   *    and should not treat the current LSP with remaining lifetime == 0 as older.</a>
+<a name="ln284">   * b) The LSP has an incorrect checksum. In this case, we need to react as given</a>
+<a name="ln285">   *    in 7.3.16.2.</a>
+<a name="ln286">   */</a>
+<a name="ln287">   if (ntohl (seq_num) &gt; ntohl (lsp-&gt;lsp_header-&gt;seq_num)</a>
+<a name="ln288">      || (ntohl(seq_num) == ntohl(lsp-&gt;lsp_header-&gt;seq_num)</a>
+<a name="ln289">          &amp;&amp; (  (lsp-&gt;lsp_header-&gt;rem_lifetime != 0</a>
+<a name="ln290">                 &amp;&amp; rem_lifetime == 0)</a>
+<a name="ln291">              || lsp-&gt;lsp_header-&gt;checksum != checksum)))</a>
+<a name="ln292">    {</a>
+<a name="ln293">      if (isis-&gt;debugs &amp; DEBUG_SNP_PACKETS)</a>
+<a name="ln294">	{</a>
+<a name="ln295">	  zlog_debug (&quot;ISIS-Snp (%s): Compare LSP %s seq 0x%08x, cksum 0x%04x,&quot;</a>
+<a name="ln296">		      &quot; lifetime %us&quot;,</a>
+<a name="ln297">		      areatag,</a>
+<a name="ln298">		      rawlspid_print (lsp-&gt;lsp_header-&gt;lsp_id),</a>
+<a name="ln299">		      ntohl (seq_num), ntohs (checksum), ntohs (rem_lifetime));</a>
+<a name="ln300">	  zlog_debug (&quot;ISIS-Snp (%s):       is newer than ours seq 0x%08x, &quot;</a>
+<a name="ln301">		      &quot;cksum 0x%04x, lifetime %us&quot;,</a>
+<a name="ln302">		      areatag,</a>
+<a name="ln303">		      ntohl (lsp-&gt;lsp_header-&gt;seq_num),</a>
+<a name="ln304">		      ntohs (lsp-&gt;lsp_header-&gt;checksum),</a>
+<a name="ln305">		      ntohs (lsp-&gt;lsp_header-&gt;rem_lifetime));</a>
+<a name="ln306">	}</a>
+<a name="ln307">      return LSP_NEWER;</a>
+<a name="ln308">    }</a>
+<a name="ln309">  if (isis-&gt;debugs &amp; DEBUG_SNP_PACKETS)</a>
+<a name="ln310">    {</a>
+<a name="ln311">      zlog_debug</a>
+<a name="ln312">	(&quot;ISIS-Snp (%s): Compare LSP %s seq 0x%08x, cksum 0x%04x, lifetime %us&quot;,</a>
+<a name="ln313">	 areatag, rawlspid_print (lsp-&gt;lsp_header-&gt;lsp_id), ntohl (seq_num),</a>
+<a name="ln314">	 ntohs (checksum), ntohs (rem_lifetime));</a>
+<a name="ln315">      zlog_debug (&quot;ISIS-Snp (%s):       is older than ours seq 0x%08x,&quot;</a>
+<a name="ln316">		  &quot; cksum 0x%04x, lifetime %us&quot;, areatag,</a>
+<a name="ln317">		  ntohl (lsp-&gt;lsp_header-&gt;seq_num),</a>
+<a name="ln318">		  ntohs (lsp-&gt;lsp_header-&gt;checksum),</a>
+<a name="ln319">		  ntohs (lsp-&gt;lsp_header-&gt;rem_lifetime));</a>
+<a name="ln320">    }</a>
+<a name="ln321"> </a>
+<a name="ln322">  return LSP_OLDER;</a>
+<a name="ln323">}</a>
+<a name="ln324"> </a>
+<a name="ln325">static void</a>
+<a name="ln326">lsp_auth_add (struct isis_lsp *lsp)</a>
+<a name="ln327">{</a>
+<a name="ln328">  struct isis_passwd *passwd;</a>
+<a name="ln329">  unsigned char hmac_md5_hash[ISIS_AUTH_MD5_SIZE];</a>
+<a name="ln330"> </a>
+<a name="ln331">  /*</a>
+<a name="ln332">   * Add the authentication info if its present</a>
+<a name="ln333">   */</a>
+<a name="ln334">  (lsp-&gt;level == IS_LEVEL_1) ? (passwd = &amp;lsp-&gt;area-&gt;area_passwd) :</a>
+<a name="ln335">                               (passwd = &amp;lsp-&gt;area-&gt;domain_passwd);</a>
+<a name="ln336">  switch (passwd-&gt;type)</a>
+<a name="ln337">    {</a>
+<a name="ln338">      /* Cleartext */</a>
+<a name="ln339">      case ISIS_PASSWD_TYPE_CLEARTXT:</a>
+<a name="ln340">        memcpy (&amp;lsp-&gt;tlv_data.auth_info, passwd, sizeof (struct isis_passwd));</a>
+<a name="ln341">        tlv_add_authinfo (passwd-&gt;type, passwd-&gt;len, passwd-&gt;passwd, lsp-&gt;pdu);</a>
+<a name="ln342">        break;</a>
+<a name="ln343"> </a>
+<a name="ln344">      /* HMAC MD5 */</a>
+<a name="ln345">      case ISIS_PASSWD_TYPE_HMAC_MD5:</a>
+<a name="ln346">        /* Remember where TLV is written so we can later</a>
+<a name="ln347">         * overwrite the MD5 hash */</a>
+<a name="ln348">        lsp-&gt;auth_tlv_offset = stream_get_endp (lsp-&gt;pdu);</a>
+<a name="ln349">        memset(&amp;hmac_md5_hash, 0, ISIS_AUTH_MD5_SIZE);</a>
+<a name="ln350">        lsp-&gt;tlv_data.auth_info.type = ISIS_PASSWD_TYPE_HMAC_MD5;</a>
+<a name="ln351">        lsp-&gt;tlv_data.auth_info.len = ISIS_AUTH_MD5_SIZE;</a>
+<a name="ln352">        memcpy (&amp;lsp-&gt;tlv_data.auth_info.passwd, hmac_md5_hash,</a>
+<a name="ln353">                ISIS_AUTH_MD5_SIZE);</a>
+<a name="ln354">        tlv_add_authinfo (passwd-&gt;type, ISIS_AUTH_MD5_SIZE, hmac_md5_hash,</a>
+<a name="ln355">                          lsp-&gt;pdu);</a>
+<a name="ln356">        break;</a>
+<a name="ln357"> </a>
+<a name="ln358">      default:</a>
+<a name="ln359">        break;</a>
+<a name="ln360">    }</a>
+<a name="ln361">}</a>
+<a name="ln362"> </a>
+<a name="ln363">static void</a>
+<a name="ln364">lsp_auth_update (struct isis_lsp *lsp)</a>
+<a name="ln365">{</a>
+<a name="ln366">  struct isis_passwd *passwd;</a>
+<a name="ln367">  unsigned char hmac_md5_hash[ISIS_AUTH_MD5_SIZE];</a>
+<a name="ln368">  uint16_t checksum, rem_lifetime;</a>
+<a name="ln369"> </a>
+<a name="ln370">  /* For HMAC MD5 we need to recompute the md5 hash and store it */</a>
+<a name="ln371">  (lsp-&gt;level == IS_LEVEL_1) ? (passwd = &amp;lsp-&gt;area-&gt;area_passwd) :</a>
+<a name="ln372">                               (passwd = &amp;lsp-&gt;area-&gt;domain_passwd);</a>
+<a name="ln373">  if (passwd-&gt;type != ISIS_PASSWD_TYPE_HMAC_MD5)</a>
+<a name="ln374">    return;</a>
+<a name="ln375"> </a>
+<a name="ln376">  /*</a>
+<a name="ln377">   * In transient conditions (when net is configured where authentication</a>
+<a name="ln378">   * config and lsp regenerate schedule is not yet run), there could be</a>
+<a name="ln379">   * an own_lsp with auth_tlv_offset set to 0. In such a case, simply</a>
+<a name="ln380">   * return, when lsp_regenerate is run, lsp will have auth tlv.</a>
+<a name="ln381">   */</a>
+<a name="ln382">  if (lsp-&gt;auth_tlv_offset == 0)</a>
+<a name="ln383">    return;</a>
+<a name="ln384"> </a>
+<a name="ln385">  /*</a>
+<a name="ln386">   * RFC 5304 set auth value, checksum and remaining lifetime to zero</a>
+<a name="ln387">   * before computation and reset to old values after computation.</a>
+<a name="ln388">   */</a>
+<a name="ln389">  checksum = lsp-&gt;lsp_header-&gt;checksum;</a>
+<a name="ln390">  rem_lifetime = lsp-&gt;lsp_header-&gt;rem_lifetime;</a>
+<a name="ln391">  lsp-&gt;lsp_header-&gt;checksum = 0;</a>
+<a name="ln392">  lsp-&gt;lsp_header-&gt;rem_lifetime = 0;</a>
+<a name="ln393">  /* Set the authentication value as well to zero */</a>
+<a name="ln394">  memset (STREAM_DATA (lsp-&gt;pdu) + lsp-&gt;auth_tlv_offset + 3,</a>
+<a name="ln395">          0, ISIS_AUTH_MD5_SIZE);</a>
+<a name="ln396">  /* Compute autentication value */</a>
+<a name="ln397">  hmac_md5 (STREAM_DATA (lsp-&gt;pdu), stream_get_endp(lsp-&gt;pdu),</a>
+<a name="ln398">            (unsigned char *) &amp;passwd-&gt;passwd, passwd-&gt;len,</a>
+<a name="ln399">            (unsigned char *) &amp;hmac_md5_hash);</a>
+<a name="ln400">  /* Copy the hash into the stream */</a>
+<a name="ln401">  memcpy (STREAM_DATA (lsp-&gt;pdu) + lsp-&gt;auth_tlv_offset + 3,</a>
+<a name="ln402">          hmac_md5_hash, ISIS_AUTH_MD5_SIZE);</a>
+<a name="ln403">  memcpy (&amp;lsp-&gt;tlv_data.auth_info.passwd, hmac_md5_hash,</a>
+<a name="ln404">          ISIS_AUTH_MD5_SIZE);</a>
+<a name="ln405">  /* Copy back the checksum and remaining lifetime */</a>
+<a name="ln406">  lsp-&gt;lsp_header-&gt;checksum = checksum;</a>
+<a name="ln407">  lsp-&gt;lsp_header-&gt;rem_lifetime = rem_lifetime;</a>
+<a name="ln408">}</a>
+<a name="ln409"> </a>
+<a name="ln410">void</a>
+<a name="ln411">lsp_inc_seqnum (struct isis_lsp *lsp, u_int32_t seq_num)</a>
+<a name="ln412">{</a>
+<a name="ln413">  u_int32_t newseq;</a>
+<a name="ln414"> </a>
+<a name="ln415">  if (seq_num == 0 || ntohl (lsp-&gt;lsp_header-&gt;seq_num) &gt; seq_num)</a>
+<a name="ln416">    newseq = ntohl (lsp-&gt;lsp_header-&gt;seq_num) + 1;</a>
+<a name="ln417">  else</a>
+<a name="ln418">    newseq = seq_num + 1;</a>
+<a name="ln419"> </a>
+<a name="ln420">  lsp-&gt;lsp_header-&gt;seq_num = htonl (newseq);</a>
+<a name="ln421"> </a>
+<a name="ln422">  /* Recompute authentication and checksum information */</a>
+<a name="ln423">  lsp_auth_update (lsp);</a>
+<a name="ln424">  /* ISO 10589 - 7.3.11 Generation of the checksum</a>
+<a name="ln425">   * The checksum shall be computed over all fields in the LSP which appear</a>
+<a name="ln426">   * after the Remaining Lifetime field. This field (and those appearing</a>
+<a name="ln427">   * before it) are excluded so that the LSP may be aged by systems without</a>
+<a name="ln428">   * requiring recomputation.</a>
+<a name="ln429">   */</a>
+<a name="ln430">  fletcher_checksum(STREAM_DATA (lsp-&gt;pdu) + 12,</a>
+<a name="ln431">                    ntohs (lsp-&gt;lsp_header-&gt;pdu_len) - 12, 12);</a>
+<a name="ln432"> </a>
+<a name="ln433">  isis_spf_schedule (lsp-&gt;area, lsp-&gt;level);</a>
+<a name="ln434">#ifdef HAVE_IPV6</a>
+<a name="ln435">  isis_spf_schedule6 (lsp-&gt;area, lsp-&gt;level);</a>
+<a name="ln436">#endif</a>
+<a name="ln437"> </a>
+<a name="ln438">  return;</a>
+<a name="ln439">}</a>
+<a name="ln440"> </a>
+<a name="ln441">/*</a>
+<a name="ln442"> * Genetates checksum for LSP and its frags</a>
+<a name="ln443"> */</a>
+<a name="ln444">static void</a>
+<a name="ln445">lsp_seqnum_update (struct isis_lsp *lsp0)</a>
+<a name="ln446">{</a>
+<a name="ln447">  struct isis_lsp *lsp;</a>
+<a name="ln448">  struct listnode *node;</a>
+<a name="ln449"> </a>
+<a name="ln450">  lsp_inc_seqnum (lsp0, 0);</a>
+<a name="ln451"> </a>
+<a name="ln452">  if (!lsp0-&gt;lspu.frags)</a>
+<a name="ln453">    return;</a>
+<a name="ln454"> </a>
+<a name="ln455">  for (ALL_LIST_ELEMENTS_RO (lsp0-&gt;lspu.frags, node, lsp))</a>
+<a name="ln456">    lsp_inc_seqnum (lsp, 0);</a>
+<a name="ln457"> </a>
+<a name="ln458">  return;</a>
+<a name="ln459">}</a>
+<a name="ln460"> </a>
+<a name="ln461">static u_int8_t</a>
+<a name="ln462">lsp_bits_generate (int level, int overload_bit, int attached_bit)</a>
+<a name="ln463">{</a>
+<a name="ln464">  u_int8_t lsp_bits = 0;</a>
+<a name="ln465">  if (level == IS_LEVEL_1)</a>
+<a name="ln466">    lsp_bits = IS_LEVEL_1;</a>
+<a name="ln467">  else</a>
+<a name="ln468">    lsp_bits = IS_LEVEL_1_AND_2;</a>
+<a name="ln469">  if (overload_bit)</a>
+<a name="ln470">    lsp_bits |= overload_bit;</a>
+<a name="ln471">  if (attached_bit)</a>
+<a name="ln472">    lsp_bits |= attached_bit;</a>
+<a name="ln473">  return lsp_bits;</a>
+<a name="ln474">}</a>
+<a name="ln475"> </a>
+<a name="ln476">static void</a>
+<a name="ln477">lsp_update_data (struct isis_lsp *lsp, struct stream *stream,</a>
+<a name="ln478">                 struct isis_area *area, int level)</a>
+<a name="ln479">{</a>
+<a name="ln480">  uint32_t expected = 0, found;</a>
+<a name="ln481">  int retval;</a>
+<a name="ln482"> </a>
+<a name="ln483">  /* free the old lsp data */</a>
+<a name="ln484">  lsp_clear_data (lsp);</a>
+<a name="ln485"> </a>
+<a name="ln486">  /* copying only the relevant part of our stream */</a>
+<a name="ln487">  if (lsp-&gt;pdu != NULL)</a>
+<a name="ln488">    stream_free (lsp-&gt;pdu);</a>
+<a name="ln489">  lsp-&gt;pdu = stream_dup (stream);</a>
+<a name="ln490"> </a>
+<a name="ln491">  /* setting pointers to the correct place */</a>
+<a name="ln492">  lsp-&gt;isis_header = (struct isis_fixed_hdr *) (STREAM_DATA (lsp-&gt;pdu));</a>
+<a name="ln493">  lsp-&gt;lsp_header = (struct isis_link_state_hdr *) (STREAM_DATA (lsp-&gt;pdu) +</a>
+<a name="ln494">						    ISIS_FIXED_HDR_LEN);</a>
+<a name="ln495">  lsp-&gt;area = area;</a>
+<a name="ln496">  lsp-&gt;level = level;</a>
+<a name="ln497">  lsp-&gt;age_out = ZERO_AGE_LIFETIME;</a>
+<a name="ln498">  lsp-&gt;installed = time (NULL);</a>
+<a name="ln499">  /*</a>
+<a name="ln500">   * Get LSP data i.e. TLVs</a>
+<a name="ln501">   */</a>
+<a name="ln502">  expected |= TLVFLAG_AUTH_INFO;</a>
+<a name="ln503">  expected |= TLVFLAG_AREA_ADDRS;</a>
+<a name="ln504">  expected |= TLVFLAG_IS_NEIGHS;</a>
+<a name="ln505">  expected |= TLVFLAG_NLPID;</a>
+<a name="ln506">  if (area-&gt;dynhostname)</a>
+<a name="ln507">    expected |= TLVFLAG_DYN_HOSTNAME;</a>
+<a name="ln508">  if (area-&gt;newmetric)</a>
+<a name="ln509">    {</a>
+<a name="ln510">      expected |= TLVFLAG_TE_IS_NEIGHS;</a>
+<a name="ln511">      expected |= TLVFLAG_TE_IPV4_REACHABILITY;</a>
+<a name="ln512">      expected |= TLVFLAG_TE_ROUTER_ID;</a>
+<a name="ln513">    }</a>
+<a name="ln514">  expected |= TLVFLAG_IPV4_ADDR;</a>
+<a name="ln515">  expected |= TLVFLAG_IPV4_INT_REACHABILITY;</a>
+<a name="ln516">  expected |= TLVFLAG_IPV4_EXT_REACHABILITY;</a>
+<a name="ln517">#ifdef HAVE_IPV6</a>
+<a name="ln518">  expected |= TLVFLAG_IPV6_ADDR;</a>
+<a name="ln519">  expected |= TLVFLAG_IPV6_REACHABILITY;</a>
+<a name="ln520">#endif /* HAVE_IPV6 */</a>
+<a name="ln521"> </a>
+<a name="ln522">  retval = parse_tlvs (area-&gt;area_tag, STREAM_DATA (lsp-&gt;pdu) +</a>
+<a name="ln523">                       ISIS_FIXED_HDR_LEN + ISIS_LSP_HDR_LEN,</a>
+<a name="ln524">                       ntohs (lsp-&gt;lsp_header-&gt;pdu_len) -</a>
+<a name="ln525">                       ISIS_FIXED_HDR_LEN - ISIS_LSP_HDR_LEN,</a>
+<a name="ln526">                       &amp;expected, &amp;found, &amp;lsp-&gt;tlv_data,</a>
+<a name="ln527">                       NULL);</a>
+<a name="ln528">  if (retval != ISIS_OK)</a>
+<a name="ln529">    {</a>
+<a name="ln530">      zlog_warn (&quot;Could not parse LSP&quot;);</a>
+<a name="ln531">      return;</a>
+<a name="ln532">    }</a>
+<a name="ln533"> </a>
+<a name="ln534">  if ((found &amp; TLVFLAG_DYN_HOSTNAME) &amp;&amp; (area-&gt;dynhostname))</a>
+<a name="ln535">    {</a>
+<a name="ln536">      isis_dynhn_insert (lsp-&gt;lsp_header-&gt;lsp_id, lsp-&gt;tlv_data.hostname,</a>
+<a name="ln537">                         (lsp-&gt;lsp_header-&gt;lsp_bits &amp; LSPBIT_IST) ==</a>
+<a name="ln538">                          IS_LEVEL_1_AND_2 ? IS_LEVEL_2 : IS_LEVEL_1);</a>
+<a name="ln539">    }</a>
+<a name="ln540"> </a>
+<a name="ln541">  return;</a>
+<a name="ln542">}</a>
+<a name="ln543"> </a>
+<a name="ln544">void</a>
+<a name="ln545">lsp_update (struct isis_lsp *lsp, struct stream *stream,</a>
+<a name="ln546">            struct isis_area *area, int level)</a>
+<a name="ln547">{</a>
+<a name="ln548">  dnode_t *dnode = NULL;</a>
+<a name="ln549"> </a>
+<a name="ln550">  /* Remove old LSP from database. This is required since the</a>
+<a name="ln551">   * lsp_update_data will free the lsp-&gt;pdu (which has the key, lsp_id)</a>
+<a name="ln552">   * and will update it with the new data in the stream. */</a>
+<a name="ln553">  dnode = dict_lookup (area-&gt;lspdb[level - 1], lsp-&gt;lsp_header-&gt;lsp_id);</a>
+<a name="ln554">  if (dnode)</a>
+<a name="ln555">    dnode_destroy (dict_delete (area-&gt;lspdb[level - 1], dnode));</a>
+<a name="ln556"> </a>
+<a name="ln557">  /* rebuild the lsp data */</a>
+<a name="ln558">  lsp_update_data (lsp, stream, area, level);</a>
+<a name="ln559"> </a>
+<a name="ln560">  /* insert the lsp back into the database */</a>
+<a name="ln561">  lsp_insert (lsp, area-&gt;lspdb[level - 1]);</a>
+<a name="ln562">}</a>
+<a name="ln563"> </a>
+<a name="ln564">/* creation of LSP directly from what we received */</a>
+<a name="ln565">struct isis_lsp *</a>
+<a name="ln566">lsp_new_from_stream_ptr (struct stream *stream,</a>
+<a name="ln567">			 u_int16_t pdu_len, struct isis_lsp *lsp0,</a>
+<a name="ln568">			 struct isis_area *area, int level)</a>
+<a name="ln569">{</a>
+<a name="ln570">  struct isis_lsp *lsp;</a>
+<a name="ln571"> </a>
+<a name="ln572">  lsp = XCALLOC (MTYPE_ISIS_LSP, sizeof (struct isis_lsp));</a>
+<a name="ln573">  lsp_update_data (lsp, stream, area, level);</a>
+<a name="ln574"> </a>
+<a name="ln575">  if (lsp0 == NULL)</a>
+<a name="ln576">    {</a>
+<a name="ln577">      /*</a>
+<a name="ln578">       * zero lsp -&gt; create the list for fragments</a>
+<a name="ln579">       */</a>
+<a name="ln580">      lsp-&gt;lspu.frags = list_new ();</a>
+<a name="ln581">    }</a>
+<a name="ln582">  else</a>
+<a name="ln583">    {</a>
+<a name="ln584">      /*</a>
+<a name="ln585">       * a fragment -&gt; set the backpointer and add this to zero lsps frag list</a>
+<a name="ln586">       */</a>
+<a name="ln587">      lsp-&gt;lspu.zero_lsp = lsp0;</a>
+<a name="ln588">      listnode_add (lsp0-&gt;lspu.frags, lsp);</a>
+<a name="ln589">    }</a>
+<a name="ln590"> </a>
+<a name="ln591">  return lsp;</a>
+<a name="ln592">}</a>
+<a name="ln593"> </a>
+<a name="ln594">struct isis_lsp *</a>
+<a name="ln595">lsp_new(struct isis_area *area, u_char * lsp_id,</a>
+<a name="ln596">	u_int16_t rem_lifetime, u_int32_t seq_num,</a>
+<a name="ln597">	u_int8_t lsp_bits, u_int16_t checksum, int level)</a>
+<a name="ln598">{</a>
+<a name="ln599">  struct isis_lsp *lsp;</a>
+<a name="ln600"> </a>
+<a name="ln601">  lsp = XCALLOC (MTYPE_ISIS_LSP, sizeof (struct isis_lsp));</a>
+<a name="ln602">  lsp-&gt;area = area;</a>
+<a name="ln603"> </a>
+<a name="ln604">  lsp-&gt;pdu = stream_new(LLC_LEN + area-&gt;lsp_mtu);</a>
+<a name="ln605">  if (LSP_FRAGMENT (lsp_id) == 0)</a>
+<a name="ln606">    lsp-&gt;lspu.frags = list_new ();</a>
+<a name="ln607">  lsp-&gt;isis_header = (struct isis_fixed_hdr *) (STREAM_DATA (lsp-&gt;pdu));</a>
+<a name="ln608">  lsp-&gt;lsp_header = (struct isis_link_state_hdr *)</a>
+<a name="ln609">    (STREAM_DATA (lsp-&gt;pdu) + ISIS_FIXED_HDR_LEN);</a>
+<a name="ln610"> </a>
+<a name="ln611">  /* at first we fill the FIXED HEADER */</a>
+<a name="ln612">  (level == IS_LEVEL_1) ? fill_fixed_hdr (lsp-&gt;isis_header, L1_LINK_STATE) :</a>
+<a name="ln613">    fill_fixed_hdr (lsp-&gt;isis_header, L2_LINK_STATE);</a>
+<a name="ln614"> </a>
+<a name="ln615">  /* now for the LSP HEADER */</a>
+<a name="ln616">  /* Minimal LSP PDU size */</a>
+<a name="ln617">  lsp-&gt;lsp_header-&gt;pdu_len = htons (ISIS_FIXED_HDR_LEN + ISIS_LSP_HDR_LEN);</a>
+<a name="ln618">  memcpy (lsp-&gt;lsp_header-&gt;lsp_id, lsp_id, ISIS_SYS_ID_LEN + 2);</a>
+<a name="ln619">  lsp-&gt;lsp_header-&gt;checksum = checksum;	/* Provided in network order */</a>
+<a name="ln620">  lsp-&gt;lsp_header-&gt;seq_num = htonl (seq_num);</a>
+<a name="ln621">  lsp-&gt;lsp_header-&gt;rem_lifetime = htons (rem_lifetime);</a>
+<a name="ln622">  lsp-&gt;lsp_header-&gt;lsp_bits = lsp_bits;</a>
+<a name="ln623">  lsp-&gt;level = level;</a>
+<a name="ln624">  lsp-&gt;age_out = ZERO_AGE_LIFETIME;</a>
+<a name="ln625"> </a>
+<a name="ln626">  stream_forward_endp (lsp-&gt;pdu, ISIS_FIXED_HDR_LEN + ISIS_LSP_HDR_LEN);</a>
+<a name="ln627"> </a>
+<a name="ln628">  if (isis-&gt;debugs &amp; DEBUG_EVENTS)</a>
+<a name="ln629">    zlog_debug (&quot;New LSP with ID %s-%02x-%02x len %d seqnum %08x&quot;,</a>
+<a name="ln630">		sysid_print (lsp_id), LSP_PSEUDO_ID (lsp-&gt;lsp_header-&gt;lsp_id),</a>
+<a name="ln631">		LSP_FRAGMENT (lsp-&gt;lsp_header-&gt;lsp_id),</a>
+<a name="ln632">		ntohl (lsp-&gt;lsp_header-&gt;pdu_len),</a>
+<a name="ln633">		ntohl (lsp-&gt;lsp_header-&gt;seq_num));</a>
+<a name="ln634"> </a>
+<a name="ln635">  return lsp;</a>
+<a name="ln636">}</a>
+<a name="ln637"> </a>
+<a name="ln638">void</a>
+<a name="ln639">lsp_insert (struct isis_lsp *lsp, dict_t * lspdb)</a>
+<a name="ln640">{</a>
+<a name="ln641">  dict_alloc_insert (lspdb, lsp-&gt;lsp_header-&gt;lsp_id, lsp);</a>
+<a name="ln642">  if (lsp-&gt;lsp_header-&gt;seq_num != 0)</a>
+<a name="ln643">    {</a>
+<a name="ln644">      isis_spf_schedule (lsp-&gt;area, lsp-&gt;level);</a>
+<a name="ln645">#ifdef HAVE_IPV6</a>
+<a name="ln646">      isis_spf_schedule6 (lsp-&gt;area, lsp-&gt;level);</a>
+<a name="ln647">#endif</a>
+<a name="ln648">    }</a>
+<a name="ln649">}</a>
+<a name="ln650"> </a>
+<a name="ln651">/*</a>
+<a name="ln652"> * Build a list of LSPs with non-zero ht bounded by start and stop ids</a>
+<a name="ln653"> */</a>
+<a name="ln654">void</a>
+<a name="ln655">lsp_build_list_nonzero_ht (u_char * start_id, u_char * stop_id,</a>
+<a name="ln656">			   struct list *list, dict_t * lspdb)</a>
+<a name="ln657">{</a>
+<a name="ln658">  dnode_t *first, *last, *curr;</a>
+<a name="ln659"> </a>
+<a name="ln660">  first = dict_lower_bound (lspdb, start_id);</a>
+<a name="ln661">  if (!first)</a>
+<a name="ln662">    return;</a>
+<a name="ln663"> </a>
+<a name="ln664">  last = dict_upper_bound (lspdb, stop_id);</a>
+<a name="ln665"> </a>
+<a name="ln666">  curr = first;</a>
+<a name="ln667"> </a>
+<a name="ln668">  if (((struct isis_lsp *) (curr-&gt;dict_data))-&gt;lsp_header-&gt;rem_lifetime)</a>
+<a name="ln669">    listnode_add (list, first-&gt;dict_data);</a>
+<a name="ln670"> </a>
+<a name="ln671">  while (curr)</a>
+<a name="ln672">    {</a>
+<a name="ln673">      curr = dict_next (lspdb, curr);</a>
+<a name="ln674">      if (curr &amp;&amp;</a>
+<a name="ln675">	  ((struct isis_lsp *) (curr-&gt;dict_data))-&gt;lsp_header-&gt;rem_lifetime)</a>
+<a name="ln676">	listnode_add (list, curr-&gt;dict_data);</a>
+<a name="ln677">      if (curr == last)</a>
+<a name="ln678">	break;</a>
+<a name="ln679">    }</a>
+<a name="ln680"> </a>
+<a name="ln681">  return;</a>
+<a name="ln682">}</a>
+<a name="ln683"> </a>
+<a name="ln684">/*</a>
+<a name="ln685"> * Build a list of num_lsps LSPs bounded by start_id and stop_id.</a>
+<a name="ln686"> */</a>
+<a name="ln687">void</a>
+<a name="ln688">lsp_build_list (u_char * start_id, u_char * stop_id, u_char num_lsps,</a>
+<a name="ln689">		struct list *list, dict_t * lspdb)</a>
+<a name="ln690">{</a>
+<a name="ln691">  u_char count;</a>
+<a name="ln692">  dnode_t *first, *last, *curr;</a>
+<a name="ln693"> </a>
+<a name="ln694">  first = dict_lower_bound (lspdb, start_id);</a>
+<a name="ln695">  if (!first)</a>
+<a name="ln696">    return;</a>
+<a name="ln697"> </a>
+<a name="ln698">  last = dict_upper_bound (lspdb, stop_id);</a>
+<a name="ln699"> </a>
+<a name="ln700">  curr = first;</a>
+<a name="ln701"> </a>
+<a name="ln702">  listnode_add (list, first-&gt;dict_data);</a>
+<a name="ln703">  count = 1;</a>
+<a name="ln704"> </a>
+<a name="ln705">  while (curr)</a>
+<a name="ln706">    {</a>
+<a name="ln707">      curr = dict_next (lspdb, curr);</a>
+<a name="ln708">      if (curr)</a>
+<a name="ln709">        {</a>
+<a name="ln710">          listnode_add (list, curr-&gt;dict_data);</a>
+<a name="ln711">          count++;</a>
+<a name="ln712">        }</a>
+<a name="ln713">      if (count == num_lsps || curr == last)</a>
+<a name="ln714">        break;</a>
+<a name="ln715">    }</a>
+<a name="ln716"> </a>
+<a name="ln717">  return;</a>
+<a name="ln718">}</a>
+<a name="ln719"> </a>
+<a name="ln720">/*</a>
+<a name="ln721"> * Build a list of LSPs with SSN flag set for the given circuit</a>
+<a name="ln722"> */</a>
+<a name="ln723">void</a>
+<a name="ln724">lsp_build_list_ssn (struct isis_circuit *circuit, u_char num_lsps,</a>
+<a name="ln725">                    struct list *list, dict_t * lspdb)</a>
+<a name="ln726">{</a>
+<a name="ln727">  dnode_t *dnode, *next;</a>
+<a name="ln728">  struct isis_lsp *lsp;</a>
+<a name="ln729">  u_char count = 0;</a>
+<a name="ln730"> </a>
+<a name="ln731">  dnode = dict_first (lspdb);</a>
+<a name="ln732">  while (dnode != NULL)</a>
+<a name="ln733">    {</a>
+<a name="ln734">      next = dict_next (lspdb, dnode);</a>
+<a name="ln735">      lsp = dnode_get (dnode);</a>
+<a name="ln736">      if (ISIS_CHECK_FLAG (lsp-&gt;SSNflags, circuit))</a>
+<a name="ln737">        {</a>
+<a name="ln738">          listnode_add (list, lsp);</a>
+<a name="ln739">          ++count;</a>
+<a name="ln740">        }</a>
+<a name="ln741">      if (count == num_lsps)</a>
+<a name="ln742">        break;</a>
+<a name="ln743">      dnode = next;</a>
+<a name="ln744">    }</a>
+<a name="ln745"> </a>
+<a name="ln746">  return;</a>
+<a name="ln747">}</a>
+<a name="ln748"> </a>
+<a name="ln749">static void</a>
+<a name="ln750">lsp_set_time (struct isis_lsp *lsp)</a>
+<a name="ln751">{</a>
+<a name="ln752">  assert (lsp);</a>
+<a name="ln753"> </a>
+<a name="ln754">  if (lsp-&gt;lsp_header-&gt;rem_lifetime == 0)</a>
+<a name="ln755">    {</a>
+<a name="ln756">      if (lsp-&gt;age_out &gt; 0)</a>
+<a name="ln757">        lsp-&gt;age_out--;</a>
+<a name="ln758">      return;</a>
+<a name="ln759">    }</a>
+<a name="ln760"> </a>
+<a name="ln761">  lsp-&gt;lsp_header-&gt;rem_lifetime =</a>
+<a name="ln762">    htons (ntohs (lsp-&gt;lsp_header-&gt;rem_lifetime) - 1);</a>
+<a name="ln763">}</a>
+<a name="ln764"> </a>
+<a name="ln765">static void</a>
+<a name="ln766">lspid_print (u_char * lsp_id, u_char * trg, char dynhost, char frag)</a>
+<a name="ln767">{</a>
+<a name="ln768">  struct isis_dynhn *dyn = NULL;</a>
+<a name="ln769">  u_char id[SYSID_STRLEN];</a>
+<a name="ln770"> </a>
+<a name="ln771">  if (dynhost)</a>
+<a name="ln772">    dyn = dynhn_find_by_id (lsp_id);</a>
+<a name="ln773">  else</a>
+<a name="ln774">    dyn = NULL;</a>
+<a name="ln775"> </a>
+<a name="ln776">  if (dyn)</a>
+<a name="ln777">      sprintf ((char *)id, &quot;%.14s&quot;, dyn-&gt;name.name);</a>
+<a name="ln778">  else if (!memcmp (isis-&gt;sysid, lsp_id, ISIS_SYS_ID_LEN) &amp;&amp; dynhost)</a>
+<a name="ln779">      sprintf ((char *)id, &quot;%.14s&quot;, unix_hostname ());</a>
+<a name="ln780">  else</a>
+<a name="ln781">      memcpy (id, sysid_print (lsp_id), 15);</a>
+<a name="ln782">  if (frag)</a>
+<a name="ln783">    sprintf ((char *)trg, &quot;%s.%02x-%02x&quot;, id, LSP_PSEUDO_ID (lsp_id),</a>
+<a name="ln784">	     LSP_FRAGMENT (lsp_id));</a>
+<a name="ln785">  else</a>
+<a name="ln786">    sprintf ((char *)trg, &quot;%s.%02x&quot;, id, LSP_PSEUDO_ID (lsp_id));</a>
+<a name="ln787">}</a>
+<a name="ln788"> </a>
+<a name="ln789">/* Convert the lsp attribute bits to attribute string */</a>
+<a name="ln790">const char *</a>
+<a name="ln791">lsp_bits2string (u_char * lsp_bits)</a>
+<a name="ln792">{</a>
+<a name="ln793">  char *pos = lsp_bits_string;</a>
+<a name="ln794"> </a>
+<a name="ln795">  if (!*lsp_bits)</a>
+<a name="ln796">    return &quot; none&quot;;</a>
+<a name="ln797"> </a>
+<a name="ln798">  /* we only focus on the default metric */</a>
+<a name="ln799">  pos += sprintf (pos, &quot;%d/&quot;,</a>
+<a name="ln800">		  ISIS_MASK_LSP_ATT_DEFAULT_BIT (*lsp_bits) ? 1 : 0);</a>
+<a name="ln801"> </a>
+<a name="ln802">  pos += sprintf (pos, &quot;%d/&quot;,</a>
+<a name="ln803">		  ISIS_MASK_LSP_PARTITION_BIT (*lsp_bits) ? 1 : 0);</a>
+<a name="ln804"> </a>
+<a name="ln805">  pos += sprintf (pos, &quot;%d&quot;, ISIS_MASK_LSP_OL_BIT (*lsp_bits) ? 1 : 0);</a>
+<a name="ln806"> </a>
+<a name="ln807">  *(pos) = '\0';</a>
+<a name="ln808"> </a>
+<a name="ln809">  return lsp_bits_string;</a>
+<a name="ln810">}</a>
+<a name="ln811"> </a>
+<a name="ln812">/* this function prints the lsp on show isis database */</a>
+<a name="ln813">void</a>
+<a name="ln814">lsp_print (struct isis_lsp *lsp, struct vty *vty, char dynhost)</a>
+<a name="ln815">{</a>
+<a name="ln816">  u_char LSPid[255];</a>
+<a name="ln817">  char age_out[8];</a>
+<a name="ln818"> </a>
+<a name="ln819">  lspid_print (lsp-&gt;lsp_header-&gt;lsp_id, LSPid, dynhost, 1);</a>
+<a name="ln820">  vty_out (vty, &quot;%-21s%c  &quot;, LSPid, lsp-&gt;own_lsp ? '*' : ' ');</a>
+<a name="ln821">  vty_out (vty, &quot;%5u   &quot;, ntohs (lsp-&gt;lsp_header-&gt;pdu_len));</a>
+<a name="ln822">  vty_out (vty, &quot;0x%08x  &quot;, ntohl (lsp-&gt;lsp_header-&gt;seq_num));</a>
+<a name="ln823">  vty_out (vty, &quot;0x%04x  &quot;, ntohs (lsp-&gt;lsp_header-&gt;checksum));</a>
+<a name="ln824">  if (ntohs (lsp-&gt;lsp_header-&gt;rem_lifetime) == 0)</a>
+<a name="ln825">    {</a>
+<a name="ln826">      snprintf (age_out, 8, &quot;(%u)&quot;, lsp-&gt;age_out);</a>
+<a name="ln827">      age_out[7] = '\0';</a>
+<a name="ln828">      vty_out (vty, &quot;%7s   &quot;, age_out);</a>
+<a name="ln829">    }</a>
+<a name="ln830">  else</a>
+<a name="ln831">    vty_out (vty, &quot; %5u    &quot;, ntohs (lsp-&gt;lsp_header-&gt;rem_lifetime));</a>
+<a name="ln832">  vty_out (vty, &quot;%s%s&quot;,</a>
+<a name="ln833">           lsp_bits2string (&amp;lsp-&gt;lsp_header-&gt;lsp_bits), VTY_NEWLINE);</a>
+<a name="ln834">}</a>
+<a name="ln835"> </a>
+<a name="ln836">void</a>
+<a name="ln837">lsp_print_detail (struct isis_lsp *lsp, struct vty *vty, char dynhost)</a>
+<a name="ln838">{</a>
+<a name="ln839">  struct area_addr *area_addr;</a>
+<a name="ln840">  int i;</a>
+<a name="ln841">  struct listnode *lnode;</a>
+<a name="ln842">  struct is_neigh *is_neigh;</a>
+<a name="ln843">  struct te_is_neigh *te_is_neigh;</a>
+<a name="ln844">  struct ipv4_reachability *ipv4_reach;</a>
+<a name="ln845">  struct in_addr *ipv4_addr;</a>
+<a name="ln846">  struct te_ipv4_reachability *te_ipv4_reach;</a>
+<a name="ln847">#ifdef HAVE_IPV6</a>
+<a name="ln848">  struct ipv6_reachability *ipv6_reach;</a>
+<a name="ln849">  struct in6_addr in6;</a>
+<a name="ln850">  u_char buff[BUFSIZ];</a>
+<a name="ln851">#endif</a>
+<a name="ln852">  u_char LSPid[255];</a>
+<a name="ln853">  u_char hostname[255];</a>
+<a name="ln854">  u_char ipv4_reach_prefix[20];</a>
+<a name="ln855">  u_char ipv4_reach_mask[20];</a>
+<a name="ln856">  u_char ipv4_address[20];</a>
+<a name="ln857"> </a>
+<a name="ln858">  lspid_print (lsp-&gt;lsp_header-&gt;lsp_id, LSPid, dynhost, 1);</a>
+<a name="ln859">  lsp_print (lsp, vty, dynhost);</a>
+<a name="ln860"> </a>
+<a name="ln861">  /* for all area address */</a>
+<a name="ln862">  if (lsp-&gt;tlv_data.area_addrs)</a>
+<a name="ln863">    for (ALL_LIST_ELEMENTS_RO (lsp-&gt;tlv_data.area_addrs, lnode, area_addr))</a>
+<a name="ln864">      {</a>
+<a name="ln865">	vty_out (vty, &quot;  Area Address: %s%s&quot;,</a>
+<a name="ln866">		 isonet_print (area_addr-&gt;area_addr, area_addr-&gt;addr_len),</a>
+<a name="ln867">		 VTY_NEWLINE);</a>
+<a name="ln868">      }</a>
+<a name="ln869">  </a>
+<a name="ln870">  /* for the nlpid tlv */</a>
+<a name="ln871">  if (lsp-&gt;tlv_data.nlpids)</a>
+<a name="ln872">    {</a>
+<a name="ln873">      for (i = 0; i &lt; lsp-&gt;tlv_data.nlpids-&gt;count; i++)</a>
+<a name="ln874">	{</a>
+<a name="ln875">	  switch (lsp-&gt;tlv_data.nlpids-&gt;nlpids[i])</a>
+<a name="ln876">	    {</a>
+<a name="ln877">	    case NLPID_IP:</a>
+<a name="ln878">	    case NLPID_IPV6:</a>
+<a name="ln879">	      vty_out (vty, &quot;  NLPID       : 0x%X%s&quot;,</a>
+<a name="ln880">		       lsp-&gt;tlv_data.nlpids-&gt;nlpids[i], VTY_NEWLINE);</a>
+<a name="ln881">	      break;</a>
+<a name="ln882">	    default:</a>
+<a name="ln883">	      vty_out (vty, &quot;  NLPID       : %s%s&quot;, &quot;unknown&quot;, VTY_NEWLINE);</a>
+<a name="ln884">	      break;</a>
+<a name="ln885">	    }</a>
+<a name="ln886">	}</a>
+<a name="ln887">    }</a>
+<a name="ln888"> </a>
+<a name="ln889">  /* for the hostname tlv */</a>
+<a name="ln890">  if (lsp-&gt;tlv_data.hostname)</a>
+<a name="ln891">    {</a>
+<a name="ln892">      bzero (hostname, sizeof (hostname));</a>
+<a name="ln893">      memcpy (hostname, lsp-&gt;tlv_data.hostname-&gt;name,</a>
+<a name="ln894">	      lsp-&gt;tlv_data.hostname-&gt;namelen);</a>
+<a name="ln895">      vty_out (vty, &quot;  Hostname    : %s%s&quot;, hostname, VTY_NEWLINE);</a>
+<a name="ln896">    }</a>
+<a name="ln897"> </a>
+<a name="ln898">  /* authentication tlv */</a>
+<a name="ln899">  if (lsp-&gt;tlv_data.auth_info.type != ISIS_PASSWD_TYPE_UNUSED)</a>
+<a name="ln900">    {</a>
+<a name="ln901">      if (lsp-&gt;tlv_data.auth_info.type == ISIS_PASSWD_TYPE_HMAC_MD5)</a>
+<a name="ln902">        vty_out (vty, &quot;  Auth type   : md5%s&quot;, VTY_NEWLINE);</a>
+<a name="ln903">      else if (lsp-&gt;tlv_data.auth_info.type == ISIS_PASSWD_TYPE_CLEARTXT)</a>
+<a name="ln904">        vty_out (vty, &quot;  Auth type   : clear text%s&quot;, VTY_NEWLINE);</a>
+<a name="ln905">    }</a>
+<a name="ln906"> </a>
+<a name="ln907">  /* TE router id */</a>
+<a name="ln908">  if (lsp-&gt;tlv_data.router_id)</a>
+<a name="ln909">    {</a>
+<a name="ln910">      memcpy (ipv4_address, inet_ntoa (lsp-&gt;tlv_data.router_id-&gt;id),</a>
+<a name="ln911">	      sizeof (ipv4_address));</a>
+<a name="ln912">      vty_out (vty, &quot;  Router ID   : %s%s&quot;, ipv4_address, VTY_NEWLINE);</a>
+<a name="ln913">    }</a>
+<a name="ln914"> </a>
+<a name="ln915">  if (lsp-&gt;tlv_data.ipv4_addrs)</a>
+<a name="ln916">    for (ALL_LIST_ELEMENTS_RO (lsp-&gt;tlv_data.ipv4_addrs, lnode, ipv4_addr))</a>
+<a name="ln917">      {</a>
+<a name="ln918">        memcpy (ipv4_address, inet_ntoa (*ipv4_addr), sizeof (ipv4_address));</a>
+<a name="ln919">        vty_out (vty, &quot;  IPv4 Address: %s%s&quot;, ipv4_address, VTY_NEWLINE);</a>
+<a name="ln920">      }</a>
+<a name="ln921"> </a>
+<a name="ln922">  /* for the IS neighbor tlv */</a>
+<a name="ln923">  if (lsp-&gt;tlv_data.is_neighs)</a>
+<a name="ln924">    for (ALL_LIST_ELEMENTS_RO (lsp-&gt;tlv_data.is_neighs, lnode, is_neigh))</a>
+<a name="ln925">      {</a>
+<a name="ln926">	lspid_print (is_neigh-&gt;neigh_id, LSPid, dynhost, 0);</a>
+<a name="ln927">	vty_out (vty, &quot;  Metric      : %-8d IS            : %s%s&quot;,</a>
+<a name="ln928">		 is_neigh-&gt;metrics.metric_default, LSPid, VTY_NEWLINE);</a>
+<a name="ln929">      }</a>
+<a name="ln930">  </a>
+<a name="ln931">  /* for the internal reachable tlv */</a>
+<a name="ln932">  if (lsp-&gt;tlv_data.ipv4_int_reachs)</a>
+<a name="ln933">    for (ALL_LIST_ELEMENTS_RO (lsp-&gt;tlv_data.ipv4_int_reachs, lnode,</a>
+<a name="ln934">			       ipv4_reach))</a>
+<a name="ln935">    {</a>
+<a name="ln936">      memcpy (ipv4_reach_prefix, inet_ntoa (ipv4_reach-&gt;prefix),</a>
+<a name="ln937">	      sizeof (ipv4_reach_prefix));</a>
+<a name="ln938">      memcpy (ipv4_reach_mask, inet_ntoa (ipv4_reach-&gt;mask),</a>
+<a name="ln939">	      sizeof (ipv4_reach_mask));</a>
+<a name="ln940">      vty_out (vty, &quot;  Metric      : %-8d IPv4-Internal : %s %s%s&quot;,</a>
+<a name="ln941">	       ipv4_reach-&gt;metrics.metric_default, ipv4_reach_prefix,</a>
+<a name="ln942">	       ipv4_reach_mask, VTY_NEWLINE);</a>
+<a name="ln943">    }</a>
+<a name="ln944"> </a>
+<a name="ln945">  /* for the external reachable tlv */</a>
+<a name="ln946">  if (lsp-&gt;tlv_data.ipv4_ext_reachs)</a>
+<a name="ln947">    for (ALL_LIST_ELEMENTS_RO (lsp-&gt;tlv_data.ipv4_ext_reachs, lnode, </a>
+<a name="ln948">			       ipv4_reach))</a>
+<a name="ln949">    {</a>
+<a name="ln950">      memcpy (ipv4_reach_prefix, inet_ntoa (ipv4_reach-&gt;prefix),</a>
+<a name="ln951">	      sizeof (ipv4_reach_prefix));</a>
+<a name="ln952">      memcpy (ipv4_reach_mask, inet_ntoa (ipv4_reach-&gt;mask),</a>
+<a name="ln953">	      sizeof (ipv4_reach_mask));</a>
+<a name="ln954">      vty_out (vty, &quot;  Metric      : %-8d IPv4-External : %s %s%s&quot;,</a>
+<a name="ln955">	       ipv4_reach-&gt;metrics.metric_default, ipv4_reach_prefix,</a>
+<a name="ln956">	       ipv4_reach_mask, VTY_NEWLINE);</a>
+<a name="ln957">    }</a>
+<a name="ln958">  </a>
+<a name="ln959">  /* IPv6 tlv */</a>
+<a name="ln960">#ifdef HAVE_IPV6</a>
+<a name="ln961">  if (lsp-&gt;tlv_data.ipv6_reachs)</a>
+<a name="ln962">    for (ALL_LIST_ELEMENTS_RO (lsp-&gt;tlv_data.ipv6_reachs, lnode, ipv6_reach))</a>
+<a name="ln963">    {</a>
+<a name="ln964">      memset (&amp;in6, 0, sizeof (in6));</a>
+<a name="ln965">      memcpy (in6.s6_addr, ipv6_reach-&gt;prefix,</a>
+<a name="ln966">	      PSIZE (ipv6_reach-&gt;prefix_len));</a>
+<a name="ln967">      inet_ntop (AF_INET6, &amp;in6, (char *)buff, BUFSIZ);</a>
+<a name="ln968">      if ((ipv6_reach-&gt;control_info &amp;</a>
+<a name="ln969">	   CTRL_INFO_DISTRIBUTION) == DISTRIBUTION_INTERNAL)</a>
+<a name="ln970">	vty_out (vty, &quot;  Metric      : %-8d IPv6-Internal : %s/%d%s&quot;,</a>
+<a name="ln971">		 ntohl (ipv6_reach-&gt;metric),</a>
+<a name="ln972">		 buff, ipv6_reach-&gt;prefix_len, VTY_NEWLINE);</a>
+<a name="ln973">      else</a>
+<a name="ln974">	vty_out (vty, &quot;  Metric      : %-8d IPv6-External : %s/%d%s&quot;,</a>
+<a name="ln975">		 ntohl (ipv6_reach-&gt;metric),</a>
+<a name="ln976">		 buff, ipv6_reach-&gt;prefix_len, VTY_NEWLINE);</a>
+<a name="ln977">    }</a>
+<a name="ln978">#endif</a>
+<a name="ln979"> </a>
+<a name="ln980">  /* TE IS neighbor tlv */</a>
+<a name="ln981">  if (lsp-&gt;tlv_data.te_is_neighs)</a>
+<a name="ln982">    for (ALL_LIST_ELEMENTS_RO (lsp-&gt;tlv_data.te_is_neighs, lnode, te_is_neigh))</a>
+<a name="ln983">    {</a>
+<a name="ln984">      lspid_print (te_is_neigh-&gt;neigh_id, LSPid, dynhost, 0);</a>
+<a name="ln985">      vty_out (vty, &quot;  Metric      : %-8d IS-Extended   : %s%s&quot;,</a>
+<a name="ln986">	       GET_TE_METRIC(te_is_neigh), LSPid, VTY_NEWLINE);</a>
+<a name="ln987">      if (IS_MPLS_TE(isisMplsTE))</a>
+<a name="ln988">        mpls_te_print_detail(vty, te_is_neigh);</a>
+<a name="ln989">    }</a>
+<a name="ln990"> </a>
+<a name="ln991">  /* TE IPv4 tlv */</a>
+<a name="ln992">  if (lsp-&gt;tlv_data.te_ipv4_reachs)</a>
+<a name="ln993">    for (ALL_LIST_ELEMENTS_RO (lsp-&gt;tlv_data.te_ipv4_reachs, lnode,</a>
+<a name="ln994">			       te_ipv4_reach))</a>
+<a name="ln995">    {</a>
+<a name="ln996">      /* FIXME: There should be better way to output this stuff. */</a>
+<a name="ln997">      vty_out (vty, &quot;  Metric      : %-8d IPv4-Extended : %s/%d%s&quot;,</a>
+<a name="ln998">	       ntohl (te_ipv4_reach-&gt;te_metric),</a>
+<a name="ln999">	       inet_ntoa (newprefix2inaddr (&amp;te_ipv4_reach-&gt;prefix_start,</a>
+<a name="ln1000">					    te_ipv4_reach-&gt;control)),</a>
+<a name="ln1001">	       te_ipv4_reach-&gt;control &amp; 0x3F, VTY_NEWLINE);</a>
+<a name="ln1002">    }</a>
+<a name="ln1003">  vty_out (vty, &quot;%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1004"> </a>
+<a name="ln1005">  return;</a>
+<a name="ln1006">}</a>
+<a name="ln1007"> </a>
+<a name="ln1008">/* print all the lsps info in the local lspdb */</a>
+<a name="ln1009">int</a>
+<a name="ln1010">lsp_print_all (struct vty *vty, dict_t * lspdb, char detail, char dynhost)</a>
+<a name="ln1011">{</a>
+<a name="ln1012"> </a>
+<a name="ln1013">  dnode_t *node = dict_first (lspdb), *next;</a>
+<a name="ln1014">  int lsp_count = 0;</a>
+<a name="ln1015"> </a>
+<a name="ln1016">  if (detail == ISIS_UI_LEVEL_BRIEF)</a>
+<a name="ln1017">    {</a>
+<a name="ln1018">      while (node != NULL)</a>
+<a name="ln1019">	{</a>
+<a name="ln1020">	  /* I think it is unnecessary, so I comment it out */</a>
+<a name="ln1021">	  /* dict_contains (lspdb, node); */</a>
+<a name="ln1022">	  next = dict_next (lspdb, node);</a>
+<a name="ln1023">	  lsp_print (dnode_get (node), vty, dynhost);</a>
+<a name="ln1024">	  node = next;</a>
+<a name="ln1025">	  lsp_count++;</a>
+<a name="ln1026">	}</a>
+<a name="ln1027">    }</a>
+<a name="ln1028">  else if (detail == ISIS_UI_LEVEL_DETAIL)</a>
+<a name="ln1029">    {</a>
+<a name="ln1030">      while (node != NULL)</a>
+<a name="ln1031">	{</a>
+<a name="ln1032">	  next = dict_next (lspdb, node);</a>
+<a name="ln1033">	  lsp_print_detail (dnode_get (node), vty, dynhost);</a>
+<a name="ln1034">	  node = next;</a>
+<a name="ln1035">	  lsp_count++;</a>
+<a name="ln1036">	}</a>
+<a name="ln1037">    }</a>
+<a name="ln1038"> </a>
+<a name="ln1039">  return lsp_count;</a>
+<a name="ln1040">}</a>
+<a name="ln1041"> </a>
+<a name="ln1042">#define FRAG_THOLD(S,T) \</a>
+<a name="ln1043">  ((STREAM_SIZE(S)*T)/100)</a>
+<a name="ln1044"> </a>
+<a name="ln1045">/* stream*, area-&gt;lsp_frag_threshold, increment */</a>
+<a name="ln1046">#define FRAG_NEEDED(S,T,I) \</a>
+<a name="ln1047">  (STREAM_SIZE(S)-STREAM_REMAIN(S)+(I) &gt; FRAG_THOLD(S,T))</a>
+<a name="ln1048"> </a>
+<a name="ln1049">/* FIXME: It shouldn't be necessary to pass tlvsize here, TLVs can have</a>
+<a name="ln1050"> * variable length (TE TLVs, sub TLVs). */</a>
+<a name="ln1051">static void</a>
+<a name="ln1052">lsp_tlv_fit (struct isis_lsp *lsp, struct list **from, struct list **to,</a>
+<a name="ln1053">	     int tlvsize, int frag_thold,</a>
+<a name="ln1054">	     int tlv_build_func (struct list *, struct stream *))</a>
+<a name="ln1055">{</a>
+<a name="ln1056">  int count, i;</a>
+<a name="ln1057"> </a>
+<a name="ln1058">  /* can we fit all ? */</a>
+<a name="ln1059">  if (!FRAG_NEEDED (lsp-&gt;pdu, frag_thold, listcount (*from) * tlvsize + 2))</a>
+<a name="ln1060">    {</a>
+<a name="ln1061">      tlv_build_func (*from, lsp-&gt;pdu);</a>
+<a name="ln1062">      if (listcount (*to) != 0)</a>
+<a name="ln1063">	{</a>
+<a name="ln1064">	  struct listnode *node, *nextnode;</a>
+<a name="ln1065">	  void *elem;</a>
+<a name="ln1066"> </a>
+<a name="ln1067">	  for (ALL_LIST_ELEMENTS (*from, node, nextnode, elem))</a>
+<a name="ln1068">	    {</a>
+<a name="ln1069">	      listnode_add (*to, elem);</a>
+<a name="ln1070">	      list_delete_node (*from, node);</a>
+<a name="ln1071">	    }</a>
+<a name="ln1072">	}</a>
+<a name="ln1073">      else</a>
+<a name="ln1074">	{</a>
+<a name="ln1075">	  list_free (*to);</a>
+<a name="ln1076">	  *to = *from;</a>
+<a name="ln1077">	  *from = NULL;</a>
+<a name="ln1078">	}</a>
+<a name="ln1079">    }</a>
+<a name="ln1080">  else if (!FRAG_NEEDED (lsp-&gt;pdu, frag_thold, tlvsize + 2))</a>
+<a name="ln1081">    {</a>
+<a name="ln1082">      /* fit all we can */</a>
+<a name="ln1083">      count = FRAG_THOLD (lsp-&gt;pdu, frag_thold) - 2 -</a>
+<a name="ln1084">	(STREAM_SIZE (lsp-&gt;pdu) - STREAM_REMAIN (lsp-&gt;pdu));</a>
+<a name="ln1085">      count = count / tlvsize;</a>
+<a name="ln1086">      if (count &gt; (int)listcount (*from))</a>
+<a name="ln1087">	count = listcount (*from);</a>
+<a name="ln1088">      for (i = 0; i &lt; count; i++)</a>
+<a name="ln1089">	{</a>
+<a name="ln1090">	  listnode_add (*to, listgetdata (listhead (*from)));</a>
+<a name="ln1091">	  listnode_delete (*from, listgetdata (listhead (*from)));</a>
+<a name="ln1092">	}</a>
+<a name="ln1093">      tlv_build_func (*to, lsp-&gt;pdu);</a>
+<a name="ln1094">    }</a>
+<a name="ln1095">  lsp-&gt;lsp_header-&gt;pdu_len = htons (stream_get_endp (lsp-&gt;pdu));</a>
+<a name="ln1096">  return;</a>
+<a name="ln1097">}</a>
+<a name="ln1098"> </a>
+<a name="ln1099">/* Process IS_NEIGHBOURS TLV with TE subTLVs */</a>
+<a name="ln1100">static void</a>
+<a name="ln1101">lsp_te_tlv_fit (struct isis_lsp *lsp, struct list **from, struct list **to, int frag_thold)</a>
+<a name="ln1102">{</a>
+<a name="ln1103">  int count, size = 0;</a>
+<a name="ln1104">  struct listnode *node, *nextnode;</a>
+<a name="ln1105">  struct te_is_neigh *elem;</a>
+<a name="ln1106"> </a>
+<a name="ln1107">  /* Start computing real size of TLVs */</a>
+<a name="ln1108">  for (ALL_LIST_ELEMENTS (*from, node, nextnode, elem))</a>
+<a name="ln1109">    size = size + elem-&gt;sub_tlvs_length + IS_NEIGHBOURS_LEN;</a>
+<a name="ln1110"> </a>
+<a name="ln1111">  /* can we fit all ? */</a>
+<a name="ln1112">  if (!FRAG_NEEDED (lsp-&gt;pdu, frag_thold, size))</a>
+<a name="ln1113">    {</a>
+<a name="ln1114">      tlv_add_te_is_neighs (*from, lsp-&gt;pdu);</a>
+<a name="ln1115">      if (listcount (*to) != 0)</a>
+<a name="ln1116">        {</a>
+<a name="ln1117">          for (ALL_LIST_ELEMENTS (*from, node, nextnode, elem))</a>
+<a name="ln1118">            {</a>
+<a name="ln1119">              listnode_add (*to, elem);</a>
+<a name="ln1120">              list_delete_node (*from, node);</a>
+<a name="ln1121">            }</a>
+<a name="ln1122">        }</a>
+<a name="ln1123">      else</a>
+<a name="ln1124">        {</a>
+<a name="ln1125">          list_free (*to);</a>
+<a name="ln1126">          *to = *from;</a>
+<a name="ln1127">          *from = NULL;</a>
+<a name="ln1128">        }</a>
+<a name="ln1129">    }</a>
+<a name="ln1130">  else</a>
+<a name="ln1131">    {</a>
+<a name="ln1132">      /* fit all we can */</a>
+<a name="ln1133">      /* Compute remaining place in LSP PDU */</a>
+<a name="ln1134">      count = FRAG_THOLD (lsp-&gt;pdu, frag_thold) - 2 -</a>
+<a name="ln1135">        (STREAM_SIZE (lsp-&gt;pdu) - STREAM_REMAIN (lsp-&gt;pdu));</a>
+<a name="ln1136">      /* Determine size of TE SubTLVs */</a>
+<a name="ln1137">      elem = (struct te_is_neigh *)listgetdata ((struct listnode *)listhead (*from));</a>
+<a name="ln1138">      count = count - elem-&gt;sub_tlvs_length - IS_NEIGHBOURS_LEN;</a>
+<a name="ln1139">      if (count &gt; 0)</a>
+<a name="ln1140">        {</a>
+<a name="ln1141">          while (count &gt; 0)</a>
+<a name="ln1142">            {</a>
+<a name="ln1143">              listnode_add (*to, listgetdata ((struct listnode *)listhead (*from)));</a>
+<a name="ln1144">              listnode_delete (*from, listgetdata ((struct listnode *)listhead (*from)));</a>
+<a name="ln1145"> </a>
+<a name="ln1146">              elem = (struct te_is_neigh *)listgetdata ((struct listnode *)listhead (*from));</a>
+<a name="ln1147">              count = count - elem-&gt;sub_tlvs_length - IS_NEIGHBOURS_LEN;</a>
+<a name="ln1148">            }</a>
+<a name="ln1149"> </a>
+<a name="ln1150">          tlv_add_te_is_neighs (*to, lsp-&gt;pdu);</a>
+<a name="ln1151">        }</a>
+<a name="ln1152">    }</a>
+<a name="ln1153">  lsp-&gt;lsp_header-&gt;pdu_len = htons (stream_get_endp (lsp-&gt;pdu));</a>
+<a name="ln1154">  return;</a>
+<a name="ln1155">}</a>
+<a name="ln1156"> </a>
+<a name="ln1157">static u_int16_t</a>
+<a name="ln1158">lsp_rem_lifetime (struct isis_area *area, int level)</a>
+<a name="ln1159">{</a>
+<a name="ln1160">  u_int16_t rem_lifetime;</a>
+<a name="ln1161"> </a>
+<a name="ln1162">  /* Add jitter to configured LSP lifetime */</a>
+<a name="ln1163">  rem_lifetime = isis_jitter (area-&gt;max_lsp_lifetime[level - 1],</a>
+<a name="ln1164">                              MAX_AGE_JITTER);</a>
+<a name="ln1165"> </a>
+<a name="ln1166">  /* No jitter if the max refresh will be less than configure gen interval */</a>
+<a name="ln1167">  /* N.B. this calucation is acceptable since rem_lifetime is in [332,65535] at</a>
+<a name="ln1168">   * this point */</a>
+<a name="ln1169">  if (area-&gt;lsp_gen_interval[level - 1] &gt; (rem_lifetime - 300))</a>
+<a name="ln1170">    rem_lifetime = area-&gt;max_lsp_lifetime[level - 1];</a>
+<a name="ln1171"> </a>
+<a name="ln1172">  return rem_lifetime;</a>
+<a name="ln1173">}</a>
+<a name="ln1174"> </a>
+<a name="ln1175">static u_int16_t</a>
+<a name="ln1176">lsp_refresh_time (struct isis_lsp *lsp, u_int16_t rem_lifetime)</a>
+<a name="ln1177">{</a>
+<a name="ln1178">  struct isis_area *area = lsp-&gt;area;</a>
+<a name="ln1179">  int level = lsp-&gt;level;</a>
+<a name="ln1180">  u_int16_t refresh_time;</a>
+<a name="ln1181"> </a>
+<a name="ln1182">  /* Add jitter to LSP refresh time */</a>
+<a name="ln1183">  refresh_time = isis_jitter (area-&gt;lsp_refresh[level - 1],</a>
+<a name="ln1184">                              MAX_LSP_GEN_JITTER);</a>
+<a name="ln1185"> </a>
+<a name="ln1186">  /* RFC 4444 : make sure the refresh time is at least less than 300</a>
+<a name="ln1187">   * of the remaining lifetime and more than gen interval */</a>
+<a name="ln1188">  if (refresh_time &lt;= area-&gt;lsp_gen_interval[level - 1] ||</a>
+<a name="ln1189">      refresh_time &gt; (rem_lifetime - 300))</a>
+<a name="ln1190">    refresh_time = rem_lifetime - 300;</a>
+<a name="ln1191"> </a>
+<a name="ln1192">  /* In cornercases, refresh_time might be &lt;= lsp_gen_interval, however</a>
+<a name="ln1193">   * we accept this violation to satisfy refresh_time &lt;= rem_lifetime - 300 */</a>
+<a name="ln1194"> </a>
+<a name="ln1195">  return refresh_time;</a>
+<a name="ln1196">}</a>
+<a name="ln1197"> </a>
+<a name="ln1198">static struct isis_lsp *</a>
+<a name="ln1199">lsp_next_frag (u_char frag_num, struct isis_lsp *lsp0, struct isis_area *area,</a>
+<a name="ln1200">	       int level)</a>
+<a name="ln1201">{</a>
+<a name="ln1202">  struct isis_lsp *lsp;</a>
+<a name="ln1203">  u_char frag_id[ISIS_SYS_ID_LEN + 2];</a>
+<a name="ln1204"> </a>
+<a name="ln1205">  memcpy (frag_id, lsp0-&gt;lsp_header-&gt;lsp_id, ISIS_SYS_ID_LEN + 1);</a>
+<a name="ln1206">  LSP_FRAGMENT (frag_id) = frag_num;</a>
+<a name="ln1207">  /* FIXME add authentication TLV for fragment LSPs */</a>
+<a name="ln1208">  lsp = lsp_search (frag_id, area-&gt;lspdb[level - 1]);</a>
+<a name="ln1209">  if (lsp)</a>
+<a name="ln1210">    {</a>
+<a name="ln1211">      /* Clear the TLVs */</a>
+<a name="ln1212">      lsp_clear_data (lsp);</a>
+<a name="ln1213">      return lsp;</a>
+<a name="ln1214">    }</a>
+<a name="ln1215">  lsp = lsp_new (area, frag_id, ntohs(lsp0-&gt;lsp_header-&gt;rem_lifetime), 0,</a>
+<a name="ln1216">                 lsp_bits_generate (level, area-&gt;overload_bit,</a>
+<a name="ln1217">                 area-&gt;attached_bit), 0, level);</a>
+<a name="ln1218">  lsp-&gt;area = area;</a>
+<a name="ln1219">  lsp-&gt;own_lsp = 1;</a>
+<a name="ln1220">  lsp_insert (lsp, area-&gt;lspdb[level - 1]);</a>
+<a name="ln1221">  listnode_add (lsp0-&gt;lspu.frags, lsp);</a>
+<a name="ln1222">  lsp-&gt;lspu.zero_lsp = lsp0;</a>
+<a name="ln1223">  return lsp;</a>
+<a name="ln1224">}</a>
+<a name="ln1225"> </a>
+<a name="ln1226">static void</a>
+<a name="ln1227">lsp_build_ext_reach_ipv4(struct isis_lsp *lsp, struct isis_area *area,</a>
+<a name="ln1228">                         struct tlvs *tlv_data)</a>
+<a name="ln1229">{</a>
+<a name="ln1230">  struct route_table *er_table;</a>
+<a name="ln1231">  struct route_node *rn;</a>
+<a name="ln1232">  struct prefix_ipv4 *ipv4;</a>
+<a name="ln1233">  struct isis_ext_info *info;</a>
+<a name="ln1234">  struct ipv4_reachability *ipreach;</a>
+<a name="ln1235">  struct te_ipv4_reachability *te_ipreach;</a>
+<a name="ln1236"> </a>
+<a name="ln1237">  er_table = get_ext_reach(area, AF_INET, lsp-&gt;level);</a>
+<a name="ln1238">  if (!er_table)</a>
+<a name="ln1239">    return;</a>
+<a name="ln1240"> </a>
+<a name="ln1241">  for (rn = route_top(er_table); rn; rn = route_next(rn))</a>
+<a name="ln1242">    {</a>
+<a name="ln1243">      if (!rn-&gt;info)</a>
+<a name="ln1244">        continue;</a>
+<a name="ln1245"> </a>
+<a name="ln1246">      ipv4 = (struct prefix_ipv4*)&amp;rn-&gt;p;</a>
+<a name="ln1247">      info = rn-&gt;info;</a>
+<a name="ln1248">      if (area-&gt;oldmetric)</a>
+<a name="ln1249">        {</a>
+<a name="ln1250">          if (tlv_data-&gt;ipv4_ext_reachs == NULL)</a>
+<a name="ln1251">            {</a>
+<a name="ln1252">              tlv_data-&gt;ipv4_ext_reachs = list_new();</a>
+<a name="ln1253">              tlv_data-&gt;ipv4_ext_reachs-&gt;del = free_tlv;</a>
+<a name="ln1254">            }</a>
+<a name="ln1255">          ipreach = XMALLOC(MTYPE_ISIS_TLV, sizeof(*ipreach));</a>
+<a name="ln1256"> </a>
+<a name="ln1257">          ipreach-&gt;prefix.s_addr = ipv4-&gt;prefix.s_addr;</a>
+<a name="ln1258">          masklen2ip(ipv4-&gt;prefixlen, &amp;ipreach-&gt;mask);</a>
+<a name="ln1259">          ipreach-&gt;prefix.s_addr &amp;= ipreach-&gt;mask.s_addr;</a>
+<a name="ln1260"> </a>
+<a name="ln1261">          if ((info-&gt;metric &amp; 0x3f) != info-&gt;metric)</a>
+<a name="ln1262">            ipreach-&gt;metrics.metric_default = 0x3f;</a>
+<a name="ln1263">          else</a>
+<a name="ln1264">            ipreach-&gt;metrics.metric_default = info-&gt;metric;</a>
+<a name="ln1265">          ipreach-&gt;metrics.metric_expense = METRICS_UNSUPPORTED;</a>
+<a name="ln1266">          ipreach-&gt;metrics.metric_error = METRICS_UNSUPPORTED;</a>
+<a name="ln1267">          ipreach-&gt;metrics.metric_delay = METRICS_UNSUPPORTED;</a>
+<a name="ln1268">          listnode_add(tlv_data-&gt;ipv4_ext_reachs, ipreach);</a>
+<a name="ln1269">        }</a>
+<a name="ln1270">      if (area-&gt;newmetric)</a>
+<a name="ln1271">        {</a>
+<a name="ln1272">          if (tlv_data-&gt;te_ipv4_reachs == NULL)</a>
+<a name="ln1273">            {</a>
+<a name="ln1274">              tlv_data-&gt;te_ipv4_reachs = list_new();</a>
+<a name="ln1275">              tlv_data-&gt;te_ipv4_reachs-&gt;del = free_tlv;</a>
+<a name="ln1276">            }</a>
+<a name="ln1277">          te_ipreach =</a>
+<a name="ln1278">              XCALLOC(MTYPE_ISIS_TLV,</a>
+<a name="ln1279">                      sizeof(*te_ipreach) - 1 + PSIZE(ipv4-&gt;prefixlen));</a>
+<a name="ln1280">          if (info-&gt;metric &gt; MAX_WIDE_PATH_METRIC)</a>
+<a name="ln1281">            te_ipreach-&gt;te_metric = htonl(MAX_WIDE_PATH_METRIC);</a>
+<a name="ln1282">          else</a>
+<a name="ln1283">            te_ipreach-&gt;te_metric = htonl(info-&gt;metric);</a>
+<a name="ln1284">          te_ipreach-&gt;control = ipv4-&gt;prefixlen &amp; 0x3f;</a>
+<a name="ln1285">          memcpy(&amp;te_ipreach-&gt;prefix_start, &amp;ipv4-&gt;prefix.s_addr,</a>
+<a name="ln1286">                 PSIZE(ipv4-&gt;prefixlen));</a>
+<a name="ln1287">          listnode_add(tlv_data-&gt;te_ipv4_reachs, te_ipreach);</a>
+<a name="ln1288">        }</a>
+<a name="ln1289">    }</a>
+<a name="ln1290">}</a>
+<a name="ln1291"> </a>
+<a name="ln1292">static void</a>
+<a name="ln1293">lsp_build_ext_reach_ipv6(struct isis_lsp *lsp, struct isis_area *area,</a>
+<a name="ln1294">                         struct tlvs *tlv_data)</a>
+<a name="ln1295">{</a>
+<a name="ln1296">  struct route_table *er_table;</a>
+<a name="ln1297">  struct route_node *rn;</a>
+<a name="ln1298">  struct prefix_ipv6 *ipv6;</a>
+<a name="ln1299">  struct isis_ext_info *info;</a>
+<a name="ln1300">  struct ipv6_reachability *ip6reach;</a>
+<a name="ln1301"> </a>
+<a name="ln1302">  er_table = get_ext_reach(area, AF_INET6, lsp-&gt;level);</a>
+<a name="ln1303">  if (!er_table)</a>
+<a name="ln1304">    return;</a>
+<a name="ln1305"> </a>
+<a name="ln1306">  for (rn = route_top(er_table); rn; rn = route_next(rn))</a>
+<a name="ln1307">    {</a>
+<a name="ln1308">      if (!rn-&gt;info)</a>
+<a name="ln1309">        continue;</a>
+<a name="ln1310"> </a>
+<a name="ln1311">      ipv6 = (struct prefix_ipv6*)&amp;rn-&gt;p;</a>
+<a name="ln1312">      info = rn-&gt;info;</a>
+<a name="ln1313"> </a>
+<a name="ln1314">      if (tlv_data-&gt;ipv6_reachs == NULL)</a>
+<a name="ln1315">        {</a>
+<a name="ln1316">          tlv_data-&gt;ipv6_reachs = list_new();</a>
+<a name="ln1317">          tlv_data-&gt;ipv6_reachs-&gt;del = free_tlv;</a>
+<a name="ln1318">        }</a>
+<a name="ln1319">      ip6reach = XCALLOC(MTYPE_ISIS_TLV, sizeof(*ip6reach));</a>
+<a name="ln1320">      if (info-&gt;metric &gt; MAX_WIDE_PATH_METRIC)</a>
+<a name="ln1321">        ip6reach-&gt;metric = htonl(MAX_WIDE_PATH_METRIC);</a>
+<a name="ln1322">      else</a>
+<a name="ln1323">        ip6reach-&gt;metric = htonl(info-&gt;metric);</a>
+<a name="ln1324">      ip6reach-&gt;control_info = DISTRIBUTION_EXTERNAL;</a>
+<a name="ln1325">      ip6reach-&gt;prefix_len = ipv6-&gt;prefixlen;</a>
+<a name="ln1326">      memcpy(ip6reach-&gt;prefix, ipv6-&gt;prefix.s6_addr, sizeof(ip6reach-&gt;prefix));</a>
+<a name="ln1327">      listnode_add(tlv_data-&gt;ipv6_reachs, ip6reach);</a>
+<a name="ln1328">    }</a>
+<a name="ln1329">}</a>
+<a name="ln1330"> </a>
+<a name="ln1331">static void</a>
+<a name="ln1332">lsp_build_ext_reach (struct isis_lsp *lsp, struct isis_area *area,</a>
+<a name="ln1333">                     struct tlvs *tlv_data)</a>
+<a name="ln1334">{</a>
+<a name="ln1335">  lsp_build_ext_reach_ipv4(lsp, area, tlv_data);</a>
+<a name="ln1336">  lsp_build_ext_reach_ipv6(lsp, area, tlv_data);</a>
+<a name="ln1337">}</a>
+<a name="ln1338"> </a>
+<a name="ln1339">/*</a>
+<a name="ln1340"> * Builds the LSP data part. This func creates a new frag whenever </a>
+<a name="ln1341"> * area-&gt;lsp_frag_threshold is exceeded.</a>
+<a name="ln1342"> */</a>
+<a name="ln1343">static void</a>
+<a name="ln1344">lsp_build (struct isis_lsp *lsp, struct isis_area *area)</a>
+<a name="ln1345">{</a>
+<a name="ln1346">  struct is_neigh *is_neigh;</a>
+<a name="ln1347">  struct te_is_neigh *te_is_neigh;</a>
+<a name="ln1348">  struct listnode *node, *ipnode;</a>
+<a name="ln1349">  int level = lsp-&gt;level;</a>
+<a name="ln1350">  struct isis_circuit *circuit;</a>
+<a name="ln1351">  struct prefix_ipv4 *ipv4;</a>
+<a name="ln1352">  struct ipv4_reachability *ipreach;</a>
+<a name="ln1353">  struct te_ipv4_reachability *te_ipreach;</a>
+<a name="ln1354">  struct isis_adjacency *nei;</a>
+<a name="ln1355">#ifdef HAVE_IPV6</a>
+<a name="ln1356">  struct prefix_ipv6 *ipv6, ip6prefix;</a>
+<a name="ln1357">  struct ipv6_reachability *ip6reach;</a>
+<a name="ln1358">#endif /* HAVE_IPV6 */</a>
+<a name="ln1359">  struct tlvs tlv_data;</a>
+<a name="ln1360">  struct isis_lsp *lsp0 = lsp;</a>
+<a name="ln1361">  struct in_addr *routerid;</a>
+<a name="ln1362">  uint32_t expected = 0, found = 0;</a>
+<a name="ln1363">  uint32_t metric;</a>
+<a name="ln1364">  u_char zero_id[ISIS_SYS_ID_LEN + 1];</a>
+<a name="ln1365">  int retval = ISIS_OK;</a>
+<a name="ln1366">  char buf[BUFSIZ];</a>
+<a name="ln1367"> </a>
+<a name="ln1368">  lsp_debug(&quot;ISIS (%s): Constructing local system LSP for level %d&quot;, area-&gt;area_tag, level);</a>
+<a name="ln1369"> </a>
+<a name="ln1370">  /*</a>
+<a name="ln1371">   * Building the zero lsp</a>
+<a name="ln1372">   */</a>
+<a name="ln1373">  memset (zero_id, 0, ISIS_SYS_ID_LEN + 1);</a>
+<a name="ln1374"> </a>
+<a name="ln1375">  /* Reset stream endp. Stream is always there and on every LSP refresh only</a>
+<a name="ln1376">   * TLV part of it is overwritten. So we must seek past header we will not</a>
+<a name="ln1377">   * touch. */</a>
+<a name="ln1378">  stream_reset (lsp-&gt;pdu);</a>
+<a name="ln1379">  stream_forward_endp (lsp-&gt;pdu, ISIS_FIXED_HDR_LEN + ISIS_LSP_HDR_LEN);</a>
+<a name="ln1380"> </a>
+<a name="ln1381">  /*</a>
+<a name="ln1382">   * Add the authentication info if its present</a>
+<a name="ln1383">   */</a>
+<a name="ln1384">  lsp_auth_add (lsp);</a>
+<a name="ln1385"> </a>
+<a name="ln1386">  /*</a>
+<a name="ln1387">   * First add the tlvs related to area</a>
+<a name="ln1388">   */</a>
+<a name="ln1389"> </a>
+<a name="ln1390">  /* Area addresses */</a>
+<a name="ln1391">  if (lsp-&gt;tlv_data.area_addrs == NULL)</a>
+<a name="ln1392">    lsp-&gt;tlv_data.area_addrs = list_new ();</a>
+<a name="ln1393">  list_add_list (lsp-&gt;tlv_data.area_addrs, area-&gt;area_addrs);</a>
+<a name="ln1394">  if (listcount (lsp-&gt;tlv_data.area_addrs) &gt; 0)</a>
+<a name="ln1395">    tlv_add_area_addrs (lsp-&gt;tlv_data.area_addrs, lsp-&gt;pdu);</a>
+<a name="ln1396"> </a>
+<a name="ln1397">  /* Protocols Supported */</a>
+<a name="ln1398">  if (area-&gt;ip_circuits &gt; 0</a>
+<a name="ln1399">#ifdef HAVE_IPV6</a>
+<a name="ln1400">      || area-&gt;ipv6_circuits &gt; 0</a>
+<a name="ln1401">#endif /* HAVE_IPV6 */</a>
+<a name="ln1402">    )</a>
+<a name="ln1403">    {</a>
+<a name="ln1404">      lsp-&gt;tlv_data.nlpids = XCALLOC (MTYPE_ISIS_TLV, sizeof (struct nlpids));</a>
+<a name="ln1405">      lsp-&gt;tlv_data.nlpids-&gt;count = 0;</a>
+<a name="ln1406">      if (area-&gt;ip_circuits &gt; 0)</a>
+<a name="ln1407">	{</a>
+<a name="ln1408">	  lsp_debug(&quot;ISIS (%s): Found IPv4 circuit, adding IPv4 to NLPIDs&quot;, area-&gt;area_tag);</a>
+<a name="ln1409">	  lsp-&gt;tlv_data.nlpids-&gt;count++;</a>
+<a name="ln1410">	  lsp-&gt;tlv_data.nlpids-&gt;nlpids[0] = NLPID_IP;</a>
+<a name="ln1411">	}</a>
+<a name="ln1412">#ifdef HAVE_IPV6</a>
+<a name="ln1413">      if (area-&gt;ipv6_circuits &gt; 0)</a>
+<a name="ln1414">	{</a>
+<a name="ln1415">	  lsp_debug(&quot;ISIS (%s): Found IPv6 circuit, adding IPv6 to NLPIDs&quot;, area-&gt;area_tag);</a>
+<a name="ln1416">	  lsp-&gt;tlv_data.nlpids-&gt;count++;</a>
+<a name="ln1417">	  lsp-&gt;tlv_data.nlpids-&gt;nlpids[lsp-&gt;tlv_data.nlpids-&gt;count - 1] =</a>
+<a name="ln1418">	    NLPID_IPV6;</a>
+<a name="ln1419">	}</a>
+<a name="ln1420">#endif /* HAVE_IPV6 */</a>
+<a name="ln1421">      tlv_add_nlpid (lsp-&gt;tlv_data.nlpids, lsp-&gt;pdu);</a>
+<a name="ln1422">    }</a>
+<a name="ln1423"> </a>
+<a name="ln1424">  /* Dynamic Hostname */</a>
+<a name="ln1425">  if (area-&gt;dynhostname)</a>
+<a name="ln1426">    {</a>
+<a name="ln1427">      const char *hostname = unix_hostname();</a>
+<a name="ln1428">      size_t hostname_len = strlen(hostname);</a>
+<a name="ln1429"> </a>
+<a name="ln1430">      lsp-&gt;tlv_data.hostname = XMALLOC (MTYPE_ISIS_TLV,</a>
+<a name="ln1431">					sizeof (struct hostname));</a>
+<a name="ln1432"> </a>
+<a name="ln1433">      strncpy((char *)lsp-&gt;tlv_data.hostname-&gt;name, hostname,</a>
+<a name="ln1434">              sizeof(lsp-&gt;tlv_data.hostname-&gt;name));</a>
+<a name="ln1435">      if (hostname_len &lt;= MAX_TLV_LEN)</a>
+<a name="ln1436">        lsp-&gt;tlv_data.hostname-&gt;namelen = hostname_len;</a>
+<a name="ln1437">      else</a>
+<a name="ln1438">        lsp-&gt;tlv_data.hostname-&gt;namelen = MAX_TLV_LEN;</a>
+<a name="ln1439"> </a>
+<a name="ln1440">      lsp_debug(&quot;ISIS (%s): Adding dynamic hostname '%.*s'&quot;, area-&gt;area_tag,</a>
+<a name="ln1441">                lsp-&gt;tlv_data.hostname-&gt;namelen, lsp-&gt;tlv_data.hostname-&gt;name);</a>
+<a name="ln1442">      tlv_add_dynamic_hostname (lsp-&gt;tlv_data.hostname, lsp-&gt;pdu);</a>
+<a name="ln1443">    }</a>
+<a name="ln1444">  else</a>
+<a name="ln1445">    {</a>
+<a name="ln1446">      lsp_debug(&quot;ISIS (%s): Not adding dynamic hostname (disabled)&quot;, area-&gt;area_tag);</a>
+<a name="ln1447">    }</a>
+<a name="ln1448"> </a>
+<a name="ln1449">  /* IPv4 address and TE router ID TLVs. In case of the first one we don't</a>
+<a name="ln1450">   * follow &quot;C&quot; vendor, but &quot;J&quot; vendor behavior - one IPv4 address is put into</a>
+<a name="ln1451">   * LSP and this address is same as router id. */</a>
+<a name="ln1452">  if (isis-&gt;router_id != 0)</a>
+<a name="ln1453">    {</a>
+<a name="ln1454">      inet_ntop(AF_INET, &amp;isis-&gt;router_id, buf, sizeof(buf));</a>
+<a name="ln1455">      lsp_debug(&quot;ISIS (%s): Adding router ID %s as IPv4 tlv.&quot;, area-&gt;area_tag, buf);</a>
+<a name="ln1456">      if (lsp-&gt;tlv_data.ipv4_addrs == NULL)</a>
+<a name="ln1457">	{</a>
+<a name="ln1458">	  lsp-&gt;tlv_data.ipv4_addrs = list_new ();</a>
+<a name="ln1459">	  lsp-&gt;tlv_data.ipv4_addrs-&gt;del = free_tlv;</a>
+<a name="ln1460">	}</a>
+<a name="ln1461"> </a>
+<a name="ln1462">      routerid = XMALLOC (MTYPE_ISIS_TLV, sizeof (struct in_addr));</a>
+<a name="ln1463">      routerid-&gt;s_addr = isis-&gt;router_id;</a>
+<a name="ln1464">      listnode_add (lsp-&gt;tlv_data.ipv4_addrs, routerid);</a>
+<a name="ln1465">      tlv_add_in_addr (routerid, lsp-&gt;pdu, IPV4_ADDR);</a>
+<a name="ln1466"> </a>
+<a name="ln1467">      /* Exactly same data is put into TE router ID TLV, but only if new style</a>
+<a name="ln1468">       * TLV's are in use. */</a>
+<a name="ln1469">      if (area-&gt;newmetric)</a>
+<a name="ln1470">	{</a>
+<a name="ln1471">          lsp_debug(&quot;ISIS (%s): Adding router ID also as TE router ID tlv.&quot;, area-&gt;area_tag);</a>
+<a name="ln1472">	  lsp-&gt;tlv_data.router_id = XMALLOC (MTYPE_ISIS_TLV,</a>
+<a name="ln1473">					     sizeof (struct in_addr));</a>
+<a name="ln1474">	  lsp-&gt;tlv_data.router_id-&gt;id.s_addr = isis-&gt;router_id;</a>
+<a name="ln1475">	  tlv_add_in_addr (&amp;lsp-&gt;tlv_data.router_id-&gt;id, lsp-&gt;pdu,</a>
+<a name="ln1476">                           TE_ROUTER_ID);</a>
+<a name="ln1477">	}</a>
+<a name="ln1478">    }</a>
+<a name="ln1479">  else</a>
+<a name="ln1480">    {</a>
+<a name="ln1481">      lsp_debug(&quot;ISIS (%s): Router ID is unset. Not adding tlv.&quot;, area-&gt;area_tag);</a>
+<a name="ln1482">    }</a>
+<a name="ln1483"> </a>
+<a name="ln1484">  memset (&amp;tlv_data, 0, sizeof (struct tlvs));</a>
+<a name="ln1485"> </a>
+<a name="ln1486">#ifdef TOPOLOGY_GENERATE</a>
+<a name="ln1487">  /* If topology exists (and we create topology for level 1 only), create</a>
+<a name="ln1488">   * (hardcoded) link to topology. */</a>
+<a name="ln1489">  if (area-&gt;topology &amp;&amp; level == IS_LEVEL_1)</a>
+<a name="ln1490">    {</a>
+<a name="ln1491">      if (tlv_data.is_neighs == NULL)</a>
+<a name="ln1492">	{</a>
+<a name="ln1493">	  tlv_data.is_neighs = list_new ();</a>
+<a name="ln1494">	  tlv_data.is_neighs-&gt;del = free_tlv;</a>
+<a name="ln1495">	}</a>
+<a name="ln1496">      is_neigh = XCALLOC (MTYPE_ISIS_TLV, sizeof (struct is_neigh));</a>
+<a name="ln1497"> </a>
+<a name="ln1498">      memcpy (&amp;is_neigh-&gt;neigh_id, area-&gt;topology_baseis, ISIS_SYS_ID_LEN);</a>
+<a name="ln1499">      is_neigh-&gt;neigh_id[ISIS_SYS_ID_LEN - 1] = (1 &amp; 0xFF);</a>
+<a name="ln1500">      is_neigh-&gt;neigh_id[ISIS_SYS_ID_LEN - 2] = ((1 &gt;&gt; 8) &amp; 0xFF);</a>
+<a name="ln1501">      is_neigh-&gt;metrics.metric_default = 0x01;</a>
+<a name="ln1502">      is_neigh-&gt;metrics.metric_delay = METRICS_UNSUPPORTED;</a>
+<a name="ln1503">      is_neigh-&gt;metrics.metric_expense = METRICS_UNSUPPORTED;</a>
+<a name="ln1504">      is_neigh-&gt;metrics.metric_error = METRICS_UNSUPPORTED;</a>
+<a name="ln1505">      listnode_add (tlv_data.is_neighs, is_neigh);</a>
+<a name="ln1506">    }</a>
+<a name="ln1507">#endif /* TOPOLOGY_GENERATE */</a>
+<a name="ln1508"> </a>
+<a name="ln1509">  lsp_debug(&quot;ISIS (%s): Adding circuit specific information.&quot;, area-&gt;area_tag);</a>
+<a name="ln1510"> </a>
+<a name="ln1511">  /*</a>
+<a name="ln1512">   * Then build lists of tlvs related to circuits</a>
+<a name="ln1513">   */</a>
+<a name="ln1514">  for (ALL_LIST_ELEMENTS_RO (area-&gt;circuit_list, node, circuit))</a>
+<a name="ln1515">    {</a>
+<a name="ln1516">      if (!circuit-&gt;interface)</a>
+<a name="ln1517">        lsp_debug(&quot;ISIS (%s): Processing %s circuit %p with unknown interface&quot;,</a>
+<a name="ln1518">                  area-&gt;area_tag, circuit_type2string(circuit-&gt;circ_type), circuit);</a>
+<a name="ln1519">      else</a>
+<a name="ln1520">        lsp_debug(&quot;ISIS (%s): Processing %s circuit %s&quot;,</a>
+<a name="ln1521">                  area-&gt;area_tag, circuit_type2string(circuit-&gt;circ_type), circuit-&gt;interface-&gt;name);</a>
+<a name="ln1522"> </a>
+<a name="ln1523">      if (circuit-&gt;state != C_STATE_UP)</a>
+<a name="ln1524">        {</a>
+<a name="ln1525">          lsp_debug(&quot;ISIS (%s): Circuit is not up, ignoring.&quot;, area-&gt;area_tag);</a>
+<a name="ln1526">          continue;</a>
+<a name="ln1527">        }</a>
+<a name="ln1528"> </a>
+<a name="ln1529">      /*</a>
+<a name="ln1530">       * Add IPv4 internal reachability of this circuit</a>
+<a name="ln1531">       */</a>
+<a name="ln1532">      if (circuit-&gt;ip_router &amp;&amp; circuit-&gt;ip_addrs &amp;&amp;</a>
+<a name="ln1533">	  circuit-&gt;ip_addrs-&gt;count &gt; 0)</a>
+<a name="ln1534">	{</a>
+<a name="ln1535">	  lsp_debug(&quot;ISIS (%s): Circuit has IPv4 active, adding respective TLVs.&quot;, area-&gt;area_tag);</a>
+<a name="ln1536">	  if (area-&gt;oldmetric)</a>
+<a name="ln1537">	    {</a>
+<a name="ln1538">	      if (tlv_data.ipv4_int_reachs == NULL)</a>
+<a name="ln1539">		{</a>
+<a name="ln1540">		  tlv_data.ipv4_int_reachs = list_new ();</a>
+<a name="ln1541">		  tlv_data.ipv4_int_reachs-&gt;del = free_tlv;</a>
+<a name="ln1542">		}</a>
+<a name="ln1543">	      for (ALL_LIST_ELEMENTS_RO (circuit-&gt;ip_addrs, ipnode, ipv4))</a>
+<a name="ln1544">		{</a>
+<a name="ln1545">		  ipreach =</a>
+<a name="ln1546">		    XMALLOC (MTYPE_ISIS_TLV, sizeof (struct ipv4_reachability));</a>
+<a name="ln1547">		  ipreach-&gt;metrics.metric_default = circuit-&gt;metric[level - 1];</a>
+<a name="ln1548">		  ipreach-&gt;metrics.metric_expense = METRICS_UNSUPPORTED;</a>
+<a name="ln1549">		  ipreach-&gt;metrics.metric_error = METRICS_UNSUPPORTED;</a>
+<a name="ln1550">		  ipreach-&gt;metrics.metric_delay = METRICS_UNSUPPORTED;</a>
+<a name="ln1551">		  masklen2ip (ipv4-&gt;prefixlen, &amp;ipreach-&gt;mask);</a>
+<a name="ln1552">		  ipreach-&gt;prefix.s_addr = ((ipreach-&gt;mask.s_addr) &amp;</a>
+<a name="ln1553">					    (ipv4-&gt;prefix.s_addr));</a>
+<a name="ln1554">		  inet_ntop(AF_INET, &amp;ipreach-&gt;prefix.s_addr, buf, sizeof(buf));</a>
+<a name="ln1555">		  lsp_debug(&quot;ISIS (%s): Adding old-style IP reachability for %s/%d&quot;,</a>
+<a name="ln1556">		            area-&gt;area_tag, buf, ipv4-&gt;prefixlen);</a>
+<a name="ln1557">		  listnode_add (tlv_data.ipv4_int_reachs, ipreach);</a>
+<a name="ln1558">		}</a>
+<a name="ln1559">	    }</a>
+<a name="ln1560">	  if (area-&gt;newmetric)</a>
+<a name="ln1561">	    {</a>
+<a name="ln1562">	      if (tlv_data.te_ipv4_reachs == NULL)</a>
+<a name="ln1563">		{</a>
+<a name="ln1564">		  tlv_data.te_ipv4_reachs = list_new ();</a>
+<a name="ln1565">		  tlv_data.te_ipv4_reachs-&gt;del = free_tlv;</a>
+<a name="ln1566">		}</a>
+<a name="ln1567">	      for (ALL_LIST_ELEMENTS_RO (circuit-&gt;ip_addrs, ipnode, ipv4))</a>
+<a name="ln1568">		{</a>
+<a name="ln1569">		  /* FIXME All this assumes that we have no sub TLVs. */</a>
+<a name="ln1570">		  te_ipreach = XCALLOC (MTYPE_ISIS_TLV,</a>
+<a name="ln1571">					sizeof (struct te_ipv4_reachability) +</a>
+<a name="ln1572">					((ipv4-&gt;prefixlen + 7)/8) - 1);</a>
+<a name="ln1573"> </a>
+<a name="ln1574">		  if (area-&gt;oldmetric)</a>
+<a name="ln1575">		    te_ipreach-&gt;te_metric = htonl (circuit-&gt;metric[level - 1]);</a>
+<a name="ln1576">		  else</a>
+<a name="ln1577">		    te_ipreach-&gt;te_metric = htonl (circuit-&gt;te_metric[level - 1]);</a>
+<a name="ln1578"> </a>
+<a name="ln1579">		  te_ipreach-&gt;control = (ipv4-&gt;prefixlen &amp; 0x3F);</a>
+<a name="ln1580">		  memcpy (&amp;te_ipreach-&gt;prefix_start, &amp;ipv4-&gt;prefix.s_addr,</a>
+<a name="ln1581">			  (ipv4-&gt;prefixlen + 7)/8);</a>
+<a name="ln1582">		  inet_ntop(AF_INET, &amp;ipv4-&gt;prefix.s_addr, buf, sizeof(buf));</a>
+<a name="ln1583">		  lsp_debug(&quot;ISIS (%s): Adding te-style IP reachability for %s/%d&quot;,</a>
+<a name="ln1584">		            area-&gt;area_tag, buf, ipv4-&gt;prefixlen);</a>
+<a name="ln1585">		  listnode_add (tlv_data.te_ipv4_reachs, te_ipreach);</a>
+<a name="ln1586">		}</a>
+<a name="ln1587">	    }</a>
+<a name="ln1588">	}</a>
+<a name="ln1589"> </a>
+<a name="ln1590">#ifdef HAVE_IPV6</a>
+<a name="ln1591">      /*</a>
+<a name="ln1592">       * Add IPv6 reachability of this circuit</a>
+<a name="ln1593">       */</a>
+<a name="ln1594">      if (circuit-&gt;ipv6_router &amp;&amp; circuit-&gt;ipv6_non_link &amp;&amp;</a>
+<a name="ln1595">	  circuit-&gt;ipv6_non_link-&gt;count &gt; 0)</a>
+<a name="ln1596">	{</a>
+<a name="ln1597"> </a>
+<a name="ln1598">	  if (tlv_data.ipv6_reachs == NULL)</a>
+<a name="ln1599">	    {</a>
+<a name="ln1600">	      tlv_data.ipv6_reachs = list_new ();</a>
+<a name="ln1601">	      tlv_data.ipv6_reachs-&gt;del = free_tlv;</a>
+<a name="ln1602">	    }</a>
+<a name="ln1603">          for (ALL_LIST_ELEMENTS_RO (circuit-&gt;ipv6_non_link, ipnode, ipv6))</a>
+<a name="ln1604">	    {</a>
+<a name="ln1605">	      ip6reach =</a>
+<a name="ln1606">		XCALLOC (MTYPE_ISIS_TLV, sizeof (struct ipv6_reachability));</a>
+<a name="ln1607"> </a>
+<a name="ln1608">	      if (area-&gt;oldmetric)</a>
+<a name="ln1609">		ip6reach-&gt;metric =</a>
+<a name="ln1610">			  htonl (circuit-&gt;metric[level - 1]);</a>
+<a name="ln1611">	      else</a>
+<a name="ln1612">		  ip6reach-&gt;metric = htonl (circuit-&gt;te_metric[level - 1]);</a>
+<a name="ln1613"> </a>
+<a name="ln1614">	      ip6reach-&gt;control_info = 0;</a>
+<a name="ln1615">	      ip6reach-&gt;prefix_len = ipv6-&gt;prefixlen;</a>
+<a name="ln1616">	      memcpy(&amp;ip6prefix, ipv6, sizeof(ip6prefix));</a>
+<a name="ln1617">	      apply_mask_ipv6(&amp;ip6prefix);</a>
+<a name="ln1618"> </a>
+<a name="ln1619">	      inet_ntop(AF_INET6, &amp;ip6prefix.prefix.s6_addr, buf, sizeof(buf));</a>
+<a name="ln1620">	      lsp_debug(&quot;ISIS (%s): Adding IPv6 reachability for %s/%d&quot;,</a>
+<a name="ln1621">	                area-&gt;area_tag, buf, ipv6-&gt;prefixlen);</a>
+<a name="ln1622"> </a>
+<a name="ln1623">	      memcpy (ip6reach-&gt;prefix, ip6prefix.prefix.s6_addr,</a>
+<a name="ln1624">		      sizeof (ip6reach-&gt;prefix));</a>
+<a name="ln1625">	      listnode_add (tlv_data.ipv6_reachs, ip6reach);</a>
+<a name="ln1626">	    }</a>
+<a name="ln1627">	}</a>
+<a name="ln1628">#endif /* HAVE_IPV6 */</a>
+<a name="ln1629"> </a>
+<a name="ln1630">      switch (circuit-&gt;circ_type)</a>
+<a name="ln1631">	{</a>
+<a name="ln1632">	case CIRCUIT_T_BROADCAST:</a>
+<a name="ln1633">	  if (level &amp; circuit-&gt;is_type)</a>
+<a name="ln1634">	    {</a>
+<a name="ln1635">	      if (area-&gt;oldmetric)</a>
+<a name="ln1636">		{</a>
+<a name="ln1637">		  if (tlv_data.is_neighs == NULL)</a>
+<a name="ln1638">		    {</a>
+<a name="ln1639">		      tlv_data.is_neighs = list_new ();</a>
+<a name="ln1640">		      tlv_data.is_neighs-&gt;del = free_tlv;</a>
+<a name="ln1641">		    }</a>
+<a name="ln1642">		  is_neigh = XCALLOC (MTYPE_ISIS_TLV, sizeof (struct is_neigh));</a>
+<a name="ln1643">		  if (level == IS_LEVEL_1)</a>
+<a name="ln1644">		    memcpy (is_neigh-&gt;neigh_id,</a>
+<a name="ln1645">			    circuit-&gt;u.bc.l1_desig_is, ISIS_SYS_ID_LEN + 1);</a>
+<a name="ln1646">		  else</a>
+<a name="ln1647">		    memcpy (is_neigh-&gt;neigh_id,</a>
+<a name="ln1648">			    circuit-&gt;u.bc.l2_desig_is, ISIS_SYS_ID_LEN + 1);</a>
+<a name="ln1649">		  is_neigh-&gt;metrics.metric_default = circuit-&gt;metric[level - 1];</a>
+<a name="ln1650">		  is_neigh-&gt;metrics.metric_expense = METRICS_UNSUPPORTED;</a>
+<a name="ln1651">		  is_neigh-&gt;metrics.metric_error = METRICS_UNSUPPORTED;</a>
+<a name="ln1652">		  is_neigh-&gt;metrics.metric_delay = METRICS_UNSUPPORTED;</a>
+<a name="ln1653">                  if (!memcmp (is_neigh-&gt;neigh_id, zero_id,</a>
+<a name="ln1654">                               ISIS_SYS_ID_LEN + 1))</a>
+<a name="ln1655">                    {</a>
+<a name="ln1656">                      XFREE (MTYPE_ISIS_TLV, is_neigh);</a>
+<a name="ln1657">                      lsp_debug(&quot;ISIS (%s): No DIS for circuit, not adding old-style IS neighbor.&quot;,</a>
+<a name="ln1658">                                area-&gt;area_tag);</a>
+<a name="ln1659">                    }</a>
+<a name="ln1660">                  else</a>
+<a name="ln1661">                    {</a>
+<a name="ln1662">                      listnode_add (tlv_data.is_neighs, is_neigh);</a>
+<a name="ln1663">                      lsp_debug(&quot;ISIS (%s): Adding DIS %s.%02x as old-style neighbor&quot;,</a>
+<a name="ln1664">                                area-&gt;area_tag, sysid_print(is_neigh-&gt;neigh_id),</a>
+<a name="ln1665">                                LSP_PSEUDO_ID(is_neigh-&gt;neigh_id));</a>
+<a name="ln1666">                    }</a>
+<a name="ln1667">		}</a>
+<a name="ln1668">	      if (area-&gt;newmetric)</a>
+<a name="ln1669">		{</a>
+<a name="ln1670">		  if (tlv_data.te_is_neighs == NULL)</a>
+<a name="ln1671">		    {</a>
+<a name="ln1672">		      tlv_data.te_is_neighs = list_new ();</a>
+<a name="ln1673">		      tlv_data.te_is_neighs-&gt;del = free_tlv;</a>
+<a name="ln1674">		    }</a>
+<a name="ln1675">		  te_is_neigh = XCALLOC (MTYPE_ISIS_TLV,</a>
+<a name="ln1676">					 sizeof (struct te_is_neigh));</a>
+<a name="ln1677">		  if (level == IS_LEVEL_1)</a>
+<a name="ln1678">		    memcpy (te_is_neigh-&gt;neigh_id,</a>
+<a name="ln1679">			    circuit-&gt;u.bc.l1_desig_is, ISIS_SYS_ID_LEN + 1);</a>
+<a name="ln1680">		  else</a>
+<a name="ln1681">		    memcpy (te_is_neigh-&gt;neigh_id,</a>
+<a name="ln1682">			    circuit-&gt;u.bc.l2_desig_is, ISIS_SYS_ID_LEN + 1);</a>
+<a name="ln1683">		  if (area-&gt;oldmetric)</a>
+<a name="ln1684">		    metric = circuit-&gt;metric[level - 1];</a>
+<a name="ln1685">		  else</a>
+<a name="ln1686">		    metric = circuit-&gt;te_metric[level - 1];</a>
+<a name="ln1687">		  SET_TE_METRIC(te_is_neigh, metric);</a>
+<a name="ln1688">                  if (!memcmp (te_is_neigh-&gt;neigh_id, zero_id,</a>
+<a name="ln1689">                               ISIS_SYS_ID_LEN + 1))</a>
+<a name="ln1690">                    {</a>
+<a name="ln1691">                      XFREE (MTYPE_ISIS_TLV, te_is_neigh);</a>
+<a name="ln1692">                      lsp_debug(&quot;ISIS (%s): No DIS for circuit, not adding te-style IS neighbor.&quot;,</a>
+<a name="ln1693">                                area-&gt;area_tag);</a>
+<a name="ln1694">                    }</a>
+<a name="ln1695">                  else</a>
+<a name="ln1696">                    {</a>
+<a name="ln1697">                      /* Check if MPLS_TE is activate */</a>
+<a name="ln1698">                      if (IS_MPLS_TE(isisMplsTE) &amp;&amp; HAS_LINK_PARAMS(circuit-&gt;interface))</a>
+<a name="ln1699">                        /* Add SubTLVs &amp; Adjust real size of SubTLVs */</a>
+<a name="ln1700">                        te_is_neigh-&gt;sub_tlvs_length = add_te_subtlvs(te_is_neigh-&gt;sub_tlvs, circuit-&gt;mtc);</a>
+<a name="ln1701">                      else</a>
+<a name="ln1702">                        /* Or keep only TE metric with no SubTLVs if MPLS_TE is off */</a>
+<a name="ln1703">                        te_is_neigh-&gt;sub_tlvs_length = 0;</a>
+<a name="ln1704"> </a>
+<a name="ln1705">                      listnode_add (tlv_data.te_is_neighs, te_is_neigh);</a>
+<a name="ln1706">                      lsp_debug(&quot;ISIS (%s): Adding DIS %s.%02x as te-style neighbor&quot;,</a>
+<a name="ln1707">                                area-&gt;area_tag, sysid_print(te_is_neigh-&gt;neigh_id),</a>
+<a name="ln1708">                                LSP_PSEUDO_ID(te_is_neigh-&gt;neigh_id));</a>
+<a name="ln1709">                    }</a>
+<a name="ln1710">		}</a>
+<a name="ln1711">	    }</a>
+<a name="ln1712">	  else</a>
+<a name="ln1713">	    {</a>
+<a name="ln1714">	      lsp_debug(&quot;ISIS (%s): Circuit is not active for current level. Not adding IS neighbors&quot;,</a>
+<a name="ln1715">	                area-&gt;area_tag);</a>
+<a name="ln1716">	    }</a>
+<a name="ln1717">	  break;</a>
+<a name="ln1718">	case CIRCUIT_T_P2P:</a>
+<a name="ln1719">	  nei = circuit-&gt;u.p2p.neighbor;</a>
+<a name="ln1720">	  if (nei &amp;&amp; (level &amp; nei-&gt;circuit_t))</a>
+<a name="ln1721">	    {</a>
+<a name="ln1722">	      if (area-&gt;oldmetric)</a>
+<a name="ln1723">		{</a>
+<a name="ln1724">		  if (tlv_data.is_neighs == NULL)</a>
+<a name="ln1725">		    {</a>
+<a name="ln1726">		      tlv_data.is_neighs = list_new ();</a>
+<a name="ln1727">		      tlv_data.is_neighs-&gt;del = free_tlv;</a>
+<a name="ln1728">		    }</a>
+<a name="ln1729">		  is_neigh = XCALLOC (MTYPE_ISIS_TLV, sizeof (struct is_neigh));</a>
+<a name="ln1730">		  memcpy (is_neigh-&gt;neigh_id, nei-&gt;sysid, ISIS_SYS_ID_LEN);</a>
+<a name="ln1731">		  is_neigh-&gt;metrics.metric_default = circuit-&gt;metric[level - 1];</a>
+<a name="ln1732">		  is_neigh-&gt;metrics.metric_expense = METRICS_UNSUPPORTED;</a>
+<a name="ln1733">		  is_neigh-&gt;metrics.metric_error = METRICS_UNSUPPORTED;</a>
+<a name="ln1734">		  is_neigh-&gt;metrics.metric_delay = METRICS_UNSUPPORTED;</a>
+<a name="ln1735">		  listnode_add (tlv_data.is_neighs, is_neigh);</a>
+<a name="ln1736">		  lsp_debug(&quot;ISIS (%s): Adding old-style is reach for %s&quot;, area-&gt;area_tag,</a>
+<a name="ln1737">                            sysid_print(is_neigh-&gt;neigh_id));</a>
+<a name="ln1738">		}</a>
+<a name="ln1739">	      if (area-&gt;newmetric)</a>
+<a name="ln1740">		{</a>
+<a name="ln1741">		  uint32_t metric;</a>
+<a name="ln1742"> </a>
+<a name="ln1743">		  if (tlv_data.te_is_neighs == NULL)</a>
+<a name="ln1744">		    {</a>
+<a name="ln1745">		      tlv_data.te_is_neighs = list_new ();</a>
+<a name="ln1746">		      tlv_data.te_is_neighs-&gt;del = free_tlv;</a>
+<a name="ln1747">		    }</a>
+<a name="ln1748">		  te_is_neigh = XCALLOC (MTYPE_ISIS_TLV,</a>
+<a name="ln1749">					 sizeof (struct te_is_neigh));</a>
+<a name="ln1750">		  memcpy (te_is_neigh-&gt;neigh_id, nei-&gt;sysid, ISIS_SYS_ID_LEN);</a>
+<a name="ln1751">		  metric = circuit-&gt;te_metric[level - 1];</a>
+<a name="ln1752">		  SET_TE_METRIC(te_is_neigh, metric);</a>
+<a name="ln1753">		  /* Check if MPLS_TE is activate */</a>
+<a name="ln1754">                  if (IS_MPLS_TE(isisMplsTE) &amp;&amp; HAS_LINK_PARAMS(circuit-&gt;interface))</a>
+<a name="ln1755">                    /* Update Local and Remote IP address for MPLS TE circuit parameters */</a>
+<a name="ln1756">                    /* NOTE sure that it is the pertinent place for that updates */</a>
+<a name="ln1757">                    /* Local IP address could be updated in isis_circuit.c - isis_circuit_add_addr() */</a>
+<a name="ln1758">                    /* But, where update remote IP address ? in isis_pdu.c - process_p2p_hello() ? */</a>
+<a name="ln1759"> </a>
+<a name="ln1760">                    /* Add SubTLVs &amp; Adjust real size of SubTLVs */</a>
+<a name="ln1761">                    te_is_neigh-&gt;sub_tlvs_length = add_te_subtlvs(te_is_neigh-&gt;sub_tlvs, circuit-&gt;mtc);</a>
+<a name="ln1762">                  else</a>
+<a name="ln1763">                    /* Or keep only TE metric with no SubTLVs if MPLS_TE is off */</a>
+<a name="ln1764">                    te_is_neigh-&gt;sub_tlvs_length = 0;</a>
+<a name="ln1765">		  listnode_add (tlv_data.te_is_neighs, te_is_neigh);</a>
+<a name="ln1766">		  lsp_debug(&quot;ISIS (%s): Adding te-style is reach for %s&quot;, area-&gt;area_tag,</a>
+<a name="ln1767">                            sysid_print(te_is_neigh-&gt;neigh_id));</a>
+<a name="ln1768">		}</a>
+<a name="ln1769">	    }</a>
+<a name="ln1770">          else</a>
+<a name="ln1771">            {</a>
+<a name="ln1772">              lsp_debug(&quot;ISIS (%s): No adjacency for given level on this circuit. Not adding IS neighbors&quot;,</a>
+<a name="ln1773">              area-&gt;area_tag);</a>
+<a name="ln1774">            }</a>
+<a name="ln1775">	  break;</a>
+<a name="ln1776">	case CIRCUIT_T_LOOPBACK:</a>
+<a name="ln1777">          break;</a>
+<a name="ln1778">	default:</a>
+<a name="ln1779">	  zlog_warn (&quot;lsp_area_create: unknown circuit type&quot;);</a>
+<a name="ln1780">	}</a>
+<a name="ln1781">    }</a>
+<a name="ln1782"> </a>
+<a name="ln1783">  lsp_build_ext_reach(lsp, area, &amp;tlv_data);</a>
+<a name="ln1784"> </a>
+<a name="ln1785">  lsp_debug(&quot;ISIS (%s): LSP construction is complete. Serializing...&quot;, area-&gt;area_tag);</a>
+<a name="ln1786"> </a>
+<a name="ln1787">  while (tlv_data.ipv4_int_reachs &amp;&amp; listcount (tlv_data.ipv4_int_reachs))</a>
+<a name="ln1788">    {</a>
+<a name="ln1789">      if (lsp-&gt;tlv_data.ipv4_int_reachs == NULL)</a>
+<a name="ln1790">	lsp-&gt;tlv_data.ipv4_int_reachs = list_new ();</a>
+<a name="ln1791">      lsp_tlv_fit (lsp, &amp;tlv_data.ipv4_int_reachs,</a>
+<a name="ln1792">		   &amp;lsp-&gt;tlv_data.ipv4_int_reachs,</a>
+<a name="ln1793">		   IPV4_REACH_LEN, area-&gt;lsp_frag_threshold,</a>
+<a name="ln1794">		   tlv_add_ipv4_int_reachs);</a>
+<a name="ln1795">      if (tlv_data.ipv4_int_reachs &amp;&amp; listcount (tlv_data.ipv4_int_reachs))</a>
+<a name="ln1796">	lsp = lsp_next_frag (LSP_FRAGMENT (lsp-&gt;lsp_header-&gt;lsp_id) + 1,</a>
+<a name="ln1797">			     lsp0, area, level);</a>
+<a name="ln1798">    }</a>
+<a name="ln1799"> </a>
+<a name="ln1800">  while (tlv_data.ipv4_ext_reachs &amp;&amp; listcount (tlv_data.ipv4_ext_reachs))</a>
+<a name="ln1801">    {</a>
+<a name="ln1802">      if (lsp-&gt;tlv_data.ipv4_ext_reachs == NULL)</a>
+<a name="ln1803">	lsp-&gt;tlv_data.ipv4_ext_reachs = list_new ();</a>
+<a name="ln1804">      lsp_tlv_fit (lsp, &amp;tlv_data.ipv4_ext_reachs,</a>
+<a name="ln1805">		   &amp;lsp-&gt;tlv_data.ipv4_ext_reachs,</a>
+<a name="ln1806">		   IPV4_REACH_LEN, area-&gt;lsp_frag_threshold,</a>
+<a name="ln1807">		   tlv_add_ipv4_ext_reachs);</a>
+<a name="ln1808">      if (tlv_data.ipv4_ext_reachs &amp;&amp; listcount (tlv_data.ipv4_ext_reachs))</a>
+<a name="ln1809">	lsp = lsp_next_frag (LSP_FRAGMENT (lsp-&gt;lsp_header-&gt;lsp_id) + 1,</a>
+<a name="ln1810">			     lsp0, area, level);</a>
+<a name="ln1811">    }</a>
+<a name="ln1812"> </a>
+<a name="ln1813">  /* FIXME: We pass maximum te_ipv4_reachability length to the lsp_tlv_fit()</a>
+<a name="ln1814">   * for now. lsp_tlv_fit() needs to be fixed to deal with variable length</a>
+<a name="ln1815">   * TLVs (sub TLVs!). */</a>
+<a name="ln1816">  while (tlv_data.te_ipv4_reachs &amp;&amp; listcount (tlv_data.te_ipv4_reachs))</a>
+<a name="ln1817">    {</a>
+<a name="ln1818">      if (lsp-&gt;tlv_data.te_ipv4_reachs == NULL)</a>
+<a name="ln1819">	lsp-&gt;tlv_data.te_ipv4_reachs = list_new ();</a>
+<a name="ln1820">      lsp_tlv_fit (lsp, &amp;tlv_data.te_ipv4_reachs,</a>
+<a name="ln1821">		   &amp;lsp-&gt;tlv_data.te_ipv4_reachs,</a>
+<a name="ln1822">		   TE_IPV4_REACH_LEN, area-&gt;lsp_frag_threshold,</a>
+<a name="ln1823">		   tlv_add_te_ipv4_reachs);</a>
+<a name="ln1824">      if (tlv_data.te_ipv4_reachs &amp;&amp; listcount (tlv_data.te_ipv4_reachs))</a>
+<a name="ln1825">	lsp = lsp_next_frag (LSP_FRAGMENT (lsp-&gt;lsp_header-&gt;lsp_id) + 1,</a>
+<a name="ln1826">			     lsp0, area, level);</a>
+<a name="ln1827">    }</a>
+<a name="ln1828"> </a>
+<a name="ln1829">#ifdef  HAVE_IPV6</a>
+<a name="ln1830">  while (tlv_data.ipv6_reachs &amp;&amp; listcount (tlv_data.ipv6_reachs))</a>
+<a name="ln1831">    {</a>
+<a name="ln1832">      if (lsp-&gt;tlv_data.ipv6_reachs == NULL)</a>
+<a name="ln1833">	lsp-&gt;tlv_data.ipv6_reachs = list_new ();</a>
+<a name="ln1834">      lsp_tlv_fit (lsp, &amp;tlv_data.ipv6_reachs,</a>
+<a name="ln1835">		   &amp;lsp-&gt;tlv_data.ipv6_reachs,</a>
+<a name="ln1836">		   IPV6_REACH_LEN, area-&gt;lsp_frag_threshold,</a>
+<a name="ln1837">		   tlv_add_ipv6_reachs);</a>
+<a name="ln1838">      if (tlv_data.ipv6_reachs &amp;&amp; listcount (tlv_data.ipv6_reachs))</a>
+<a name="ln1839">	lsp = lsp_next_frag (LSP_FRAGMENT (lsp-&gt;lsp_header-&gt;lsp_id) + 1,</a>
+<a name="ln1840">			     lsp0, area, level);</a>
+<a name="ln1841">    }</a>
+<a name="ln1842">#endif /* HAVE_IPV6 */</a>
+<a name="ln1843"> </a>
+<a name="ln1844">  while (tlv_data.is_neighs &amp;&amp; listcount (tlv_data.is_neighs))</a>
+<a name="ln1845">    {</a>
+<a name="ln1846">      if (lsp-&gt;tlv_data.is_neighs == NULL)</a>
+<a name="ln1847">	lsp-&gt;tlv_data.is_neighs = list_new ();</a>
+<a name="ln1848">      lsp_tlv_fit (lsp, &amp;tlv_data.is_neighs,</a>
+<a name="ln1849">		   &amp;lsp-&gt;tlv_data.is_neighs,</a>
+<a name="ln1850">		   IS_NEIGHBOURS_LEN, area-&gt;lsp_frag_threshold,</a>
+<a name="ln1851">		   tlv_add_is_neighs);</a>
+<a name="ln1852">      if (tlv_data.is_neighs &amp;&amp; listcount (tlv_data.is_neighs))</a>
+<a name="ln1853">	lsp = lsp_next_frag (LSP_FRAGMENT (lsp-&gt;lsp_header-&gt;lsp_id) + 1,</a>
+<a name="ln1854">			     lsp0, area, level);</a>
+<a name="ln1855">    }</a>
+<a name="ln1856"> </a>
+<a name="ln1857">  while (tlv_data.te_is_neighs &amp;&amp; listcount (tlv_data.te_is_neighs))</a>
+<a name="ln1858">    {</a>
+<a name="ln1859">      if (lsp-&gt;tlv_data.te_is_neighs == NULL)</a>
+<a name="ln1860">	lsp-&gt;tlv_data.te_is_neighs = list_new ();</a>
+<a name="ln1861">      lsp_tlv_fit (lsp, &amp;tlv_data.te_is_neighs, &amp;lsp-&gt;tlv_data.te_is_neighs,</a>
+<a name="ln1862">		   IS_NEIGHBOURS_LEN, area-&gt;lsp_frag_threshold,</a>
+<a name="ln1863">		   tlv_add_te_is_neighs);</a>
+<a name="ln1864">      if (tlv_data.te_is_neighs &amp;&amp; listcount (tlv_data.te_is_neighs))</a>
+<a name="ln1865">	lsp = lsp_next_frag (LSP_FRAGMENT (lsp-&gt;lsp_header-&gt;lsp_id) + 1,</a>
+<a name="ln1866">			     lsp0, area, level);</a>
+<a name="ln1867">    }</a>
+<a name="ln1868">  lsp-&gt;lsp_header-&gt;pdu_len = htons (stream_get_endp (lsp-&gt;pdu));</a>
+<a name="ln1869"> </a>
+<a name="ln1870">  free_tlvs (&amp;tlv_data);</a>
+<a name="ln1871"> </a>
+<a name="ln1872">  /* Validate the LSP */</a>
+<a name="ln1873">  retval = parse_tlvs (area-&gt;area_tag, STREAM_DATA (lsp-&gt;pdu) +</a>
+<a name="ln1874">                       ISIS_FIXED_HDR_LEN + ISIS_LSP_HDR_LEN,</a>
+<a name="ln1875">                       stream_get_endp (lsp-&gt;pdu) -</a>
+<a name="ln1876">                       ISIS_FIXED_HDR_LEN - ISIS_LSP_HDR_LEN,</a>
+<a name="ln1877">                       &amp;expected, &amp;found, &amp;tlv_data, NULL);</a>
+<a name="ln1878">  assert (retval == ISIS_OK);</a>
+<a name="ln1879"> </a>
+<a name="ln1880">  return;</a>
+<a name="ln1881">}</a>
+<a name="ln1882"> </a>
+<a name="ln1883">/*</a>
+<a name="ln1884"> * 7.3.7 and 7.3.9 Generation on non-pseudonode LSPs</a>
+<a name="ln1885"> */</a>
+<a name="ln1886">int</a>
+<a name="ln1887">lsp_generate (struct isis_area *area, int level)</a>
+<a name="ln1888">{</a>
+<a name="ln1889">  struct isis_lsp *oldlsp, *newlsp;</a>
+<a name="ln1890">  u_int32_t seq_num = 0;</a>
+<a name="ln1891">  u_char lspid[ISIS_SYS_ID_LEN + 2];</a>
+<a name="ln1892">  u_int16_t rem_lifetime, refresh_time;</a>
+<a name="ln1893"> </a>
+<a name="ln1894">  if ((area == NULL) || (area-&gt;is_type &amp; level) != level)</a>
+<a name="ln1895">    return ISIS_ERROR;</a>
+<a name="ln1896"> </a>
+<a name="ln1897">  memset (&amp;lspid, 0, ISIS_SYS_ID_LEN + 2);</a>
+<a name="ln1898">  memcpy (&amp;lspid, isis-&gt;sysid, ISIS_SYS_ID_LEN);</a>
+<a name="ln1899"> </a>
+<a name="ln1900">  /* only builds the lsp if the area shares the level */</a>
+<a name="ln1901">  oldlsp = lsp_search (lspid, area-&gt;lspdb[level - 1]);</a>
+<a name="ln1902">  if (oldlsp)</a>
+<a name="ln1903">    {</a>
+<a name="ln1904">      /* FIXME: we should actually initiate a purge */</a>
+<a name="ln1905">      seq_num = ntohl (oldlsp-&gt;lsp_header-&gt;seq_num);</a>
+<a name="ln1906">      lsp_search_and_destroy (oldlsp-&gt;lsp_header-&gt;lsp_id,</a>
+<a name="ln1907">                              area-&gt;lspdb[level - 1]);</a>
+<a name="ln1908">    }</a>
+<a name="ln1909">  rem_lifetime = lsp_rem_lifetime (area, level);</a>
+<a name="ln1910">  newlsp = lsp_new (area, lspid, rem_lifetime, seq_num,</a>
+<a name="ln1911">                    area-&gt;is_type | area-&gt;overload_bit | area-&gt;attached_bit,</a>
+<a name="ln1912">                    0, level);</a>
+<a name="ln1913">  newlsp-&gt;area = area;</a>
+<a name="ln1914">  newlsp-&gt;own_lsp = 1;</a>
+<a name="ln1915"> </a>
+<a name="ln1916">  lsp_insert (newlsp, area-&gt;lspdb[level - 1]);</a>
+<a name="ln1917">  /* build_lsp_data (newlsp, area); */</a>
+<a name="ln1918">  lsp_build (newlsp, area);</a>
+<a name="ln1919">  /* time to calculate our checksum */</a>
+<a name="ln1920">  lsp_seqnum_update (newlsp);</a>
+<a name="ln1921">  newlsp-&gt;last_generated = time(NULL);</a>
+<a name="ln1922">  lsp_set_all_srmflags (newlsp);</a>
+<a name="ln1923"> </a>
+<a name="ln1924">  refresh_time = lsp_refresh_time (newlsp, rem_lifetime);</a>
+<a name="ln1925"> </a>
+<a name="ln1926">  THREAD_TIMER_OFF (area-&gt;t_lsp_refresh[level - 1]);</a>
+<a name="ln1927">  area-&gt;lsp_regenerate_pending[level - 1] = 0;</a>
+<a name="ln1928">  if (level == IS_LEVEL_1)</a>
+<a name="ln1929">    THREAD_TIMER_ON (master, area-&gt;t_lsp_refresh[level - 1],</a>
+<a name="ln1930">                     lsp_l1_refresh, area, refresh_time);</a>
+<a name="ln1931">  else if (level == IS_LEVEL_2)</a>
+<a name="ln1932">    THREAD_TIMER_ON (master, area-&gt;t_lsp_refresh[level - 1],</a>
+<a name="ln1933">                     lsp_l2_refresh, area, refresh_time);</a>
+<a name="ln1934"> </a>
+<a name="ln1935">  if (isis-&gt;debugs &amp; DEBUG_UPDATE_PACKETS)</a>
+<a name="ln1936">    {</a>
+<a name="ln1937">      zlog_debug (&quot;ISIS-Upd (%s): Building L%d LSP %s, len %d, &quot;</a>
+<a name="ln1938">                  &quot;seq 0x%08x, cksum 0x%04x, lifetime %us refresh %us&quot;,</a>
+<a name="ln1939">                  area-&gt;area_tag, level,</a>
+<a name="ln1940">                  rawlspid_print (newlsp-&gt;lsp_header-&gt;lsp_id),</a>
+<a name="ln1941">                  ntohl (newlsp-&gt;lsp_header-&gt;pdu_len),</a>
+<a name="ln1942">                  ntohl (newlsp-&gt;lsp_header-&gt;seq_num),</a>
+<a name="ln1943">                  ntohs (newlsp-&gt;lsp_header-&gt;checksum),</a>
+<a name="ln1944">                  ntohs (newlsp-&gt;lsp_header-&gt;rem_lifetime),</a>
+<a name="ln1945">                  refresh_time);</a>
+<a name="ln1946">    }</a>
+<a name="ln1947">  sched_debug(&quot;ISIS (%s): Built L%d LSP. Set triggered regenerate to non-pending.&quot;,</a>
+<a name="ln1948">              area-&gt;area_tag, level);</a>
+<a name="ln1949"> </a>
+<a name="ln1950">  return ISIS_OK;</a>
+<a name="ln1951">}</a>
+<a name="ln1952"> </a>
+<a name="ln1953">/*</a>
+<a name="ln1954"> * Search own LSPs, update holding time and set SRM</a>
+<a name="ln1955"> */</a>
+<a name="ln1956">static int</a>
+<a name="ln1957">lsp_regenerate (struct isis_area *area, int level)</a>
+<a name="ln1958">{</a>
+<a name="ln1959">  dict_t *lspdb;</a>
+<a name="ln1960">  struct isis_lsp *lsp, *frag;</a>
+<a name="ln1961">  struct listnode *node;</a>
+<a name="ln1962">  u_char lspid[ISIS_SYS_ID_LEN + 2];</a>
+<a name="ln1963">  u_int16_t rem_lifetime, refresh_time;</a>
+<a name="ln1964"> </a>
+<a name="ln1965">  if ((area == NULL) || (area-&gt;is_type &amp; level) != level)</a>
+<a name="ln1966">    return ISIS_ERROR;</a>
+<a name="ln1967"> </a>
+<a name="ln1968">  lspdb = area-&gt;lspdb[level - 1];</a>
+<a name="ln1969"> </a>
+<a name="ln1970">  memset (lspid, 0, ISIS_SYS_ID_LEN + 2);</a>
+<a name="ln1971">  memcpy (lspid, isis-&gt;sysid, ISIS_SYS_ID_LEN);</a>
+<a name="ln1972"> </a>
+<a name="ln1973">  lsp = lsp_search (lspid, lspdb);</a>
+<a name="ln1974"> </a>
+<a name="ln1975">  if (!lsp)</a>
+<a name="ln1976">    {</a>
+<a name="ln1977">      zlog_err (&quot;ISIS-Upd (%s): lsp_regenerate: no L%d LSP found!&quot;,</a>
+<a name="ln1978">                area-&gt;area_tag, level);</a>
+<a name="ln1979">      return ISIS_ERROR;</a>
+<a name="ln1980">    }</a>
+<a name="ln1981"> </a>
+<a name="ln1982">  lsp_clear_data (lsp);</a>
+<a name="ln1983">  lsp_build (lsp, area);</a>
+<a name="ln1984">  lsp-&gt;lsp_header-&gt;lsp_bits = lsp_bits_generate (level, area-&gt;overload_bit,</a>
+<a name="ln1985">                                                 area-&gt;attached_bit);</a>
+<a name="ln1986">  rem_lifetime = lsp_rem_lifetime (area, level);</a>
+<a name="ln1987">  lsp-&gt;lsp_header-&gt;rem_lifetime = htons (rem_lifetime);</a>
+<a name="ln1988">  lsp_seqnum_update (lsp);</a>
+<a name="ln1989"> </a>
+<a name="ln1990">  lsp-&gt;last_generated = time (NULL);</a>
+<a name="ln1991">  lsp_set_all_srmflags (lsp);</a>
+<a name="ln1992">  for (ALL_LIST_ELEMENTS_RO (lsp-&gt;lspu.frags, node, frag))</a>
+<a name="ln1993">    {</a>
+<a name="ln1994">      frag-&gt;lsp_header-&gt;lsp_bits = lsp_bits_generate (level,</a>
+<a name="ln1995">                                                      area-&gt;overload_bit,</a>
+<a name="ln1996">                                                      area-&gt;attached_bit);</a>
+<a name="ln1997">      /* Set the lifetime values of all the fragments to the same value,</a>
+<a name="ln1998">       * so that no fragment expires before the lsp is refreshed.</a>
+<a name="ln1999">       */</a>
+<a name="ln2000">      frag-&gt;lsp_header-&gt;rem_lifetime = htons (rem_lifetime);</a>
+<a name="ln2001">      lsp_set_all_srmflags (frag);</a>
+<a name="ln2002">    }</a>
+<a name="ln2003"> </a>
+<a name="ln2004">  refresh_time = lsp_refresh_time (lsp, rem_lifetime);</a>
+<a name="ln2005">  if (level == IS_LEVEL_1)</a>
+<a name="ln2006">    THREAD_TIMER_ON (master, area-&gt;t_lsp_refresh[level - 1],</a>
+<a name="ln2007">                     lsp_l1_refresh, area, refresh_time);</a>
+<a name="ln2008">  else if (level == IS_LEVEL_2)</a>
+<a name="ln2009">    THREAD_TIMER_ON (master, area-&gt;t_lsp_refresh[level - 1],</a>
+<a name="ln2010">                     lsp_l2_refresh, area, refresh_time);</a>
+<a name="ln2011">  area-&gt;lsp_regenerate_pending[level - 1] = 0;</a>
+<a name="ln2012"> </a>
+<a name="ln2013">  if (isis-&gt;debugs &amp; DEBUG_UPDATE_PACKETS)</a>
+<a name="ln2014">    {</a>
+<a name="ln2015">      zlog_debug (&quot;ISIS-Upd (%s): Refreshing our L%d LSP %s, len %d, &quot;</a>
+<a name="ln2016">                  &quot;seq 0x%08x, cksum 0x%04x, lifetime %us refresh %us&quot;,</a>
+<a name="ln2017">                  area-&gt;area_tag, level,</a>
+<a name="ln2018">                  rawlspid_print (lsp-&gt;lsp_header-&gt;lsp_id),</a>
+<a name="ln2019">                  ntohl (lsp-&gt;lsp_header-&gt;pdu_len),</a>
+<a name="ln2020">                  ntohl (lsp-&gt;lsp_header-&gt;seq_num),</a>
+<a name="ln2021">                  ntohs (lsp-&gt;lsp_header-&gt;checksum),</a>
+<a name="ln2022">                  ntohs (lsp-&gt;lsp_header-&gt;rem_lifetime),</a>
+<a name="ln2023">                  refresh_time);</a>
+<a name="ln2024">    }</a>
+<a name="ln2025">  sched_debug(&quot;ISIS (%s): Rebuilt L%d LSP. Set triggered regenerate to non-pending.&quot;,</a>
+<a name="ln2026">              area-&gt;area_tag, level);</a>
+<a name="ln2027"> </a>
+<a name="ln2028">  return ISIS_OK;</a>
+<a name="ln2029">}</a>
+<a name="ln2030"> </a>
+<a name="ln2031">/*</a>
+<a name="ln2032"> * Something has changed or periodic refresh -&gt; regenerate LSP</a>
+<a name="ln2033"> */</a>
+<a name="ln2034">static int</a>
+<a name="ln2035">lsp_l1_refresh (struct thread *thread)</a>
+<a name="ln2036">{</a>
+<a name="ln2037">  struct isis_area *area;</a>
+<a name="ln2038"> </a>
+<a name="ln2039">  area = THREAD_ARG (thread);</a>
+<a name="ln2040">  assert (area);</a>
+<a name="ln2041"> </a>
+<a name="ln2042">  area-&gt;t_lsp_refresh[0] = NULL;</a>
+<a name="ln2043">  area-&gt;lsp_regenerate_pending[0] = 0;</a>
+<a name="ln2044"> </a>
+<a name="ln2045">  if ((area-&gt;is_type &amp; IS_LEVEL_1) == 0)</a>
+<a name="ln2046">    return ISIS_ERROR;</a>
+<a name="ln2047"> </a>
+<a name="ln2048">  sched_debug(&quot;ISIS (%s): LSP L1 refresh timer expired. Refreshing LSP...&quot;, area-&gt;area_tag);</a>
+<a name="ln2049">  return lsp_regenerate (area, IS_LEVEL_1);</a>
+<a name="ln2050">}</a>
+<a name="ln2051"> </a>
+<a name="ln2052">static int</a>
+<a name="ln2053">lsp_l2_refresh (struct thread *thread)</a>
+<a name="ln2054">{</a>
+<a name="ln2055">  struct isis_area *area;</a>
+<a name="ln2056"> </a>
+<a name="ln2057">  area = THREAD_ARG (thread);</a>
+<a name="ln2058">  assert (area);</a>
+<a name="ln2059"> </a>
+<a name="ln2060">  area-&gt;t_lsp_refresh[1] = NULL;</a>
+<a name="ln2061">  area-&gt;lsp_regenerate_pending[1] = 0;</a>
+<a name="ln2062"> </a>
+<a name="ln2063">  if ((area-&gt;is_type &amp; IS_LEVEL_2) == 0)</a>
+<a name="ln2064">    return ISIS_ERROR;</a>
+<a name="ln2065"> </a>
+<a name="ln2066">  sched_debug(&quot;ISIS (%s): LSP L2 refresh timer expired. Refreshing LSP...&quot;, area-&gt;area_tag);</a>
+<a name="ln2067">  return lsp_regenerate (area, IS_LEVEL_2);</a>
+<a name="ln2068">}</a>
+<a name="ln2069"> </a>
+<a name="ln2070">int</a>
+<a name="ln2071">lsp_regenerate_schedule (struct isis_area *area, int level, int all_pseudo)</a>
+<a name="ln2072">{</a>
+<a name="ln2073">  struct isis_lsp *lsp;</a>
+<a name="ln2074">  u_char id[ISIS_SYS_ID_LEN + 2];</a>
+<a name="ln2075">  time_t now, diff;</a>
+<a name="ln2076">  long timeout;</a>
+<a name="ln2077">  struct listnode *cnode;</a>
+<a name="ln2078">  struct isis_circuit *circuit;</a>
+<a name="ln2079">  int lvl;</a>
+<a name="ln2080"> </a>
+<a name="ln2081">  if (area == NULL)</a>
+<a name="ln2082">    return ISIS_ERROR;</a>
+<a name="ln2083"> </a>
+<a name="ln2084">  sched_debug(&quot;ISIS (%s): Scheduling regeneration of %s LSPs, %sincluding PSNs&quot;,</a>
+<a name="ln2085">            area-&gt;area_tag, circuit_t2string(level), all_pseudo ? &quot;&quot; : &quot;not &quot;);</a>
+<a name="ln2086"> </a>
+<a name="ln2087">  memcpy (id, isis-&gt;sysid, ISIS_SYS_ID_LEN);</a>
+<a name="ln2088">  LSP_PSEUDO_ID (id) = LSP_FRAGMENT (id) = 0;</a>
+<a name="ln2089">  now = time (NULL);</a>
+<a name="ln2090"> </a>
+<a name="ln2091">  for (lvl = IS_LEVEL_1; lvl &lt;= IS_LEVEL_2; lvl++)</a>
+<a name="ln2092">    {</a>
+<a name="ln2093">      if (!((level &amp; lvl) &amp;&amp; (area-&gt;is_type &amp; lvl)))</a>
+<a name="ln2094">        continue;</a>
+<a name="ln2095"> </a>
+<a name="ln2096">      sched_debug(&quot;ISIS (%s): Checking whether L%d needs to be scheduled&quot;,</a>
+<a name="ln2097">                  area-&gt;area_tag, lvl);</a>
+<a name="ln2098"> </a>
+<a name="ln2099">      if (area-&gt;lsp_regenerate_pending[lvl - 1])</a>
+<a name="ln2100">        {</a>
+<a name="ln2101">          struct timeval remain = thread_timer_remain(area-&gt;t_lsp_refresh[lvl - 1]);</a>
+<a name="ln2102">          sched_debug(&quot;ISIS (%s): Regeneration is already pending, nothing todo.&quot;</a>
+<a name="ln2103">                      &quot; (Due in %lld.%03lld seconds)&quot;, area-&gt;area_tag,</a>
+<a name="ln2104">                      (long long)remain.tv_sec, (long long)remain.tv_usec / 1000);</a>
+<a name="ln2105">          continue;</a>
+<a name="ln2106">        }</a>
+<a name="ln2107"> </a>
+<a name="ln2108">      lsp = lsp_search (id, area-&gt;lspdb[lvl - 1]);</a>
+<a name="ln2109">      if (!lsp)</a>
+<a name="ln2110">        {</a>
+<a name="ln2111">          sched_debug(&quot;ISIS (%s): We do not have any LSPs to regenerate, nothing todo.&quot;,</a>
+<a name="ln2112">                      area-&gt;area_tag);</a>
+<a name="ln2113">          continue;</a>
+<a name="ln2114">        }</a>
+<a name="ln2115"> </a>
+<a name="ln2116">      /*</a>
+<a name="ln2117">       * Throttle avoidance</a>
+<a name="ln2118">       */</a>
+<a name="ln2119">      sched_debug(&quot;ISIS (%s): Will schedule regen timer. Last run was: %lld, Now is: %lld&quot;,</a>
+<a name="ln2120">                  area-&gt;area_tag, (long long)lsp-&gt;last_generated, (long long)now);</a>
+<a name="ln2121">      THREAD_TIMER_OFF (area-&gt;t_lsp_refresh[lvl - 1]);</a>
+<a name="ln2122">      diff = now - lsp-&gt;last_generated;</a>
+<a name="ln2123">      if (diff &lt; area-&gt;lsp_gen_interval[lvl - 1])</a>
+<a name="ln2124">        {</a>
+<a name="ln2125">          timeout = 1000 * (area-&gt;lsp_gen_interval[lvl - 1] - diff);</a>
+<a name="ln2126">          sched_debug(&quot;ISIS (%s): Scheduling in %ld ms to match configured lsp_gen_interval&quot;,</a>
+<a name="ln2127">                      area-&gt;area_tag, timeout);</a>
+<a name="ln2128">        }</a>
+<a name="ln2129">      else</a>
+<a name="ln2130">        {</a>
+<a name="ln2131">          /*</a>
+<a name="ln2132">           * lsps are not regenerated if lsp_regenerate function is called</a>
+<a name="ln2133">           * directly. However if the lsp_regenerate call is queued for</a>
+<a name="ln2134">           * later execution it works.</a>
+<a name="ln2135">           */</a>
+<a name="ln2136">          timeout = 100;</a>
+<a name="ln2137">          sched_debug(&quot;ISIS (%s): Last generation was more than lsp_gen_interval ago.&quot;</a>
+<a name="ln2138">                      &quot; Scheduling for execution in %ld ms.&quot;, area-&gt;area_tag, timeout);</a>
+<a name="ln2139">        }</a>
+<a name="ln2140"> </a>
+<a name="ln2141">      area-&gt;lsp_regenerate_pending[lvl - 1] = 1;</a>
+<a name="ln2142">      if (lvl == IS_LEVEL_1)</a>
+<a name="ln2143">        {</a>
+<a name="ln2144">          THREAD_TIMER_MSEC_ON(master, area-&gt;t_lsp_refresh[lvl - 1],</a>
+<a name="ln2145">                               lsp_l1_refresh, area, timeout);</a>
+<a name="ln2146">        }</a>
+<a name="ln2147">      else if (lvl == IS_LEVEL_2)</a>
+<a name="ln2148">        {</a>
+<a name="ln2149">          THREAD_TIMER_MSEC_ON(master, area-&gt;t_lsp_refresh[lvl - 1],</a>
+<a name="ln2150">                               lsp_l2_refresh, area, timeout);</a>
+<a name="ln2151">        }</a>
+<a name="ln2152">    }</a>
+<a name="ln2153"> </a>
+<a name="ln2154">  if (all_pseudo)</a>
+<a name="ln2155">    {</a>
+<a name="ln2156">      for (ALL_LIST_ELEMENTS_RO (area-&gt;circuit_list, cnode, circuit))</a>
+<a name="ln2157">        lsp_regenerate_schedule_pseudo (circuit, level);</a>
+<a name="ln2158">    }</a>
+<a name="ln2159"> </a>
+<a name="ln2160">  return ISIS_OK;</a>
+<a name="ln2161">}</a>
+<a name="ln2162"> </a>
+<a name="ln2163">/*</a>
+<a name="ln2164"> * Funcs for pseudonode LSPs</a>
+<a name="ln2165"> */</a>
+<a name="ln2166"> </a>
+<a name="ln2167">/*</a>
+<a name="ln2168"> * 7.3.8 and 7.3.10 Generation of level 1 and 2 pseudonode LSPs </a>
+<a name="ln2169"> */</a>
+<a name="ln2170">static void</a>
+<a name="ln2171">lsp_build_pseudo (struct isis_lsp *lsp, struct isis_circuit *circuit,</a>
+<a name="ln2172">		  int level)</a>
+<a name="ln2173">{</a>
+<a name="ln2174">  struct isis_adjacency *adj;</a>
+<a name="ln2175">  struct is_neigh *is_neigh;</a>
+<a name="ln2176">  struct te_is_neigh *te_is_neigh;</a>
+<a name="ln2177">  struct es_neigh *es_neigh;</a>
+<a name="ln2178">  struct list *adj_list;</a>
+<a name="ln2179">  struct listnode *node;</a>
+<a name="ln2180">  struct isis_area *area = circuit-&gt;area;</a>
+<a name="ln2181"> </a>
+<a name="ln2182">  lsp_debug(&quot;ISIS (%s): Constructing pseudo LSP %s for interface %s level %d&quot;,</a>
+<a name="ln2183">            area-&gt;area_tag, rawlspid_print(lsp-&gt;lsp_header-&gt;lsp_id),</a>
+<a name="ln2184">            circuit-&gt;interface-&gt;name, level);</a>
+<a name="ln2185"> </a>
+<a name="ln2186">  lsp-&gt;level = level;</a>
+<a name="ln2187">  /* RFC3787  section 4 SHOULD not set overload bit in pseudo LSPs */</a>
+<a name="ln2188">  lsp-&gt;lsp_header-&gt;lsp_bits = lsp_bits_generate (level, 0,</a>
+<a name="ln2189">                                                 circuit-&gt;area-&gt;attached_bit);</a>
+<a name="ln2190"> </a>
+<a name="ln2191">  /*</a>
+<a name="ln2192">   * add self to IS neighbours </a>
+<a name="ln2193">   */</a>
+<a name="ln2194">  if (circuit-&gt;area-&gt;oldmetric)</a>
+<a name="ln2195">    {</a>
+<a name="ln2196">      if (lsp-&gt;tlv_data.is_neighs == NULL)</a>
+<a name="ln2197">	{</a>
+<a name="ln2198">	  lsp-&gt;tlv_data.is_neighs = list_new ();</a>
+<a name="ln2199">	  lsp-&gt;tlv_data.is_neighs-&gt;del = free_tlv;</a>
+<a name="ln2200">	}</a>
+<a name="ln2201">      is_neigh = XCALLOC (MTYPE_ISIS_TLV, sizeof (struct is_neigh));</a>
+<a name="ln2202"> </a>
+<a name="ln2203">      memcpy (&amp;is_neigh-&gt;neigh_id, isis-&gt;sysid, ISIS_SYS_ID_LEN);</a>
+<a name="ln2204">      listnode_add (lsp-&gt;tlv_data.is_neighs, is_neigh);</a>
+<a name="ln2205">      lsp_debug(&quot;ISIS (%s): Adding %s.%02x as old-style neighbor (self)&quot;,</a>
+<a name="ln2206">                area-&gt;area_tag, sysid_print(is_neigh-&gt;neigh_id),</a>
+<a name="ln2207">                LSP_PSEUDO_ID(is_neigh-&gt;neigh_id));</a>
+<a name="ln2208">    }</a>
+<a name="ln2209">  if (circuit-&gt;area-&gt;newmetric)</a>
+<a name="ln2210">    {</a>
+<a name="ln2211">      if (lsp-&gt;tlv_data.te_is_neighs == NULL)</a>
+<a name="ln2212">	{</a>
+<a name="ln2213">	  lsp-&gt;tlv_data.te_is_neighs = list_new ();</a>
+<a name="ln2214">	  lsp-&gt;tlv_data.te_is_neighs-&gt;del = free_tlv;</a>
+<a name="ln2215">	}</a>
+<a name="ln2216">      te_is_neigh = XCALLOC (MTYPE_ISIS_TLV, sizeof (struct te_is_neigh));</a>
+<a name="ln2217"> </a>
+<a name="ln2218">      memcpy (&amp;te_is_neigh-&gt;neigh_id, isis-&gt;sysid, ISIS_SYS_ID_LEN);</a>
+<a name="ln2219">      listnode_add (lsp-&gt;tlv_data.te_is_neighs, te_is_neigh);</a>
+<a name="ln2220">      lsp_debug(&quot;ISIS (%s): Adding %s.%02x as te-style neighbor (self)&quot;,</a>
+<a name="ln2221">                area-&gt;area_tag, sysid_print(te_is_neigh-&gt;neigh_id),</a>
+<a name="ln2222">                LSP_PSEUDO_ID(te_is_neigh-&gt;neigh_id));</a>
+<a name="ln2223">    }</a>
+<a name="ln2224"> </a>
+<a name="ln2225">  adj_list = list_new ();</a>
+<a name="ln2226">  isis_adj_build_up_list (circuit-&gt;u.bc.adjdb[level - 1], adj_list);</a>
+<a name="ln2227"> </a>
+<a name="ln2228">  for (ALL_LIST_ELEMENTS_RO (adj_list, node, adj))</a>
+<a name="ln2229">    {</a>
+<a name="ln2230">      if (adj-&gt;level &amp; level)</a>
+<a name="ln2231">	{</a>
+<a name="ln2232">	  if ((level == IS_LEVEL_1 &amp;&amp; adj-&gt;sys_type == ISIS_SYSTYPE_L1_IS) ||</a>
+<a name="ln2233">	      (level == IS_LEVEL_1 &amp;&amp; adj-&gt;sys_type == ISIS_SYSTYPE_L2_IS &amp;&amp;</a>
+<a name="ln2234">	      adj-&gt;adj_usage == ISIS_ADJ_LEVEL1AND2) ||</a>
+<a name="ln2235">	      (level == IS_LEVEL_2 &amp;&amp; adj-&gt;sys_type == ISIS_SYSTYPE_L2_IS))</a>
+<a name="ln2236">	    {</a>
+<a name="ln2237">	      /* an IS neighbour -&gt; add it */</a>
+<a name="ln2238">	      if (circuit-&gt;area-&gt;oldmetric)</a>
+<a name="ln2239">		{</a>
+<a name="ln2240">		  is_neigh = XCALLOC (MTYPE_ISIS_TLV, sizeof (struct is_neigh));</a>
+<a name="ln2241"> </a>
+<a name="ln2242">		  memcpy (&amp;is_neigh-&gt;neigh_id, adj-&gt;sysid, ISIS_SYS_ID_LEN);</a>
+<a name="ln2243">		  listnode_add (lsp-&gt;tlv_data.is_neighs, is_neigh);</a>
+<a name="ln2244">		  lsp_debug(&quot;ISIS (%s): Adding %s.%02x as old-style neighbor (peer)&quot;,</a>
+<a name="ln2245">		            area-&gt;area_tag, sysid_print(is_neigh-&gt;neigh_id),</a>
+<a name="ln2246">		            LSP_PSEUDO_ID(is_neigh-&gt;neigh_id));</a>
+<a name="ln2247">		}</a>
+<a name="ln2248">	      if (circuit-&gt;area-&gt;newmetric)</a>
+<a name="ln2249">		{</a>
+<a name="ln2250">		  te_is_neigh = XCALLOC (MTYPE_ISIS_TLV,</a>
+<a name="ln2251">					 sizeof (struct te_is_neigh));</a>
+<a name="ln2252">		  memcpy (&amp;te_is_neigh-&gt;neigh_id, adj-&gt;sysid, ISIS_SYS_ID_LEN);</a>
+<a name="ln2253">		  listnode_add (lsp-&gt;tlv_data.te_is_neighs, te_is_neigh);</a>
+<a name="ln2254">		  lsp_debug(&quot;ISIS (%s): Adding %s.%02x as te-style neighbor (peer)&quot;,</a>
+<a name="ln2255">		            area-&gt;area_tag, sysid_print(te_is_neigh-&gt;neigh_id),</a>
+<a name="ln2256">		            LSP_PSEUDO_ID(te_is_neigh-&gt;neigh_id));</a>
+<a name="ln2257">		}</a>
+<a name="ln2258">	    }</a>
+<a name="ln2259">	  else if (level == IS_LEVEL_1 &amp;&amp; adj-&gt;sys_type == ISIS_SYSTYPE_ES)</a>
+<a name="ln2260">	    {</a>
+<a name="ln2261">	      /* an ES neigbour add it, if we are building level 1 LSP */</a>
+<a name="ln2262">	      /* FIXME: the tlv-format is hard to use here */</a>
+<a name="ln2263">	      if (lsp-&gt;tlv_data.es_neighs == NULL)</a>
+<a name="ln2264">		{</a>
+<a name="ln2265">		  lsp-&gt;tlv_data.es_neighs = list_new ();</a>
+<a name="ln2266">		  lsp-&gt;tlv_data.es_neighs-&gt;del = free_tlv;</a>
+<a name="ln2267">		}</a>
+<a name="ln2268">	      es_neigh = XCALLOC (MTYPE_ISIS_TLV, sizeof (struct es_neigh));</a>
+<a name="ln2269">	      </a>
+<a name="ln2270">	      memcpy (&amp;es_neigh-&gt;first_es_neigh, adj-&gt;sysid, ISIS_SYS_ID_LEN);</a>
+<a name="ln2271">	      listnode_add (lsp-&gt;tlv_data.es_neighs, es_neigh);</a>
+<a name="ln2272">	      lsp_debug(&quot;ISIS (%s): Adding %s as ES neighbor (peer)&quot;,</a>
+<a name="ln2273">	                area-&gt;area_tag, sysid_print(es_neigh-&gt;first_es_neigh));</a>
+<a name="ln2274">	    }</a>
+<a name="ln2275">	  else</a>
+<a name="ln2276">	    {</a>
+<a name="ln2277">	      lsp_debug(&quot;ISIS (%s): Ignoring neighbor %s, level does not match&quot;,</a>
+<a name="ln2278">	                area-&gt;area_tag, sysid_print(adj-&gt;sysid));</a>
+<a name="ln2279">	    }</a>
+<a name="ln2280">	}</a>
+<a name="ln2281">      else</a>
+<a name="ln2282">        {</a>
+<a name="ln2283">	  lsp_debug(&quot;ISIS (%s): Ignoring neighbor %s, level does not intersect&quot;,</a>
+<a name="ln2284">	            area-&gt;area_tag, sysid_print(adj-&gt;sysid));</a>
+<a name="ln2285">	}</a>
+<a name="ln2286">    }</a>
+<a name="ln2287">  list_delete (adj_list);</a>
+<a name="ln2288"> </a>
+<a name="ln2289">  lsp_debug(&quot;ISIS (%s): Pseudo LSP construction is complete.&quot;, area-&gt;area_tag);</a>
+<a name="ln2290"> </a>
+<a name="ln2291">  /* Reset endp of stream to overwrite only TLV part of it. */</a>
+<a name="ln2292">  stream_reset (lsp-&gt;pdu);</a>
+<a name="ln2293">  stream_forward_endp (lsp-&gt;pdu, ISIS_FIXED_HDR_LEN + ISIS_LSP_HDR_LEN);</a>
+<a name="ln2294"> </a>
+<a name="ln2295">  /*</a>
+<a name="ln2296">   * Add the authentication info if it's present</a>
+<a name="ln2297">   */</a>
+<a name="ln2298">  lsp_auth_add (lsp);</a>
+<a name="ln2299"> </a>
+<a name="ln2300">  if (lsp-&gt;tlv_data.is_neighs &amp;&amp; listcount (lsp-&gt;tlv_data.is_neighs) &gt; 0)</a>
+<a name="ln2301">    tlv_add_is_neighs (lsp-&gt;tlv_data.is_neighs, lsp-&gt;pdu);</a>
+<a name="ln2302"> </a>
+<a name="ln2303">  if (lsp-&gt;tlv_data.te_is_neighs &amp;&amp; listcount (lsp-&gt;tlv_data.te_is_neighs) &gt; 0)</a>
+<a name="ln2304">    tlv_add_te_is_neighs (lsp-&gt;tlv_data.te_is_neighs, lsp-&gt;pdu);</a>
+<a name="ln2305"> </a>
+<a name="ln2306">  if (lsp-&gt;tlv_data.es_neighs &amp;&amp; listcount (lsp-&gt;tlv_data.es_neighs) &gt; 0)</a>
+<a name="ln2307">    tlv_add_is_neighs (lsp-&gt;tlv_data.es_neighs, lsp-&gt;pdu);</a>
+<a name="ln2308"> </a>
+<a name="ln2309">  lsp-&gt;lsp_header-&gt;pdu_len = htons (stream_get_endp (lsp-&gt;pdu));</a>
+<a name="ln2310"> </a>
+<a name="ln2311">  /* Recompute authentication and checksum information */</a>
+<a name="ln2312">  lsp_auth_update (lsp);</a>
+<a name="ln2313">  fletcher_checksum(STREAM_DATA (lsp-&gt;pdu) + 12,</a>
+<a name="ln2314">                    ntohs (lsp-&gt;lsp_header-&gt;pdu_len) - 12, 12);</a>
+<a name="ln2315"> </a>
+<a name="ln2316">  return;</a>
+<a name="ln2317">}</a>
+<a name="ln2318"> </a>
+<a name="ln2319">int</a>
+<a name="ln2320">lsp_generate_pseudo (struct isis_circuit *circuit, int level)</a>
+<a name="ln2321">{</a>
+<a name="ln2322">  dict_t *lspdb = circuit-&gt;area-&gt;lspdb[level - 1];</a>
+<a name="ln2323">  struct isis_lsp *lsp;</a>
+<a name="ln2324">  u_char lsp_id[ISIS_SYS_ID_LEN + 2];</a>
+<a name="ln2325">  u_int16_t rem_lifetime, refresh_time;</a>
+<a name="ln2326"> </a>
+<a name="ln2327">  if ((circuit-&gt;is_type &amp; level) != level ||</a>
+<a name="ln2328">      (circuit-&gt;state != C_STATE_UP) ||</a>
+<a name="ln2329">      (circuit-&gt;circ_type != CIRCUIT_T_BROADCAST) ||</a>
+<a name="ln2330">      (circuit-&gt;u.bc.is_dr[level - 1] == 0))</a>
+<a name="ln2331">    return ISIS_ERROR;</a>
+<a name="ln2332"> </a>
+<a name="ln2333">  memcpy (lsp_id, isis-&gt;sysid, ISIS_SYS_ID_LEN);</a>
+<a name="ln2334">  LSP_FRAGMENT (lsp_id) = 0;</a>
+<a name="ln2335">  LSP_PSEUDO_ID (lsp_id) = circuit-&gt;circuit_id;</a>
+<a name="ln2336"> </a>
+<a name="ln2337">  /*</a>
+<a name="ln2338">   * If for some reason have a pseudo LSP in the db already -&gt; regenerate</a>
+<a name="ln2339">   */</a>
+<a name="ln2340">  if (lsp_search (lsp_id, lspdb))</a>
+<a name="ln2341">    return lsp_regenerate_schedule_pseudo (circuit, level);</a>
+<a name="ln2342"> </a>
+<a name="ln2343">  rem_lifetime = lsp_rem_lifetime (circuit-&gt;area, level);</a>
+<a name="ln2344">  /* RFC3787  section 4 SHOULD not set overload bit in pseudo LSPs */</a>
+<a name="ln2345">  lsp = lsp_new (circuit-&gt;area, lsp_id, rem_lifetime, 1,</a>
+<a name="ln2346">                 circuit-&gt;area-&gt;is_type | circuit-&gt;area-&gt;attached_bit,</a>
+<a name="ln2347">                 0, level);</a>
+<a name="ln2348">  lsp-&gt;area = circuit-&gt;area;</a>
+<a name="ln2349"> </a>
+<a name="ln2350">  lsp_build_pseudo (lsp, circuit, level);</a>
+<a name="ln2351"> </a>
+<a name="ln2352">  lsp-&gt;own_lsp = 1;</a>
+<a name="ln2353">  lsp_insert (lsp, lspdb);</a>
+<a name="ln2354">  lsp_set_all_srmflags (lsp);</a>
+<a name="ln2355"> </a>
+<a name="ln2356">  refresh_time = lsp_refresh_time (lsp, rem_lifetime);</a>
+<a name="ln2357">  THREAD_TIMER_OFF (circuit-&gt;u.bc.t_refresh_pseudo_lsp[level - 1]);</a>
+<a name="ln2358">  circuit-&gt;lsp_regenerate_pending[level - 1] = 0;</a>
+<a name="ln2359">  if (level == IS_LEVEL_1)</a>
+<a name="ln2360">    THREAD_TIMER_ON (master, circuit-&gt;u.bc.t_refresh_pseudo_lsp[level - 1],</a>
+<a name="ln2361">                     lsp_l1_refresh_pseudo, circuit, refresh_time);</a>
+<a name="ln2362">  else if (level == IS_LEVEL_2)</a>
+<a name="ln2363">    THREAD_TIMER_ON (master, circuit-&gt;u.bc.t_refresh_pseudo_lsp[level - 1],</a>
+<a name="ln2364">                     lsp_l2_refresh_pseudo, circuit, refresh_time);</a>
+<a name="ln2365"> </a>
+<a name="ln2366">  if (isis-&gt;debugs &amp; DEBUG_UPDATE_PACKETS)</a>
+<a name="ln2367">    {</a>
+<a name="ln2368">      zlog_debug (&quot;ISIS-Upd (%s): Building L%d Pseudo LSP %s, len %d, &quot;</a>
+<a name="ln2369">                  &quot;seq 0x%08x, cksum 0x%04x, lifetime %us, refresh %us&quot;,</a>
+<a name="ln2370">                  circuit-&gt;area-&gt;area_tag, level,</a>
+<a name="ln2371">                  rawlspid_print (lsp-&gt;lsp_header-&gt;lsp_id),</a>
+<a name="ln2372">                  ntohl (lsp-&gt;lsp_header-&gt;pdu_len),</a>
+<a name="ln2373">                  ntohl (lsp-&gt;lsp_header-&gt;seq_num),</a>
+<a name="ln2374">                  ntohs (lsp-&gt;lsp_header-&gt;checksum),</a>
+<a name="ln2375">                  ntohs (lsp-&gt;lsp_header-&gt;rem_lifetime),</a>
+<a name="ln2376">                  refresh_time);</a>
+<a name="ln2377">    }</a>
+<a name="ln2378"> </a>
+<a name="ln2379">  return ISIS_OK;</a>
+<a name="ln2380">}</a>
+<a name="ln2381"> </a>
+<a name="ln2382">static int</a>
+<a name="ln2383">lsp_regenerate_pseudo (struct isis_circuit *circuit, int level)</a>
+<a name="ln2384">{</a>
+<a name="ln2385">  dict_t *lspdb = circuit-&gt;area-&gt;lspdb[level - 1];</a>
+<a name="ln2386">  struct isis_lsp *lsp;</a>
+<a name="ln2387">  u_char lsp_id[ISIS_SYS_ID_LEN + 2];</a>
+<a name="ln2388">  u_int16_t rem_lifetime, refresh_time;</a>
+<a name="ln2389"> </a>
+<a name="ln2390">  if ((circuit-&gt;is_type &amp; level) != level ||</a>
+<a name="ln2391">      (circuit-&gt;state != C_STATE_UP) ||</a>
+<a name="ln2392">      (circuit-&gt;circ_type != CIRCUIT_T_BROADCAST) ||</a>
+<a name="ln2393">      (circuit-&gt;u.bc.is_dr[level - 1] == 0))</a>
+<a name="ln2394">    return ISIS_ERROR;</a>
+<a name="ln2395"> </a>
+<a name="ln2396">  memcpy (lsp_id, isis-&gt;sysid, ISIS_SYS_ID_LEN);</a>
+<a name="ln2397">  LSP_PSEUDO_ID (lsp_id) = circuit-&gt;circuit_id;</a>
+<a name="ln2398">  LSP_FRAGMENT (lsp_id) = 0;</a>
+<a name="ln2399"> </a>
+<a name="ln2400">  lsp = lsp_search (lsp_id, lspdb);</a>
+<a name="ln2401"> </a>
+<a name="ln2402">  if (!lsp)</a>
+<a name="ln2403">    {</a>
+<a name="ln2404">      zlog_err (&quot;lsp_regenerate_pseudo: no l%d LSP %s found!&quot;,</a>
+<a name="ln2405">                level, rawlspid_print (lsp_id));</a>
+<a name="ln2406">      return ISIS_ERROR;</a>
+<a name="ln2407">    }</a>
+<a name="ln2408">  lsp_clear_data (lsp);</a>
+<a name="ln2409"> </a>
+<a name="ln2410">  lsp_build_pseudo (lsp, circuit, level);</a>
+<a name="ln2411"> </a>
+<a name="ln2412">  /* RFC3787  section 4 SHOULD not set overload bit in pseudo LSPs */</a>
+<a name="ln2413">  lsp-&gt;lsp_header-&gt;lsp_bits = lsp_bits_generate (level, 0,</a>
+<a name="ln2414">                                                 circuit-&gt;area-&gt;attached_bit);</a>
+<a name="ln2415">  rem_lifetime = lsp_rem_lifetime (circuit-&gt;area, level);</a>
+<a name="ln2416">  lsp-&gt;lsp_header-&gt;rem_lifetime = htons (rem_lifetime);</a>
+<a name="ln2417">  lsp_inc_seqnum (lsp, 0);</a>
+<a name="ln2418">  lsp-&gt;last_generated = time (NULL);</a>
+<a name="ln2419">  lsp_set_all_srmflags (lsp);</a>
+<a name="ln2420"> </a>
+<a name="ln2421">  refresh_time = lsp_refresh_time (lsp, rem_lifetime);</a>
+<a name="ln2422">  if (level == IS_LEVEL_1)</a>
+<a name="ln2423">    THREAD_TIMER_ON (master, circuit-&gt;u.bc.t_refresh_pseudo_lsp[level - 1],</a>
+<a name="ln2424">                     lsp_l1_refresh_pseudo, circuit, refresh_time);</a>
+<a name="ln2425">  else if (level == IS_LEVEL_2)</a>
+<a name="ln2426">    THREAD_TIMER_ON (master, circuit-&gt;u.bc.t_refresh_pseudo_lsp[level - 1],</a>
+<a name="ln2427">                     lsp_l2_refresh_pseudo, circuit, refresh_time);</a>
+<a name="ln2428"> </a>
+<a name="ln2429">  if (isis-&gt;debugs &amp; DEBUG_UPDATE_PACKETS)</a>
+<a name="ln2430">    {</a>
+<a name="ln2431">      zlog_debug (&quot;ISIS-Upd (%s): Refreshing L%d Pseudo LSP %s, len %d, &quot;</a>
+<a name="ln2432">                  &quot;seq 0x%08x, cksum 0x%04x, lifetime %us, refresh %us&quot;,</a>
+<a name="ln2433">                  circuit-&gt;area-&gt;area_tag, level,</a>
+<a name="ln2434">                  rawlspid_print (lsp-&gt;lsp_header-&gt;lsp_id),</a>
+<a name="ln2435">                  ntohl (lsp-&gt;lsp_header-&gt;pdu_len),</a>
+<a name="ln2436">                  ntohl (lsp-&gt;lsp_header-&gt;seq_num),</a>
+<a name="ln2437">                  ntohs (lsp-&gt;lsp_header-&gt;checksum),</a>
+<a name="ln2438">                  ntohs (lsp-&gt;lsp_header-&gt;rem_lifetime),</a>
+<a name="ln2439">                  refresh_time);</a>
+<a name="ln2440">    }</a>
+<a name="ln2441"> </a>
+<a name="ln2442">  return ISIS_OK;</a>
+<a name="ln2443">}</a>
+<a name="ln2444"> </a>
+<a name="ln2445">/*</a>
+<a name="ln2446"> * Something has changed or periodic refresh -&gt; regenerate pseudo LSP</a>
+<a name="ln2447"> */</a>
+<a name="ln2448">static int</a>
+<a name="ln2449">lsp_l1_refresh_pseudo (struct thread *thread)</a>
+<a name="ln2450">{</a>
+<a name="ln2451">  struct isis_circuit *circuit;</a>
+<a name="ln2452">  u_char id[ISIS_SYS_ID_LEN + 2];</a>
+<a name="ln2453"> </a>
+<a name="ln2454">  circuit = THREAD_ARG (thread);</a>
+<a name="ln2455"> </a>
+<a name="ln2456">  circuit-&gt;u.bc.t_refresh_pseudo_lsp[0] = NULL;</a>
+<a name="ln2457">  circuit-&gt;lsp_regenerate_pending[0] = 0;</a>
+<a name="ln2458"> </a>
+<a name="ln2459">  if ((circuit-&gt;u.bc.is_dr[0] == 0) ||</a>
+<a name="ln2460">      (circuit-&gt;is_type &amp; IS_LEVEL_1) == 0)</a>
+<a name="ln2461">    {</a>
+<a name="ln2462">      memcpy (id, isis-&gt;sysid, ISIS_SYS_ID_LEN);</a>
+<a name="ln2463">      LSP_PSEUDO_ID (id) = circuit-&gt;circuit_id;</a>
+<a name="ln2464">      LSP_FRAGMENT (id) = 0;</a>
+<a name="ln2465">      lsp_purge_pseudo (id, circuit, IS_LEVEL_1);</a>
+<a name="ln2466">      return ISIS_ERROR;</a>
+<a name="ln2467">    }</a>
+<a name="ln2468"> </a>
+<a name="ln2469">  return lsp_regenerate_pseudo (circuit, IS_LEVEL_1);</a>
+<a name="ln2470">}</a>
+<a name="ln2471"> </a>
+<a name="ln2472">static int</a>
+<a name="ln2473">lsp_l2_refresh_pseudo (struct thread *thread)</a>
+<a name="ln2474">{</a>
+<a name="ln2475">  struct isis_circuit *circuit;</a>
+<a name="ln2476">  u_char id[ISIS_SYS_ID_LEN + 2];</a>
+<a name="ln2477"> </a>
+<a name="ln2478">  circuit = THREAD_ARG (thread);</a>
+<a name="ln2479"> </a>
+<a name="ln2480">  circuit-&gt;u.bc.t_refresh_pseudo_lsp[1] = NULL;</a>
+<a name="ln2481">  circuit-&gt;lsp_regenerate_pending[1] = 0;</a>
+<a name="ln2482"> </a>
+<a name="ln2483">  if ((circuit-&gt;u.bc.is_dr[1] == 0) ||</a>
+<a name="ln2484">      (circuit-&gt;is_type &amp; IS_LEVEL_2) == 0)</a>
+<a name="ln2485">    {</a>
+<a name="ln2486">      memcpy (id, isis-&gt;sysid, ISIS_SYS_ID_LEN);</a>
+<a name="ln2487">      LSP_PSEUDO_ID (id) = circuit-&gt;circuit_id;</a>
+<a name="ln2488">      LSP_FRAGMENT (id) = 0;</a>
+<a name="ln2489">      lsp_purge_pseudo (id, circuit, IS_LEVEL_2);</a>
+<a name="ln2490">      return ISIS_ERROR;</a>
+<a name="ln2491">    }</a>
+<a name="ln2492"> </a>
+<a name="ln2493">  return lsp_regenerate_pseudo (circuit, IS_LEVEL_2);</a>
+<a name="ln2494">}</a>
+<a name="ln2495"> </a>
+<a name="ln2496">int</a>
+<a name="ln2497">lsp_regenerate_schedule_pseudo (struct isis_circuit *circuit, int level)</a>
+<a name="ln2498">{</a>
+<a name="ln2499">  struct isis_lsp *lsp;</a>
+<a name="ln2500">  u_char lsp_id[ISIS_SYS_ID_LEN + 2];</a>
+<a name="ln2501">  time_t now, diff;</a>
+<a name="ln2502">  long timeout;</a>
+<a name="ln2503">  int lvl;</a>
+<a name="ln2504">  struct isis_area *area = circuit-&gt;area;</a>
+<a name="ln2505"> </a>
+<a name="ln2506">  if (circuit == NULL ||</a>
+<a name="ln2507">      circuit-&gt;circ_type != CIRCUIT_T_BROADCAST ||</a>
+<a name="ln2508">      circuit-&gt;state != C_STATE_UP)</a>
+<a name="ln2509">    return ISIS_OK;</a>
+<a name="ln2510"> </a>
+<a name="ln2511">  sched_debug(&quot;ISIS (%s): Scheduling regeneration of %s pseudo LSP for interface %s&quot;,</a>
+<a name="ln2512">              area-&gt;area_tag, circuit_t2string(level), circuit-&gt;interface-&gt;name);</a>
+<a name="ln2513"> </a>
+<a name="ln2514">  memcpy (lsp_id, isis-&gt;sysid, ISIS_SYS_ID_LEN);</a>
+<a name="ln2515">  LSP_PSEUDO_ID (lsp_id) = circuit-&gt;circuit_id;</a>
+<a name="ln2516">  LSP_FRAGMENT (lsp_id) = 0;</a>
+<a name="ln2517">  now = time (NULL);</a>
+<a name="ln2518"> </a>
+<a name="ln2519">  for (lvl = IS_LEVEL_1; lvl &lt;= IS_LEVEL_2; lvl++)</a>
+<a name="ln2520">    {</a>
+<a name="ln2521">      sched_debug(&quot;ISIS (%s): Checking whether L%d pseudo LSP needs to be scheduled&quot;,</a>
+<a name="ln2522">                  area-&gt;area_tag, lvl);</a>
+<a name="ln2523"> </a>
+<a name="ln2524">      if (!((level &amp; lvl) &amp;&amp; (circuit-&gt;is_type &amp; lvl)))</a>
+<a name="ln2525">        {</a>
+<a name="ln2526">          sched_debug(&quot;ISIS (%s): Level is not active on circuit&quot;,</a>
+<a name="ln2527">                      area-&gt;area_tag);</a>
+<a name="ln2528">          continue;</a>
+<a name="ln2529">        }</a>
+<a name="ln2530"> </a>
+<a name="ln2531">      if (circuit-&gt;u.bc.is_dr[lvl - 1] == 0)</a>
+<a name="ln2532">        {</a>
+<a name="ln2533">          sched_debug(&quot;ISIS (%s): This IS is not DR, nothing to do.&quot;,</a>
+<a name="ln2534">                      area-&gt;area_tag);</a>
+<a name="ln2535">          continue;</a>
+<a name="ln2536">        }</a>
+<a name="ln2537"> </a>
+<a name="ln2538">      if (circuit-&gt;lsp_regenerate_pending[lvl - 1])</a>
+<a name="ln2539">        {</a>
+<a name="ln2540">          struct timeval remain =</a>
+<a name="ln2541">                  thread_timer_remain(circuit-&gt;u.bc.t_refresh_pseudo_lsp[lvl - 1]);</a>
+<a name="ln2542">          sched_debug(&quot;ISIS (%s): Regenerate is already pending, nothing todo.&quot;</a>
+<a name="ln2543">                      &quot; (Due in %lld.%03lld seconds)&quot;, area-&gt;area_tag,</a>
+<a name="ln2544">                      (long long)remain.tv_sec, (long long)remain.tv_usec/1000);</a>
+<a name="ln2545">          continue;</a>
+<a name="ln2546">        }</a>
+<a name="ln2547"> </a>
+<a name="ln2548">      lsp = lsp_search (lsp_id, circuit-&gt;area-&gt;lspdb[lvl - 1]);</a>
+<a name="ln2549">      if (!lsp)</a>
+<a name="ln2550">        {</a>
+<a name="ln2551">          sched_debug(&quot;ISIS (%s): Pseudonode LSP does not exist yet, nothing to regenerate.&quot;,</a>
+<a name="ln2552">                      area-&gt;area_tag);</a>
+<a name="ln2553">          continue;</a>
+<a name="ln2554">        }</a>
+<a name="ln2555"> </a>
+<a name="ln2556">      /*</a>
+<a name="ln2557">       * Throttle avoidance</a>
+<a name="ln2558">       */</a>
+<a name="ln2559">      sched_debug(&quot;ISIS (%s): Will schedule PSN regen timer. Last run was: %lld, Now is: %lld&quot;,</a>
+<a name="ln2560">                  area-&gt;area_tag, (long long)lsp-&gt;last_generated, (long long) now);</a>
+<a name="ln2561">      THREAD_TIMER_OFF (circuit-&gt;u.bc.t_refresh_pseudo_lsp[lvl - 1]);</a>
+<a name="ln2562">      diff = now - lsp-&gt;last_generated;</a>
+<a name="ln2563">      if (diff &lt; circuit-&gt;area-&gt;lsp_gen_interval[lvl - 1])</a>
+<a name="ln2564">        {</a>
+<a name="ln2565">          timeout = 1000 * (circuit-&gt;area-&gt;lsp_gen_interval[lvl - 1] - diff);</a>
+<a name="ln2566">          sched_debug(&quot;ISIS (%s): Sechduling in %ld ms to match configured lsp_gen_interval&quot;,</a>
+<a name="ln2567">                      area-&gt;area_tag, timeout);</a>
+<a name="ln2568">        }</a>
+<a name="ln2569">      else</a>
+<a name="ln2570">        {</a>
+<a name="ln2571">          timeout = 100;</a>
+<a name="ln2572">          sched_debug(&quot;ISIS (%s): Last generation was more than lsp_gen_interval ago.&quot;</a>
+<a name="ln2573">                      &quot; Scheduling for execution in %ld ms.&quot;, area-&gt;area_tag, timeout);</a>
+<a name="ln2574">        }</a>
+<a name="ln2575"> </a>
+<a name="ln2576">      circuit-&gt;lsp_regenerate_pending[lvl - 1] = 1;</a>
+<a name="ln2577"> </a>
+<a name="ln2578">      if (lvl == IS_LEVEL_1)</a>
+<a name="ln2579">        {</a>
+<a name="ln2580">          THREAD_TIMER_MSEC_ON(master,</a>
+<a name="ln2581">                               circuit-&gt;u.bc.t_refresh_pseudo_lsp[lvl - 1],</a>
+<a name="ln2582">                               lsp_l1_refresh_pseudo, circuit, timeout);</a>
+<a name="ln2583">        }</a>
+<a name="ln2584">      else if (lvl == IS_LEVEL_2)</a>
+<a name="ln2585">        {</a>
+<a name="ln2586">          THREAD_TIMER_MSEC_ON(master,</a>
+<a name="ln2587">                               circuit-&gt;u.bc.t_refresh_pseudo_lsp[lvl - 1],</a>
+<a name="ln2588">                               lsp_l2_refresh_pseudo, circuit, timeout);</a>
+<a name="ln2589">        }</a>
+<a name="ln2590">    }</a>
+<a name="ln2591"> </a>
+<a name="ln2592">  return ISIS_OK;</a>
+<a name="ln2593">}</a>
+<a name="ln2594"> </a>
+<a name="ln2595">/*</a>
+<a name="ln2596"> * Walk through LSPs for an area</a>
+<a name="ln2597"> *  - set remaining lifetime</a>
+<a name="ln2598"> *  - set LSPs with SRMflag set for sending</a>
+<a name="ln2599"> */</a>
+<a name="ln2600">int</a>
+<a name="ln2601">lsp_tick (struct thread *thread)</a>
+<a name="ln2602">{</a>
+<a name="ln2603">  struct isis_area *area;</a>
+<a name="ln2604">  struct isis_circuit *circuit;</a>
+<a name="ln2605">  struct isis_lsp *lsp;</a>
+<a name="ln2606">  struct list *lsp_list;</a>
+<a name="ln2607">  struct listnode *lspnode, *cnode;</a>
+<a name="ln2608">  dnode_t *dnode, *dnode_next;</a>
+<a name="ln2609">  int level;</a>
+<a name="ln2610">  u_int16_t rem_lifetime;</a>
+<a name="ln2611"> </a>
+<a name="ln2612">  lsp_list = list_new ();</a>
+<a name="ln2613"> </a>
+<a name="ln2614">  area = THREAD_ARG (thread);</a>
+<a name="ln2615">  assert (area);</a>
+<a name="ln2616">  area-&gt;t_tick = NULL;</a>
+<a name="ln2617">  THREAD_TIMER_ON (master, area-&gt;t_tick, lsp_tick, area, 1);</a>
+<a name="ln2618"> </a>
+<a name="ln2619">  /*</a>
+<a name="ln2620">   * Build a list of LSPs with (any) SRMflag set</a>
+<a name="ln2621">   * and removed the ones that have aged out</a>
+<a name="ln2622">   */</a>
+<a name="ln2623">  for (level = 0; level &lt; ISIS_LEVELS; level++)</a>
+<a name="ln2624">    {</a>
+<a name="ln2625">      if (area-&gt;lspdb[level] &amp;&amp; dict_count (area-&gt;lspdb[level]) &gt; 0)</a>
+<a name="ln2626">        {</a>
+<a name="ln2627">          for (dnode = dict_first (area-&gt;lspdb[level]);</a>
+<a name="ln2628">               dnode != NULL; dnode = dnode_next)</a>
+<a name="ln2629">            {</a>
+<a name="ln2630">              dnode_next = dict_next (area-&gt;lspdb[level], dnode);</a>
+<a name="ln2631">              lsp = dnode_get (dnode);</a>
+<a name="ln2632"> </a>
+<a name="ln2633">              /*</a>
+<a name="ln2634">               * The lsp rem_lifetime is kept at 0 for MaxAge or</a>
+<a name="ln2635">               * ZeroAgeLifetime depending on explicit purge or</a>
+<a name="ln2636">               * natural age out. So schedule spf only once when</a>
+<a name="ln2637">               * the first time rem_lifetime becomes 0.</a>
+<a name="ln2638">               */</a>
+<a name="ln2639">              rem_lifetime = ntohs(lsp-&gt;lsp_header-&gt;rem_lifetime);</a>
+<a name="ln2640">              lsp_set_time (lsp);</a>
+<a name="ln2641"> </a>
+<a name="ln2642">              /*</a>
+<a name="ln2643">               * Schedule may run spf which should be done only after</a>
+<a name="ln2644">               * the lsp rem_lifetime becomes 0 for the first time.</a>
+<a name="ln2645">               * ISO 10589 - 7.3.16.4 first paragraph.</a>
+<a name="ln2646">               */</a>
+<a name="ln2647">              if (rem_lifetime == 1 &amp;&amp; lsp-&gt;lsp_header-&gt;seq_num != 0)</a>
+<a name="ln2648">                {</a>
+<a name="ln2649">                  /* 7.3.16.4 a) set SRM flags on all */</a>
+<a name="ln2650">                  lsp_set_all_srmflags (lsp);</a>
+<a name="ln2651">                  /* 7.3.16.4 b) retain only the header FIXME  */</a>
+<a name="ln2652">                  /* 7.3.16.4 c) record the time to purge FIXME */</a>
+<a name="ln2653">                  /* run/schedule spf */</a>
+<a name="ln2654">                  /* isis_spf_schedule is called inside lsp_destroy() below;</a>
+<a name="ln2655">                   * so it is not needed here. */</a>
+<a name="ln2656">                  /* isis_spf_schedule (lsp-&gt;area, lsp-&gt;level); */</a>
+<a name="ln2657">                }</a>
+<a name="ln2658"> </a>
+<a name="ln2659">              if (lsp-&gt;age_out == 0)</a>
+<a name="ln2660">                {</a>
+<a name="ln2661">                  zlog_debug (&quot;ISIS-Upd (%s): L%u LSP %s seq 0x%08x aged out&quot;,</a>
+<a name="ln2662">                              area-&gt;area_tag,</a>
+<a name="ln2663">                              lsp-&gt;level,</a>
+<a name="ln2664">                              rawlspid_print (lsp-&gt;lsp_header-&gt;lsp_id),</a>
+<a name="ln2665">                              ntohl (lsp-&gt;lsp_header-&gt;seq_num));</a>
+<a name="ln2666">#ifdef TOPOLOGY_GENERATE</a>
+<a name="ln2667">                  if (lsp-&gt;from_topology)</a>
+<a name="ln2668">                    THREAD_TIMER_OFF (lsp-&gt;t_lsp_top_ref);</a>
+<a name="ln2669">#endif /* TOPOLOGY_GENERATE */</a>
+<a name="ln2670">                  lsp_destroy (lsp);</a>
+<a name="ln2671">                  lsp = NULL;</a>
+<a name="ln2672">                  dict_delete_free (area-&gt;lspdb[level], dnode);</a>
+<a name="ln2673">                }</a>
+<a name="ln2674">              else if (flags_any_set (lsp-&gt;SRMflags))</a>
+<a name="ln2675">                listnode_add (lsp_list, lsp);</a>
+<a name="ln2676">            }</a>
+<a name="ln2677"> </a>
+<a name="ln2678">          /*</a>
+<a name="ln2679">           * Send LSPs on circuits indicated by the SRMflags</a>
+<a name="ln2680">           */</a>
+<a name="ln2681">          if (listcount (lsp_list) &gt; 0)</a>
+<a name="ln2682">            {</a>
+<a name="ln2683">              for (ALL_LIST_ELEMENTS_RO (area-&gt;circuit_list, cnode, circuit))</a>
+<a name="ln2684">                {</a>
+<a name="ln2685">                  int diff = time (NULL) - circuit-&gt;lsp_queue_last_cleared;</a>
+<a name="ln2686">                  if (circuit-&gt;lsp_queue == NULL ||</a>
+<a name="ln2687">                      diff &lt; MIN_LSP_TRANS_INTERVAL)</a>
+<a name="ln2688">                    continue;</a>
+<a name="ln2689">                  for (ALL_LIST_ELEMENTS_RO (lsp_list, lspnode, lsp))</a>
+<a name="ln2690">                    {</a>
+<a name="ln2691">                      if (circuit-&gt;upadjcount[lsp-&gt;level - 1] &amp;&amp;</a>
+<a name="ln2692">                          ISIS_CHECK_FLAG (lsp-&gt;SRMflags, circuit))</a>
+<a name="ln2693">                        {</a>
+<a name="ln2694">                          /* Add the lsp only if it is not already in lsp</a>
+<a name="ln2695">                           * queue */</a>
+<a name="ln2696">                          if (! listnode_lookup (circuit-&gt;lsp_queue, lsp))</a>
+<a name="ln2697">                            {</a>
+<a name="ln2698">                              listnode_add (circuit-&gt;lsp_queue, lsp);</a>
+<a name="ln2699">                              thread_add_event (master, send_lsp, circuit, 0);</a>
+<a name="ln2700">                            }</a>
+<a name="ln2701">                        }</a>
+<a name="ln2702">                    }</a>
+<a name="ln2703">                }</a>
+<a name="ln2704">              list_delete_all_node (lsp_list);</a>
+<a name="ln2705">            }</a>
+<a name="ln2706">        }</a>
+<a name="ln2707">    }</a>
+<a name="ln2708"> </a>
+<a name="ln2709">  list_delete (lsp_list);</a>
+<a name="ln2710"> </a>
+<a name="ln2711">  return ISIS_OK;</a>
+<a name="ln2712">}</a>
+<a name="ln2713"> </a>
+<a name="ln2714">void</a>
+<a name="ln2715">lsp_purge_pseudo (u_char * id, struct isis_circuit *circuit, int level)</a>
+<a name="ln2716">{</a>
+<a name="ln2717">  struct isis_lsp *lsp;</a>
+<a name="ln2718">  u_int16_t seq_num;</a>
+<a name="ln2719">  u_int8_t lsp_bits;</a>
+<a name="ln2720"> </a>
+<a name="ln2721">  lsp = lsp_search (id, circuit-&gt;area-&gt;lspdb[level - 1]);</a>
+<a name="ln2722">  if (!lsp)</a>
+<a name="ln2723">    return;</a>
+<a name="ln2724"> </a>
+<a name="ln2725">  /* store old values */</a>
+<a name="ln2726">  seq_num = lsp-&gt;lsp_header-&gt;seq_num;</a>
+<a name="ln2727">  lsp_bits = lsp-&gt;lsp_header-&gt;lsp_bits;</a>
+<a name="ln2728"> </a>
+<a name="ln2729">  /* reset stream */</a>
+<a name="ln2730">  lsp_clear_data (lsp);</a>
+<a name="ln2731">  stream_reset (lsp-&gt;pdu);</a>
+<a name="ln2732"> </a>
+<a name="ln2733">  /* update header */</a>
+<a name="ln2734">  lsp-&gt;lsp_header-&gt;pdu_len = htons (ISIS_FIXED_HDR_LEN + ISIS_LSP_HDR_LEN);</a>
+<a name="ln2735">  memcpy (lsp-&gt;lsp_header-&gt;lsp_id, id, ISIS_SYS_ID_LEN + 2);</a>
+<a name="ln2736">  lsp-&gt;lsp_header-&gt;checksum = 0;</a>
+<a name="ln2737">  lsp-&gt;lsp_header-&gt;seq_num = seq_num;</a>
+<a name="ln2738">  lsp-&gt;lsp_header-&gt;rem_lifetime = 0;</a>
+<a name="ln2739">  lsp-&gt;lsp_header-&gt;lsp_bits = lsp_bits;</a>
+<a name="ln2740">  lsp-&gt;level = level;</a>
+<a name="ln2741">  lsp-&gt;age_out = lsp-&gt;area-&gt;max_lsp_lifetime[level-1];</a>
+<a name="ln2742">  stream_forward_endp (lsp-&gt;pdu, ISIS_FIXED_HDR_LEN + ISIS_LSP_HDR_LEN);</a>
+<a name="ln2743"> </a>
+<a name="ln2744">  /*</a>
+<a name="ln2745">   * Add and update the authentication info if its present</a>
+<a name="ln2746">   */</a>
+<a name="ln2747">  lsp_auth_add (lsp);</a>
+<a name="ln2748">  lsp-&gt;lsp_header-&gt;pdu_len = htons (stream_get_endp (lsp-&gt;pdu));</a>
+<a name="ln2749">  lsp_auth_update (lsp);</a>
+<a name="ln2750">  fletcher_checksum(STREAM_DATA (lsp-&gt;pdu) + 12,</a>
+<a name="ln2751">                    ntohs (lsp-&gt;lsp_header-&gt;pdu_len) - 12, 12);</a>
+<a name="ln2752"> </a>
+<a name="ln2753">  lsp_set_all_srmflags (lsp);</a>
+<a name="ln2754"> </a>
+<a name="ln2755">  return;</a>
+<a name="ln2756">}</a>
+<a name="ln2757"> </a>
+<a name="ln2758">/*</a>
+<a name="ln2759"> * Purge own LSP that is received and we don't have. </a>
+<a name="ln2760"> * -&gt; Do as in 7.3.16.4</a>
+<a name="ln2761"> */</a>
+<a name="ln2762">void</a>
+<a name="ln2763">lsp_purge_non_exist (int level,</a>
+<a name="ln2764">		     struct isis_link_state_hdr *lsp_hdr,</a>
+<a name="ln2765">		     struct isis_area *area)</a>
+<a name="ln2766">{</a>
+<a name="ln2767">  struct isis_lsp *lsp;</a>
+<a name="ln2768"> </a>
+<a name="ln2769">  /*</a>
+<a name="ln2770">   * We need to create the LSP to be purged </a>
+<a name="ln2771">   */</a>
+<a name="ln2772">  lsp = XCALLOC (MTYPE_ISIS_LSP, sizeof (struct isis_lsp));</a>
+<a name="ln2773">  lsp-&gt;area = area;</a>
+<a name="ln2774">  lsp-&gt;level = level;</a>
+<a name="ln2775">  lsp-&gt;pdu = stream_new(LLC_LEN + area-&gt;lsp_mtu);</a>
+<a name="ln2776">  lsp-&gt;isis_header = (struct isis_fixed_hdr *) STREAM_DATA (lsp-&gt;pdu);</a>
+<a name="ln2777">  fill_fixed_hdr (lsp-&gt;isis_header, (lsp-&gt;level == IS_LEVEL_1) ? L1_LINK_STATE</a>
+<a name="ln2778">		  : L2_LINK_STATE);</a>
+<a name="ln2779">  lsp-&gt;lsp_header = (struct isis_link_state_hdr *) (STREAM_DATA (lsp-&gt;pdu) +</a>
+<a name="ln2780">						    ISIS_FIXED_HDR_LEN);</a>
+<a name="ln2781">  memcpy (lsp-&gt;lsp_header, lsp_hdr, ISIS_LSP_HDR_LEN);</a>
+<a name="ln2782">  stream_forward_endp (lsp-&gt;pdu, ISIS_FIXED_HDR_LEN + ISIS_LSP_HDR_LEN);</a>
+<a name="ln2783"> </a>
+<a name="ln2784">  /*</a>
+<a name="ln2785">   * Set the remaining lifetime to 0</a>
+<a name="ln2786">   */</a>
+<a name="ln2787">  lsp-&gt;lsp_header-&gt;rem_lifetime = 0;</a>
+<a name="ln2788"> </a>
+<a name="ln2789">  /*</a>
+<a name="ln2790">   * Add and update the authentication info if its present</a>
+<a name="ln2791">   */</a>
+<a name="ln2792">  lsp_auth_add (lsp);</a>
+<a name="ln2793">  lsp_auth_update (lsp);</a>
+<a name="ln2794"> </a>
+<a name="ln2795">  /*</a>
+<a name="ln2796">   * Update the PDU length to header plus any authentication TLV.</a>
+<a name="ln2797">   */</a>
+<a name="ln2798">  lsp-&gt;lsp_header-&gt;pdu_len = htons (stream_get_endp (lsp-&gt;pdu));</a>
+<a name="ln2799"> </a>
+<a name="ln2800">  /*</a>
+<a name="ln2801">   * Put the lsp into LSPdb</a>
+<a name="ln2802">   */</a>
+<a name="ln2803">  lsp_insert (lsp, area-&gt;lspdb[lsp-&gt;level - 1]);</a>
+<a name="ln2804"> </a>
+<a name="ln2805">  /*</a>
+<a name="ln2806">   * Send in to whole area</a>
+<a name="ln2807">   */</a>
+<a name="ln2808">  lsp_set_all_srmflags (lsp);</a>
+<a name="ln2809"> </a>
+<a name="ln2810">  return;</a>
+<a name="ln2811">}</a>
+<a name="ln2812"> </a>
+<a name="ln2813">void lsp_set_all_srmflags (struct isis_lsp *lsp)</a>
+<a name="ln2814">{</a>
+<a name="ln2815">  struct listnode *node;</a>
+<a name="ln2816">  struct isis_circuit *circuit;</a>
+<a name="ln2817"> </a>
+<a name="ln2818">  assert (lsp);</a>
+<a name="ln2819"> </a>
+<a name="ln2820">  ISIS_FLAGS_CLEAR_ALL(lsp-&gt;SRMflags);</a>
+<a name="ln2821"> </a>
+<a name="ln2822">  if (lsp-&gt;area)</a>
+<a name="ln2823">    {</a>
+<a name="ln2824">      struct list *circuit_list = lsp-&gt;area-&gt;circuit_list;</a>
+<a name="ln2825">      for (ALL_LIST_ELEMENTS_RO (circuit_list, node, circuit))</a>
+<a name="ln2826">        {</a>
+<a name="ln2827">          ISIS_SET_FLAG(lsp-&gt;SRMflags, circuit);</a>
+<a name="ln2828">        }</a>
+<a name="ln2829">    }</a>
+<a name="ln2830">}</a>
+<a name="ln2831"> </a>
+<a name="ln2832">#ifdef TOPOLOGY_GENERATE</a>
+<a name="ln2833">static int</a>
+<a name="ln2834">top_lsp_refresh (struct thread *thread)</a>
+<a name="ln2835">{</a>
+<a name="ln2836">  struct isis_lsp *lsp;</a>
+<a name="ln2837">  u_int16_t rem_lifetime;</a>
+<a name="ln2838"> </a>
+<a name="ln2839">  lsp = THREAD_ARG (thread);</a>
+<a name="ln2840">  assert (lsp);</a>
+<a name="ln2841"> </a>
+<a name="ln2842">  lsp-&gt;t_lsp_top_ref = NULL;</a>
+<a name="ln2843"> </a>
+<a name="ln2844">  lsp_seqnum_update (lsp);</a>
+<a name="ln2845"> </a>
+<a name="ln2846">  lsp_set_all_srmflags (lsp);</a>
+<a name="ln2847">  if (isis-&gt;debugs &amp; DEBUG_UPDATE_PACKETS)</a>
+<a name="ln2848">    {</a>
+<a name="ln2849">      zlog_debug (&quot;ISIS-Upd (): refreshing Topology L1 %s&quot;,</a>
+<a name="ln2850">		  rawlspid_print (lsp-&gt;lsp_header-&gt;lsp_id));</a>
+<a name="ln2851">    }</a>
+<a name="ln2852">  /* Refresh dynamic hostname in the cache. */</a>
+<a name="ln2853">  isis_dynhn_insert (lsp-&gt;lsp_header-&gt;lsp_id, lsp-&gt;tlv_data.hostname,</a>
+<a name="ln2854">		     IS_LEVEL_1);</a>
+<a name="ln2855"> </a>
+<a name="ln2856">  lsp-&gt;lsp_header-&gt;lsp_bits = lsp_bits_generate (lsp-&gt;level,</a>
+<a name="ln2857">                                                 lsp-&gt;area-&gt;overload_bit,</a>
+<a name="ln2858">                                                 lsp-&gt;area-&gt;attached_bit);</a>
+<a name="ln2859">  rem_lifetime = lsp_rem_lifetime (lsp-&gt;area, IS_LEVEL_1);</a>
+<a name="ln2860">  lsp-&gt;lsp_header-&gt;rem_lifetime = htons (rem_lifetime);</a>
+<a name="ln2861"> </a>
+<a name="ln2862">  /* refresh_time = lsp_refresh_time (lsp, rem_lifetime); */</a>
+<a name="ln2863">  THREAD_TIMER_ON (master, lsp-&gt;t_lsp_top_ref, top_lsp_refresh, lsp,</a>
+<a name="ln2864">		   lsp-&gt;area-&gt;lsp_refresh[0]);</a>
+<a name="ln2865"> </a>
+<a name="ln2866">  return ISIS_OK;</a>
+<a name="ln2867">}</a>
+<a name="ln2868"> </a>
+<a name="ln2869">void</a>
+<a name="ln2870">generate_topology_lsps (struct isis_area *area)</a>
+<a name="ln2871">{</a>
+<a name="ln2872">  struct listnode *node;</a>
+<a name="ln2873">  int i, max = 0;</a>
+<a name="ln2874">  struct arc *arc;</a>
+<a name="ln2875">  u_char lspid[ISIS_SYS_ID_LEN + 2];</a>
+<a name="ln2876">  struct isis_lsp *lsp;</a>
+<a name="ln2877">  u_int16_t rem_lifetime, refresh_time;</a>
+<a name="ln2878"> </a>
+<a name="ln2879">  /* first we find the maximal node */</a>
+<a name="ln2880">  for (ALL_LIST_ELEMENTS_RO (area-&gt;topology, node, arc))</a>
+<a name="ln2881">    {</a>
+<a name="ln2882">      if (arc-&gt;from_node &gt; max)</a>
+<a name="ln2883">        max = arc-&gt;from_node;</a>
+<a name="ln2884">      if (arc-&gt;to_node &gt; max)</a>
+<a name="ln2885">        max = arc-&gt;to_node;</a>
+<a name="ln2886">    }</a>
+<a name="ln2887"> </a>
+<a name="ln2888">  for (i = 1; i &lt; (max + 1); i++)</a>
+<a name="ln2889">    {</a>
+<a name="ln2890">      memcpy (lspid, area-&gt;topology_baseis, ISIS_SYS_ID_LEN);</a>
+<a name="ln2891">      LSP_PSEUDO_ID (lspid) = 0x00;</a>
+<a name="ln2892">      LSP_FRAGMENT (lspid) = 0x00;</a>
+<a name="ln2893">      lspid[ISIS_SYS_ID_LEN - 1] = (i &amp; 0xFF);</a>
+<a name="ln2894">      lspid[ISIS_SYS_ID_LEN - 2] = ((i &gt;&gt; 8) &amp; 0xFF);</a>
+<a name="ln2895"> </a>
+<a name="ln2896">      rem_lifetime = lsp_rem_lifetime (area, IS_LEVEL_1);</a>
+<a name="ln2897">      lsp = lsp_new (area, lspid, rem_lifetime, 1,</a>
+<a name="ln2898">                     IS_LEVEL_1 | area-&gt;overload_bit | area-&gt;attached_bit,</a>
+<a name="ln2899">                     0, 1);</a>
+<a name="ln2900">      if (!lsp)</a>
+<a name="ln2901">	return;</a>
+<a name="ln2902">      lsp-&gt;from_topology = 1;</a>
+<a name="ln2903"> </a>
+<a name="ln2904">      /* Creating LSP data based on topology info. */</a>
+<a name="ln2905">      build_topology_lsp_data (lsp, area, i);</a>
+<a name="ln2906">      /* Checksum is also calculated here. */</a>
+<a name="ln2907">      lsp_seqnum_update (lsp);</a>
+<a name="ln2908">      /* Take care of inserting dynamic hostname into cache. */</a>
+<a name="ln2909">      isis_dynhn_insert (lspid, lsp-&gt;tlv_data.hostname, IS_LEVEL_1);</a>
+<a name="ln2910"> </a>
+<a name="ln2911">      refresh_time = lsp_refresh_time (lsp, rem_lifetime);</a>
+<a name="ln2912">      THREAD_TIMER_ON (master, lsp-&gt;t_lsp_top_ref, top_lsp_refresh, lsp,</a>
+<a name="ln2913">		       refresh_time);</a>
+<a name="ln2914">      lsp_set_all_srmflags (lsp);</a>
+<a name="ln2915">      lsp_insert (lsp, area-&gt;lspdb[0]);</a>
+<a name="ln2916">    }</a>
+<a name="ln2917">}</a>
+<a name="ln2918"> </a>
+<a name="ln2919">void</a>
+<a name="ln2920">remove_topology_lsps (struct isis_area *area)</a>
+<a name="ln2921">{</a>
+<a name="ln2922">  struct isis_lsp *lsp;</a>
+<a name="ln2923">  dnode_t *dnode, *dnode_next;</a>
+<a name="ln2924"> </a>
+<a name="ln2925">  dnode = dict_first (area-&gt;lspdb[0]);</a>
+<a name="ln2926">  while (dnode != NULL)</a>
+<a name="ln2927">    {</a>
+<a name="ln2928">      dnode_next = dict_next (area-&gt;lspdb[0], dnode);</a>
+<a name="ln2929">      lsp = dnode_get (dnode);</a>
+<a name="ln2930">      if (lsp-&gt;from_topology)</a>
+<a name="ln2931">	{</a>
+<a name="ln2932">	  THREAD_TIMER_OFF (lsp-&gt;t_lsp_top_ref);</a>
+<a name="ln2933">	  lsp_destroy (lsp);</a>
+<a name="ln2934">	  dict_delete (area-&gt;lspdb[0], dnode);</a>
+<a name="ln2935">	}</a>
+<a name="ln2936">      dnode = dnode_next;</a>
+<a name="ln2937">    }</a>
+<a name="ln2938">}</a>
+<a name="ln2939"> </a>
+<a name="ln2940">void</a>
+<a name="ln2941">build_topology_lsp_data (struct isis_lsp *lsp, struct isis_area *area,</a>
+<a name="ln2942">			 int lsp_top_num)</a>
+<a name="ln2943">{</a>
+<a name="ln2944">  struct listnode *node;</a>
+<a name="ln2945">  struct arc *arc;</a>
+<a name="ln2946">  struct is_neigh *is_neigh;</a>
+<a name="ln2947">  struct te_is_neigh *te_is_neigh;</a>
+<a name="ln2948">  char buff[200];</a>
+<a name="ln2949">  struct tlvs tlv_data;</a>
+<a name="ln2950">  struct isis_lsp *lsp0 = lsp;</a>
+<a name="ln2951"> </a>
+<a name="ln2952">  /* Add area addresses. FIXME: Is it needed at all? */</a>
+<a name="ln2953">  if (lsp-&gt;tlv_data.area_addrs == NULL)</a>
+<a name="ln2954">    lsp-&gt;tlv_data.area_addrs = list_new ();</a>
+<a name="ln2955">  list_add_list (lsp-&gt;tlv_data.area_addrs, area-&gt;area_addrs);</a>
+<a name="ln2956"> </a>
+<a name="ln2957">  if (lsp-&gt;tlv_data.nlpids == NULL)</a>
+<a name="ln2958">    lsp-&gt;tlv_data.nlpids = XMALLOC (MTYPE_ISIS_TLV, sizeof (struct nlpids));</a>
+<a name="ln2959">  lsp-&gt;tlv_data.nlpids-&gt;count = 1;</a>
+<a name="ln2960">  lsp-&gt;tlv_data.nlpids-&gt;nlpids[0] = NLPID_IP;</a>
+<a name="ln2961"> </a>
+<a name="ln2962">  if (area-&gt;dynhostname)</a>
+<a name="ln2963">    {</a>
+<a name="ln2964">      lsp-&gt;tlv_data.hostname = XMALLOC (MTYPE_ISIS_TLV,</a>
+<a name="ln2965">					sizeof (struct hostname));</a>
+<a name="ln2966">      memset (buff, 0x00, 200);</a>
+<a name="ln2967">      sprintf (buff, &quot;%s%d&quot;, area-&gt;topology_basedynh ? area-&gt;topology_basedynh :</a>
+<a name="ln2968">	       &quot;feedme&quot;, lsp_top_num);</a>
+<a name="ln2969">      memcpy (lsp-&gt;tlv_data.hostname-&gt;name, buff, strlen (buff));</a>
+<a name="ln2970">      lsp-&gt;tlv_data.hostname-&gt;namelen = strlen (buff);</a>
+<a name="ln2971">    }</a>
+<a name="ln2972"> </a>
+<a name="ln2973">  if (lsp-&gt;tlv_data.nlpids)</a>
+<a name="ln2974">    tlv_add_nlpid (lsp-&gt;tlv_data.nlpids, lsp-&gt;pdu);</a>
+<a name="ln2975">  if (lsp-&gt;tlv_data.hostname)</a>
+<a name="ln2976">    tlv_add_dynamic_hostname (lsp-&gt;tlv_data.hostname, lsp-&gt;pdu);</a>
+<a name="ln2977">  if (lsp-&gt;tlv_data.area_addrs &amp;&amp; listcount (lsp-&gt;tlv_data.area_addrs) &gt; 0)</a>
+<a name="ln2978">    tlv_add_area_addrs (lsp-&gt;tlv_data.area_addrs, lsp-&gt;pdu);</a>
+<a name="ln2979"> </a>
+<a name="ln2980">  memset (&amp;tlv_data, 0, sizeof (struct tlvs));</a>
+<a name="ln2981">  if (tlv_data.is_neighs == NULL)</a>
+<a name="ln2982">    {</a>
+<a name="ln2983">      tlv_data.is_neighs = list_new ();</a>
+<a name="ln2984">      tlv_data.is_neighs-&gt;del = free_tlv;</a>
+<a name="ln2985">    }</a>
+<a name="ln2986"> </a>
+<a name="ln2987">  /* Add reachability for this IS for simulated 1. */</a>
+<a name="ln2988">  if (lsp_top_num == 1)</a>
+<a name="ln2989">    {</a>
+<a name="ln2990">      is_neigh = XCALLOC (MTYPE_ISIS_TLV, sizeof (struct is_neigh));</a>
+<a name="ln2991"> </a>
+<a name="ln2992">      memcpy (&amp;is_neigh-&gt;neigh_id, isis-&gt;sysid, ISIS_SYS_ID_LEN);</a>
+<a name="ln2993">      LSP_PSEUDO_ID (is_neigh-&gt;neigh_id) = 0x00;</a>
+<a name="ln2994">      /* Metric MUST NOT be 0, unless it's not alias TLV. */</a>
+<a name="ln2995">      is_neigh-&gt;metrics.metric_default = 0x01;</a>
+<a name="ln2996">      is_neigh-&gt;metrics.metric_delay = METRICS_UNSUPPORTED;</a>
+<a name="ln2997">      is_neigh-&gt;metrics.metric_expense = METRICS_UNSUPPORTED;</a>
+<a name="ln2998">      is_neigh-&gt;metrics.metric_error = METRICS_UNSUPPORTED;</a>
+<a name="ln2999">      listnode_add (tlv_data.is_neighs, is_neigh);</a>
+<a name="ln3000">    }</a>
+<a name="ln3001"> </a>
+<a name="ln3002">  /* Add IS reachabilities. */</a>
+<a name="ln3003">  for (ALL_LIST_ELEMENTS_RO (area-&gt;topology, node, arc))</a>
+<a name="ln3004">    {</a>
+<a name="ln3005">      int to_lsp = 0;</a>
+<a name="ln3006">      </a>
+<a name="ln3007">      if ((lsp_top_num != arc-&gt;from_node) &amp;&amp; (lsp_top_num != arc-&gt;to_node))</a>
+<a name="ln3008">	continue;</a>
+<a name="ln3009"> </a>
+<a name="ln3010">      if (lsp_top_num == arc-&gt;from_node)</a>
+<a name="ln3011">	to_lsp = arc-&gt;to_node;</a>
+<a name="ln3012">      else</a>
+<a name="ln3013">	to_lsp = arc-&gt;from_node;</a>
+<a name="ln3014"> </a>
+<a name="ln3015">      if (area-&gt;oldmetric)</a>
+<a name="ln3016">	{</a>
+<a name="ln3017">	  is_neigh = XCALLOC (MTYPE_ISIS_TLV, sizeof (struct is_neigh));</a>
+<a name="ln3018"> </a>
+<a name="ln3019">	  memcpy (&amp;is_neigh-&gt;neigh_id, area-&gt;topology_baseis, ISIS_SYS_ID_LEN);</a>
+<a name="ln3020">	  is_neigh-&gt;neigh_id[ISIS_SYS_ID_LEN - 1] = (to_lsp &amp; 0xFF);</a>
+<a name="ln3021">	  is_neigh-&gt;neigh_id[ISIS_SYS_ID_LEN - 2] = ((to_lsp &gt;&gt; 8) &amp; 0xFF);</a>
+<a name="ln3022">	  is_neigh-&gt;metrics.metric_default = arc-&gt;distance;</a>
+<a name="ln3023">	  is_neigh-&gt;metrics.metric_delay = METRICS_UNSUPPORTED;</a>
+<a name="ln3024">	  is_neigh-&gt;metrics.metric_expense = METRICS_UNSUPPORTED;</a>
+<a name="ln3025">	  is_neigh-&gt;metrics.metric_error = METRICS_UNSUPPORTED;</a>
+<a name="ln3026">	  listnode_add (tlv_data.is_neighs, is_neigh);</a>
+<a name="ln3027">	}</a>
+<a name="ln3028"> </a>
+<a name="ln3029">      if (area-&gt;newmetric)</a>
+<a name="ln3030">	{</a>
+<a name="ln3031">	  if (tlv_data.te_is_neighs == NULL)</a>
+<a name="ln3032">	    {</a>
+<a name="ln3033">	      tlv_data.te_is_neighs = list_new ();</a>
+<a name="ln3034">	      tlv_data.te_is_neighs-&gt;del = free_tlv;</a>
+<a name="ln3035">	    }</a>
+<a name="ln3036">	  te_is_neigh = XCALLOC (MTYPE_ISIS_TLV, sizeof (struct te_is_neigh));</a>
+<a name="ln3037">	  memcpy (&amp;te_is_neigh-&gt;neigh_id, area-&gt;topology_baseis,</a>
+<a name="ln3038">		  ISIS_SYS_ID_LEN);</a>
+<a name="ln3039">	  te_is_neigh-&gt;neigh_id[ISIS_SYS_ID_LEN - 1] = (to_lsp &amp; 0xFF);</a>
+<a name="ln3040">	  te_is_neigh-&gt;neigh_id[ISIS_SYS_ID_LEN - 2] = ((to_lsp &gt;&gt; 8) &amp; 0xFF);</a>
+<a name="ln3041">	  SET_TE_METRIC(te_is_neigh, arc-&gt;distance);</a>
+<a name="ln3042">	  listnode_add (tlv_data.te_is_neighs, te_is_neigh);</a>
+<a name="ln3043">	}</a>
+<a name="ln3044">    }</a>
+<a name="ln3045"> </a>
+<a name="ln3046">  while (tlv_data.is_neighs &amp;&amp; listcount (tlv_data.is_neighs))</a>
+<a name="ln3047">    {</a>
+<a name="ln3048">      if (lsp-&gt;tlv_data.is_neighs == NULL)</a>
+<a name="ln3049">	lsp-&gt;tlv_data.is_neighs = list_new ();</a>
+<a name="ln3050">      lsp_tlv_fit (lsp, &amp;tlv_data.is_neighs, &amp;lsp-&gt;tlv_data.is_neighs,</a>
+<a name="ln3051">		   IS_NEIGHBOURS_LEN, area-&gt;lsp_frag_threshold,</a>
+<a name="ln3052">		   tlv_add_is_neighs);</a>
+<a name="ln3053">      if (tlv_data.is_neighs &amp;&amp; listcount (tlv_data.is_neighs))</a>
+<a name="ln3054">        lsp = lsp_next_frag (LSP_FRAGMENT (lsp-&gt;lsp_header-&gt;lsp_id) + 1,</a>
+<a name="ln3055">			     lsp0, area, IS_LEVEL_1);</a>
+<a name="ln3056">    }</a>
+<a name="ln3057"> </a>
+<a name="ln3058">  while (tlv_data.te_is_neighs &amp;&amp; listcount (tlv_data.te_is_neighs))</a>
+<a name="ln3059">    {</a>
+<a name="ln3060">      if (lsp-&gt;tlv_data.te_is_neighs == NULL)</a>
+<a name="ln3061">	lsp-&gt;tlv_data.te_is_neighs = list_new ();</a>
+<a name="ln3062">      lsp_tlv_fit (lsp, &amp;tlv_data.te_is_neighs, &amp;lsp-&gt;tlv_data.te_is_neighs,</a>
+<a name="ln3063">		   IS_NEIGHBOURS_LEN, area-&gt;lsp_frag_threshold,</a>
+<a name="ln3064">		   tlv_add_te_is_neighs);</a>
+<a name="ln3065">      if (tlv_data.te_is_neighs &amp;&amp; listcount (tlv_data.te_is_neighs))</a>
+<a name="ln3066">	lsp = lsp_next_frag (LSP_FRAGMENT (lsp-&gt;lsp_header-&gt;lsp_id) + 1,</a>
+<a name="ln3067">			     lsp0, area, IS_LEVEL_1);</a>
+<a name="ln3068">    }</a>
+<a name="ln3069"> </a>
+<a name="ln3070">  free_tlvs (&amp;tlv_data);</a>
+<a name="ln3071">  return;</a>
+<a name="ln3072">}</a>
+<a name="ln3073">#endif /* TOPOLOGY_GENERATE */</a>
+
+</code></pre>
+<div class="balloon" rel="11"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1042/" target="_blank">V1042</a> This file is marked with copyleft license, which requires you to open the derived source code.</p></div>
+<div class="balloon" rel="781"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v512/" target="_blank">V512</a> A call of the 'memcpy' function will lead to underflow of the buffer 'id'.</p></div>
+<div class="balloon" rel="2504"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v595/" target="_blank">V595</a> The 'circuit' pointer was utilized before it was verified against nullptr. Check lines: 2504, 2506.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

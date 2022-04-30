@@ -1,0 +1,966 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>ospf6_spf.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.5.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright (C) 2003 Yasuhiro Ohara</a>
+<a name="ln3"> *</a>
+<a name="ln4"> * This file is part of GNU Zebra.</a>
+<a name="ln5"> *</a>
+<a name="ln6"> * GNU Zebra is free software; you can redistribute it and/or modify it</a>
+<a name="ln7"> * under the terms of the GNU General Public License as published by the</a>
+<a name="ln8"> * Free Software Foundation; either version 2, or (at your option) any</a>
+<a name="ln9"> * later version.</a>
+<a name="ln10"> *</a>
+<a name="ln11"> * GNU Zebra is distributed in the hope that it will be useful, but</a>
+<a name="ln12"> * WITHOUT ANY WARRANTY; without even the implied warranty of</a>
+<a name="ln13"> * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU</a>
+<a name="ln14"> * General Public License for more details.</a>
+<a name="ln15"> *</a>
+<a name="ln16"> * You should have received a copy of the GNU General Public License</a>
+<a name="ln17"> * along with GNU Zebra; see the file COPYING.  If not, write to the </a>
+<a name="ln18"> * Free Software Foundation, Inc., 59 Temple Place - Suite 330, </a>
+<a name="ln19"> * Boston, MA 02111-1307, USA.  </a>
+<a name="ln20"> */</a>
+<a name="ln21"> </a>
+<a name="ln22">/* Shortest Path First calculation for OSPFv3 */</a>
+<a name="ln23"> </a>
+<a name="ln24">#include &lt;zebra.h&gt;</a>
+<a name="ln25"> </a>
+<a name="ln26">#include &quot;log.h&quot;</a>
+<a name="ln27">#include &quot;memory.h&quot;</a>
+<a name="ln28">#include &quot;command.h&quot;</a>
+<a name="ln29">#include &quot;vty.h&quot;</a>
+<a name="ln30">#include &quot;prefix.h&quot;</a>
+<a name="ln31">#include &quot;pqueue.h&quot;</a>
+<a name="ln32">#include &quot;linklist.h&quot;</a>
+<a name="ln33">#include &quot;thread.h&quot;</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &quot;ospf6_lsa.h&quot;</a>
+<a name="ln36">#include &quot;ospf6_lsdb.h&quot;</a>
+<a name="ln37">#include &quot;ospf6_route.h&quot;</a>
+<a name="ln38">#include &quot;ospf6_area.h&quot;</a>
+<a name="ln39">#include &quot;ospf6_spf.h&quot;</a>
+<a name="ln40">#include &quot;ospf6_intra.h&quot;</a>
+<a name="ln41">#include &quot;ospf6_interface.h&quot;</a>
+<a name="ln42">#include &quot;ospf6d.h&quot;</a>
+<a name="ln43">#include &quot;ospf6_abr.h&quot;</a>
+<a name="ln44"> </a>
+<a name="ln45">unsigned char conf_debug_ospf6_spf = 0;</a>
+<a name="ln46"> </a>
+<a name="ln47">static int</a>
+<a name="ln48">ospf6_vertex_cmp (void *a, void *b)</a>
+<a name="ln49">{</a>
+<a name="ln50">  struct ospf6_vertex *va = (struct ospf6_vertex *) a;</a>
+<a name="ln51">  struct ospf6_vertex *vb = (struct ospf6_vertex *) b;</a>
+<a name="ln52"> </a>
+<a name="ln53">  /* ascending order */</a>
+<a name="ln54">  if (va-&gt;cost != vb-&gt;cost)</a>
+<a name="ln55">    return (va-&gt;cost - vb-&gt;cost);</a>
+<a name="ln56">  return (va-&gt;hops - vb-&gt;hops);</a>
+<a name="ln57">}</a>
+<a name="ln58"> </a>
+<a name="ln59">static int</a>
+<a name="ln60">ospf6_vertex_id_cmp (void *a, void *b)</a>
+<a name="ln61">{</a>
+<a name="ln62">  struct ospf6_vertex *va = (struct ospf6_vertex *) a;</a>
+<a name="ln63">  struct ospf6_vertex *vb = (struct ospf6_vertex *) b;</a>
+<a name="ln64">  int ret = 0;</a>
+<a name="ln65"> </a>
+<a name="ln66">  ret = ntohl (ospf6_linkstate_prefix_adv_router (&amp;va-&gt;vertex_id)) -</a>
+<a name="ln67">        ntohl (ospf6_linkstate_prefix_adv_router (&amp;vb-&gt;vertex_id));</a>
+<a name="ln68">  if (ret)</a>
+<a name="ln69">    return ret;</a>
+<a name="ln70"> </a>
+<a name="ln71">  ret = ntohl (ospf6_linkstate_prefix_id (&amp;va-&gt;vertex_id)) -</a>
+<a name="ln72">        ntohl (ospf6_linkstate_prefix_id (&amp;vb-&gt;vertex_id));</a>
+<a name="ln73">  return ret;</a>
+<a name="ln74">}</a>
+<a name="ln75"> </a>
+<a name="ln76">static struct ospf6_vertex *</a>
+<a name="ln77">ospf6_vertex_create (struct ospf6_lsa *lsa)</a>
+<a name="ln78">{</a>
+<a name="ln79">  struct ospf6_vertex *v;</a>
+<a name="ln80">  int i;</a>
+<a name="ln81"> </a>
+<a name="ln82">  v = (struct ospf6_vertex *)</a>
+<a name="ln83">    XMALLOC (MTYPE_OSPF6_VERTEX, sizeof (struct ospf6_vertex));</a>
+<a name="ln84"> </a>
+<a name="ln85">  /* type */</a>
+<a name="ln86">  if (ntohs (lsa-&gt;header-&gt;type) == OSPF6_LSTYPE_ROUTER)</a>
+<a name="ln87">    v-&gt;type = OSPF6_VERTEX_TYPE_ROUTER;</a>
+<a name="ln88">  else if (ntohs (lsa-&gt;header-&gt;type) == OSPF6_LSTYPE_NETWORK)</a>
+<a name="ln89">    v-&gt;type = OSPF6_VERTEX_TYPE_NETWORK;</a>
+<a name="ln90">  else</a>
+<a name="ln91">    assert (0);</a>
+<a name="ln92"> </a>
+<a name="ln93">  /* vertex_id */</a>
+<a name="ln94">  ospf6_linkstate_prefix (lsa-&gt;header-&gt;adv_router, lsa-&gt;header-&gt;id,</a>
+<a name="ln95">                          &amp;v-&gt;vertex_id);</a>
+<a name="ln96"> </a>
+<a name="ln97">  /* name */</a>
+<a name="ln98">  ospf6_linkstate_prefix2str (&amp;v-&gt;vertex_id, v-&gt;name, sizeof (v-&gt;name));</a>
+<a name="ln99"> </a>
+<a name="ln100">  /* Associated LSA */</a>
+<a name="ln101">  v-&gt;lsa = lsa;</a>
+<a name="ln102"> </a>
+<a name="ln103">  /* capability bits + options */</a>
+<a name="ln104">  v-&gt;capability = *(u_char *)(OSPF6_LSA_HEADER_END (lsa-&gt;header));</a>
+<a name="ln105">  v-&gt;options[0] = *(u_char *)(OSPF6_LSA_HEADER_END (lsa-&gt;header) + 1);</a>
+<a name="ln106">  v-&gt;options[1] = *(u_char *)(OSPF6_LSA_HEADER_END (lsa-&gt;header) + 2);</a>
+<a name="ln107">  v-&gt;options[2] = *(u_char *)(OSPF6_LSA_HEADER_END (lsa-&gt;header) + 3);</a>
+<a name="ln108"> </a>
+<a name="ln109">  for (i = 0; i &lt; OSPF6_MULTI_PATH_LIMIT; i++)</a>
+<a name="ln110">    ospf6_nexthop_clear (&amp;v-&gt;nexthop[i]);</a>
+<a name="ln111"> </a>
+<a name="ln112">  v-&gt;parent = NULL;</a>
+<a name="ln113">  v-&gt;child_list = list_new ();</a>
+<a name="ln114">  v-&gt;child_list-&gt;cmp = ospf6_vertex_id_cmp;</a>
+<a name="ln115"> </a>
+<a name="ln116">  return v;</a>
+<a name="ln117">}</a>
+<a name="ln118"> </a>
+<a name="ln119">static void</a>
+<a name="ln120">ospf6_vertex_delete (struct ospf6_vertex *v)</a>
+<a name="ln121">{</a>
+<a name="ln122">  list_delete (v-&gt;child_list);</a>
+<a name="ln123">  XFREE (MTYPE_OSPF6_VERTEX, v);</a>
+<a name="ln124">}</a>
+<a name="ln125"> </a>
+<a name="ln126">static struct ospf6_lsa *</a>
+<a name="ln127">ospf6_lsdesc_lsa (caddr_t lsdesc, struct ospf6_vertex *v)</a>
+<a name="ln128">{</a>
+<a name="ln129">  struct ospf6_lsa *lsa;</a>
+<a name="ln130">  u_int16_t type = 0;</a>
+<a name="ln131">  u_int32_t id = 0, adv_router = 0;</a>
+<a name="ln132"> </a>
+<a name="ln133">  if (VERTEX_IS_TYPE (NETWORK, v))</a>
+<a name="ln134">    {</a>
+<a name="ln135">      type = htons (OSPF6_LSTYPE_ROUTER);</a>
+<a name="ln136">      id = htonl (0);</a>
+<a name="ln137">      adv_router = NETWORK_LSDESC_GET_NBR_ROUTERID (lsdesc);</a>
+<a name="ln138">    }</a>
+<a name="ln139">  else</a>
+<a name="ln140">    {</a>
+<a name="ln141">      if (ROUTER_LSDESC_IS_TYPE (POINTTOPOINT, lsdesc))</a>
+<a name="ln142">        {</a>
+<a name="ln143">          type = htons (OSPF6_LSTYPE_ROUTER);</a>
+<a name="ln144">          id = htonl (0);</a>
+<a name="ln145">          adv_router = ROUTER_LSDESC_GET_NBR_ROUTERID (lsdesc);</a>
+<a name="ln146">        }</a>
+<a name="ln147">      else if (ROUTER_LSDESC_IS_TYPE (TRANSIT_NETWORK, lsdesc))</a>
+<a name="ln148">        {</a>
+<a name="ln149">          type = htons (OSPF6_LSTYPE_NETWORK);</a>
+<a name="ln150">          id = htonl (ROUTER_LSDESC_GET_NBR_IFID (lsdesc));</a>
+<a name="ln151">          adv_router = ROUTER_LSDESC_GET_NBR_ROUTERID (lsdesc);</a>
+<a name="ln152">        }</a>
+<a name="ln153">    }</a>
+<a name="ln154"> </a>
+<a name="ln155">  lsa = ospf6_lsdb_lookup (type, id, adv_router, v-&gt;area-&gt;lsdb);</a>
+<a name="ln156"> </a>
+<a name="ln157">  if (IS_OSPF6_DEBUG_SPF (PROCESS))</a>
+<a name="ln158">    {</a>
+<a name="ln159">      char ibuf[16], abuf[16];</a>
+<a name="ln160">      inet_ntop (AF_INET, &amp;id, ibuf, sizeof (ibuf));</a>
+<a name="ln161">      inet_ntop (AF_INET, &amp;adv_router, abuf, sizeof (abuf));</a>
+<a name="ln162">      if (lsa)</a>
+<a name="ln163">        zlog_debug (&quot;  Link to: %s&quot;, lsa-&gt;name);</a>
+<a name="ln164">      else</a>
+<a name="ln165">        zlog_debug (&quot;  Link to: [%s Id:%s Adv:%s] No LSA&quot;,</a>
+<a name="ln166">		    ospf6_lstype_name (type), ibuf, abuf);</a>
+<a name="ln167">    }</a>
+<a name="ln168"> </a>
+<a name="ln169">  return lsa;</a>
+<a name="ln170">}</a>
+<a name="ln171"> </a>
+<a name="ln172">static char *</a>
+<a name="ln173">ospf6_lsdesc_backlink (struct ospf6_lsa *lsa,</a>
+<a name="ln174">                       caddr_t lsdesc, struct ospf6_vertex *v)</a>
+<a name="ln175">{</a>
+<a name="ln176">  caddr_t backlink, found = NULL;</a>
+<a name="ln177">  int size;</a>
+<a name="ln178"> </a>
+<a name="ln179">  size = (OSPF6_LSA_IS_TYPE (ROUTER, lsa) ?</a>
+<a name="ln180">          sizeof (struct ospf6_router_lsdesc) :</a>
+<a name="ln181">          sizeof (struct ospf6_network_lsdesc));</a>
+<a name="ln182">  for (backlink = OSPF6_LSA_HEADER_END (lsa-&gt;header) + 4;</a>
+<a name="ln183">       backlink + size &lt;= OSPF6_LSA_END (lsa-&gt;header); backlink += size)</a>
+<a name="ln184">    {</a>
+<a name="ln185">      assert (! (OSPF6_LSA_IS_TYPE (NETWORK, lsa) &amp;&amp;</a>
+<a name="ln186">                 VERTEX_IS_TYPE (NETWORK, v)));</a>
+<a name="ln187"> </a>
+<a name="ln188">      if (OSPF6_LSA_IS_TYPE (NETWORK, lsa) &amp;&amp;</a>
+<a name="ln189">          NETWORK_LSDESC_GET_NBR_ROUTERID (backlink)</a>
+<a name="ln190">            == v-&gt;lsa-&gt;header-&gt;adv_router)</a>
+<a name="ln191">        found = backlink;</a>
+<a name="ln192">      else if (VERTEX_IS_TYPE (NETWORK, v) &amp;&amp;</a>
+<a name="ln193">          ROUTER_LSDESC_IS_TYPE (TRANSIT_NETWORK, backlink) &amp;&amp;</a>
+<a name="ln194">          ROUTER_LSDESC_GET_NBR_ROUTERID (backlink)</a>
+<a name="ln195">            == v-&gt;lsa-&gt;header-&gt;adv_router &amp;&amp;</a>
+<a name="ln196">          ROUTER_LSDESC_GET_NBR_IFID (backlink)</a>
+<a name="ln197">            == ntohl (v-&gt;lsa-&gt;header-&gt;id))</a>
+<a name="ln198">        found = backlink;</a>
+<a name="ln199">      else</a>
+<a name="ln200">        {</a>
+<a name="ln201">          if (! ROUTER_LSDESC_IS_TYPE (POINTTOPOINT, backlink) ||</a>
+<a name="ln202">              ! ROUTER_LSDESC_IS_TYPE (POINTTOPOINT, lsdesc))</a>
+<a name="ln203">            continue;</a>
+<a name="ln204">          if (ROUTER_LSDESC_GET_NBR_IFID (backlink) !=</a>
+<a name="ln205">              ROUTER_LSDESC_GET_IFID (lsdesc) ||</a>
+<a name="ln206">              ROUTER_LSDESC_GET_NBR_IFID (lsdesc) !=</a>
+<a name="ln207">              ROUTER_LSDESC_GET_IFID (backlink))</a>
+<a name="ln208">            continue;</a>
+<a name="ln209">          if (ROUTER_LSDESC_GET_NBR_ROUTERID (backlink) !=</a>
+<a name="ln210">              v-&gt;lsa-&gt;header-&gt;adv_router ||</a>
+<a name="ln211">              ROUTER_LSDESC_GET_NBR_ROUTERID (lsdesc) !=</a>
+<a name="ln212">              lsa-&gt;header-&gt;adv_router)</a>
+<a name="ln213">            continue;</a>
+<a name="ln214">          found = backlink;</a>
+<a name="ln215">        }</a>
+<a name="ln216">    }</a>
+<a name="ln217"> </a>
+<a name="ln218">  if (IS_OSPF6_DEBUG_SPF (PROCESS))</a>
+<a name="ln219">    zlog_debug (&quot;  Backlink %s&quot;, (found ? &quot;OK&quot; : &quot;FAIL&quot;));</a>
+<a name="ln220"> </a>
+<a name="ln221">  return found;</a>
+<a name="ln222">}</a>
+<a name="ln223"> </a>
+<a name="ln224">static void</a>
+<a name="ln225">ospf6_nexthop_calc (struct ospf6_vertex *w, struct ospf6_vertex *v,</a>
+<a name="ln226">                    caddr_t lsdesc)</a>
+<a name="ln227">{</a>
+<a name="ln228">  int i;</a>
+<a name="ln229">  ifindex_t ifindex;</a>
+<a name="ln230">  struct ospf6_interface *oi;</a>
+<a name="ln231">  u_int16_t type;</a>
+<a name="ln232">  u_int32_t adv_router;</a>
+<a name="ln233">  struct ospf6_lsa *lsa;</a>
+<a name="ln234">  struct ospf6_link_lsa *link_lsa;</a>
+<a name="ln235">  char buf[64];</a>
+<a name="ln236"> </a>
+<a name="ln237">  assert (VERTEX_IS_TYPE (ROUTER, w));</a>
+<a name="ln238">  ifindex = (VERTEX_IS_TYPE (NETWORK, v) ? v-&gt;nexthop[0].ifindex :</a>
+<a name="ln239">             /* v is the local router &amp; the interface_id is a local ifindex */</a>
+<a name="ln240">             (ifindex_t) ROUTER_LSDESC_GET_IFID (lsdesc));</a>
+<a name="ln241">  assert (ifindex &gt;= 0);</a>
+<a name="ln242">  </a>
+<a name="ln243">  oi = ospf6_interface_lookup_by_ifindex (ifindex);</a>
+<a name="ln244">  if (oi == NULL)</a>
+<a name="ln245">    {</a>
+<a name="ln246">      if (IS_OSPF6_DEBUG_SPF (PROCESS))</a>
+<a name="ln247">        zlog_debug (&quot;Can't find interface in SPF: ifindex %d&quot;, ifindex);</a>
+<a name="ln248">      return;</a>
+<a name="ln249">    }</a>
+<a name="ln250"> </a>
+<a name="ln251">  type = htons (OSPF6_LSTYPE_LINK);</a>
+<a name="ln252">  adv_router = (VERTEX_IS_TYPE (NETWORK, v) ?</a>
+<a name="ln253">                NETWORK_LSDESC_GET_NBR_ROUTERID (lsdesc) :</a>
+<a name="ln254">                ROUTER_LSDESC_GET_NBR_ROUTERID (lsdesc));</a>
+<a name="ln255"> </a>
+<a name="ln256">  i = 0;</a>
+<a name="ln257">  for (lsa = ospf6_lsdb_type_router_head (type, adv_router, oi-&gt;lsdb); lsa;</a>
+<a name="ln258">       lsa = ospf6_lsdb_type_router_next (type, adv_router, lsa))</a>
+<a name="ln259">    {</a>
+<a name="ln260">      if (VERTEX_IS_TYPE (ROUTER, v) &amp;&amp;</a>
+<a name="ln261">          htonl (ROUTER_LSDESC_GET_NBR_IFID (lsdesc)) != lsa-&gt;header-&gt;id)</a>
+<a name="ln262">        continue;</a>
+<a name="ln263"> </a>
+<a name="ln264">      link_lsa = (struct ospf6_link_lsa *) OSPF6_LSA_HEADER_END (lsa-&gt;header);</a>
+<a name="ln265">      if (IS_OSPF6_DEBUG_SPF (PROCESS))</a>
+<a name="ln266">        {</a>
+<a name="ln267">          inet_ntop (AF_INET6, &amp;link_lsa-&gt;linklocal_addr, buf, sizeof (buf));</a>
+<a name="ln268">          zlog_debug (&quot;  nexthop %s from %s&quot;, buf, lsa-&gt;name);</a>
+<a name="ln269">        }</a>
+<a name="ln270"> </a>
+<a name="ln271">      if (i &lt; OSPF6_MULTI_PATH_LIMIT)</a>
+<a name="ln272">        {</a>
+<a name="ln273">          memcpy (&amp;w-&gt;nexthop[i].address, &amp;link_lsa-&gt;linklocal_addr,</a>
+<a name="ln274">                  sizeof (struct in6_addr));</a>
+<a name="ln275">          w-&gt;nexthop[i].ifindex = ifindex;</a>
+<a name="ln276">          i++;</a>
+<a name="ln277">        }</a>
+<a name="ln278">    }</a>
+<a name="ln279"> </a>
+<a name="ln280">  if (i == 0 &amp;&amp; IS_OSPF6_DEBUG_SPF (PROCESS))</a>
+<a name="ln281">    zlog_debug (&quot;No nexthop for %s found&quot;, w-&gt;name);</a>
+<a name="ln282">}</a>
+<a name="ln283"> </a>
+<a name="ln284">static int</a>
+<a name="ln285">ospf6_spf_install (struct ospf6_vertex *v,</a>
+<a name="ln286">                   struct ospf6_route_table *result_table)</a>
+<a name="ln287">{</a>
+<a name="ln288">  struct ospf6_route *route;</a>
+<a name="ln289">  int i, j;</a>
+<a name="ln290">  struct ospf6_vertex *prev;</a>
+<a name="ln291"> </a>
+<a name="ln292">  if (IS_OSPF6_DEBUG_SPF (PROCESS))</a>
+<a name="ln293">    zlog_debug (&quot;SPF install %s hops %d cost %d&quot;,</a>
+<a name="ln294">		v-&gt;name, v-&gt;hops, v-&gt;cost);</a>
+<a name="ln295"> </a>
+<a name="ln296">  route = ospf6_route_lookup (&amp;v-&gt;vertex_id, result_table);</a>
+<a name="ln297">  if (route &amp;&amp; route-&gt;path.cost &lt; v-&gt;cost)</a>
+<a name="ln298">    {</a>
+<a name="ln299">      if (IS_OSPF6_DEBUG_SPF (PROCESS))</a>
+<a name="ln300">        zlog_debug (&quot;  already installed with lower cost (%d), ignore&quot;,</a>
+<a name="ln301">		    route-&gt;path.cost);</a>
+<a name="ln302">      ospf6_vertex_delete (v);</a>
+<a name="ln303">      return -1;</a>
+<a name="ln304">    }</a>
+<a name="ln305">  else if (route &amp;&amp; route-&gt;path.cost == v-&gt;cost)</a>
+<a name="ln306">    {</a>
+<a name="ln307">      if (IS_OSPF6_DEBUG_SPF (PROCESS))</a>
+<a name="ln308">        zlog_debug (&quot;  another path found, merge&quot;);</a>
+<a name="ln309"> </a>
+<a name="ln310">      for (i = 0; i &lt; OSPF6_MULTI_PATH_LIMIT &amp;&amp;</a>
+<a name="ln311">           ospf6_nexthop_is_set (&amp;v-&gt;nexthop[i]); i++)</a>
+<a name="ln312">        {</a>
+<a name="ln313">          for (j = 0; j &lt; OSPF6_MULTI_PATH_LIMIT; j++)</a>
+<a name="ln314">            {</a>
+<a name="ln315">              if (ospf6_nexthop_is_set (&amp;route-&gt;nexthop[j]))</a>
+<a name="ln316">                {</a>
+<a name="ln317">                  if (ospf6_nexthop_is_same (&amp;route-&gt;nexthop[j],</a>
+<a name="ln318">                                             &amp;v-&gt;nexthop[i]))</a>
+<a name="ln319">                    break;</a>
+<a name="ln320">                  else</a>
+<a name="ln321">                    continue;</a>
+<a name="ln322">                }</a>
+<a name="ln323">              ospf6_nexthop_copy (&amp;route-&gt;nexthop[j], &amp;v-&gt;nexthop[i]);</a>
+<a name="ln324">              break;</a>
+<a name="ln325">            }</a>
+<a name="ln326">        }</a>
+<a name="ln327"> </a>
+<a name="ln328">      prev = (struct ospf6_vertex *) route-&gt;route_option;</a>
+<a name="ln329">      assert (prev-&gt;hops &lt;= v-&gt;hops);</a>
+<a name="ln330">      ospf6_vertex_delete (v);</a>
+<a name="ln331"> </a>
+<a name="ln332">      return -1;</a>
+<a name="ln333">    }</a>
+<a name="ln334"> </a>
+<a name="ln335">  /* There should be no case where candidate being installed (variable</a>
+<a name="ln336">     &quot;v&quot;) is closer than the one in the SPF tree (variable &quot;route&quot;).</a>
+<a name="ln337">     In the case something has gone wrong with the behavior of</a>
+<a name="ln338">     Priority-Queue. */</a>
+<a name="ln339"> </a>
+<a name="ln340">  /* the case where the route exists already is handled and returned</a>
+<a name="ln341">     up to here. */</a>
+<a name="ln342">  assert (route == NULL);</a>
+<a name="ln343"> </a>
+<a name="ln344">  route = ospf6_route_create ();</a>
+<a name="ln345">  memcpy (&amp;route-&gt;prefix, &amp;v-&gt;vertex_id, sizeof (struct prefix));</a>
+<a name="ln346">  route-&gt;type = OSPF6_DEST_TYPE_LINKSTATE;</a>
+<a name="ln347">  route-&gt;path.type = OSPF6_PATH_TYPE_INTRA;</a>
+<a name="ln348">  route-&gt;path.origin.type = v-&gt;lsa-&gt;header-&gt;type;</a>
+<a name="ln349">  route-&gt;path.origin.id = v-&gt;lsa-&gt;header-&gt;id;</a>
+<a name="ln350">  route-&gt;path.origin.adv_router = v-&gt;lsa-&gt;header-&gt;adv_router;</a>
+<a name="ln351">  route-&gt;path.metric_type = 1;</a>
+<a name="ln352">  route-&gt;path.cost = v-&gt;cost;</a>
+<a name="ln353">  route-&gt;path.cost_e2 = v-&gt;hops;</a>
+<a name="ln354">  route-&gt;path.router_bits = v-&gt;capability;</a>
+<a name="ln355">  route-&gt;path.options[0] = v-&gt;options[0];</a>
+<a name="ln356">  route-&gt;path.options[1] = v-&gt;options[1];</a>
+<a name="ln357">  route-&gt;path.options[2] = v-&gt;options[2];</a>
+<a name="ln358"> </a>
+<a name="ln359">  for (i = 0; i &lt; OSPF6_MULTI_PATH_LIMIT &amp;&amp;</a>
+<a name="ln360">       ospf6_nexthop_is_set (&amp;v-&gt;nexthop[i]); i++)</a>
+<a name="ln361">    ospf6_nexthop_copy (&amp;route-&gt;nexthop[i], &amp;v-&gt;nexthop[i]);</a>
+<a name="ln362"> </a>
+<a name="ln363">  if (v-&gt;parent)</a>
+<a name="ln364">    listnode_add_sort (v-&gt;parent-&gt;child_list, v);</a>
+<a name="ln365">  route-&gt;route_option = v;</a>
+<a name="ln366"> </a>
+<a name="ln367">  ospf6_route_add (route, result_table);</a>
+<a name="ln368">  return 0;</a>
+<a name="ln369">}</a>
+<a name="ln370"> </a>
+<a name="ln371">void</a>
+<a name="ln372">ospf6_spf_table_finish (struct ospf6_route_table *result_table)</a>
+<a name="ln373">{</a>
+<a name="ln374">  struct ospf6_route *route, *nroute;</a>
+<a name="ln375">  struct ospf6_vertex *v;</a>
+<a name="ln376">  for (route = ospf6_route_head (result_table); route;</a>
+<a name="ln377">       route = nroute)</a>
+<a name="ln378">    {</a>
+<a name="ln379">      nroute = ospf6_route_next (route);</a>
+<a name="ln380">      v = (struct ospf6_vertex *) route-&gt;route_option;</a>
+<a name="ln381">      ospf6_vertex_delete (v);</a>
+<a name="ln382">      ospf6_route_remove (route, result_table);</a>
+<a name="ln383">    }</a>
+<a name="ln384">}</a>
+<a name="ln385"> </a>
+<a name="ln386">static const char *ospf6_spf_reason_str[] =</a>
+<a name="ln387">  {</a>
+<a name="ln388">    &quot;R+&quot;,</a>
+<a name="ln389">    &quot;R-&quot;,</a>
+<a name="ln390">    &quot;N+&quot;,</a>
+<a name="ln391">    &quot;N-&quot;,</a>
+<a name="ln392">    &quot;L+&quot;,</a>
+<a name="ln393">    &quot;L-&quot;,</a>
+<a name="ln394">    &quot;R*&quot;,</a>
+<a name="ln395">    &quot;N*&quot;,</a>
+<a name="ln396">  };</a>
+<a name="ln397"> </a>
+<a name="ln398">void ospf6_spf_reason_string (unsigned int reason, char *buf, int size)</a>
+<a name="ln399">{</a>
+<a name="ln400">  size_t bit;</a>
+<a name="ln401">  int len = 0;</a>
+<a name="ln402"> </a>
+<a name="ln403">  if (!buf)</a>
+<a name="ln404">    return;</a>
+<a name="ln405"> </a>
+<a name="ln406">  for (bit = 0; bit &lt; array_size(ospf6_spf_reason_str); bit++)</a>
+<a name="ln407">    {</a>
+<a name="ln408">      if ((reason &amp; (1 &lt;&lt; bit)) &amp;&amp; (len &lt; size))</a>
+<a name="ln409">	{</a>
+<a name="ln410">	  len += snprintf((buf + len), (size - len), &quot;%s%s&quot;,</a>
+<a name="ln411">			  (len &gt; 0) ? &quot;, &quot; : &quot;&quot;, ospf6_spf_reason_str[bit]);</a>
+<a name="ln412">	}</a>
+<a name="ln413">    }</a>
+<a name="ln414">}</a>
+<a name="ln415"> </a>
+<a name="ln416">/* RFC2328 16.1.  Calculating the shortest-path tree for an area */</a>
+<a name="ln417">/* RFC2740 3.8.1.  Calculating the shortest path tree for an area */</a>
+<a name="ln418">void</a>
+<a name="ln419">ospf6_spf_calculation (u_int32_t router_id,</a>
+<a name="ln420">                       struct ospf6_route_table *result_table,</a>
+<a name="ln421">                       struct ospf6_area *oa)</a>
+<a name="ln422">{</a>
+<a name="ln423">  struct pqueue *candidate_list;</a>
+<a name="ln424">  struct ospf6_vertex *root, *v, *w;</a>
+<a name="ln425">  int i;</a>
+<a name="ln426">  int size;</a>
+<a name="ln427">  caddr_t lsdesc;</a>
+<a name="ln428">  struct ospf6_lsa *lsa;</a>
+<a name="ln429"> </a>
+<a name="ln430">  ospf6_spf_table_finish (result_table);</a>
+<a name="ln431"> </a>
+<a name="ln432">  /* Install the calculating router itself as the root of the SPF tree */</a>
+<a name="ln433">  /* construct root vertex */</a>
+<a name="ln434">  lsa = ospf6_lsdb_lookup (htons (OSPF6_LSTYPE_ROUTER), htonl (0),</a>
+<a name="ln435">                           router_id, oa-&gt;lsdb);</a>
+<a name="ln436">  if (lsa == NULL)</a>
+<a name="ln437">    return;</a>
+<a name="ln438"> </a>
+<a name="ln439">  /* initialize */</a>
+<a name="ln440">  candidate_list = pqueue_create ();</a>
+<a name="ln441">  candidate_list-&gt;cmp = ospf6_vertex_cmp;</a>
+<a name="ln442"> </a>
+<a name="ln443">  root = ospf6_vertex_create (lsa);</a>
+<a name="ln444">  root-&gt;area = oa;</a>
+<a name="ln445">  root-&gt;cost = 0;</a>
+<a name="ln446">  root-&gt;hops = 0;</a>
+<a name="ln447">  root-&gt;nexthop[0].ifindex = 0; /* loopbak I/F is better ... */</a>
+<a name="ln448">  inet_pton (AF_INET6, &quot;::1&quot;, &amp;root-&gt;nexthop[0].address);</a>
+<a name="ln449"> </a>
+<a name="ln450">  /* Actually insert root to the candidate-list as the only candidate */</a>
+<a name="ln451">  pqueue_enqueue (root, candidate_list);</a>
+<a name="ln452"> </a>
+<a name="ln453">  /* Iterate until candidate-list becomes empty */</a>
+<a name="ln454">  while (candidate_list-&gt;size)</a>
+<a name="ln455">    {</a>
+<a name="ln456">      /* get closest candidate from priority queue */</a>
+<a name="ln457">      v = pqueue_dequeue (candidate_list);</a>
+<a name="ln458"> </a>
+<a name="ln459">      /* installing may result in merging or rejecting of the vertex */</a>
+<a name="ln460">      if (ospf6_spf_install (v, result_table) &lt; 0)</a>
+<a name="ln461">        continue;</a>
+<a name="ln462"> </a>
+<a name="ln463">      /* Skip overloaded routers */</a>
+<a name="ln464">      if ((OSPF6_LSA_IS_TYPE (ROUTER, v-&gt;lsa) &amp;&amp;</a>
+<a name="ln465">	   ospf6_router_is_stub_router (v-&gt;lsa)))</a>
+<a name="ln466">	continue;</a>
+<a name="ln467"> </a>
+<a name="ln468">      /* For each LS description in the just-added vertex V's LSA */</a>
+<a name="ln469">      size = (VERTEX_IS_TYPE (ROUTER, v) ?</a>
+<a name="ln470">              sizeof (struct ospf6_router_lsdesc) :</a>
+<a name="ln471">              sizeof (struct ospf6_network_lsdesc));</a>
+<a name="ln472">      for (lsdesc = OSPF6_LSA_HEADER_END (v-&gt;lsa-&gt;header) + 4;</a>
+<a name="ln473">           lsdesc + size &lt;= OSPF6_LSA_END (v-&gt;lsa-&gt;header); lsdesc += size)</a>
+<a name="ln474">        {</a>
+<a name="ln475">          lsa = ospf6_lsdesc_lsa (lsdesc, v);</a>
+<a name="ln476">          if (lsa == NULL)</a>
+<a name="ln477">            continue;</a>
+<a name="ln478"> </a>
+<a name="ln479">          if (! ospf6_lsdesc_backlink (lsa, lsdesc, v))</a>
+<a name="ln480">            continue;</a>
+<a name="ln481"> </a>
+<a name="ln482">          w = ospf6_vertex_create (lsa);</a>
+<a name="ln483">          w-&gt;area = oa;</a>
+<a name="ln484">          w-&gt;parent = v;</a>
+<a name="ln485">          if (VERTEX_IS_TYPE (ROUTER, v))</a>
+<a name="ln486">            {</a>
+<a name="ln487">              w-&gt;cost = v-&gt;cost + ROUTER_LSDESC_GET_METRIC (lsdesc);</a>
+<a name="ln488">              w-&gt;hops = v-&gt;hops + (VERTEX_IS_TYPE (NETWORK, w) ? 0 : 1);</a>
+<a name="ln489">            }</a>
+<a name="ln490">          else /* NETWORK */</a>
+<a name="ln491">            {</a>
+<a name="ln492">              w-&gt;cost = v-&gt;cost;</a>
+<a name="ln493">              w-&gt;hops = v-&gt;hops + 1;</a>
+<a name="ln494">            }</a>
+<a name="ln495"> </a>
+<a name="ln496">          /* nexthop calculation */</a>
+<a name="ln497">          if (w-&gt;hops == 0)</a>
+<a name="ln498">            w-&gt;nexthop[0].ifindex = ROUTER_LSDESC_GET_IFID (lsdesc);</a>
+<a name="ln499">          else if (w-&gt;hops == 1 &amp;&amp; v-&gt;hops == 0)</a>
+<a name="ln500">            ospf6_nexthop_calc (w, v, lsdesc);</a>
+<a name="ln501">          else</a>
+<a name="ln502">            {</a>
+<a name="ln503">              for (i = 0; i &lt; OSPF6_MULTI_PATH_LIMIT &amp;&amp;</a>
+<a name="ln504">                   ospf6_nexthop_is_set (&amp;v-&gt;nexthop[i]); i++)</a>
+<a name="ln505">                ospf6_nexthop_copy (&amp;w-&gt;nexthop[i], &amp;v-&gt;nexthop[i]);</a>
+<a name="ln506">            }</a>
+<a name="ln507"> </a>
+<a name="ln508">          /* add new candidate to the candidate_list */</a>
+<a name="ln509">          if (IS_OSPF6_DEBUG_SPF (PROCESS))</a>
+<a name="ln510">            zlog_debug (&quot;  New candidate: %s hops %d cost %d&quot;,</a>
+<a name="ln511">			w-&gt;name, w-&gt;hops, w-&gt;cost);</a>
+<a name="ln512">          pqueue_enqueue (w, candidate_list);</a>
+<a name="ln513">        }</a>
+<a name="ln514">    }</a>
+<a name="ln515"> </a>
+<a name="ln516">  pqueue_delete (candidate_list);</a>
+<a name="ln517"> </a>
+<a name="ln518">  oa-&gt;spf_calculation++;</a>
+<a name="ln519">}</a>
+<a name="ln520"> </a>
+<a name="ln521">static void</a>
+<a name="ln522">ospf6_spf_log_database (struct ospf6_area *oa)</a>
+<a name="ln523">{</a>
+<a name="ln524">  char *p, *end, buffer[256];</a>
+<a name="ln525">  struct listnode *node;</a>
+<a name="ln526">  struct ospf6_interface *oi;</a>
+<a name="ln527"> </a>
+<a name="ln528">  p = buffer;</a>
+<a name="ln529">  end = buffer + sizeof (buffer);</a>
+<a name="ln530"> </a>
+<a name="ln531">  snprintf (p, end - p, &quot;SPF on DB (#LSAs):&quot;);</a>
+<a name="ln532">  p = (buffer + strlen (buffer) &lt; end ? buffer + strlen (buffer) : end);</a>
+<a name="ln533">  snprintf (p, end - p, &quot; Area %s: %d&quot;, oa-&gt;name, oa-&gt;lsdb-&gt;count);</a>
+<a name="ln534">  p = (buffer + strlen (buffer) &lt; end ? buffer + strlen (buffer) : end);</a>
+<a name="ln535"> </a>
+<a name="ln536">  for (ALL_LIST_ELEMENTS_RO (oa-&gt;if_list, node, oi))</a>
+<a name="ln537">    {</a>
+<a name="ln538">      snprintf (p, end - p, &quot; I/F %s: %d&quot;,</a>
+<a name="ln539">                oi-&gt;interface-&gt;name, oi-&gt;lsdb-&gt;count);</a>
+<a name="ln540">      p = (buffer + strlen (buffer) &lt; end ? buffer + strlen (buffer) : end);</a>
+<a name="ln541">    }</a>
+<a name="ln542"> </a>
+<a name="ln543">  zlog_debug (&quot;%s&quot;, buffer);</a>
+<a name="ln544">}</a>
+<a name="ln545"> </a>
+<a name="ln546">static int</a>
+<a name="ln547">ospf6_spf_calculation_thread (struct thread *t)</a>
+<a name="ln548">{</a>
+<a name="ln549">  struct ospf6_area *oa;</a>
+<a name="ln550">  struct ospf6 *ospf6;</a>
+<a name="ln551">  struct timeval start, end, runtime;</a>
+<a name="ln552">  struct listnode *node;</a>
+<a name="ln553">  struct ospf6_route *route;</a>
+<a name="ln554">  int areas_processed = 0;</a>
+<a name="ln555">  char rbuf[32];</a>
+<a name="ln556"> </a>
+<a name="ln557">  ospf6 = (struct ospf6 *)THREAD_ARG (t);</a>
+<a name="ln558">  ospf6-&gt;t_spf_calc = NULL;</a>
+<a name="ln559"> </a>
+<a name="ln560">  /* execute SPF calculation */</a>
+<a name="ln561">  quagga_gettime (QUAGGA_CLK_MONOTONIC, &amp;start);</a>
+<a name="ln562"> </a>
+<a name="ln563">  for (ALL_LIST_ELEMENTS_RO(ospf6-&gt;area_list, node, oa))</a>
+<a name="ln564">    {</a>
+<a name="ln565"> </a>
+<a name="ln566">      if (oa == ospf6-&gt;backbone)</a>
+<a name="ln567">	continue;</a>
+<a name="ln568"> </a>
+<a name="ln569">      if (IS_OSPF6_DEBUG_SPF (PROCESS))</a>
+<a name="ln570">	zlog_debug (&quot;SPF calculation for Area %s&quot;, oa-&gt;name);</a>
+<a name="ln571">      if (IS_OSPF6_DEBUG_SPF (DATABASE))</a>
+<a name="ln572">	ospf6_spf_log_database (oa);</a>
+<a name="ln573"> </a>
+<a name="ln574">      ospf6_spf_calculation (ospf6-&gt;router_id, oa-&gt;spf_table, oa);</a>
+<a name="ln575">      ospf6_intra_route_calculation (oa);</a>
+<a name="ln576">      ospf6_intra_brouter_calculation (oa);</a>
+<a name="ln577"> </a>
+<a name="ln578">      areas_processed++;</a>
+<a name="ln579">    }</a>
+<a name="ln580"> </a>
+<a name="ln581">  if (ospf6-&gt;backbone)</a>
+<a name="ln582">    {</a>
+<a name="ln583">      if (IS_OSPF6_DEBUG_SPF (PROCESS))</a>
+<a name="ln584">	zlog_debug (&quot;SPF calculation for Backbone area %s&quot;,</a>
+<a name="ln585">		    ospf6-&gt;backbone-&gt;name);</a>
+<a name="ln586">      if (IS_OSPF6_DEBUG_SPF (DATABASE))</a>
+<a name="ln587">	ospf6_spf_log_database(ospf6-&gt;backbone);</a>
+<a name="ln588"> </a>
+<a name="ln589">      ospf6_spf_calculation(ospf6-&gt;router_id, ospf6-&gt;backbone-&gt;spf_table,</a>
+<a name="ln590">			    ospf6-&gt;backbone);</a>
+<a name="ln591">      ospf6_intra_route_calculation(ospf6-&gt;backbone);</a>
+<a name="ln592">      ospf6_intra_brouter_calculation(ospf6-&gt;backbone);</a>
+<a name="ln593">      areas_processed++;</a>
+<a name="ln594">    }</a>
+<a name="ln595"> </a>
+<a name="ln596">  /* Redo summaries if required */</a>
+<a name="ln597">  for (route = ospf6_route_head (ospf6-&gt;route_table); route;</a>
+<a name="ln598">       route = ospf6_route_next (route))</a>
+<a name="ln599">    ospf6_abr_originate_summary(route);</a>
+<a name="ln600"> </a>
+<a name="ln601">  quagga_gettime (QUAGGA_CLK_MONOTONIC, &amp;end);</a>
+<a name="ln602">  timersub (&amp;end, &amp;start, &amp;runtime);</a>
+<a name="ln603"> </a>
+<a name="ln604">  ospf6-&gt;ts_spf_duration = runtime;</a>
+<a name="ln605"> </a>
+<a name="ln606">  ospf6_spf_reason_string(ospf6-&gt;spf_reason, rbuf, sizeof(rbuf));</a>
+<a name="ln607"> </a>
+<a name="ln608">  if (IS_OSPF6_DEBUG_SPF (PROCESS) || IS_OSPF6_DEBUG_SPF (TIME))</a>
+<a name="ln609">    zlog_debug (&quot;SPF runtime: %lld sec %lld usec&quot;,</a>
+<a name="ln610">		(long long)runtime.tv_sec, (long long)runtime.tv_usec);</a>
+<a name="ln611"> </a>
+<a name="ln612">  zlog_info(&quot;SPF processing: # Areas: %d, SPF runtime: %lld sec %lld usec, &quot;</a>
+<a name="ln613">	    &quot;Reason: %s\n&quot;, areas_processed,</a>
+<a name="ln614">	    (long long)runtime.tv_sec, (long long)runtime.tv_usec,</a>
+<a name="ln615">	    rbuf);</a>
+<a name="ln616">  ospf6-&gt;last_spf_reason = ospf6-&gt;spf_reason;</a>
+<a name="ln617">  ospf6_reset_spf_reason(ospf6);</a>
+<a name="ln618">  return 0;</a>
+<a name="ln619">}</a>
+<a name="ln620"> </a>
+<a name="ln621">/* Add schedule for SPF calculation.  To avoid frequenst SPF calc, we</a>
+<a name="ln622">   set timer for SPF calc. */</a>
+<a name="ln623">void</a>
+<a name="ln624">ospf6_spf_schedule (struct ospf6 *ospf6, unsigned int reason)</a>
+<a name="ln625">{</a>
+<a name="ln626">  unsigned long delay, elapsed, ht;</a>
+<a name="ln627">  struct timeval now, result;</a>
+<a name="ln628"> </a>
+<a name="ln629">  ospf6_set_spf_reason(ospf6, reason);</a>
+<a name="ln630"> </a>
+<a name="ln631">  if (IS_OSPF6_DEBUG_SPF(PROCESS) || IS_OSPF6_DEBUG_SPF (TIME))</a>
+<a name="ln632">    {</a>
+<a name="ln633">      char rbuf[32];</a>
+<a name="ln634">      ospf6_spf_reason_string(reason, rbuf, sizeof(rbuf));</a>
+<a name="ln635">      zlog_debug (&quot;SPF: calculation timer scheduled (reason %s)&quot;, rbuf);</a>
+<a name="ln636">    }</a>
+<a name="ln637"> </a>
+<a name="ln638">  /* OSPF instance does not exist. */</a>
+<a name="ln639">  if (ospf6 == NULL)</a>
+<a name="ln640">    return;</a>
+<a name="ln641"> </a>
+<a name="ln642">  /* SPF calculation timer is already scheduled. */</a>
+<a name="ln643">  if (ospf6-&gt;t_spf_calc)</a>
+<a name="ln644">    {</a>
+<a name="ln645">      if (IS_OSPF6_DEBUG_SPF(PROCESS) || IS_OSPF6_DEBUG_SPF (TIME))</a>
+<a name="ln646">        zlog_debug (&quot;SPF: calculation timer is already scheduled: %p&quot;,</a>
+<a name="ln647">                    (void *)ospf6-&gt;t_spf_calc);</a>
+<a name="ln648">      return;</a>
+<a name="ln649">    }</a>
+<a name="ln650"> </a>
+<a name="ln651">  /* XXX Monotic timers: we only care about relative time here. */</a>
+<a name="ln652">  now = recent_relative_time ();</a>
+<a name="ln653">  timersub (&amp;now, &amp;ospf6-&gt;ts_spf, &amp;result);</a>
+<a name="ln654"> </a>
+<a name="ln655">  elapsed = (result.tv_sec * 1000) + (result.tv_usec / 1000);</a>
+<a name="ln656">  ht = ospf6-&gt;spf_holdtime * ospf6-&gt;spf_hold_multiplier;</a>
+<a name="ln657"> </a>
+<a name="ln658">  if (ht &gt; ospf6-&gt;spf_max_holdtime)</a>
+<a name="ln659">    ht = ospf6-&gt;spf_max_holdtime;</a>
+<a name="ln660"> </a>
+<a name="ln661">  /* Get SPF calculation delay time. */</a>
+<a name="ln662">  if (elapsed &lt; ht)</a>
+<a name="ln663">    {</a>
+<a name="ln664">      /* Got an event within the hold time of last SPF. We need to</a>
+<a name="ln665">       * increase the hold_multiplier, if it's not already at/past</a>
+<a name="ln666">       * maximum value, and wasn't already increased..</a>
+<a name="ln667">       */</a>
+<a name="ln668">      if (ht &lt; ospf6-&gt;spf_max_holdtime)</a>
+<a name="ln669">        ospf6-&gt;spf_hold_multiplier++;</a>
+<a name="ln670"> </a>
+<a name="ln671">      /* always honour the SPF initial delay */</a>
+<a name="ln672">      if ( (ht - elapsed) &lt; ospf6-&gt;spf_delay)</a>
+<a name="ln673">        delay = ospf6-&gt;spf_delay;</a>
+<a name="ln674">      else</a>
+<a name="ln675">        delay = ht - elapsed;</a>
+<a name="ln676">    }</a>
+<a name="ln677">  else</a>
+<a name="ln678">    {</a>
+<a name="ln679">      /* Event is past required hold-time of last SPF */</a>
+<a name="ln680">      delay = ospf6-&gt;spf_delay;</a>
+<a name="ln681">      ospf6-&gt;spf_hold_multiplier = 1;</a>
+<a name="ln682">    }</a>
+<a name="ln683"> </a>
+<a name="ln684">  if (IS_OSPF6_DEBUG_SPF(PROCESS) || IS_OSPF6_DEBUG_SPF (TIME))</a>
+<a name="ln685">    zlog_debug (&quot;SPF: calculation timer delay = %ld&quot;, delay);</a>
+<a name="ln686"> </a>
+<a name="ln687">  zlog_info (&quot;SPF: Scheduled in %ld msec&quot;, delay);</a>
+<a name="ln688"> </a>
+<a name="ln689">  ospf6-&gt;t_spf_calc =</a>
+<a name="ln690">    thread_add_timer_msec (master, ospf6_spf_calculation_thread, ospf6, delay);</a>
+<a name="ln691">}</a>
+<a name="ln692"> </a>
+<a name="ln693">void</a>
+<a name="ln694">ospf6_spf_display_subtree (struct vty *vty, const char *prefix, int rest,</a>
+<a name="ln695">                           struct ospf6_vertex *v)</a>
+<a name="ln696">{</a>
+<a name="ln697">  struct listnode *node, *nnode;</a>
+<a name="ln698">  struct ospf6_vertex *c;</a>
+<a name="ln699">  char *next_prefix;</a>
+<a name="ln700">  int len;</a>
+<a name="ln701">  int restnum;</a>
+<a name="ln702"> </a>
+<a name="ln703">  /* &quot;prefix&quot; is the space prefix of the display line */</a>
+<a name="ln704">  vty_out (vty, &quot;%s+-%s [%d]%s&quot;, prefix, v-&gt;name, v-&gt;cost, VNL);</a>
+<a name="ln705"> </a>
+<a name="ln706">  len = strlen (prefix) + 4;</a>
+<a name="ln707">  next_prefix = (char *) malloc (len);</a>
+<a name="ln708">  if (next_prefix == NULL)</a>
+<a name="ln709">    {</a>
+<a name="ln710">      vty_out (vty, &quot;malloc failed%s&quot;, VNL);</a>
+<a name="ln711">      return;</a>
+<a name="ln712">    }</a>
+<a name="ln713">  snprintf (next_prefix, len, &quot;%s%s&quot;, prefix, (rest ? &quot;|  &quot; : &quot;   &quot;));</a>
+<a name="ln714"> </a>
+<a name="ln715">  restnum = listcount (v-&gt;child_list);</a>
+<a name="ln716">  for (ALL_LIST_ELEMENTS (v-&gt;child_list, node, nnode, c))</a>
+<a name="ln717">    {</a>
+<a name="ln718">      restnum--;</a>
+<a name="ln719">      ospf6_spf_display_subtree (vty, next_prefix, restnum, c);</a>
+<a name="ln720">    }</a>
+<a name="ln721"> </a>
+<a name="ln722">  free (next_prefix);</a>
+<a name="ln723">}</a>
+<a name="ln724"> </a>
+<a name="ln725">DEFUN (debug_ospf6_spf_process,</a>
+<a name="ln726">       debug_ospf6_spf_process_cmd,</a>
+<a name="ln727">       &quot;debug ospf6 spf process&quot;,</a>
+<a name="ln728">       DEBUG_STR</a>
+<a name="ln729">       OSPF6_STR</a>
+<a name="ln730">       &quot;Debug SPF Calculation\n&quot;</a>
+<a name="ln731">       &quot;Debug Detailed SPF Process\n&quot;</a>
+<a name="ln732">      )</a>
+<a name="ln733">{</a>
+<a name="ln734">  unsigned char level = 0;</a>
+<a name="ln735">  level = OSPF6_DEBUG_SPF_PROCESS;</a>
+<a name="ln736">  OSPF6_DEBUG_SPF_ON (level);</a>
+<a name="ln737">  return CMD_SUCCESS;</a>
+<a name="ln738">}</a>
+<a name="ln739"> </a>
+<a name="ln740">DEFUN (debug_ospf6_spf_time,</a>
+<a name="ln741">       debug_ospf6_spf_time_cmd,</a>
+<a name="ln742">       &quot;debug ospf6 spf time&quot;,</a>
+<a name="ln743">       DEBUG_STR</a>
+<a name="ln744">       OSPF6_STR</a>
+<a name="ln745">       &quot;Debug SPF Calculation\n&quot;</a>
+<a name="ln746">       &quot;Measure time taken by SPF Calculation\n&quot;</a>
+<a name="ln747">      )</a>
+<a name="ln748">{</a>
+<a name="ln749">  unsigned char level = 0;</a>
+<a name="ln750">  level = OSPF6_DEBUG_SPF_TIME;</a>
+<a name="ln751">  OSPF6_DEBUG_SPF_ON (level);</a>
+<a name="ln752">  return CMD_SUCCESS;</a>
+<a name="ln753">}</a>
+<a name="ln754"> </a>
+<a name="ln755">DEFUN (debug_ospf6_spf_database,</a>
+<a name="ln756">       debug_ospf6_spf_database_cmd,</a>
+<a name="ln757">       &quot;debug ospf6 spf database&quot;,</a>
+<a name="ln758">       DEBUG_STR</a>
+<a name="ln759">       OSPF6_STR</a>
+<a name="ln760">       &quot;Debug SPF Calculation\n&quot;</a>
+<a name="ln761">       &quot;Log number of LSAs at SPF Calculation time\n&quot;</a>
+<a name="ln762">      )</a>
+<a name="ln763">{</a>
+<a name="ln764">  unsigned char level = 0;</a>
+<a name="ln765">  level = OSPF6_DEBUG_SPF_DATABASE;</a>
+<a name="ln766">  OSPF6_DEBUG_SPF_ON (level);</a>
+<a name="ln767">  return CMD_SUCCESS;</a>
+<a name="ln768">}</a>
+<a name="ln769"> </a>
+<a name="ln770">DEFUN (no_debug_ospf6_spf_process,</a>
+<a name="ln771">       no_debug_ospf6_spf_process_cmd,</a>
+<a name="ln772">       &quot;no debug ospf6 spf process&quot;,</a>
+<a name="ln773">       NO_STR</a>
+<a name="ln774">       DEBUG_STR</a>
+<a name="ln775">       OSPF6_STR</a>
+<a name="ln776">       &quot;Quit Debugging SPF Calculation\n&quot;</a>
+<a name="ln777">       &quot;Quit Debugging Detailed SPF Process\n&quot;</a>
+<a name="ln778">      )</a>
+<a name="ln779">{</a>
+<a name="ln780">  unsigned char level = 0;</a>
+<a name="ln781">  level = OSPF6_DEBUG_SPF_PROCESS;</a>
+<a name="ln782">  OSPF6_DEBUG_SPF_OFF (level);</a>
+<a name="ln783">  return CMD_SUCCESS;</a>
+<a name="ln784">}</a>
+<a name="ln785"> </a>
+<a name="ln786">DEFUN (no_debug_ospf6_spf_time,</a>
+<a name="ln787">       no_debug_ospf6_spf_time_cmd,</a>
+<a name="ln788">       &quot;no debug ospf6 spf time&quot;,</a>
+<a name="ln789">       NO_STR</a>
+<a name="ln790">       DEBUG_STR</a>
+<a name="ln791">       OSPF6_STR</a>
+<a name="ln792">       &quot;Quit Debugging SPF Calculation\n&quot;</a>
+<a name="ln793">       &quot;Quit Measuring time taken by SPF Calculation\n&quot;</a>
+<a name="ln794">      )</a>
+<a name="ln795">{</a>
+<a name="ln796">  unsigned char level = 0;</a>
+<a name="ln797">  level = OSPF6_DEBUG_SPF_TIME;</a>
+<a name="ln798">  OSPF6_DEBUG_SPF_OFF (level);</a>
+<a name="ln799">  return CMD_SUCCESS;</a>
+<a name="ln800">}</a>
+<a name="ln801"> </a>
+<a name="ln802">DEFUN (no_debug_ospf6_spf_database,</a>
+<a name="ln803">       no_debug_ospf6_spf_database_cmd,</a>
+<a name="ln804">       &quot;no debug ospf6 spf database&quot;,</a>
+<a name="ln805">       NO_STR</a>
+<a name="ln806">       DEBUG_STR</a>
+<a name="ln807">       OSPF6_STR</a>
+<a name="ln808">       &quot;Debug SPF Calculation\n&quot;</a>
+<a name="ln809">       &quot;Quit Logging number of LSAs at SPF Calculation time\n&quot;</a>
+<a name="ln810">      )</a>
+<a name="ln811">{</a>
+<a name="ln812">  unsigned char level = 0;</a>
+<a name="ln813">  level = OSPF6_DEBUG_SPF_DATABASE;</a>
+<a name="ln814">  OSPF6_DEBUG_SPF_OFF (level);</a>
+<a name="ln815">  return CMD_SUCCESS;</a>
+<a name="ln816">}</a>
+<a name="ln817"> </a>
+<a name="ln818">static int</a>
+<a name="ln819">ospf6_timers_spf_set (struct vty *vty, unsigned int delay,</a>
+<a name="ln820">                     unsigned int hold,</a>
+<a name="ln821">                     unsigned int max)</a>
+<a name="ln822">{</a>
+<a name="ln823">  struct ospf6 *ospf = vty-&gt;index;</a>
+<a name="ln824"> </a>
+<a name="ln825">  ospf-&gt;spf_delay = delay;</a>
+<a name="ln826">  ospf-&gt;spf_holdtime = hold;</a>
+<a name="ln827">  ospf-&gt;spf_max_holdtime = max;</a>
+<a name="ln828"> </a>
+<a name="ln829">  return CMD_SUCCESS;</a>
+<a name="ln830">}</a>
+<a name="ln831"> </a>
+<a name="ln832">DEFUN (ospf6_timers_throttle_spf,</a>
+<a name="ln833">       ospf6_timers_throttle_spf_cmd,</a>
+<a name="ln834">       &quot;timers throttle spf &lt;0-600000&gt; &lt;0-600000&gt; &lt;0-600000&gt;&quot;,</a>
+<a name="ln835">       &quot;Adjust routing timers\n&quot;</a>
+<a name="ln836">       &quot;Throttling adaptive timer\n&quot;</a>
+<a name="ln837">       &quot;OSPF6 SPF timers\n&quot;</a>
+<a name="ln838">       &quot;Delay (msec) from first change received till SPF calculation\n&quot;</a>
+<a name="ln839">       &quot;Initial hold time (msec) between consecutive SPF calculations\n&quot;</a>
+<a name="ln840">       &quot;Maximum hold time (msec)\n&quot;)</a>
+<a name="ln841">{</a>
+<a name="ln842">  unsigned int delay, hold, max;</a>
+<a name="ln843"> </a>
+<a name="ln844">  if (argc != 3)</a>
+<a name="ln845">    {</a>
+<a name="ln846">      vty_out (vty, &quot;Insufficient arguments%s&quot;, VTY_NEWLINE);</a>
+<a name="ln847">      return CMD_WARNING;</a>
+<a name="ln848">    }</a>
+<a name="ln849"> </a>
+<a name="ln850">  VTY_GET_INTEGER_RANGE (&quot;SPF delay timer&quot;, delay, argv[0], 0, 600000);</a>
+<a name="ln851">  VTY_GET_INTEGER_RANGE (&quot;SPF hold timer&quot;, hold, argv[1], 0, 600000);</a>
+<a name="ln852">  VTY_GET_INTEGER_RANGE (&quot;SPF max-hold timer&quot;, max, argv[2], 0, 600000);</a>
+<a name="ln853"> </a>
+<a name="ln854">  return ospf6_timers_spf_set (vty, delay, hold, max);</a>
+<a name="ln855">}</a>
+<a name="ln856"> </a>
+<a name="ln857">DEFUN (no_ospf6_timers_throttle_spf,</a>
+<a name="ln858">       no_ospf6_timers_throttle_spf_cmd,</a>
+<a name="ln859">       &quot;no timers throttle spf&quot;,</a>
+<a name="ln860">       NO_STR</a>
+<a name="ln861">       &quot;Adjust routing timers\n&quot;</a>
+<a name="ln862">       &quot;Throttling adaptive timer\n&quot;</a>
+<a name="ln863">       &quot;OSPF6 SPF timers\n&quot;)</a>
+<a name="ln864">{</a>
+<a name="ln865">  return ospf6_timers_spf_set (vty,</a>
+<a name="ln866">                              OSPF_SPF_DELAY_DEFAULT,</a>
+<a name="ln867">                              OSPF_SPF_HOLDTIME_DEFAULT,</a>
+<a name="ln868">                              OSPF_SPF_MAX_HOLDTIME_DEFAULT);</a>
+<a name="ln869">}</a>
+<a name="ln870"> </a>
+<a name="ln871">int</a>
+<a name="ln872">config_write_ospf6_debug_spf (struct vty *vty)</a>
+<a name="ln873">{</a>
+<a name="ln874">  if (IS_OSPF6_DEBUG_SPF (PROCESS))</a>
+<a name="ln875">    vty_out (vty, &quot;debug ospf6 spf process%s&quot;, VNL);</a>
+<a name="ln876">  if (IS_OSPF6_DEBUG_SPF (TIME))</a>
+<a name="ln877">    vty_out (vty, &quot;debug ospf6 spf time%s&quot;, VNL);</a>
+<a name="ln878">  if (IS_OSPF6_DEBUG_SPF (DATABASE))</a>
+<a name="ln879">    vty_out (vty, &quot;debug ospf6 spf database%s&quot;, VNL);</a>
+<a name="ln880">  return 0;</a>
+<a name="ln881">}</a>
+<a name="ln882"> </a>
+<a name="ln883">void</a>
+<a name="ln884">ospf6_spf_config_write (struct vty *vty)</a>
+<a name="ln885">{</a>
+<a name="ln886"> </a>
+<a name="ln887">  if (ospf6-&gt;spf_delay != OSPF_SPF_DELAY_DEFAULT ||</a>
+<a name="ln888">      ospf6-&gt;spf_holdtime != OSPF_SPF_HOLDTIME_DEFAULT ||</a>
+<a name="ln889">      ospf6-&gt;spf_max_holdtime != OSPF_SPF_MAX_HOLDTIME_DEFAULT)</a>
+<a name="ln890">    vty_out (vty, &quot; timers throttle spf %d %d %d%s&quot;,</a>
+<a name="ln891">	     ospf6-&gt;spf_delay, ospf6-&gt;spf_holdtime,</a>
+<a name="ln892">	     ospf6-&gt;spf_max_holdtime, VTY_NEWLINE);</a>
+<a name="ln893"> </a>
+<a name="ln894">}</a>
+<a name="ln895"> </a>
+<a name="ln896">void</a>
+<a name="ln897">install_element_ospf6_debug_spf (void)</a>
+<a name="ln898">{</a>
+<a name="ln899">  install_element (ENABLE_NODE, &amp;debug_ospf6_spf_process_cmd);</a>
+<a name="ln900">  install_element (ENABLE_NODE, &amp;debug_ospf6_spf_time_cmd);</a>
+<a name="ln901">  install_element (ENABLE_NODE, &amp;debug_ospf6_spf_database_cmd);</a>
+<a name="ln902">  install_element (ENABLE_NODE, &amp;no_debug_ospf6_spf_process_cmd);</a>
+<a name="ln903">  install_element (ENABLE_NODE, &amp;no_debug_ospf6_spf_time_cmd);</a>
+<a name="ln904">  install_element (ENABLE_NODE, &amp;no_debug_ospf6_spf_database_cmd);</a>
+<a name="ln905">  install_element (CONFIG_NODE, &amp;debug_ospf6_spf_process_cmd);</a>
+<a name="ln906">  install_element (CONFIG_NODE, &amp;debug_ospf6_spf_time_cmd);</a>
+<a name="ln907">  install_element (CONFIG_NODE, &amp;debug_ospf6_spf_database_cmd);</a>
+<a name="ln908">  install_element (CONFIG_NODE, &amp;no_debug_ospf6_spf_process_cmd);</a>
+<a name="ln909">  install_element (CONFIG_NODE, &amp;no_debug_ospf6_spf_time_cmd);</a>
+<a name="ln910">  install_element (CONFIG_NODE, &amp;no_debug_ospf6_spf_database_cmd);</a>
+<a name="ln911">}</a>
+<a name="ln912"> </a>
+<a name="ln913">void</a>
+<a name="ln914">ospf6_spf_init (void)</a>
+<a name="ln915">{</a>
+<a name="ln916">  install_element (OSPF6_NODE, &amp;ospf6_timers_throttle_spf_cmd);</a>
+<a name="ln917">  install_element (OSPF6_NODE, &amp;no_ospf6_timers_throttle_spf_cmd);</a>
+<a name="ln918">}</a>
+
+</code></pre>
+<div class="balloon" rel="7"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1042/" target="_blank">V1042</a> This file is marked with copyleft license, which requires you to open the derived source code.</p></div>
+<div class="balloon" rel="629"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v595/" target="_blank">V595</a> The 'ospf6' pointer was utilized before it was verified against nullptr. Check lines: 'ospf6_spf.h:95', 'ospf6_spf.c:629', 'ospf6_spf.c:639'.</p></div>
+<div class="balloon" rel="715"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v595/" target="_blank">V595</a> The 'v->child_list' pointer was utilized before it was verified against nullptr. Check lines: 715, 716.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

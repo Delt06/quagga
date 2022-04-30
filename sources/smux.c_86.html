@@ -1,0 +1,1548 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>smux.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.5.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/* SNMP support</a>
+<a name="ln2"> * Copyright (C) 1999 Kunihiro Ishiguro &lt;kunihiro@zebra.org&gt;</a>
+<a name="ln3"> *</a>
+<a name="ln4"> * This file is part of GNU Zebra.</a>
+<a name="ln5"> *</a>
+<a name="ln6"> * GNU Zebra is free software; you can redistribute it and/or modify it</a>
+<a name="ln7"> * under the terms of the GNU General Public License as published by the</a>
+<a name="ln8"> * Free Software Foundation; either version 2, or (at your option) any</a>
+<a name="ln9"> * later version.</a>
+<a name="ln10"> *</a>
+<a name="ln11"> * GNU Zebra is distributed in the hope that it will be useful, but</a>
+<a name="ln12"> * WITHOUT ANY WARRANTY; without even the implied warranty of</a>
+<a name="ln13"> * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU</a>
+<a name="ln14"> * General Public License for more details.</a>
+<a name="ln15"> *</a>
+<a name="ln16"> * You should have received a copy of the GNU General Public License</a>
+<a name="ln17"> * along with GNU Zebra; see the file COPYING.  If not, write to the Free</a>
+<a name="ln18"> * Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA</a>
+<a name="ln19"> * 02111-1307, USA.  </a>
+<a name="ln20"> */</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &lt;zebra.h&gt;</a>
+<a name="ln23"> </a>
+<a name="ln24">#if defined HAVE_SNMP &amp;&amp; defined SNMP_SMUX</a>
+<a name="ln25">#include &lt;net-snmp/net-snmp-config.h&gt;</a>
+<a name="ln26">#include &lt;net-snmp/net-snmp-includes.h&gt;</a>
+<a name="ln27"> </a>
+<a name="ln28">#include &quot;log.h&quot;</a>
+<a name="ln29">#include &quot;thread.h&quot;</a>
+<a name="ln30">#include &quot;linklist.h&quot;</a>
+<a name="ln31">#include &quot;command.h&quot;</a>
+<a name="ln32">#include &lt;lib/version.h&gt;</a>
+<a name="ln33">#include &quot;memory.h&quot;</a>
+<a name="ln34">#include &quot;sockunion.h&quot;</a>
+<a name="ln35">#include &quot;smux.h&quot;</a>
+<a name="ln36"> </a>
+<a name="ln37">#define SMUX_PORT_DEFAULT 199</a>
+<a name="ln38"> </a>
+<a name="ln39">#define SMUXMAXPKTSIZE    1500</a>
+<a name="ln40">#define SMUXMAXSTRLEN      256</a>
+<a name="ln41"> </a>
+<a name="ln42">#define SMUX_OPEN       (ASN_APPLICATION | ASN_CONSTRUCTOR | 0)</a>
+<a name="ln43">#define SMUX_CLOSE      (ASN_APPLICATION | ASN_PRIMITIVE | 1)</a>
+<a name="ln44">#define SMUX_RREQ       (ASN_APPLICATION | ASN_CONSTRUCTOR | 2)</a>
+<a name="ln45">#define SMUX_RRSP       (ASN_APPLICATION | ASN_PRIMITIVE | 3)</a>
+<a name="ln46">#define SMUX_SOUT       (ASN_APPLICATION | ASN_PRIMITIVE | 4)</a>
+<a name="ln47"> </a>
+<a name="ln48">#define SMUX_GET        (ASN_CONTEXT | ASN_CONSTRUCTOR | 0)</a>
+<a name="ln49">#define SMUX_GETNEXT    (ASN_CONTEXT | ASN_CONSTRUCTOR | 1)</a>
+<a name="ln50">#define SMUX_GETRSP     (ASN_CONTEXT | ASN_CONSTRUCTOR | 2)</a>
+<a name="ln51">#define SMUX_SET	(ASN_CONTEXT | ASN_CONSTRUCTOR | 3)</a>
+<a name="ln52">#define SMUX_TRAP	(ASN_CONTEXT | ASN_CONSTRUCTOR | 4)</a>
+<a name="ln53"> </a>
+<a name="ln54">#define SMUX_MAX_FAILURE 3</a>
+<a name="ln55"> </a>
+<a name="ln56">/* SNMP tree. */</a>
+<a name="ln57">struct subtree</a>
+<a name="ln58">{</a>
+<a name="ln59">  /* Tree's oid. */</a>
+<a name="ln60">  oid name[MAX_OID_LEN];</a>
+<a name="ln61">  u_char name_len;</a>
+<a name="ln62"> </a>
+<a name="ln63">  /* List of the variables. */</a>
+<a name="ln64">  struct variable *variables;</a>
+<a name="ln65"> </a>
+<a name="ln66">  /* Length of the variables list. */</a>
+<a name="ln67">  int variables_num;</a>
+<a name="ln68"> </a>
+<a name="ln69">  /* Width of the variables list. */</a>
+<a name="ln70">  int variables_width;</a>
+<a name="ln71"> </a>
+<a name="ln72">  /* Registered flag. */</a>
+<a name="ln73">  int registered;</a>
+<a name="ln74">};</a>
+<a name="ln75"> </a>
+<a name="ln76">#define min(A,B) ((A) &lt; (B) ? (A) : (B))</a>
+<a name="ln77"> </a>
+<a name="ln78">enum smux_event {SMUX_SCHEDULE, SMUX_CONNECT, SMUX_READ};</a>
+<a name="ln79"> </a>
+<a name="ln80">void smux_event (enum smux_event, int);</a>
+<a name="ln81"> </a>
+<a name="ln82"> </a>
+<a name="ln83">/* SMUX socket. */</a>
+<a name="ln84">int smux_sock = -1;</a>
+<a name="ln85"> </a>
+<a name="ln86">/* SMUX subtree list. */</a>
+<a name="ln87">struct list *treelist;</a>
+<a name="ln88"> </a>
+<a name="ln89">/* SMUX oid. */</a>
+<a name="ln90">oid *smux_oid = NULL;</a>
+<a name="ln91">size_t smux_oid_len;</a>
+<a name="ln92"> </a>
+<a name="ln93">/* SMUX password. */</a>
+<a name="ln94">char *smux_passwd = NULL;</a>
+<a name="ln95"> </a>
+<a name="ln96">/* SMUX read threads. */</a>
+<a name="ln97">struct thread *smux_read_thread;</a>
+<a name="ln98"> </a>
+<a name="ln99">/* SMUX connect thrads. */</a>
+<a name="ln100">struct thread *smux_connect_thread;</a>
+<a name="ln101"> </a>
+<a name="ln102">/* SMUX debug flag. */</a>
+<a name="ln103">int debug_smux = 0;</a>
+<a name="ln104"> </a>
+<a name="ln105">/* SMUX failure count. */</a>
+<a name="ln106">int fail = 0;</a>
+<a name="ln107"> </a>
+<a name="ln108">/* SMUX node. */</a>
+<a name="ln109">static struct cmd_node smux_node =</a>
+<a name="ln110">{</a>
+<a name="ln111">  SMUX_NODE,</a>
+<a name="ln112">  &quot;&quot;                            /* SMUX has no interface. */</a>
+<a name="ln113">};</a>
+<a name="ln114"> </a>
+<a name="ln115">/* thread master */</a>
+<a name="ln116">static struct thread_master *smux_master;</a>
+<a name="ln117"> </a>
+<a name="ln118">static int</a>
+<a name="ln119">oid_compare_part (oid *o1, int o1_len, oid *o2, int o2_len)</a>
+<a name="ln120">{</a>
+<a name="ln121">  int i;</a>
+<a name="ln122"> </a>
+<a name="ln123">  for (i = 0; i &lt; min (o1_len, o2_len); i++)</a>
+<a name="ln124">    {</a>
+<a name="ln125">      if (o1[i] &lt; o2[i])</a>
+<a name="ln126">	return -1;</a>
+<a name="ln127">      else if (o1[i] &gt; o2[i])</a>
+<a name="ln128">	return 1;</a>
+<a name="ln129">    }</a>
+<a name="ln130">  if (o1_len &lt; o2_len)</a>
+<a name="ln131">    return -1;</a>
+<a name="ln132"> </a>
+<a name="ln133">  return 0;</a>
+<a name="ln134">}</a>
+<a name="ln135"> </a>
+<a name="ln136">static void</a>
+<a name="ln137">smux_oid_dump (const char *prefix, const oid *oid, size_t oid_len)</a>
+<a name="ln138">{</a>
+<a name="ln139">  unsigned int i;</a>
+<a name="ln140">  int first = 1;</a>
+<a name="ln141">  char buf[MAX_OID_LEN * 3];</a>
+<a name="ln142"> </a>
+<a name="ln143">  buf[0] = '\0';</a>
+<a name="ln144"> </a>
+<a name="ln145">  for (i = 0; i &lt; oid_len; i++)</a>
+<a name="ln146">    {</a>
+<a name="ln147">      sprintf (buf + strlen (buf), &quot;%s%d&quot;, first ? &quot;&quot; : &quot;.&quot;, (int) oid[i]);</a>
+<a name="ln148">      first = 0;</a>
+<a name="ln149">    }</a>
+<a name="ln150">  zlog_debug (&quot;%s: %s&quot;, prefix, buf);</a>
+<a name="ln151">}</a>
+<a name="ln152"> </a>
+<a name="ln153">static int</a>
+<a name="ln154">smux_socket (void)</a>
+<a name="ln155">{</a>
+<a name="ln156">  int ret;</a>
+<a name="ln157">#ifdef HAVE_IPV6</a>
+<a name="ln158">  struct addrinfo hints, *res0, *res;</a>
+<a name="ln159">  int gai;</a>
+<a name="ln160">#else</a>
+<a name="ln161">  struct sockaddr_in serv;</a>
+<a name="ln162">  struct servent *sp;</a>
+<a name="ln163">#endif</a>
+<a name="ln164">  int sock = 0;</a>
+<a name="ln165"> </a>
+<a name="ln166">#ifdef HAVE_IPV6</a>
+<a name="ln167">  memset(&amp;hints, 0, sizeof(hints));</a>
+<a name="ln168">  hints.ai_family = PF_UNSPEC;</a>
+<a name="ln169">  hints.ai_socktype = SOCK_STREAM;</a>
+<a name="ln170">  gai = getaddrinfo(NULL, &quot;smux&quot;, &amp;hints, &amp;res0);</a>
+<a name="ln171">  if (gai == EAI_SERVICE)</a>
+<a name="ln172">    {</a>
+<a name="ln173">      char servbuf[NI_MAXSERV];</a>
+<a name="ln174">      sprintf(servbuf,&quot;%d&quot;,SMUX_PORT_DEFAULT);</a>
+<a name="ln175">      servbuf[sizeof (servbuf) - 1] = '\0';</a>
+<a name="ln176">      gai = getaddrinfo(NULL, servbuf, &amp;hints, &amp;res0);</a>
+<a name="ln177">    }</a>
+<a name="ln178">  if (gai)</a>
+<a name="ln179">    {</a>
+<a name="ln180">      zlog_warn(&quot;Cannot locate loopback service smux&quot;);</a>
+<a name="ln181">      return -1;</a>
+<a name="ln182">    }</a>
+<a name="ln183">  for(res=res0; res; res=res-&gt;ai_next)</a>
+<a name="ln184">    {</a>
+<a name="ln185">      if (res-&gt;ai_family != AF_INET </a>
+<a name="ln186">#ifdef HAVE_IPV6</a>
+<a name="ln187">	  &amp;&amp; res-&gt;ai_family != AF_INET6</a>
+<a name="ln188">#endif /* HAVE_IPV6 */</a>
+<a name="ln189">	  )</a>
+<a name="ln190">	continue;</a>
+<a name="ln191"> </a>
+<a name="ln192">      sock = socket(res-&gt;ai_family, res-&gt;ai_socktype, res-&gt;ai_protocol);</a>
+<a name="ln193">      if (sock &lt; 0)</a>
+<a name="ln194">	continue;</a>
+<a name="ln195">      sockopt_reuseaddr (sock);</a>
+<a name="ln196">      sockopt_reuseport (sock);</a>
+<a name="ln197">      ret = connect (sock, res-&gt;ai_addr, res-&gt;ai_addrlen);</a>
+<a name="ln198">      if (ret &lt; 0)</a>
+<a name="ln199">	{</a>
+<a name="ln200">	  close(sock);</a>
+<a name="ln201">	  sock = -1;</a>
+<a name="ln202">	  continue;</a>
+<a name="ln203">	}</a>
+<a name="ln204">      break;</a>
+<a name="ln205">    }</a>
+<a name="ln206">  freeaddrinfo(res0);</a>
+<a name="ln207">  if (sock &lt; 0)</a>
+<a name="ln208">    zlog_warn (&quot;Can't connect to SNMP agent with SMUX&quot;);</a>
+<a name="ln209">#else</a>
+<a name="ln210">  sock = socket (AF_INET, SOCK_STREAM, 0);</a>
+<a name="ln211">  if (sock &lt; 0)</a>
+<a name="ln212">    {</a>
+<a name="ln213">      zlog_warn (&quot;Can't make socket for SNMP&quot;);</a>
+<a name="ln214">      return -1;</a>
+<a name="ln215">    }</a>
+<a name="ln216"> </a>
+<a name="ln217">  memset (&amp;serv, 0, sizeof (struct sockaddr_in));</a>
+<a name="ln218">  serv.sin_family = AF_INET;</a>
+<a name="ln219">#ifdef HAVE_STRUCT_SOCKADDR_IN_SIN_LEN</a>
+<a name="ln220">  serv.sin_len = sizeof (struct sockaddr_in);</a>
+<a name="ln221">#endif /* HAVE_STRUCT_SOCKADDR_IN_SIN_LEN */</a>
+<a name="ln222"> </a>
+<a name="ln223">  sp = getservbyname (&quot;smux&quot;, &quot;tcp&quot;);</a>
+<a name="ln224">  if (sp != NULL) </a>
+<a name="ln225">    serv.sin_port = sp-&gt;s_port;</a>
+<a name="ln226">  else</a>
+<a name="ln227">    serv.sin_port = htons (SMUX_PORT_DEFAULT);</a>
+<a name="ln228"> </a>
+<a name="ln229">  serv.sin_addr.s_addr = htonl (INADDR_LOOPBACK);</a>
+<a name="ln230"> </a>
+<a name="ln231">  sockopt_reuseaddr (sock);</a>
+<a name="ln232">  sockopt_reuseport (sock);</a>
+<a name="ln233"> </a>
+<a name="ln234">  ret = connect (sock, (struct sockaddr *) &amp;serv, sizeof (struct sockaddr_in));</a>
+<a name="ln235">  if (ret &lt; 0)</a>
+<a name="ln236">    {</a>
+<a name="ln237">      close (sock);</a>
+<a name="ln238">      smux_sock = -1;</a>
+<a name="ln239">      zlog_warn (&quot;Can't connect to SNMP agent with SMUX&quot;);</a>
+<a name="ln240">      return -1;</a>
+<a name="ln241">    }</a>
+<a name="ln242">#endif</a>
+<a name="ln243">  return sock;</a>
+<a name="ln244">}</a>
+<a name="ln245"> </a>
+<a name="ln246">static void</a>
+<a name="ln247">smux_getresp_send (oid objid[], size_t objid_len, long reqid, long errstat,</a>
+<a name="ln248">		   long errindex, u_char val_type, void *arg, size_t arg_len)</a>
+<a name="ln249">{</a>
+<a name="ln250">  u_char buf[BUFSIZ];</a>
+<a name="ln251">  u_char *ptr, *h1, *h1e, *h2, *h2e;</a>
+<a name="ln252">  size_t len, length;</a>
+<a name="ln253"> </a>
+<a name="ln254">  ptr = buf;</a>
+<a name="ln255">  len = BUFSIZ;</a>
+<a name="ln256">  length = len;</a>
+<a name="ln257"> </a>
+<a name="ln258">  if (debug_smux)</a>
+<a name="ln259">    {</a>
+<a name="ln260">      zlog_debug (&quot;SMUX GETRSP send&quot;);</a>
+<a name="ln261">      zlog_debug (&quot;SMUX GETRSP reqid: %ld&quot;, reqid);</a>
+<a name="ln262">    }</a>
+<a name="ln263"> </a>
+<a name="ln264">  h1 = ptr;</a>
+<a name="ln265">  /* Place holder h1 for complete sequence */</a>
+<a name="ln266">  ptr = asn_build_sequence (ptr, &amp;len, (u_char) SMUX_GETRSP, 0);</a>
+<a name="ln267">  h1e = ptr;</a>
+<a name="ln268"> </a>
+<a name="ln269">  ptr = asn_build_int (ptr, &amp;len,</a>
+<a name="ln270">		       (u_char) (ASN_UNIVERSAL | ASN_PRIMITIVE | ASN_INTEGER),</a>
+<a name="ln271">		       &amp;reqid, sizeof (reqid));</a>
+<a name="ln272"> </a>
+<a name="ln273">  if (debug_smux)</a>
+<a name="ln274">    zlog_debug (&quot;SMUX GETRSP errstat: %ld&quot;, errstat);</a>
+<a name="ln275"> </a>
+<a name="ln276">  ptr = asn_build_int (ptr, &amp;len,</a>
+<a name="ln277">		       (u_char) (ASN_UNIVERSAL | ASN_PRIMITIVE | ASN_INTEGER),</a>
+<a name="ln278">		       &amp;errstat, sizeof (errstat));</a>
+<a name="ln279">  if (debug_smux)</a>
+<a name="ln280">    zlog_debug (&quot;SMUX GETRSP errindex: %ld&quot;, errindex);</a>
+<a name="ln281"> </a>
+<a name="ln282">  ptr = asn_build_int (ptr, &amp;len,</a>
+<a name="ln283">		       (u_char) (ASN_UNIVERSAL | ASN_PRIMITIVE | ASN_INTEGER),</a>
+<a name="ln284">		       &amp;errindex, sizeof (errindex));</a>
+<a name="ln285"> </a>
+<a name="ln286">  h2 = ptr;</a>
+<a name="ln287">  /* Place holder h2 for one variable */</a>
+<a name="ln288">  ptr = asn_build_sequence (ptr, &amp;len, </a>
+<a name="ln289">			   (u_char)(ASN_SEQUENCE | ASN_CONSTRUCTOR),</a>
+<a name="ln290">			   0);</a>
+<a name="ln291">  h2e = ptr;</a>
+<a name="ln292"> </a>
+<a name="ln293">  ptr = snmp_build_var_op (ptr, objid, &amp;objid_len, </a>
+<a name="ln294">			   val_type, arg_len, arg, &amp;len);</a>
+<a name="ln295"> </a>
+<a name="ln296">  /* Now variable size is known, fill in size */</a>
+<a name="ln297">  asn_build_sequence(h2,&amp;length,(u_char)(ASN_SEQUENCE|ASN_CONSTRUCTOR),ptr-h2e);</a>
+<a name="ln298"> </a>
+<a name="ln299">  /* Fill in size of whole sequence */</a>
+<a name="ln300">  asn_build_sequence(h1,&amp;length,(u_char)SMUX_GETRSP,ptr-h1e);</a>
+<a name="ln301"> </a>
+<a name="ln302">  if (debug_smux)</a>
+<a name="ln303">    zlog_debug (&quot;SMUX getresp send: %td&quot;, (ptr - buf));</a>
+<a name="ln304">  </a>
+<a name="ln305">  send (smux_sock, buf, (ptr - buf), 0);</a>
+<a name="ln306">}</a>
+<a name="ln307"> </a>
+<a name="ln308">static u_char *</a>
+<a name="ln309">smux_var (u_char *ptr, size_t len, oid objid[], size_t *objid_len,</a>
+<a name="ln310">          size_t *var_val_len,</a>
+<a name="ln311">          u_char *var_val_type,</a>
+<a name="ln312">          void **var_value)</a>
+<a name="ln313">{</a>
+<a name="ln314">  u_char type;</a>
+<a name="ln315">  u_char val_type;</a>
+<a name="ln316">  size_t val_len;</a>
+<a name="ln317">  u_char *val;</a>
+<a name="ln318"> </a>
+<a name="ln319">  if (debug_smux)</a>
+<a name="ln320">    zlog_debug (&quot;SMUX var parse: len %zd&quot;, len);</a>
+<a name="ln321"> </a>
+<a name="ln322">  /* Parse header. */</a>
+<a name="ln323">  ptr = asn_parse_header (ptr, &amp;len, &amp;type);</a>
+<a name="ln324">  </a>
+<a name="ln325">  if (debug_smux)</a>
+<a name="ln326">    {</a>
+<a name="ln327">      zlog_debug (&quot;SMUX var parse: type %d len %zd&quot;, type, len);</a>
+<a name="ln328">      zlog_debug (&quot;SMUX var parse: type must be %d&quot;, </a>
+<a name="ln329">		 (ASN_SEQUENCE | ASN_CONSTRUCTOR));</a>
+<a name="ln330">    }</a>
+<a name="ln331"> </a>
+<a name="ln332">  /* Parse var option. */</a>
+<a name="ln333">  *objid_len = MAX_OID_LEN;</a>
+<a name="ln334">  ptr = snmp_parse_var_op(ptr, objid, objid_len, &amp;val_type, </a>
+<a name="ln335">			  &amp;val_len, &amp;val, &amp;len);</a>
+<a name="ln336"> </a>
+<a name="ln337">  if (var_val_len)</a>
+<a name="ln338">    *var_val_len = val_len;</a>
+<a name="ln339"> </a>
+<a name="ln340">  if (var_value)</a>
+<a name="ln341">    *var_value = (void*) val;</a>
+<a name="ln342"> </a>
+<a name="ln343">  if (var_val_type)</a>
+<a name="ln344">    *var_val_type = val_type;</a>
+<a name="ln345"> </a>
+<a name="ln346">  /* Requested object id length is objid_len. */</a>
+<a name="ln347">  if (debug_smux)</a>
+<a name="ln348">    smux_oid_dump (&quot;Request OID&quot;, objid, *objid_len);</a>
+<a name="ln349"> </a>
+<a name="ln350">  if (debug_smux)</a>
+<a name="ln351">    zlog_debug (&quot;SMUX val_type: %d&quot;, val_type);</a>
+<a name="ln352"> </a>
+<a name="ln353">  /* Check request value type. */</a>
+<a name="ln354">  if (debug_smux)</a>
+<a name="ln355">  switch (val_type)</a>
+<a name="ln356">    {</a>
+<a name="ln357">    case ASN_NULL:</a>
+<a name="ln358">      /* In case of SMUX_GET or SMUX_GET_NEXT val_type is set to</a>
+<a name="ln359">         ASN_NULL. */</a>
+<a name="ln360">      zlog_debug (&quot;ASN_NULL&quot;);</a>
+<a name="ln361">      break;</a>
+<a name="ln362"> </a>
+<a name="ln363">    case ASN_INTEGER:</a>
+<a name="ln364">      zlog_debug (&quot;ASN_INTEGER&quot;);</a>
+<a name="ln365">      break;</a>
+<a name="ln366">    case ASN_COUNTER:</a>
+<a name="ln367">    case ASN_GAUGE:</a>
+<a name="ln368">    case ASN_TIMETICKS:</a>
+<a name="ln369">    case ASN_UINTEGER:</a>
+<a name="ln370">      zlog_debug (&quot;ASN_COUNTER&quot;);</a>
+<a name="ln371">      break;</a>
+<a name="ln372">    case ASN_COUNTER64:</a>
+<a name="ln373">      zlog_debug (&quot;ASN_COUNTER64&quot;);</a>
+<a name="ln374">      break;</a>
+<a name="ln375">    case ASN_IPADDRESS:</a>
+<a name="ln376">      zlog_debug (&quot;ASN_IPADDRESS&quot;);</a>
+<a name="ln377">      break;</a>
+<a name="ln378">    case ASN_OCTET_STR:</a>
+<a name="ln379">      zlog_debug (&quot;ASN_OCTET_STR&quot;);</a>
+<a name="ln380">      break;</a>
+<a name="ln381">    case ASN_OPAQUE:</a>
+<a name="ln382">    case ASN_NSAP:</a>
+<a name="ln383">    case ASN_OBJECT_ID:</a>
+<a name="ln384">      zlog_debug (&quot;ASN_OPAQUE&quot;);</a>
+<a name="ln385">      break;</a>
+<a name="ln386">    case SNMP_NOSUCHOBJECT:</a>
+<a name="ln387">      zlog_debug (&quot;SNMP_NOSUCHOBJECT&quot;);</a>
+<a name="ln388">      break;</a>
+<a name="ln389">    case SNMP_NOSUCHINSTANCE:</a>
+<a name="ln390">      zlog_debug (&quot;SNMP_NOSUCHINSTANCE&quot;);</a>
+<a name="ln391">      break;</a>
+<a name="ln392">    case SNMP_ENDOFMIBVIEW:</a>
+<a name="ln393">      zlog_debug (&quot;SNMP_ENDOFMIBVIEW&quot;);</a>
+<a name="ln394">      break;</a>
+<a name="ln395">    case ASN_BIT_STR:</a>
+<a name="ln396">      zlog_debug (&quot;ASN_BIT_STR&quot;);</a>
+<a name="ln397">      break;</a>
+<a name="ln398">    default:</a>
+<a name="ln399">      zlog_debug (&quot;Unknown type&quot;);</a>
+<a name="ln400">      break;</a>
+<a name="ln401">    }</a>
+<a name="ln402">  return ptr;</a>
+<a name="ln403">}</a>
+<a name="ln404"> </a>
+<a name="ln405">/* NOTE: all 3 functions (smux_set, smux_get &amp; smux_getnext) are based on</a>
+<a name="ln406">   ucd-snmp smux and as such suppose, that the peer receives in the message</a>
+<a name="ln407">   only one variable. Fortunately, IBM seems to do the same in AIX. */</a>
+<a name="ln408"> </a>
+<a name="ln409">static int</a>
+<a name="ln410">smux_set (oid *reqid, size_t *reqid_len,</a>
+<a name="ln411">          u_char val_type, void *val, size_t val_len, int action)</a>
+<a name="ln412">{</a>
+<a name="ln413">  int j;</a>
+<a name="ln414">  struct subtree *subtree;</a>
+<a name="ln415">  struct variable *v;</a>
+<a name="ln416">  int subresult;</a>
+<a name="ln417">  oid *suffix;</a>
+<a name="ln418">  size_t suffix_len;</a>
+<a name="ln419">  int result;</a>
+<a name="ln420">  u_char *statP = NULL;</a>
+<a name="ln421">  WriteMethod *write_method = NULL;</a>
+<a name="ln422">  struct listnode *node, *nnode;</a>
+<a name="ln423"> </a>
+<a name="ln424">  /* Check */</a>
+<a name="ln425">  for (ALL_LIST_ELEMENTS (treelist, node, nnode, subtree))</a>
+<a name="ln426">    {</a>
+<a name="ln427">      subresult = oid_compare_part (reqid, *reqid_len,</a>
+<a name="ln428">                                    subtree-&gt;name, subtree-&gt;name_len);</a>
+<a name="ln429"> </a>
+<a name="ln430">      /* Subtree matched. */</a>
+<a name="ln431">      if (subresult == 0)</a>
+<a name="ln432">        {</a>
+<a name="ln433">          /* Prepare suffix. */</a>
+<a name="ln434">          suffix = reqid + subtree-&gt;name_len;</a>
+<a name="ln435">          suffix_len = *reqid_len - subtree-&gt;name_len;</a>
+<a name="ln436">          result = subresult;</a>
+<a name="ln437"> </a>
+<a name="ln438">          /* Check variables. */</a>
+<a name="ln439">          for (j = 0; j &lt; subtree-&gt;variables_num; j++)</a>
+<a name="ln440">            {</a>
+<a name="ln441">              v = &amp;subtree-&gt;variables[j];</a>
+<a name="ln442"> </a>
+<a name="ln443">              /* Always check suffix */</a>
+<a name="ln444">              result = oid_compare_part (suffix, suffix_len,</a>
+<a name="ln445">                                         v-&gt;name, v-&gt;namelen);</a>
+<a name="ln446"> </a>
+<a name="ln447">              /* This is exact match so result must be zero. */</a>
+<a name="ln448">              if (result == 0)</a>
+<a name="ln449">                {</a>
+<a name="ln450">                  if (debug_smux)</a>
+<a name="ln451">                    zlog_debug (&quot;SMUX function call index is %d&quot;, v-&gt;magic);</a>
+<a name="ln452">		  </a>
+<a name="ln453">                  statP = (*v-&gt;findVar) (v, suffix, &amp;suffix_len, 1,</a>
+<a name="ln454">					 &amp;val_len, &amp;write_method);</a>
+<a name="ln455"> </a>
+<a name="ln456">                  if (write_method)</a>
+<a name="ln457">                    {</a>
+<a name="ln458">                      return (*write_method)(action, val, val_type, val_len,</a>
+<a name="ln459">					     statP, suffix, suffix_len);</a>
+<a name="ln460">                    }</a>
+<a name="ln461">                  else</a>
+<a name="ln462">                    {</a>
+<a name="ln463">                      return SNMP_ERR_READONLY;</a>
+<a name="ln464">                    }</a>
+<a name="ln465">                }</a>
+<a name="ln466"> </a>
+<a name="ln467">              /* If above execution is failed or oid is small (so</a>
+<a name="ln468">                 there is no further match). */</a>
+<a name="ln469">              if (result &lt; 0)</a>
+<a name="ln470">                return SNMP_ERR_NOSUCHNAME;</a>
+<a name="ln471">            }</a>
+<a name="ln472">        }</a>
+<a name="ln473">    }</a>
+<a name="ln474">  return SNMP_ERR_NOSUCHNAME;</a>
+<a name="ln475">}</a>
+<a name="ln476"> </a>
+<a name="ln477">static int</a>
+<a name="ln478">smux_get (oid *reqid, size_t *reqid_len, int exact, </a>
+<a name="ln479">	  u_char *val_type,void **val, size_t *val_len)</a>
+<a name="ln480">{</a>
+<a name="ln481">  int j;</a>
+<a name="ln482">  struct subtree *subtree;</a>
+<a name="ln483">  struct variable *v;</a>
+<a name="ln484">  int subresult;</a>
+<a name="ln485">  oid *suffix;</a>
+<a name="ln486">  size_t suffix_len;</a>
+<a name="ln487">  int result;</a>
+<a name="ln488">  WriteMethod *write_method=NULL;</a>
+<a name="ln489">  struct listnode *node, *nnode;</a>
+<a name="ln490"> </a>
+<a name="ln491">  /* Check */</a>
+<a name="ln492">  for (ALL_LIST_ELEMENTS (treelist, node, nnode,subtree))</a>
+<a name="ln493">    {</a>
+<a name="ln494">      subresult = oid_compare_part (reqid, *reqid_len, </a>
+<a name="ln495">				    subtree-&gt;name, subtree-&gt;name_len);</a>
+<a name="ln496"> </a>
+<a name="ln497">      /* Subtree matched. */</a>
+<a name="ln498">      if (subresult == 0)</a>
+<a name="ln499">	{</a>
+<a name="ln500">	  /* Prepare suffix. */</a>
+<a name="ln501">	  suffix = reqid + subtree-&gt;name_len;</a>
+<a name="ln502">	  suffix_len = *reqid_len - subtree-&gt;name_len;</a>
+<a name="ln503">	  result = subresult;</a>
+<a name="ln504"> </a>
+<a name="ln505">	  /* Check variables. */</a>
+<a name="ln506">	  for (j = 0; j &lt; subtree-&gt;variables_num; j++)</a>
+<a name="ln507">	    {</a>
+<a name="ln508">	      v = &amp;subtree-&gt;variables[j];</a>
+<a name="ln509"> </a>
+<a name="ln510">	      /* Always check suffix */</a>
+<a name="ln511">	      result = oid_compare_part (suffix, suffix_len,</a>
+<a name="ln512">					 v-&gt;name, v-&gt;namelen);</a>
+<a name="ln513"> </a>
+<a name="ln514">	      /* This is exact match so result must be zero. */</a>
+<a name="ln515">	      if (result == 0)</a>
+<a name="ln516">		{</a>
+<a name="ln517">		  if (debug_smux)</a>
+<a name="ln518">		    zlog_debug (&quot;SMUX function call index is %d&quot;, v-&gt;magic);</a>
+<a name="ln519"> </a>
+<a name="ln520">		  *val = (*v-&gt;findVar) (v, suffix, &amp;suffix_len, exact,</a>
+<a name="ln521">					val_len, &amp;write_method);</a>
+<a name="ln522"> </a>
+<a name="ln523">		  /* There is no instance. */</a>
+<a name="ln524">		  if (*val == NULL)</a>
+<a name="ln525">		    return SNMP_NOSUCHINSTANCE;</a>
+<a name="ln526"> </a>
+<a name="ln527">		  /* Call is suceed. */</a>
+<a name="ln528">		  *val_type = v-&gt;type;</a>
+<a name="ln529"> </a>
+<a name="ln530">		  return 0;</a>
+<a name="ln531">		}</a>
+<a name="ln532"> </a>
+<a name="ln533">	      /* If above execution is failed or oid is small (so</a>
+<a name="ln534">                 there is no further match). */</a>
+<a name="ln535">	      if (result &lt; 0)</a>
+<a name="ln536">		return SNMP_ERR_NOSUCHNAME;</a>
+<a name="ln537">	    }</a>
+<a name="ln538">	}</a>
+<a name="ln539">    }</a>
+<a name="ln540">  return SNMP_ERR_NOSUCHNAME;</a>
+<a name="ln541">}</a>
+<a name="ln542"> </a>
+<a name="ln543">static int</a>
+<a name="ln544">smux_getnext (oid *reqid, size_t *reqid_len, int exact, </a>
+<a name="ln545">	      u_char *val_type,void **val, size_t *val_len)</a>
+<a name="ln546">{</a>
+<a name="ln547">  int j;</a>
+<a name="ln548">  oid save[MAX_OID_LEN];</a>
+<a name="ln549">  int savelen = 0;</a>
+<a name="ln550">  struct subtree *subtree;</a>
+<a name="ln551">  struct variable *v;</a>
+<a name="ln552">  int subresult;</a>
+<a name="ln553">  oid *suffix;</a>
+<a name="ln554">  size_t suffix_len;</a>
+<a name="ln555">  int result;</a>
+<a name="ln556">  WriteMethod *write_method=NULL;</a>
+<a name="ln557">  struct listnode *node, *nnode;</a>
+<a name="ln558"> </a>
+<a name="ln559"> </a>
+<a name="ln560">  /* Save incoming request. */</a>
+<a name="ln561">  oid_copy (save, reqid, *reqid_len);</a>
+<a name="ln562">  savelen = *reqid_len;</a>
+<a name="ln563"> </a>
+<a name="ln564">  /* Check */</a>
+<a name="ln565">  for (ALL_LIST_ELEMENTS (treelist, node, nnode, subtree))</a>
+<a name="ln566">    {</a>
+<a name="ln567">      subresult = oid_compare_part (reqid, *reqid_len, </a>
+<a name="ln568">				    subtree-&gt;name, subtree-&gt;name_len);</a>
+<a name="ln569"> </a>
+<a name="ln570">      /* If request is in the tree. The agent has to make sure we</a>
+<a name="ln571">         only receive requests we have registered for. */</a>
+<a name="ln572">      /* Unfortunately, that's not true. In fact, a SMUX subagent has to</a>
+<a name="ln573">         behave as if it manages the whole SNMP MIB tree itself. It's the</a>
+<a name="ln574">         duty of the master agent to collect the best answer and return it</a>
+<a name="ln575">         to the manager. See RFC 1227 chapter 3.1.6 for the glory details</a>
+<a name="ln576">         :-). ucd-snmp really behaves bad here as it actually might ask</a>
+<a name="ln577">         multiple times for the same GETNEXT request as it throws away the</a>
+<a name="ln578">         answer when it expects it in a different subtree and might come</a>
+<a name="ln579">         back later with the very same request. --jochen */</a>
+<a name="ln580"> </a>
+<a name="ln581">      if (subresult &lt;= 0)</a>
+<a name="ln582">	{</a>
+<a name="ln583">	  /* Prepare suffix. */</a>
+<a name="ln584">	  suffix = reqid + subtree-&gt;name_len;</a>
+<a name="ln585">	  suffix_len = *reqid_len - subtree-&gt;name_len;</a>
+<a name="ln586">	  if (subresult &lt; 0)</a>
+<a name="ln587">	    {</a>
+<a name="ln588">	      oid_copy(reqid, subtree-&gt;name, subtree-&gt;name_len);</a>
+<a name="ln589">	      *reqid_len = subtree-&gt;name_len;</a>
+<a name="ln590">	    }</a>
+<a name="ln591">	  for (j = 0; j &lt; subtree-&gt;variables_num; j++)</a>
+<a name="ln592">	    {</a>
+<a name="ln593">	      result = subresult;</a>
+<a name="ln594">	      v = &amp;subtree-&gt;variables[j];</a>
+<a name="ln595"> </a>
+<a name="ln596">	      /* Next then check result &gt;= 0. */</a>
+<a name="ln597">	      if (result == 0)</a>
+<a name="ln598">		result = oid_compare_part (suffix, suffix_len,</a>
+<a name="ln599">					   v-&gt;name, v-&gt;namelen);</a>
+<a name="ln600"> </a>
+<a name="ln601">	      if (result &lt;= 0)</a>
+<a name="ln602">		{</a>
+<a name="ln603">		  if (debug_smux)</a>
+<a name="ln604">		    zlog_debug (&quot;SMUX function call index is %d&quot;, v-&gt;magic);</a>
+<a name="ln605">		  if(result&lt;0)</a>
+<a name="ln606">		    {</a>
+<a name="ln607">		      oid_copy(suffix, v-&gt;name, v-&gt;namelen);</a>
+<a name="ln608">		      suffix_len = v-&gt;namelen;</a>
+<a name="ln609">		    }</a>
+<a name="ln610">		  *val = (*v-&gt;findVar) (v, suffix, &amp;suffix_len, exact,</a>
+<a name="ln611">					val_len, &amp;write_method);</a>
+<a name="ln612">		  *reqid_len = suffix_len + subtree-&gt;name_len;</a>
+<a name="ln613">		  if (*val)</a>
+<a name="ln614">		    {</a>
+<a name="ln615">		      *val_type = v-&gt;type;</a>
+<a name="ln616">		      return 0;</a>
+<a name="ln617">		    }</a>
+<a name="ln618">		}</a>
+<a name="ln619">	    }</a>
+<a name="ln620">	}</a>
+<a name="ln621">    }</a>
+<a name="ln622">  memcpy (reqid, save, savelen * sizeof(oid));</a>
+<a name="ln623">  *reqid_len = savelen;</a>
+<a name="ln624"> </a>
+<a name="ln625">  return SNMP_ERR_NOSUCHNAME;</a>
+<a name="ln626">}</a>
+<a name="ln627"> </a>
+<a name="ln628">/* GET message header. */</a>
+<a name="ln629">static u_char *</a>
+<a name="ln630">smux_parse_get_header (u_char *ptr, size_t *len, long *reqid)</a>
+<a name="ln631">{</a>
+<a name="ln632">  u_char type;</a>
+<a name="ln633">  long errstat;</a>
+<a name="ln634">  long errindex;</a>
+<a name="ln635"> </a>
+<a name="ln636">  /* Request ID. */</a>
+<a name="ln637">  ptr = asn_parse_int (ptr, len, &amp;type, reqid, sizeof (*reqid));</a>
+<a name="ln638"> </a>
+<a name="ln639">  if (debug_smux)</a>
+<a name="ln640">    zlog_debug (&quot;SMUX GET reqid: %d len: %d&quot;, (int) *reqid, (int) *len);</a>
+<a name="ln641"> </a>
+<a name="ln642">  /* Error status. */</a>
+<a name="ln643">  ptr = asn_parse_int (ptr, len, &amp;type, &amp;errstat, sizeof (errstat));</a>
+<a name="ln644"> </a>
+<a name="ln645">  if (debug_smux)</a>
+<a name="ln646">    zlog_debug (&quot;SMUX GET errstat %ld len: %zd&quot;, errstat, *len);</a>
+<a name="ln647"> </a>
+<a name="ln648">  /* Error index. */</a>
+<a name="ln649">  ptr = asn_parse_int (ptr, len, &amp;type, &amp;errindex, sizeof (errindex));</a>
+<a name="ln650"> </a>
+<a name="ln651">  if (debug_smux)</a>
+<a name="ln652">    zlog_debug (&quot;SMUX GET errindex %ld len: %zd&quot;, errindex, *len);</a>
+<a name="ln653"> </a>
+<a name="ln654">  return ptr;</a>
+<a name="ln655">}</a>
+<a name="ln656"> </a>
+<a name="ln657">static void</a>
+<a name="ln658">smux_parse_set (u_char *ptr, size_t len, int action)</a>
+<a name="ln659">{</a>
+<a name="ln660">  long reqid;</a>
+<a name="ln661">  oid oid[MAX_OID_LEN];</a>
+<a name="ln662">  size_t oid_len;</a>
+<a name="ln663">  u_char val_type;</a>
+<a name="ln664">  void *val;</a>
+<a name="ln665">  size_t val_len;</a>
+<a name="ln666">  int ret;</a>
+<a name="ln667"> </a>
+<a name="ln668">  if (debug_smux)</a>
+<a name="ln669">    zlog_debug (&quot;SMUX SET(%s) message parse: len %zd&quot;,</a>
+<a name="ln670">               (RESERVE1 == action) ? &quot;RESERVE1&quot; : ((FREE == action) ? &quot;FREE&quot; : &quot;COMMIT&quot;),</a>
+<a name="ln671">               len);</a>
+<a name="ln672"> </a>
+<a name="ln673">  /* Parse SET message header. */</a>
+<a name="ln674">  ptr = smux_parse_get_header (ptr, &amp;len, &amp;reqid);</a>
+<a name="ln675"> </a>
+<a name="ln676">  /* Parse SET message object ID. */</a>
+<a name="ln677">  ptr = smux_var (ptr, len, oid, &amp;oid_len, &amp;val_len, &amp;val_type, &amp;val);</a>
+<a name="ln678"> </a>
+<a name="ln679">  ret = smux_set (oid, &amp;oid_len, val_type, val, val_len, action);</a>
+<a name="ln680">  if (debug_smux)</a>
+<a name="ln681">    zlog_debug (&quot;SMUX SET ret %d&quot;, ret);</a>
+<a name="ln682"> </a>
+<a name="ln683">  /* Return result. */</a>
+<a name="ln684">  if (RESERVE1 == action)</a>
+<a name="ln685">    smux_getresp_send (oid, oid_len, reqid, ret, 3, ASN_NULL, NULL, 0);</a>
+<a name="ln686">}</a>
+<a name="ln687"> </a>
+<a name="ln688">static void</a>
+<a name="ln689">smux_parse_get (u_char *ptr, size_t len, int exact)</a>
+<a name="ln690">{</a>
+<a name="ln691">  long reqid;</a>
+<a name="ln692">  oid oid[MAX_OID_LEN];</a>
+<a name="ln693">  size_t oid_len;</a>
+<a name="ln694">  u_char val_type;</a>
+<a name="ln695">  void *val;</a>
+<a name="ln696">  size_t val_len;</a>
+<a name="ln697">  int ret;</a>
+<a name="ln698"> </a>
+<a name="ln699">  if (debug_smux)</a>
+<a name="ln700">    zlog_debug (&quot;SMUX GET message parse: len %zd&quot;, len);</a>
+<a name="ln701">  </a>
+<a name="ln702">  /* Parse GET message header. */</a>
+<a name="ln703">  ptr = smux_parse_get_header (ptr, &amp;len, &amp;reqid);</a>
+<a name="ln704">  </a>
+<a name="ln705">  /* Parse GET message object ID. We needn't the value come */</a>
+<a name="ln706">  ptr = smux_var (ptr, len, oid, &amp;oid_len, NULL, NULL, NULL);</a>
+<a name="ln707"> </a>
+<a name="ln708">  /* Traditional getstatptr. */</a>
+<a name="ln709">  if (exact)</a>
+<a name="ln710">    ret = smux_get (oid, &amp;oid_len, exact, &amp;val_type, &amp;val, &amp;val_len);</a>
+<a name="ln711">  else</a>
+<a name="ln712">    ret = smux_getnext (oid, &amp;oid_len, exact, &amp;val_type, &amp;val, &amp;val_len);</a>
+<a name="ln713"> </a>
+<a name="ln714">  /* Return result. */</a>
+<a name="ln715">  if (ret == 0)</a>
+<a name="ln716">    smux_getresp_send (oid, oid_len, reqid, 0, 0, val_type, val, val_len);</a>
+<a name="ln717">  else</a>
+<a name="ln718">    smux_getresp_send (oid, oid_len, reqid, ret, 3, ASN_NULL, NULL, 0);</a>
+<a name="ln719">}</a>
+<a name="ln720"> </a>
+<a name="ln721">/* Parse SMUX_CLOSE message. */</a>
+<a name="ln722">static void</a>
+<a name="ln723">smux_parse_close (u_char *ptr, int len)</a>
+<a name="ln724">{</a>
+<a name="ln725">  long reason = 0;</a>
+<a name="ln726"> </a>
+<a name="ln727">  while (len--)</a>
+<a name="ln728">    {</a>
+<a name="ln729">      reason = (reason &lt;&lt; 8) | (long) *ptr;</a>
+<a name="ln730">      ptr++;</a>
+<a name="ln731">    }</a>
+<a name="ln732">  zlog_info (&quot;SMUX_CLOSE with reason: %ld&quot;, reason);</a>
+<a name="ln733">}</a>
+<a name="ln734"> </a>
+<a name="ln735">/* SMUX_RRSP message. */</a>
+<a name="ln736">static void</a>
+<a name="ln737">smux_parse_rrsp (u_char *ptr, size_t len)</a>
+<a name="ln738">{</a>
+<a name="ln739">  u_char val;</a>
+<a name="ln740">  long errstat;</a>
+<a name="ln741">  </a>
+<a name="ln742">  ptr = asn_parse_int (ptr, &amp;len, &amp;val, &amp;errstat, sizeof (errstat));</a>
+<a name="ln743"> </a>
+<a name="ln744">  if (debug_smux)</a>
+<a name="ln745">    zlog_debug (&quot;SMUX_RRSP value: %d errstat: %ld&quot;, val, errstat);</a>
+<a name="ln746">}</a>
+<a name="ln747"> </a>
+<a name="ln748">/* Parse SMUX message. */</a>
+<a name="ln749">static int</a>
+<a name="ln750">smux_parse (u_char *ptr, size_t len)</a>
+<a name="ln751">{</a>
+<a name="ln752">  /* This buffer we'll use for SOUT message. We could allocate it with</a>
+<a name="ln753">     malloc and save only static pointer/lenght, but IMHO static</a>
+<a name="ln754">     buffer is a faster solusion. */</a>
+<a name="ln755">  static u_char sout_save_buff[SMUXMAXPKTSIZE];</a>
+<a name="ln756">  static int sout_save_len = 0;</a>
+<a name="ln757"> </a>
+<a name="ln758">  int len_income = len; /* see note below: YYY */</a>
+<a name="ln759">  u_char type;</a>
+<a name="ln760">  u_char rollback;</a>
+<a name="ln761"> </a>
+<a name="ln762">  rollback = ptr[2]; /* important only for SMUX_SOUT */</a>
+<a name="ln763"> </a>
+<a name="ln764">process_rest: /* see note below: YYY */</a>
+<a name="ln765"> </a>
+<a name="ln766">  /* Parse SMUX message type and subsequent length. */</a>
+<a name="ln767">  ptr = asn_parse_header (ptr, &amp;len, &amp;type);</a>
+<a name="ln768"> </a>
+<a name="ln769">  if (debug_smux)</a>
+<a name="ln770">    zlog_debug (&quot;SMUX message received type: %d rest len: %zd&quot;, type, len);</a>
+<a name="ln771"> </a>
+<a name="ln772">  switch (type)</a>
+<a name="ln773">    {</a>
+<a name="ln774">    case SMUX_OPEN:</a>
+<a name="ln775">      /* Open must be not send from SNMP agent. */</a>
+<a name="ln776">      zlog_warn (&quot;SMUX_OPEN received: resetting connection.&quot;);</a>
+<a name="ln777">      return -1;</a>
+<a name="ln778">      break;</a>
+<a name="ln779">    case SMUX_RREQ:</a>
+<a name="ln780">      /* SMUX_RREQ message is invalid for us. */</a>
+<a name="ln781">      zlog_warn (&quot;SMUX_RREQ received: resetting connection.&quot;);</a>
+<a name="ln782">      return -1;</a>
+<a name="ln783">      break;</a>
+<a name="ln784">    case SMUX_SOUT:</a>
+<a name="ln785">      /* SMUX_SOUT message is now valied for us. */</a>
+<a name="ln786">      if (debug_smux)</a>
+<a name="ln787">        zlog_debug (&quot;SMUX_SOUT(%s)&quot;, rollback ? &quot;rollback&quot; : &quot;commit&quot;);</a>
+<a name="ln788"> </a>
+<a name="ln789">      if (sout_save_len &gt; 0)</a>
+<a name="ln790">        {</a>
+<a name="ln791">          smux_parse_set (sout_save_buff, sout_save_len, rollback ? FREE : COMMIT);</a>
+<a name="ln792">          sout_save_len = 0;</a>
+<a name="ln793">        }</a>
+<a name="ln794">      else</a>
+<a name="ln795">        zlog_warn (&quot;SMUX_SOUT sout_save_len=%d - invalid&quot;, (int) sout_save_len);</a>
+<a name="ln796"> </a>
+<a name="ln797">      if (len_income &gt; 3) </a>
+<a name="ln798">        {</a>
+<a name="ln799">          /* YYY: this strange code has to solve the &quot;slow peer&quot;</a>
+<a name="ln800">             problem: When agent sends SMUX_SOUT message it doesn't</a>
+<a name="ln801">             wait any responce and may send some next message to</a>
+<a name="ln802">             subagent. Then the peer in 'smux_read()' will recieve</a>
+<a name="ln803">             from socket the 'concatenated' buffer, contaning both</a>
+<a name="ln804">             SMUX_SOUT message and the next one</a>
+<a name="ln805">             (SMUX_GET/SMUX_GETNEXT/SMUX_GET). So we should check: if</a>
+<a name="ln806">             the buffer is longer than 3 ( length of SMUX_SOUT ), we</a>
+<a name="ln807">             must process the rest of it.  This effect may be observed</a>
+<a name="ln808">             if 'debug_smux' is set to '1' */</a>
+<a name="ln809">          ptr++;</a>
+<a name="ln810">          len = len_income - 3;</a>
+<a name="ln811">          goto process_rest;</a>
+<a name="ln812">        }</a>
+<a name="ln813">      break;</a>
+<a name="ln814">    case SMUX_GETRSP:</a>
+<a name="ln815">      /* SMUX_GETRSP message is invalid for us. */</a>
+<a name="ln816">      zlog_warn (&quot;SMUX_GETRSP received: resetting connection.&quot;);</a>
+<a name="ln817">      return -1;</a>
+<a name="ln818">      break;</a>
+<a name="ln819">    case SMUX_CLOSE:</a>
+<a name="ln820">      /* Close SMUX connection. */</a>
+<a name="ln821">      if (debug_smux)</a>
+<a name="ln822">	zlog_debug (&quot;SMUX_CLOSE&quot;);</a>
+<a name="ln823">      smux_parse_close (ptr, len);</a>
+<a name="ln824">      return -1;</a>
+<a name="ln825">      break;</a>
+<a name="ln826">    case SMUX_RRSP:</a>
+<a name="ln827">      /* This is response for register message. */</a>
+<a name="ln828">      if (debug_smux)</a>
+<a name="ln829">	zlog_debug (&quot;SMUX_RRSP&quot;);</a>
+<a name="ln830">      smux_parse_rrsp (ptr, len);</a>
+<a name="ln831">      break;</a>
+<a name="ln832">    case SMUX_GET:</a>
+<a name="ln833">      /* Exact request for object id. */</a>
+<a name="ln834">      if (debug_smux)</a>
+<a name="ln835">	zlog_debug (&quot;SMUX_GET&quot;);</a>
+<a name="ln836">      smux_parse_get (ptr, len, 1);</a>
+<a name="ln837">      break;</a>
+<a name="ln838">    case SMUX_GETNEXT:</a>
+<a name="ln839">      /* Next request for object id. */</a>
+<a name="ln840">      if (debug_smux)</a>
+<a name="ln841">	zlog_debug (&quot;SMUX_GETNEXT&quot;);</a>
+<a name="ln842">      smux_parse_get (ptr, len, 0);</a>
+<a name="ln843">      break;</a>
+<a name="ln844">    case SMUX_SET:</a>
+<a name="ln845">      /* SMUX_SET is supported with some limitations. */</a>
+<a name="ln846">      if (debug_smux)</a>
+<a name="ln847">	zlog_debug (&quot;SMUX_SET&quot;);</a>
+<a name="ln848"> </a>
+<a name="ln849">      /* save the data for future SMUX_SOUT */</a>
+<a name="ln850">      memcpy (sout_save_buff, ptr, len);</a>
+<a name="ln851">      sout_save_len = len;</a>
+<a name="ln852">      smux_parse_set (ptr, len, RESERVE1);</a>
+<a name="ln853">      break;</a>
+<a name="ln854">    default:</a>
+<a name="ln855">      zlog_info (&quot;Unknown type: %d&quot;, type);</a>
+<a name="ln856">      break;</a>
+<a name="ln857">    }</a>
+<a name="ln858">  return 0;</a>
+<a name="ln859">}</a>
+<a name="ln860"> </a>
+<a name="ln861">/* SMUX message read function. */</a>
+<a name="ln862">static int</a>
+<a name="ln863">smux_read (struct thread *t)</a>
+<a name="ln864">{</a>
+<a name="ln865">  int sock;</a>
+<a name="ln866">  int len;</a>
+<a name="ln867">  u_char buf[SMUXMAXPKTSIZE];</a>
+<a name="ln868">  int ret;</a>
+<a name="ln869"> </a>
+<a name="ln870">  /* Clear thread. */</a>
+<a name="ln871">  sock = THREAD_FD (t);</a>
+<a name="ln872">  smux_read_thread = NULL;</a>
+<a name="ln873"> </a>
+<a name="ln874">  if (debug_smux)</a>
+<a name="ln875">    zlog_debug (&quot;SMUX read start&quot;);</a>
+<a name="ln876"> </a>
+<a name="ln877">  /* Read message from SMUX socket. */</a>
+<a name="ln878">  len = recv (sock, buf, SMUXMAXPKTSIZE, 0);</a>
+<a name="ln879"> </a>
+<a name="ln880">  if (len &lt; 0)</a>
+<a name="ln881">    {</a>
+<a name="ln882">      zlog_warn (&quot;Can't read all SMUX packet: %s&quot;, safe_strerror (errno));</a>
+<a name="ln883">      close (sock);</a>
+<a name="ln884">      smux_sock = -1;</a>
+<a name="ln885">      smux_event (SMUX_CONNECT, 0);</a>
+<a name="ln886">      return -1;</a>
+<a name="ln887">    }</a>
+<a name="ln888"> </a>
+<a name="ln889">  if (len == 0)</a>
+<a name="ln890">    {</a>
+<a name="ln891">      zlog_warn (&quot;SMUX connection closed: %d&quot;, sock);</a>
+<a name="ln892">      close (sock);</a>
+<a name="ln893">      smux_sock = -1;</a>
+<a name="ln894">      smux_event (SMUX_CONNECT, 0);</a>
+<a name="ln895">      return -1;</a>
+<a name="ln896">    }</a>
+<a name="ln897"> </a>
+<a name="ln898">  if (debug_smux)</a>
+<a name="ln899">    zlog_debug (&quot;SMUX read len: %d&quot;, len);</a>
+<a name="ln900"> </a>
+<a name="ln901">  /* Parse the message. */</a>
+<a name="ln902">  ret = smux_parse (buf, len);</a>
+<a name="ln903"> </a>
+<a name="ln904">  if (ret &lt; 0)</a>
+<a name="ln905">    {</a>
+<a name="ln906">      close (sock);</a>
+<a name="ln907">      smux_sock = -1;</a>
+<a name="ln908">      smux_event (SMUX_CONNECT, 0);</a>
+<a name="ln909">      return -1;</a>
+<a name="ln910">    }</a>
+<a name="ln911"> </a>
+<a name="ln912">  /* Regiser read thread. */</a>
+<a name="ln913">  smux_event (SMUX_READ, sock);</a>
+<a name="ln914"> </a>
+<a name="ln915">  return 0;</a>
+<a name="ln916">}</a>
+<a name="ln917"> </a>
+<a name="ln918">static int</a>
+<a name="ln919">smux_open (int sock)</a>
+<a name="ln920">{</a>
+<a name="ln921">  u_char buf[BUFSIZ];</a>
+<a name="ln922">  u_char *ptr;</a>
+<a name="ln923">  size_t len;</a>
+<a name="ln924">  long version;</a>
+<a name="ln925">  const char progname[] = QUAGGA_PROGNAME &quot;-&quot; QUAGGA_VERSION;</a>
+<a name="ln926"> </a>
+<a name="ln927">  if (debug_smux)</a>
+<a name="ln928">    {</a>
+<a name="ln929">      smux_oid_dump (&quot;SMUX open oid&quot;, smux_oid, smux_oid_len);</a>
+<a name="ln930">      zlog_debug (&quot;SMUX open progname: %s&quot;, progname);</a>
+<a name="ln931">      zlog_debug (&quot;SMUX open password: %s&quot;, smux_passwd);</a>
+<a name="ln932">    }</a>
+<a name="ln933"> </a>
+<a name="ln934">  ptr = buf;</a>
+<a name="ln935">  len = BUFSIZ;</a>
+<a name="ln936"> </a>
+<a name="ln937">  /* SMUX Header.  As placeholder. */</a>
+<a name="ln938">  ptr = asn_build_header (ptr, &amp;len, (u_char) SMUX_OPEN, 0);</a>
+<a name="ln939"> </a>
+<a name="ln940">  /* SMUX Open. */</a>
+<a name="ln941">  version = 0;</a>
+<a name="ln942">  ptr = asn_build_int (ptr, &amp;len, </a>
+<a name="ln943">		       (u_char)(ASN_UNIVERSAL | ASN_PRIMITIVE | ASN_INTEGER),</a>
+<a name="ln944">		       &amp;version, sizeof (version));</a>
+<a name="ln945"> </a>
+<a name="ln946">  /* SMUX connection oid. */</a>
+<a name="ln947">  ptr = asn_build_objid (ptr, &amp;len,</a>
+<a name="ln948">			 (u_char) </a>
+<a name="ln949">			 (ASN_UNIVERSAL | ASN_PRIMITIVE | ASN_OBJECT_ID),</a>
+<a name="ln950">			 smux_oid, smux_oid_len);</a>
+<a name="ln951"> </a>
+<a name="ln952">  /* SMUX connection description. */</a>
+<a name="ln953">  ptr = asn_build_string (ptr, &amp;len, </a>
+<a name="ln954">			  (u_char)</a>
+<a name="ln955">			  (ASN_UNIVERSAL | ASN_PRIMITIVE | ASN_OCTET_STR),</a>
+<a name="ln956">			  (const u_char *) progname, strlen (progname));</a>
+<a name="ln957"> </a>
+<a name="ln958">  /* SMUX connection password. */</a>
+<a name="ln959">  ptr = asn_build_string (ptr, &amp;len, </a>
+<a name="ln960">			  (u_char)</a>
+<a name="ln961">			  (ASN_UNIVERSAL | ASN_PRIMITIVE | ASN_OCTET_STR),</a>
+<a name="ln962">			  (u_char *)smux_passwd, strlen (smux_passwd));</a>
+<a name="ln963"> </a>
+<a name="ln964">  /* Fill in real SMUX header.  We exclude ASN header size (2). */</a>
+<a name="ln965">  len = BUFSIZ;</a>
+<a name="ln966">  asn_build_header (buf, &amp;len, (u_char) SMUX_OPEN, (ptr - buf) - 2);</a>
+<a name="ln967"> </a>
+<a name="ln968">  return send (sock, buf, (ptr - buf), 0);</a>
+<a name="ln969">}</a>
+<a name="ln970"> </a>
+<a name="ln971">/* `ename` is ignored. Instead of using the provided enterprise OID,</a>
+<a name="ln972">   the SMUX peer is used. This keep compatibility with the previous</a>
+<a name="ln973">   versions of Quagga.</a>
+<a name="ln974"> </a>
+<a name="ln975">   All other fields are used as they are intended. */</a>
+<a name="ln976">int</a>
+<a name="ln977">smux_trap (struct variable *vp, size_t vp_len,</a>
+<a name="ln978">	   const oid *ename, size_t enamelen,</a>
+<a name="ln979">	   const oid *name, size_t namelen,</a>
+<a name="ln980">	   const oid *iname, size_t inamelen,</a>
+<a name="ln981">	   const struct trap_object *trapobj, size_t trapobjlen,</a>
+<a name="ln982">	   u_char sptrap)</a>
+<a name="ln983">{</a>
+<a name="ln984">  unsigned int i;</a>
+<a name="ln985">  u_char buf[BUFSIZ];</a>
+<a name="ln986">  u_char *ptr;</a>
+<a name="ln987">  size_t len, length;</a>
+<a name="ln988">  struct in_addr addr;</a>
+<a name="ln989">  unsigned long val;</a>
+<a name="ln990">  u_char *h1, *h1e;</a>
+<a name="ln991"> </a>
+<a name="ln992">  ptr = buf;</a>
+<a name="ln993">  len = BUFSIZ;</a>
+<a name="ln994">  length = len;</a>
+<a name="ln995"> </a>
+<a name="ln996">  /* When SMUX connection is not established. */</a>
+<a name="ln997">  if (smux_sock &lt; 0)</a>
+<a name="ln998">    return 0;</a>
+<a name="ln999"> </a>
+<a name="ln1000">  /* SMUX header. */</a>
+<a name="ln1001">  ptr = asn_build_header (ptr, &amp;len, (u_char) SMUX_TRAP, 0);</a>
+<a name="ln1002"> </a>
+<a name="ln1003">  /* Sub agent enterprise oid. */</a>
+<a name="ln1004">  ptr = asn_build_objid (ptr, &amp;len,</a>
+<a name="ln1005">			 (u_char) </a>
+<a name="ln1006">			 (ASN_UNIVERSAL | ASN_PRIMITIVE | ASN_OBJECT_ID),</a>
+<a name="ln1007">			 smux_oid, smux_oid_len);</a>
+<a name="ln1008"> </a>
+<a name="ln1009">  /* IP address. */</a>
+<a name="ln1010">  addr.s_addr = 0;</a>
+<a name="ln1011">  ptr = asn_build_string (ptr, &amp;len, </a>
+<a name="ln1012">			  (u_char)</a>
+<a name="ln1013">			  (ASN_UNIVERSAL | ASN_PRIMITIVE | ASN_IPADDRESS),</a>
+<a name="ln1014">			  (u_char *)&amp;addr, sizeof (addr));</a>
+<a name="ln1015"> </a>
+<a name="ln1016">  /* Generic trap integer. */</a>
+<a name="ln1017">  val = SNMP_TRAP_ENTERPRISESPECIFIC;</a>
+<a name="ln1018">  ptr = asn_build_int (ptr, &amp;len, </a>
+<a name="ln1019">		       (u_char)(ASN_UNIVERSAL | ASN_PRIMITIVE | ASN_INTEGER),</a>
+<a name="ln1020">		       (long *)&amp;val, sizeof (val));</a>
+<a name="ln1021"> </a>
+<a name="ln1022">  /* Specific trap integer. */</a>
+<a name="ln1023">  val = sptrap;</a>
+<a name="ln1024">  ptr = asn_build_int (ptr, &amp;len, </a>
+<a name="ln1025">		       (u_char)(ASN_UNIVERSAL | ASN_PRIMITIVE | ASN_INTEGER),</a>
+<a name="ln1026">		       (long *)&amp;val, sizeof (val));</a>
+<a name="ln1027"> </a>
+<a name="ln1028">  /* Timeticks timestamp. */</a>
+<a name="ln1029">  val = 0;</a>
+<a name="ln1030">  ptr = asn_build_unsigned_int (ptr, &amp;len, </a>
+<a name="ln1031">				(u_char)(ASN_UNIVERSAL | ASN_PRIMITIVE | ASN_TIMETICKS),</a>
+<a name="ln1032">				&amp;val, sizeof (val));</a>
+<a name="ln1033">  </a>
+<a name="ln1034">  /* Variables. */</a>
+<a name="ln1035">  h1 = ptr;</a>
+<a name="ln1036">  ptr = asn_build_sequence (ptr, &amp;len, </a>
+<a name="ln1037">			    (u_char) (ASN_SEQUENCE | ASN_CONSTRUCTOR),</a>
+<a name="ln1038">			    0);</a>
+<a name="ln1039"> </a>
+<a name="ln1040"> </a>
+<a name="ln1041">  /* Iteration for each objects. */</a>
+<a name="ln1042">  h1e = ptr;</a>
+<a name="ln1043">  for (i = 0; i &lt; trapobjlen; i++)</a>
+<a name="ln1044">    {</a>
+<a name="ln1045">      int ret;</a>
+<a name="ln1046">      oid oid[MAX_OID_LEN];</a>
+<a name="ln1047">      size_t oid_len;</a>
+<a name="ln1048">      void *val;</a>
+<a name="ln1049">      size_t val_len;</a>
+<a name="ln1050">      u_char val_type;</a>
+<a name="ln1051"> </a>
+<a name="ln1052">      /* Make OID. */</a>
+<a name="ln1053">      if (trapobj[i].namelen &gt; 0) </a>
+<a name="ln1054">        {</a>
+<a name="ln1055">          oid_copy (oid, name, namelen);</a>
+<a name="ln1056">          oid_copy (oid + namelen, trapobj[i].name, trapobj[i].namelen);</a>
+<a name="ln1057">          oid_copy (oid + namelen + trapobj[i].namelen, iname, inamelen);</a>
+<a name="ln1058">          oid_len = namelen + trapobj[i].namelen + inamelen;</a>
+<a name="ln1059">        }</a>
+<a name="ln1060">      else </a>
+<a name="ln1061">        {</a>
+<a name="ln1062">          oid_copy (oid, name, namelen);</a>
+<a name="ln1063">          oid_copy (oid + namelen, trapobj[i].name, trapobj[i].namelen * (-1));</a>
+<a name="ln1064">          oid_len = namelen + trapobj[i].namelen * (-1) ;</a>
+<a name="ln1065">        }</a>
+<a name="ln1066"> </a>
+<a name="ln1067">      if (debug_smux) </a>
+<a name="ln1068">        {</a>
+<a name="ln1069">          smux_oid_dump (&quot;Trap&quot;, name, namelen);</a>
+<a name="ln1070">          if (trapobj[i].namelen &lt; 0)</a>
+<a name="ln1071">            smux_oid_dump (&quot;Trap&quot;, </a>
+<a name="ln1072">                           trapobj[i].name, (- 1) * (trapobj[i].namelen));</a>
+<a name="ln1073">          else </a>
+<a name="ln1074">            {</a>
+<a name="ln1075">              smux_oid_dump (&quot;Trap&quot;, trapobj[i].name, (trapobj[i].namelen));</a>
+<a name="ln1076">              smux_oid_dump (&quot;Trap&quot;, iname, inamelen);</a>
+<a name="ln1077">            }</a>
+<a name="ln1078">          smux_oid_dump (&quot;Trap&quot;, oid, oid_len);</a>
+<a name="ln1079">          zlog_info (&quot;BUFSIZ: %d // oid_len: %lu&quot;, BUFSIZ, (u_long)oid_len);</a>
+<a name="ln1080">      }</a>
+<a name="ln1081"> </a>
+<a name="ln1082">      ret = smux_get (oid, &amp;oid_len, 1, &amp;val_type, &amp;val, &amp;val_len);</a>
+<a name="ln1083"> </a>
+<a name="ln1084">      if (debug_smux)</a>
+<a name="ln1085">	zlog_debug (&quot;smux_get result %d&quot;, ret);</a>
+<a name="ln1086"> </a>
+<a name="ln1087">      if (ret == 0)</a>
+<a name="ln1088">	ptr = snmp_build_var_op (ptr, oid, &amp;oid_len,</a>
+<a name="ln1089">				 val_type, val_len, val, &amp;len);</a>
+<a name="ln1090">    }</a>
+<a name="ln1091"> </a>
+<a name="ln1092">  /* Now variable size is known, fill in size */</a>
+<a name="ln1093">  asn_build_sequence(h1, &amp;length,</a>
+<a name="ln1094">		     (u_char) (ASN_SEQUENCE | ASN_CONSTRUCTOR),</a>
+<a name="ln1095">		     ptr - h1e);</a>
+<a name="ln1096"> </a>
+<a name="ln1097">  /* Fill in size of whole sequence */</a>
+<a name="ln1098">  len = BUFSIZ;</a>
+<a name="ln1099">  asn_build_header (buf, &amp;len, (u_char) SMUX_TRAP, (ptr - buf) - 2);</a>
+<a name="ln1100"> </a>
+<a name="ln1101">  return send (smux_sock, buf, (ptr - buf), 0);</a>
+<a name="ln1102">}</a>
+<a name="ln1103"> </a>
+<a name="ln1104">static int</a>
+<a name="ln1105">smux_register (int sock)</a>
+<a name="ln1106">{</a>
+<a name="ln1107">  u_char buf[BUFSIZ];</a>
+<a name="ln1108">  u_char *ptr;</a>
+<a name="ln1109">  int ret;</a>
+<a name="ln1110">  size_t len;</a>
+<a name="ln1111">  long priority;</a>
+<a name="ln1112">  long operation;</a>
+<a name="ln1113">  struct subtree *subtree;</a>
+<a name="ln1114">  struct listnode *node, *nnode;</a>
+<a name="ln1115"> </a>
+<a name="ln1116">  ret = 0;</a>
+<a name="ln1117"> </a>
+<a name="ln1118">  for (ALL_LIST_ELEMENTS (treelist, node, nnode, subtree))</a>
+<a name="ln1119">    {</a>
+<a name="ln1120">      ptr = buf;</a>
+<a name="ln1121">      len = BUFSIZ;</a>
+<a name="ln1122"> </a>
+<a name="ln1123">      /* SMUX RReq Header. */</a>
+<a name="ln1124">      ptr = asn_build_header (ptr, &amp;len, (u_char) SMUX_RREQ, 0);</a>
+<a name="ln1125"> </a>
+<a name="ln1126">      /* Register MIB tree. */</a>
+<a name="ln1127">      ptr = asn_build_objid (ptr, &amp;len,</a>
+<a name="ln1128">			    (u_char)</a>
+<a name="ln1129">			    (ASN_UNIVERSAL | ASN_PRIMITIVE | ASN_OBJECT_ID),</a>
+<a name="ln1130">			    subtree-&gt;name, subtree-&gt;name_len);</a>
+<a name="ln1131"> </a>
+<a name="ln1132">      /* Priority. */</a>
+<a name="ln1133">      priority = -1;</a>
+<a name="ln1134">      ptr = asn_build_int (ptr, &amp;len, </a>
+<a name="ln1135">		          (u_char)(ASN_UNIVERSAL | ASN_PRIMITIVE | ASN_INTEGER),</a>
+<a name="ln1136">		          &amp;priority, sizeof (priority));</a>
+<a name="ln1137"> </a>
+<a name="ln1138">      /* Operation. */</a>
+<a name="ln1139">      operation = 2; /* Register R/W */</a>
+<a name="ln1140">      ptr = asn_build_int (ptr, &amp;len, </a>
+<a name="ln1141">		          (u_char)(ASN_UNIVERSAL | ASN_PRIMITIVE | ASN_INTEGER),</a>
+<a name="ln1142">		          &amp;operation, sizeof (operation));</a>
+<a name="ln1143"> </a>
+<a name="ln1144">      if (debug_smux)</a>
+<a name="ln1145">        {</a>
+<a name="ln1146">          smux_oid_dump (&quot;SMUX register oid&quot;, subtree-&gt;name, subtree-&gt;name_len);</a>
+<a name="ln1147">          zlog_debug (&quot;SMUX register priority: %ld&quot;, priority);</a>
+<a name="ln1148">          zlog_debug (&quot;SMUX register operation: %ld&quot;, operation);</a>
+<a name="ln1149">        }</a>
+<a name="ln1150"> </a>
+<a name="ln1151">      len = BUFSIZ;</a>
+<a name="ln1152">      asn_build_header (buf, &amp;len, (u_char) SMUX_RREQ, (ptr - buf) - 2);</a>
+<a name="ln1153">      ret = send (sock, buf, (ptr - buf), 0);</a>
+<a name="ln1154">      if (ret &lt; 0)</a>
+<a name="ln1155">        return ret;</a>
+<a name="ln1156">    }</a>
+<a name="ln1157">  return ret;</a>
+<a name="ln1158">}</a>
+<a name="ln1159"> </a>
+<a name="ln1160">/* Try to connect to SNMP agent. */</a>
+<a name="ln1161">static int</a>
+<a name="ln1162">smux_connect (struct thread *t)</a>
+<a name="ln1163">{</a>
+<a name="ln1164">  int ret;</a>
+<a name="ln1165"> </a>
+<a name="ln1166">  if (debug_smux)</a>
+<a name="ln1167">    zlog_debug (&quot;SMUX connect try %d&quot;, fail + 1);</a>
+<a name="ln1168"> </a>
+<a name="ln1169">  /* Clear thread poner of myself. */</a>
+<a name="ln1170">  smux_connect_thread = NULL;</a>
+<a name="ln1171"> </a>
+<a name="ln1172">  /* Make socket.  Try to connect. */</a>
+<a name="ln1173">  smux_sock = smux_socket ();</a>
+<a name="ln1174">  if (smux_sock &lt; 0)</a>
+<a name="ln1175">    {</a>
+<a name="ln1176">      if (++fail &lt; SMUX_MAX_FAILURE)</a>
+<a name="ln1177">	smux_event (SMUX_CONNECT, 0);</a>
+<a name="ln1178">      return 0;</a>
+<a name="ln1179">    }</a>
+<a name="ln1180"> </a>
+<a name="ln1181">  /* Send OPEN PDU. */</a>
+<a name="ln1182">  ret = smux_open (smux_sock);</a>
+<a name="ln1183">  if (ret &lt; 0)</a>
+<a name="ln1184">    {</a>
+<a name="ln1185">      zlog_warn (&quot;SMUX open message send failed: %s&quot;, safe_strerror (errno));</a>
+<a name="ln1186">      close (smux_sock);</a>
+<a name="ln1187">      smux_sock = -1;</a>
+<a name="ln1188">      if (++fail &lt; SMUX_MAX_FAILURE)</a>
+<a name="ln1189">	smux_event (SMUX_CONNECT, 0);</a>
+<a name="ln1190">      return -1;</a>
+<a name="ln1191">    }</a>
+<a name="ln1192"> </a>
+<a name="ln1193">  /* Send any outstanding register PDUs. */</a>
+<a name="ln1194">  ret = smux_register (smux_sock);</a>
+<a name="ln1195">  if (ret &lt; 0)</a>
+<a name="ln1196">    {</a>
+<a name="ln1197">      zlog_warn (&quot;SMUX register message send failed: %s&quot;, safe_strerror (errno));</a>
+<a name="ln1198">      close (smux_sock);</a>
+<a name="ln1199">      smux_sock = -1;</a>
+<a name="ln1200">      if (++fail &lt; SMUX_MAX_FAILURE)</a>
+<a name="ln1201">	smux_event (SMUX_CONNECT, 0);</a>
+<a name="ln1202">      return -1;</a>
+<a name="ln1203">    }</a>
+<a name="ln1204"> </a>
+<a name="ln1205">  /* Everything goes fine. */</a>
+<a name="ln1206">  smux_event (SMUX_READ, smux_sock);</a>
+<a name="ln1207"> </a>
+<a name="ln1208">  return 0;</a>
+<a name="ln1209">}</a>
+<a name="ln1210"> </a>
+<a name="ln1211">/* Clear all SMUX related resources. */</a>
+<a name="ln1212">static void</a>
+<a name="ln1213">smux_stop (void)</a>
+<a name="ln1214">{</a>
+<a name="ln1215">  if (smux_read_thread)</a>
+<a name="ln1216">    {</a>
+<a name="ln1217">      thread_cancel (smux_read_thread);</a>
+<a name="ln1218">      smux_read_thread = NULL;</a>
+<a name="ln1219">    }</a>
+<a name="ln1220"> </a>
+<a name="ln1221">  if (smux_connect_thread)</a>
+<a name="ln1222">    {</a>
+<a name="ln1223">      thread_cancel (smux_connect_thread);</a>
+<a name="ln1224">      smux_connect_thread = NULL;</a>
+<a name="ln1225">    }</a>
+<a name="ln1226"> </a>
+<a name="ln1227">  if (smux_sock &gt;= 0)</a>
+<a name="ln1228">    {</a>
+<a name="ln1229">      close (smux_sock);</a>
+<a name="ln1230">      smux_sock = -1;</a>
+<a name="ln1231">    }</a>
+<a name="ln1232">}</a>
+<a name="ln1233"> </a>
+<a name="ln1234"> </a>
+<a name="ln1235"> </a>
+<a name="ln1236">void</a>
+<a name="ln1237">smux_event (enum smux_event event, int sock)</a>
+<a name="ln1238">{</a>
+<a name="ln1239">  switch (event)</a>
+<a name="ln1240">    {</a>
+<a name="ln1241">    case SMUX_SCHEDULE:</a>
+<a name="ln1242">      smux_connect_thread = thread_add_event (smux_master, smux_connect, NULL, 0);</a>
+<a name="ln1243">      break;</a>
+<a name="ln1244">    case SMUX_CONNECT:</a>
+<a name="ln1245">      smux_connect_thread = thread_add_timer (smux_master, smux_connect, NULL, 10);</a>
+<a name="ln1246">      break;</a>
+<a name="ln1247">    case SMUX_READ:</a>
+<a name="ln1248">      smux_read_thread = thread_add_read (smux_master, smux_read, NULL, sock);</a>
+<a name="ln1249">      break;</a>
+<a name="ln1250">    default:</a>
+<a name="ln1251">      break;</a>
+<a name="ln1252">    }</a>
+<a name="ln1253">}</a>
+<a name="ln1254"> </a>
+<a name="ln1255">static int</a>
+<a name="ln1256">smux_str2oid (const char *str, oid *oid, size_t *oid_len)</a>
+<a name="ln1257">{</a>
+<a name="ln1258">  int len;</a>
+<a name="ln1259">  int val;</a>
+<a name="ln1260"> </a>
+<a name="ln1261">  len = 0;</a>
+<a name="ln1262">  val = 0;</a>
+<a name="ln1263">  *oid_len = 0;</a>
+<a name="ln1264"> </a>
+<a name="ln1265">  if (*str == '.')</a>
+<a name="ln1266">    str++;</a>
+<a name="ln1267">  if (*str == '\0')</a>
+<a name="ln1268">    return 0;</a>
+<a name="ln1269"> </a>
+<a name="ln1270">  while (1)</a>
+<a name="ln1271">    {</a>
+<a name="ln1272">      if (! isdigit (*str))</a>
+<a name="ln1273">	return -1;</a>
+<a name="ln1274"> </a>
+<a name="ln1275">      while (isdigit (*str))</a>
+<a name="ln1276">	{</a>
+<a name="ln1277">	  val *= 10;</a>
+<a name="ln1278">	  val += (*str - '0');</a>
+<a name="ln1279">	  str++;</a>
+<a name="ln1280">	}</a>
+<a name="ln1281"> </a>
+<a name="ln1282">      if (*str == '\0')</a>
+<a name="ln1283">	break;</a>
+<a name="ln1284">      if (*str != '.')</a>
+<a name="ln1285">	return -1;</a>
+<a name="ln1286"> </a>
+<a name="ln1287">      oid[len++] = val;</a>
+<a name="ln1288">      val = 0;</a>
+<a name="ln1289">      str++;</a>
+<a name="ln1290">    }</a>
+<a name="ln1291"> </a>
+<a name="ln1292">  oid[len++] = val;</a>
+<a name="ln1293">  *oid_len = len;</a>
+<a name="ln1294"> </a>
+<a name="ln1295">  return 0;</a>
+<a name="ln1296">}</a>
+<a name="ln1297"> </a>
+<a name="ln1298">static oid *</a>
+<a name="ln1299">smux_oid_dup (oid *objid, size_t objid_len)</a>
+<a name="ln1300">{</a>
+<a name="ln1301">  oid *new;</a>
+<a name="ln1302"> </a>
+<a name="ln1303">  new = XMALLOC (MTYPE_TMP, sizeof (oid) * objid_len);</a>
+<a name="ln1304">  oid_copy (new, objid, objid_len);</a>
+<a name="ln1305"> </a>
+<a name="ln1306">  return new;</a>
+<a name="ln1307">}</a>
+<a name="ln1308"> </a>
+<a name="ln1309">static int</a>
+<a name="ln1310">smux_peer_oid (struct vty *vty, const char *oid_str, const char *passwd_str)</a>
+<a name="ln1311">{</a>
+<a name="ln1312">  int ret;</a>
+<a name="ln1313">  oid oid[MAX_OID_LEN];</a>
+<a name="ln1314">  size_t oid_len;</a>
+<a name="ln1315"> </a>
+<a name="ln1316">  ret = smux_str2oid (oid_str, oid, &amp;oid_len);</a>
+<a name="ln1317">  if (ret != 0)</a>
+<a name="ln1318">    {</a>
+<a name="ln1319">      vty_out (vty, &quot;object ID malformed%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1320">      return CMD_WARNING;</a>
+<a name="ln1321">    }</a>
+<a name="ln1322"> </a>
+<a name="ln1323">  if (smux_oid)</a>
+<a name="ln1324">    {</a>
+<a name="ln1325">      free (smux_oid);</a>
+<a name="ln1326">      smux_oid = NULL;</a>
+<a name="ln1327">    }</a>
+<a name="ln1328"> </a>
+<a name="ln1329">  /* careful, smux_passwd might point to string constant */</a>
+<a name="ln1330">  if (smux_passwd)</a>
+<a name="ln1331">    {</a>
+<a name="ln1332">      free (smux_passwd);</a>
+<a name="ln1333">      smux_passwd = NULL;</a>
+<a name="ln1334">    }</a>
+<a name="ln1335"> </a>
+<a name="ln1336">  smux_oid = smux_oid_dup (oid, oid_len);</a>
+<a name="ln1337">  smux_oid_len = oid_len;</a>
+<a name="ln1338"> </a>
+<a name="ln1339">  if (passwd_str)</a>
+<a name="ln1340">    smux_passwd = strdup (passwd_str);</a>
+<a name="ln1341">  else</a>
+<a name="ln1342">    smux_passwd = strdup (&quot;&quot;);</a>
+<a name="ln1343"> </a>
+<a name="ln1344">  return 0;</a>
+<a name="ln1345">}</a>
+<a name="ln1346"> </a>
+<a name="ln1347">static int</a>
+<a name="ln1348">smux_peer_default (void)</a>
+<a name="ln1349">{</a>
+<a name="ln1350">  if (smux_oid)</a>
+<a name="ln1351">    {</a>
+<a name="ln1352">      free (smux_oid);</a>
+<a name="ln1353">      smux_oid = NULL;</a>
+<a name="ln1354">    }</a>
+<a name="ln1355">  </a>
+<a name="ln1356">  /* careful, smux_passwd might be pointing at string constant */</a>
+<a name="ln1357">  if (smux_passwd)</a>
+<a name="ln1358">    {</a>
+<a name="ln1359">      free (smux_passwd);</a>
+<a name="ln1360">      smux_passwd = NULL;</a>
+<a name="ln1361">    }</a>
+<a name="ln1362"> </a>
+<a name="ln1363">  return CMD_SUCCESS;</a>
+<a name="ln1364">}</a>
+<a name="ln1365"> </a>
+<a name="ln1366">DEFUN (smux_peer,</a>
+<a name="ln1367">       smux_peer_cmd,</a>
+<a name="ln1368">       &quot;smux peer OID&quot;,</a>
+<a name="ln1369">       &quot;SNMP MUX protocol settings\n&quot;</a>
+<a name="ln1370">       &quot;SNMP MUX peer settings\n&quot;</a>
+<a name="ln1371">       &quot;Object ID used in SMUX peering\n&quot;)</a>
+<a name="ln1372">{</a>
+<a name="ln1373">  if (smux_peer_oid (vty, argv[0], NULL) == 0)</a>
+<a name="ln1374">    {</a>
+<a name="ln1375">      smux_start();</a>
+<a name="ln1376">      return CMD_SUCCESS;</a>
+<a name="ln1377">    }</a>
+<a name="ln1378">  else</a>
+<a name="ln1379">    return CMD_WARNING;</a>
+<a name="ln1380">}</a>
+<a name="ln1381"> </a>
+<a name="ln1382">DEFUN (smux_peer_password,</a>
+<a name="ln1383">       smux_peer_password_cmd,</a>
+<a name="ln1384">       &quot;smux peer OID PASSWORD&quot;,</a>
+<a name="ln1385">       &quot;SNMP MUX protocol settings\n&quot;</a>
+<a name="ln1386">       &quot;SNMP MUX peer settings\n&quot;</a>
+<a name="ln1387">       &quot;SMUX peering object ID\n&quot;</a>
+<a name="ln1388">       &quot;SMUX peering password\n&quot;)</a>
+<a name="ln1389">{</a>
+<a name="ln1390">  if (smux_peer_oid (vty, argv[0], argv[1]) == 0)</a>
+<a name="ln1391">    {</a>
+<a name="ln1392">      smux_start();</a>
+<a name="ln1393">      return CMD_SUCCESS;</a>
+<a name="ln1394">    }</a>
+<a name="ln1395">  else</a>
+<a name="ln1396">    return CMD_WARNING;</a>
+<a name="ln1397">}</a>
+<a name="ln1398"> </a>
+<a name="ln1399">DEFUN (no_smux_peer,</a>
+<a name="ln1400">       no_smux_peer_cmd,</a>
+<a name="ln1401">       &quot;no smux peer&quot;,</a>
+<a name="ln1402">       NO_STR</a>
+<a name="ln1403">       &quot;SNMP MUX protocol settings\n&quot;</a>
+<a name="ln1404">       &quot;SNMP MUX peer settings\n&quot;)</a>
+<a name="ln1405">{</a>
+<a name="ln1406">  smux_stop();</a>
+<a name="ln1407">  return smux_peer_default ();</a>
+<a name="ln1408">}</a>
+<a name="ln1409"> </a>
+<a name="ln1410">ALIAS (no_smux_peer,</a>
+<a name="ln1411">       no_smux_peer_oid_cmd,</a>
+<a name="ln1412">       &quot;no smux peer OID&quot;,</a>
+<a name="ln1413">       NO_STR</a>
+<a name="ln1414">       &quot;SNMP MUX protocol settings\n&quot;</a>
+<a name="ln1415">       &quot;SNMP MUX peer settings\n&quot;</a>
+<a name="ln1416">       &quot;SMUX peering object ID\n&quot;)</a>
+<a name="ln1417"> </a>
+<a name="ln1418">ALIAS (no_smux_peer,</a>
+<a name="ln1419">       no_smux_peer_oid_password_cmd,</a>
+<a name="ln1420">       &quot;no smux peer OID PASSWORD&quot;,</a>
+<a name="ln1421">       NO_STR</a>
+<a name="ln1422">       &quot;SNMP MUX protocol settings\n&quot;</a>
+<a name="ln1423">       &quot;SNMP MUX peer settings\n&quot;</a>
+<a name="ln1424">       &quot;SMUX peering object ID\n&quot;</a>
+<a name="ln1425">       &quot;SMUX peering password\n&quot;)</a>
+<a name="ln1426"> </a>
+<a name="ln1427">static int</a>
+<a name="ln1428">config_write_smux (struct vty *vty)</a>
+<a name="ln1429">{</a>
+<a name="ln1430">  int first = 1;</a>
+<a name="ln1431">  unsigned int i;</a>
+<a name="ln1432"> </a>
+<a name="ln1433">  if (smux_oid)</a>
+<a name="ln1434">    {</a>
+<a name="ln1435">      vty_out (vty, &quot;smux peer &quot;);</a>
+<a name="ln1436">      for (i = 0; i &lt; smux_oid_len; i++)</a>
+<a name="ln1437">	{</a>
+<a name="ln1438">	  vty_out (vty, &quot;%s%d&quot;, first ? &quot;&quot; : &quot;.&quot;, (int) smux_oid[i]);</a>
+<a name="ln1439">	  first = 0;</a>
+<a name="ln1440">	}</a>
+<a name="ln1441">      vty_out (vty, &quot; %s%s&quot;, smux_passwd, VTY_NEWLINE);</a>
+<a name="ln1442">    }</a>
+<a name="ln1443">  return 0;</a>
+<a name="ln1444">}</a>
+<a name="ln1445"> </a>
+<a name="ln1446">/* Register subtree to smux master tree. */</a>
+<a name="ln1447">void</a>
+<a name="ln1448">smux_register_mib (const char *descr, struct variable *var, </a>
+<a name="ln1449">                   size_t width, int num, </a>
+<a name="ln1450">		   oid name[], size_t namelen)</a>
+<a name="ln1451">{</a>
+<a name="ln1452">  struct subtree *tree;</a>
+<a name="ln1453"> </a>
+<a name="ln1454">  tree = (struct subtree *)malloc(sizeof(struct subtree));</a>
+<a name="ln1455">  oid_copy (tree-&gt;name, name, namelen);</a>
+<a name="ln1456">  tree-&gt;name_len = namelen;</a>
+<a name="ln1457">  tree-&gt;variables = var;</a>
+<a name="ln1458">  tree-&gt;variables_num = num;</a>
+<a name="ln1459">  tree-&gt;variables_width = width;</a>
+<a name="ln1460">  tree-&gt;registered = 0;</a>
+<a name="ln1461">  listnode_add_sort(treelist, tree);</a>
+<a name="ln1462">}</a>
+<a name="ln1463"> </a>
+<a name="ln1464">/* Compare function to keep treelist sorted */</a>
+<a name="ln1465">static int</a>
+<a name="ln1466">smux_tree_cmp(struct subtree *tree1, struct subtree *tree2)</a>
+<a name="ln1467">{</a>
+<a name="ln1468">  return oid_compare(tree1-&gt;name, tree1-&gt;name_len, </a>
+<a name="ln1469">		     tree2-&gt;name, tree2-&gt;name_len);</a>
+<a name="ln1470">}</a>
+<a name="ln1471"> </a>
+<a name="ln1472">/* Initialize some values then schedule first SMUX connection. */</a>
+<a name="ln1473">void</a>
+<a name="ln1474">smux_init (struct thread_master *tm)</a>
+<a name="ln1475">{</a>
+<a name="ln1476">  /* copy callers thread master */</a>
+<a name="ln1477">  smux_master = tm;</a>
+<a name="ln1478">  </a>
+<a name="ln1479">  /* Make MIB tree. */</a>
+<a name="ln1480">  treelist = list_new();</a>
+<a name="ln1481">  treelist-&gt;cmp = (int (*)(void *, void *))smux_tree_cmp;</a>
+<a name="ln1482"> </a>
+<a name="ln1483">  /* Install commands. */</a>
+<a name="ln1484">  install_node (&amp;smux_node, config_write_smux);</a>
+<a name="ln1485"> </a>
+<a name="ln1486">  install_element (CONFIG_NODE, &amp;smux_peer_cmd);</a>
+<a name="ln1487">  install_element (CONFIG_NODE, &amp;smux_peer_password_cmd);</a>
+<a name="ln1488">  install_element (CONFIG_NODE, &amp;no_smux_peer_cmd);</a>
+<a name="ln1489">  install_element (CONFIG_NODE, &amp;no_smux_peer_oid_cmd);</a>
+<a name="ln1490">  install_element (CONFIG_NODE, &amp;no_smux_peer_oid_password_cmd);</a>
+<a name="ln1491">}</a>
+<a name="ln1492"> </a>
+<a name="ln1493">void</a>
+<a name="ln1494">smux_start(void)</a>
+<a name="ln1495">{</a>
+<a name="ln1496">  /* Close any existing connections. */</a>
+<a name="ln1497">  smux_stop();</a>
+<a name="ln1498"> </a>
+<a name="ln1499">  /* Schedule first connection. */</a>
+<a name="ln1500">  smux_event (SMUX_SCHEDULE, 0);</a>
+<a name="ln1501">}</a>
+<a name="ln1502">#endif /* HAVE_SNMP */</a>
+
+</code></pre>
+<div class="balloon" rel="7"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1042/" target="_blank">V1042</a> This file is marked with copyleft license, which requires you to open the derived source code.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

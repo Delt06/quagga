@@ -1,0 +1,359 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>bgp_btoa.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.5.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/* BGP dump to ascii converter</a>
+<a name="ln2">   Copyright (C) 1999 Kunihiro Ishiguro</a>
+<a name="ln3"> </a>
+<a name="ln4">This file is part of GNU Zebra.</a>
+<a name="ln5"> </a>
+<a name="ln6">GNU Zebra is free software; you can redistribute it and/or modify it</a>
+<a name="ln7">under the terms of the GNU General Public License as published by the</a>
+<a name="ln8">Free Software Foundation; either version 2, or (at your option) any</a>
+<a name="ln9">later version.</a>
+<a name="ln10"> </a>
+<a name="ln11">GNU Zebra is distributed in the hope that it will be useful, but</a>
+<a name="ln12">WITHOUT ANY WARRANTY; without even the implied warranty of</a>
+<a name="ln13">MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU</a>
+<a name="ln14">General Public License for more details.</a>
+<a name="ln15"> </a>
+<a name="ln16">You should have received a copy of the GNU General Public License</a>
+<a name="ln17">along with GNU Zebra; see the file COPYING.  If not, write to the Free</a>
+<a name="ln18">Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA</a>
+<a name="ln19">02111-1307, USA.  */</a>
+<a name="ln20"> </a>
+<a name="ln21">#include &lt;zebra.h&gt;</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &quot;zebra.h&quot;</a>
+<a name="ln24">#include &quot;stream.h&quot;</a>
+<a name="ln25">#include &quot;log.h&quot;</a>
+<a name="ln26">#include &quot;prefix.h&quot;</a>
+<a name="ln27">#include &quot;command.h&quot;</a>
+<a name="ln28">#include &quot;memory.h&quot;</a>
+<a name="ln29">#include &quot;privs.h&quot;</a>
+<a name="ln30">#include &quot;filter.h&quot;</a>
+<a name="ln31"> </a>
+<a name="ln32">#include &quot;bgpd/bgpd.h&quot;</a>
+<a name="ln33">#include &quot;bgpd/bgp_dump.h&quot;</a>
+<a name="ln34">#include &quot;bgpd/bgp_attr.h&quot;</a>
+<a name="ln35">#include &quot;bgpd/bgp_aspath.h&quot;</a>
+<a name="ln36"> </a>
+<a name="ln37">/* privileges */</a>
+<a name="ln38">static zebra_capabilities_t _caps_p [] =</a>
+<a name="ln39">{</a>
+<a name="ln40">    ZCAP_BIND,</a>
+<a name="ln41">    ZCAP_NET_RAW,</a>
+<a name="ln42">    ZCAP_NET_ADMIN,</a>
+<a name="ln43">};</a>
+<a name="ln44"> </a>
+<a name="ln45">struct zebra_privs_t bgpd_privs =</a>
+<a name="ln46">{</a>
+<a name="ln47">#if defined(QUAGGA_USER) &amp;&amp; defined(QUAGGA_GROUP)</a>
+<a name="ln48">  .user = QUAGGA_USER,</a>
+<a name="ln49">  .group = QUAGGA_GROUP,</a>
+<a name="ln50">#endif</a>
+<a name="ln51">#ifdef VTY_GROUP</a>
+<a name="ln52">  .vty_group = VTY_GROUP,</a>
+<a name="ln53">#endif</a>
+<a name="ln54">  .caps_p = _caps_p,</a>
+<a name="ln55">  .cap_num_p = array_size(_caps_p),</a>
+<a name="ln56">  .cap_num_i = 0,</a>
+<a name="ln57">};</a>
+<a name="ln58"> </a>
+<a name="ln59">enum MRT_MSG_TYPES {</a>
+<a name="ln60">   MSG_NULL,</a>
+<a name="ln61">   MSG_START,                   /* sender is starting up */</a>
+<a name="ln62">   MSG_DIE,                     /* receiver should shut down */</a>
+<a name="ln63">   MSG_I_AM_DEAD,               /* sender is shutting down */</a>
+<a name="ln64">   MSG_PEER_DOWN,               /* sender's peer is down */</a>
+<a name="ln65">   MSG_PROTOCOL_BGP,            /* msg is a BGP packet */</a>
+<a name="ln66">   MSG_PROTOCOL_RIP,            /* msg is a RIP packet */</a>
+<a name="ln67">   MSG_PROTOCOL_IDRP,           /* msg is an IDRP packet */</a>
+<a name="ln68">   MSG_PROTOCOL_RIPNG,          /* msg is a RIPNG packet */</a>
+<a name="ln69">   MSG_PROTOCOL_BGP4PLUS,       /* msg is a BGP4+ packet */</a>
+<a name="ln70">   MSG_PROTOCOL_BGP4PLUS_01,    /* msg is a BGP4+ (draft 01) packet */</a>
+<a name="ln71">   MSG_PROTOCOL_OSPF,           /* msg is an OSPF packet */</a>
+<a name="ln72">   MSG_TABLE_DUMP               /* routing table dump */</a>
+<a name="ln73">};</a>
+<a name="ln74"> </a>
+<a name="ln75">static int</a>
+<a name="ln76">attr_parse (struct stream *s, u_int16_t len)</a>
+<a name="ln77">{</a>
+<a name="ln78">  u_int flag;</a>
+<a name="ln79">  u_int type;</a>
+<a name="ln80">  u_int16_t length;</a>
+<a name="ln81">  u_int16_t lim;</a>
+<a name="ln82"> </a>
+<a name="ln83">  lim = s-&gt;getp + len;</a>
+<a name="ln84"> </a>
+<a name="ln85">  printf (&quot;attr_parse s-&gt;getp %zd, len %d, lim %d\n&quot;, s-&gt;getp, len, lim);</a>
+<a name="ln86"> </a>
+<a name="ln87">  while (s-&gt;getp &lt; lim)</a>
+<a name="ln88">    {</a>
+<a name="ln89">      flag = stream_getc (s);</a>
+<a name="ln90">      type = stream_getc (s);</a>
+<a name="ln91"> </a>
+<a name="ln92">      if (flag &amp; BGP_ATTR_FLAG_EXTLEN)</a>
+<a name="ln93">	length = stream_getw (s);</a>
+<a name="ln94">      else</a>
+<a name="ln95">	length = stream_getc (s);</a>
+<a name="ln96"> </a>
+<a name="ln97">      printf (&quot;FLAG: %d\n&quot;, flag);</a>
+<a name="ln98">      printf (&quot;TYPE: %d\n&quot;, type);</a>
+<a name="ln99">      printf (&quot;Len: %d\n&quot;, length);</a>
+<a name="ln100"> </a>
+<a name="ln101">      switch (type)</a>
+<a name="ln102">	{</a>
+<a name="ln103">	case BGP_ATTR_ORIGIN:</a>
+<a name="ln104">	  {</a>
+<a name="ln105">	    u_char origin;</a>
+<a name="ln106">	    origin = stream_getc (s);</a>
+<a name="ln107">	    printf (&quot;ORIGIN: %d\n&quot;, origin);</a>
+<a name="ln108">	  }</a>
+<a name="ln109">	  break;</a>
+<a name="ln110">	case BGP_ATTR_AS_PATH:</a>
+<a name="ln111">	  {</a>
+<a name="ln112">	    struct aspath *aspath;</a>
+<a name="ln113"> </a>
+<a name="ln114">	    aspath = aspath_parse (s, length, 1);</a>
+<a name="ln115">	    printf (&quot;ASPATH: %s\n&quot;, aspath-&gt;str);</a>
+<a name="ln116">	    aspath_free(aspath);</a>
+<a name="ln117">	  }</a>
+<a name="ln118">	  break;</a>
+<a name="ln119">	case BGP_ATTR_NEXT_HOP:</a>
+<a name="ln120">	  {</a>
+<a name="ln121">	    struct in_addr nexthop;</a>
+<a name="ln122">	    nexthop.s_addr = stream_get_ipv4 (s);</a>
+<a name="ln123">	    printf (&quot;NEXTHOP: %s\n&quot;, inet_ntoa (nexthop));</a>
+<a name="ln124">	  }</a>
+<a name="ln125">	  break;</a>
+<a name="ln126">	default:</a>
+<a name="ln127">	  stream_getw_from (s, length);</a>
+<a name="ln128">	  break;</a>
+<a name="ln129">	}</a>
+<a name="ln130">    }</a>
+<a name="ln131"> </a>
+<a name="ln132">  return 0;</a>
+<a name="ln133">}</a>
+<a name="ln134"> </a>
+<a name="ln135">int</a>
+<a name="ln136">main (int argc, char **argv)</a>
+<a name="ln137">{</a>
+<a name="ln138">  int ret;</a>
+<a name="ln139">  FILE *fp;</a>
+<a name="ln140">  struct stream *s;</a>
+<a name="ln141">  time_t now;</a>
+<a name="ln142">  int type;</a>
+<a name="ln143">  int subtype;</a>
+<a name="ln144">  size_t len;</a>
+<a name="ln145">  int source_as;</a>
+<a name="ln146">  int dest_as;</a>
+<a name="ln147">  ifindex_t ifindex;</a>
+<a name="ln148">  int family;</a>
+<a name="ln149">  struct in_addr sip;</a>
+<a name="ln150">  struct in_addr dip;</a>
+<a name="ln151">  u_int16_t viewno, seq_num;</a>
+<a name="ln152">  struct prefix_ipv4 p;</a>
+<a name="ln153"> </a>
+<a name="ln154">  s = stream_new (10000);</a>
+<a name="ln155"> </a>
+<a name="ln156">  if (argc != 2)</a>
+<a name="ln157">    {</a>
+<a name="ln158">      fprintf (stderr, &quot;Usage: %s FILENAME\n&quot;, argv[0]);</a>
+<a name="ln159">      exit (1);</a>
+<a name="ln160">    }</a>
+<a name="ln161">  fp = fopen (argv[1], &quot;r&quot;);</a>
+<a name="ln162">  if (!fp)</a>
+<a name="ln163">    {</a>
+<a name="ln164">      perror (&quot;fopen&quot;);</a>
+<a name="ln165">      exit (1);</a>
+<a name="ln166">    }</a>
+<a name="ln167">  </a>
+<a name="ln168">  while (1)</a>
+<a name="ln169">    {</a>
+<a name="ln170">      stream_reset (s);</a>
+<a name="ln171"> </a>
+<a name="ln172">      ret = fread (s-&gt;data, 12, 1, fp);</a>
+<a name="ln173">      if (!ret || feof (fp))</a>
+<a name="ln174">	{</a>
+<a name="ln175">	  printf (&quot;END OF FILE\n&quot;);</a>
+<a name="ln176">	  break;</a>
+<a name="ln177">	}</a>
+<a name="ln178">      if (ferror (fp))</a>
+<a name="ln179">	{</a>
+<a name="ln180">	  printf (&quot;ERROR OF FREAD\n&quot;);</a>
+<a name="ln181">	  break;</a>
+<a name="ln182">	}</a>
+<a name="ln183"> </a>
+<a name="ln184">      /* Extract header. */</a>
+<a name="ln185">      now = stream_getl (s);</a>
+<a name="ln186">      type = stream_getw (s);</a>
+<a name="ln187">      subtype = stream_getw (s);</a>
+<a name="ln188">      len = stream_getl (s);</a>
+<a name="ln189"> </a>
+<a name="ln190">      printf (&quot;TIME: %s&quot;, ctime (&amp;now));</a>
+<a name="ln191"> </a>
+<a name="ln192">      /* printf (&quot;TYPE: %d/%d\n&quot;, type, subtype); */</a>
+<a name="ln193"> </a>
+<a name="ln194">      if (type == MSG_PROTOCOL_BGP4MP)</a>
+<a name="ln195">	printf (&quot;TYPE: BGP4MP&quot;);</a>
+<a name="ln196">      else if (type == MSG_PROTOCOL_BGP4MP_ET)</a>
+<a name="ln197">	printf (&quot;TYPE: BGP4MP_ET&quot;);</a>
+<a name="ln198">      else if (type == MSG_TABLE_DUMP)</a>
+<a name="ln199">	printf (&quot;TYPE: MSG_TABLE_DUMP&quot;);</a>
+<a name="ln200">      else</a>
+<a name="ln201">	printf (&quot;TYPE: Unknown %d&quot;, type);</a>
+<a name="ln202"> </a>
+<a name="ln203">      if (type == MSG_TABLE_DUMP)</a>
+<a name="ln204">	switch (subtype)</a>
+<a name="ln205">	  {</a>
+<a name="ln206">	  case AFI_IP:</a>
+<a name="ln207">	    printf (&quot;/AFI_IP\n&quot;);</a>
+<a name="ln208">	    break;</a>
+<a name="ln209">	  case AFI_IP6:</a>
+<a name="ln210">	    printf (&quot;/AFI_IP6\n&quot;);</a>
+<a name="ln211">	    break;</a>
+<a name="ln212">	  default:</a>
+<a name="ln213">	    printf (&quot;/UNKNOWN %d&quot;, subtype);</a>
+<a name="ln214">	    break;</a>
+<a name="ln215">	  }</a>
+<a name="ln216">      else</a>
+<a name="ln217">	{</a>
+<a name="ln218">	  switch (subtype)</a>
+<a name="ln219">	    {</a>
+<a name="ln220">	    case BGP4MP_STATE_CHANGE:</a>
+<a name="ln221">	      printf (&quot;/CHANGE\n&quot;);</a>
+<a name="ln222">	      break;</a>
+<a name="ln223">	    case BGP4MP_MESSAGE:</a>
+<a name="ln224">	      printf (&quot;/MESSAGE\n&quot;);</a>
+<a name="ln225">	      break;</a>
+<a name="ln226">	    case BGP4MP_ENTRY:</a>
+<a name="ln227">	      printf (&quot;/ENTRY\n&quot;);</a>
+<a name="ln228">	      break;</a>
+<a name="ln229">	    case BGP4MP_SNAPSHOT:</a>
+<a name="ln230">	      printf (&quot;/SNAPSHOT\n&quot;);</a>
+<a name="ln231">	      break;</a>
+<a name="ln232">	    default:</a>
+<a name="ln233">	      printf (&quot;/UNKNOWN %d&quot;, subtype);</a>
+<a name="ln234">	      break;</a>
+<a name="ln235">	    }</a>
+<a name="ln236">	}</a>
+<a name="ln237"> </a>
+<a name="ln238">      printf (&quot;len: %zd\n&quot;, len);</a>
+<a name="ln239"> </a>
+<a name="ln240">      ret = fread (s-&gt;data + 12, len, 1, fp);</a>
+<a name="ln241">      if (feof (fp))</a>
+<a name="ln242">	{</a>
+<a name="ln243">	  printf (&quot;ENDOF FILE 2\n&quot;);</a>
+<a name="ln244">	  break;</a>
+<a name="ln245">	}</a>
+<a name="ln246">      if (ferror (fp))</a>
+<a name="ln247">	{</a>
+<a name="ln248">	  printf (&quot;ERROR OF FREAD 2\n&quot;);</a>
+<a name="ln249">	  break;</a>
+<a name="ln250">	}</a>
+<a name="ln251"> </a>
+<a name="ln252">      /* printf (&quot;now read %d\n&quot;, len); */</a>
+<a name="ln253"> </a>
+<a name="ln254">      if (type == MSG_TABLE_DUMP)</a>
+<a name="ln255">	{</a>
+<a name="ln256">	  u_char status;</a>
+<a name="ln257">	  time_t originated;</a>
+<a name="ln258">	  struct in_addr peer;</a>
+<a name="ln259">	  u_int16_t attrlen;</a>
+<a name="ln260"> </a>
+<a name="ln261">	  viewno = stream_getw (s);</a>
+<a name="ln262">	  seq_num = stream_getw (s);</a>
+<a name="ln263">	  printf (&quot;VIEW: %d\n&quot;, viewno);</a>
+<a name="ln264">	  printf (&quot;SEQUENCE: %d\n&quot;, seq_num);</a>
+<a name="ln265"> </a>
+<a name="ln266">	  /* start */</a>
+<a name="ln267">	  while (s-&gt;getp &lt; len - 16)</a>
+<a name="ln268">	    {</a>
+<a name="ln269">	      p.prefix.s_addr = stream_get_ipv4 (s);</a>
+<a name="ln270">	      p.prefixlen = stream_getc (s);</a>
+<a name="ln271">	      printf (&quot;PREFIX: %s/%d\n&quot;, inet_ntoa (p.prefix), p.prefixlen);</a>
+<a name="ln272"> </a>
+<a name="ln273">	      status = stream_getc (s);</a>
+<a name="ln274">	      originated = stream_getl (s);</a>
+<a name="ln275">	      peer.s_addr = stream_get_ipv4 (s);</a>
+<a name="ln276">	      source_as = stream_getw(s);</a>
+<a name="ln277"> </a>
+<a name="ln278">	      printf (&quot;FROM: %s AS%d\n&quot;, inet_ntoa (peer), source_as);</a>
+<a name="ln279">	      printf (&quot;ORIGINATED: %s&quot;, ctime (&amp;originated));</a>
+<a name="ln280"> </a>
+<a name="ln281">	      attrlen = stream_getw (s);</a>
+<a name="ln282">	      printf (&quot;ATTRLEN: %d\n&quot;, attrlen);</a>
+<a name="ln283"> </a>
+<a name="ln284">	      attr_parse (s, attrlen);</a>
+<a name="ln285"> </a>
+<a name="ln286">	      printf (&quot;STATUS: 0x%x\n&quot;, status);</a>
+<a name="ln287">	    }</a>
+<a name="ln288">	}</a>
+<a name="ln289">      else</a>
+<a name="ln290">	{</a>
+<a name="ln291">	  source_as = stream_getw (s);</a>
+<a name="ln292">	  dest_as = stream_getw (s);</a>
+<a name="ln293">	  printf (&quot;source_as: %d\n&quot;, source_as);</a>
+<a name="ln294">	  printf (&quot;dest_as: %d\n&quot;, dest_as);</a>
+<a name="ln295"> </a>
+<a name="ln296">	  ifindex = stream_getw (s);</a>
+<a name="ln297">	  family = stream_getw (s);</a>
+<a name="ln298"> </a>
+<a name="ln299">	  printf (&quot;ifindex: %d\n&quot;, ifindex);</a>
+<a name="ln300">	  printf (&quot;family: %d\n&quot;, family);</a>
+<a name="ln301"> </a>
+<a name="ln302">	  sip.s_addr = stream_get_ipv4 (s);</a>
+<a name="ln303">	  dip.s_addr = stream_get_ipv4 (s);</a>
+<a name="ln304">	  </a>
+<a name="ln305">	  printf (&quot;saddr: %s\n&quot;, inet_ntoa (sip));</a>
+<a name="ln306">	  printf (&quot;daddr: %s\n&quot;, inet_ntoa (dip));</a>
+<a name="ln307"> </a>
+<a name="ln308">	  printf (&quot;\n&quot;);</a>
+<a name="ln309">	}</a>
+<a name="ln310">    }</a>
+<a name="ln311">  fclose (fp);</a>
+<a name="ln312">  return 0;</a>
+<a name="ln313">}</a>
+
+</code></pre>
+<div class="balloon" rel="7"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1042/" target="_blank">V1042</a> This file is marked with copyleft license, which requires you to open the derived source code.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

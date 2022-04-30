@@ -1,0 +1,1419 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>isis_te.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.5.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * IS-IS Rout(e)ing protocol - isis_te.c</a>
+<a name="ln3"> *</a>
+<a name="ln4"> * This is an implementation of RFC5305</a>
+<a name="ln5"> *</a>
+<a name="ln6"> *      Copyright (C) 2014 Orange Labs</a>
+<a name="ln7"> *      http://www.orange.com</a>
+<a name="ln8"> *</a>
+<a name="ln9"> * This file is part of GNU Zebra.</a>
+<a name="ln10"> *</a>
+<a name="ln11"> * GNU Zebra is free software; you can redistribute it and/or modify it</a>
+<a name="ln12"> * under the terms of the GNU General Public License as published by the</a>
+<a name="ln13"> * Free Software Foundation; either version 2, or (at your option) any</a>
+<a name="ln14"> * later version.</a>
+<a name="ln15"> *</a>
+<a name="ln16"> * GNU Zebra is distributed in the hope that it will be useful, but</a>
+<a name="ln17"> * WITHOUT ANY WARRANTY; without even the implied warranty of</a>
+<a name="ln18"> * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU</a>
+<a name="ln19"> * General Public License for more details.</a>
+<a name="ln20"> *</a>
+<a name="ln21"> * You should have received a copy of the GNU General Public License</a>
+<a name="ln22"> * along with GNU Zebra; see the file COPYING.  If not, write to the Free</a>
+<a name="ln23"> * Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA</a>
+<a name="ln24"> * 02111-1307, USA.</a>
+<a name="ln25"> */</a>
+<a name="ln26"> </a>
+<a name="ln27">#include &lt;zebra.h&gt;</a>
+<a name="ln28">#include &lt;math.h&gt;</a>
+<a name="ln29"> </a>
+<a name="ln30">#include &quot;linklist.h&quot;</a>
+<a name="ln31">#include &quot;thread.h&quot;</a>
+<a name="ln32">#include &quot;vty.h&quot;</a>
+<a name="ln33">#include &quot;stream.h&quot;</a>
+<a name="ln34">#include &quot;memory.h&quot;</a>
+<a name="ln35">#include &quot;log.h&quot;</a>
+<a name="ln36">#include &quot;prefix.h&quot;</a>
+<a name="ln37">#include &quot;command.h&quot;</a>
+<a name="ln38">#include &quot;hash.h&quot;</a>
+<a name="ln39">#include &quot;if.h&quot;</a>
+<a name="ln40">#include &quot;checksum.h&quot;</a>
+<a name="ln41">#include &quot;md5.h&quot;</a>
+<a name="ln42">#include &quot;sockunion.h&quot;</a>
+<a name="ln43">#include &quot;network.h&quot;</a>
+<a name="ln44"> </a>
+<a name="ln45">#include &quot;isisd/dict.h&quot;</a>
+<a name="ln46">#include &quot;isisd/isis_constants.h&quot;</a>
+<a name="ln47">#include &quot;isisd/isis_common.h&quot;</a>
+<a name="ln48">#include &quot;isisd/isis_flags.h&quot;</a>
+<a name="ln49">#include &quot;isisd/isis_circuit.h&quot;</a>
+<a name="ln50">#include &quot;isisd/isisd.h&quot;</a>
+<a name="ln51">#include &quot;isisd/isis_tlv.h&quot;</a>
+<a name="ln52">#include &quot;isisd/isis_lsp.h&quot;</a>
+<a name="ln53">#include &quot;isisd/isis_pdu.h&quot;</a>
+<a name="ln54">#include &quot;isisd/isis_dynhn.h&quot;</a>
+<a name="ln55">#include &quot;isisd/isis_misc.h&quot;</a>
+<a name="ln56">#include &quot;isisd/isis_csm.h&quot;</a>
+<a name="ln57">#include &quot;isisd/isis_adjacency.h&quot;</a>
+<a name="ln58">#include &quot;isisd/isis_spf.h&quot;</a>
+<a name="ln59">#include &quot;isisd/isis_te.h&quot;</a>
+<a name="ln60"> </a>
+<a name="ln61">/* Global varial for MPLS TE management */</a>
+<a name="ln62">struct isis_mpls_te isisMplsTE;</a>
+<a name="ln63"> </a>
+<a name="ln64">const char *mode2text[] = { &quot;Disable&quot;, &quot;Area&quot;, &quot;AS&quot;, &quot;Emulate&quot; };</a>
+<a name="ln65"> </a>
+<a name="ln66">/*------------------------------------------------------------------------*</a>
+<a name="ln67"> * Followings are control functions for MPLS-TE parameters management.</a>
+<a name="ln68"> *------------------------------------------------------------------------*/</a>
+<a name="ln69"> </a>
+<a name="ln70">/* Search MPLS TE Circuit context from Interface */</a>
+<a name="ln71">static struct mpls_te_circuit *</a>
+<a name="ln72">lookup_mpls_params_by_ifp (struct interface *ifp)</a>
+<a name="ln73">{</a>
+<a name="ln74">  struct isis_circuit *circuit;</a>
+<a name="ln75"> </a>
+<a name="ln76">  if ((circuit = circuit_scan_by_ifp (ifp)) == NULL)</a>
+<a name="ln77">      return NULL;</a>
+<a name="ln78"> </a>
+<a name="ln79">  return circuit-&gt;mtc;</a>
+<a name="ln80">}</a>
+<a name="ln81"> </a>
+<a name="ln82">/* Create new MPLS TE Circuit context */</a>
+<a name="ln83">struct mpls_te_circuit *</a>
+<a name="ln84">mpls_te_circuit_new()</a>
+<a name="ln85">{</a>
+<a name="ln86">  struct mpls_te_circuit *mtc;</a>
+<a name="ln87"> </a>
+<a name="ln88">  zlog_debug (&quot;ISIS MPLS-TE: Create new MPLS TE Circuit context&quot;);</a>
+<a name="ln89"> </a>
+<a name="ln90">  mtc = XCALLOC(MTYPE_ISIS_MPLS_TE, sizeof (struct mpls_te_circuit));</a>
+<a name="ln91"> </a>
+<a name="ln92">  if (mtc == NULL)</a>
+<a name="ln93">    return NULL;</a>
+<a name="ln94"> </a>
+<a name="ln95">  mtc-&gt;status = disable;</a>
+<a name="ln96">  mtc-&gt;type = STD_TE;</a>
+<a name="ln97">  mtc-&gt;length = 0;</a>
+<a name="ln98"> </a>
+<a name="ln99">  return mtc;</a>
+<a name="ln100"> </a>
+<a name="ln101">}</a>
+<a name="ln102"> </a>
+<a name="ln103">/* Copy SUB TLVs parameters into a buffer - No space verification are performed */</a>
+<a name="ln104">/* Caller must verify before that there is enough free space in the buffer */</a>
+<a name="ln105">u_char</a>
+<a name="ln106">add_te_subtlvs(u_char *buf, struct mpls_te_circuit *mtc)</a>
+<a name="ln107">{</a>
+<a name="ln108">  u_char size, *tlvs = buf;</a>
+<a name="ln109"> </a>
+<a name="ln110">  zlog_debug (&quot;ISIS MPLS-TE: Add TE Sub TLVs to buffer&quot;);</a>
+<a name="ln111"> </a>
+<a name="ln112">  if (mtc == NULL)</a>
+<a name="ln113">    {</a>
+<a name="ln114">      zlog_debug(&quot;ISIS MPLS-TE: Abort! No MPLS TE Circuit available has been specified&quot;);</a>
+<a name="ln115">      return 0;</a>
+<a name="ln116">    }</a>
+<a name="ln117"> </a>
+<a name="ln118">  /* Create buffer if not provided */</a>
+<a name="ln119">  if (buf == NULL)</a>
+<a name="ln120">    {</a>
+<a name="ln121">      zlog_debug(&quot;ISIS MPLS-TE: Abort! No Buffer has been specified&quot;);</a>
+<a name="ln122">      return 0;</a>
+<a name="ln123">    }</a>
+<a name="ln124"> </a>
+<a name="ln125">  /* TE_SUBTLV_ADMIN_GRP */</a>
+<a name="ln126">  if (SUBTLV_TYPE(mtc-&gt;admin_grp) != 0)</a>
+<a name="ln127">    {</a>
+<a name="ln128">      size = SUBTLV_SIZE (&amp;(mtc-&gt;admin_grp.header));</a>
+<a name="ln129">      memcpy(tlvs, &amp;(mtc-&gt;admin_grp), size);</a>
+<a name="ln130">      tlvs += size;</a>
+<a name="ln131">    }</a>
+<a name="ln132"> </a>
+<a name="ln133">  /* TE_SUBTLV_LLRI */</a>
+<a name="ln134">  if (SUBTLV_TYPE(mtc-&gt;llri) != 0)</a>
+<a name="ln135">    {</a>
+<a name="ln136">      size = SUBTLV_SIZE (&amp;(mtc-&gt;llri.header));</a>
+<a name="ln137">      memcpy(tlvs, &amp;(mtc-&gt;llri), size);</a>
+<a name="ln138">      tlvs += size;</a>
+<a name="ln139">    }</a>
+<a name="ln140"> </a>
+<a name="ln141">  /* TE_SUBTLV_LCLIF_IPADDR */</a>
+<a name="ln142">  if (SUBTLV_TYPE(mtc-&gt;local_ipaddr) != 0)</a>
+<a name="ln143">    {</a>
+<a name="ln144">      size = SUBTLV_SIZE (&amp;(mtc-&gt;local_ipaddr.header));</a>
+<a name="ln145">      memcpy(tlvs, &amp;(mtc-&gt;local_ipaddr), size);</a>
+<a name="ln146">      tlvs += size;</a>
+<a name="ln147">    }</a>
+<a name="ln148"> </a>
+<a name="ln149">  /* TE_SUBTLV_RMTIF_IPADDR */</a>
+<a name="ln150">  if (SUBTLV_TYPE(mtc-&gt;rmt_ipaddr) != 0)</a>
+<a name="ln151">    {</a>
+<a name="ln152">      size = SUBTLV_SIZE (&amp;(mtc-&gt;rmt_ipaddr.header));</a>
+<a name="ln153">      memcpy(tlvs, &amp;(mtc-&gt;rmt_ipaddr), size);</a>
+<a name="ln154">      tlvs += size;</a>
+<a name="ln155">    }</a>
+<a name="ln156"> </a>
+<a name="ln157">  /* TE_SUBTLV_MAX_BW */</a>
+<a name="ln158">  if (SUBTLV_TYPE(mtc-&gt;max_bw) != 0)</a>
+<a name="ln159">    {</a>
+<a name="ln160">      size = SUBTLV_SIZE (&amp;(mtc-&gt;max_bw.header));</a>
+<a name="ln161">      memcpy(tlvs, &amp;(mtc-&gt;max_bw), size);</a>
+<a name="ln162">      tlvs += size;</a>
+<a name="ln163">    }</a>
+<a name="ln164"> </a>
+<a name="ln165">  /* TE_SUBTLV_MAX_RSV_BW */</a>
+<a name="ln166">  if (SUBTLV_TYPE(mtc-&gt;max_rsv_bw) != 0)</a>
+<a name="ln167">    {</a>
+<a name="ln168">      size = SUBTLV_SIZE (&amp;(mtc-&gt;max_rsv_bw.header));</a>
+<a name="ln169">      memcpy(tlvs, &amp;(mtc-&gt;max_rsv_bw), size);</a>
+<a name="ln170">      tlvs += size;</a>
+<a name="ln171">    }</a>
+<a name="ln172"> </a>
+<a name="ln173">  /* TE_SUBTLV_UNRSV_BW */</a>
+<a name="ln174">  if (SUBTLV_TYPE(mtc-&gt;unrsv_bw) != 0)</a>
+<a name="ln175">    {</a>
+<a name="ln176">      size = SUBTLV_SIZE (&amp;(mtc-&gt;unrsv_bw.header));</a>
+<a name="ln177">      memcpy(tlvs, &amp;(mtc-&gt;unrsv_bw), size);</a>
+<a name="ln178">      tlvs += size;</a>
+<a name="ln179">    }</a>
+<a name="ln180"> </a>
+<a name="ln181">  /* TE_SUBTLV_TE_METRIC */</a>
+<a name="ln182">  if (SUBTLV_TYPE(mtc-&gt;te_metric) != 0)</a>
+<a name="ln183">    {</a>
+<a name="ln184">      size = SUBTLV_SIZE (&amp;(mtc-&gt;te_metric.header));</a>
+<a name="ln185">      memcpy(tlvs, &amp;(mtc-&gt;te_metric), size);</a>
+<a name="ln186">      tlvs += size;</a>
+<a name="ln187">    }</a>
+<a name="ln188"> </a>
+<a name="ln189">  /* TE_SUBTLV_AV_DELAY */</a>
+<a name="ln190">  if (SUBTLV_TYPE(mtc-&gt;av_delay) != 0)</a>
+<a name="ln191">    {</a>
+<a name="ln192">      size = SUBTLV_SIZE (&amp;(mtc-&gt;av_delay.header));</a>
+<a name="ln193">      memcpy(tlvs, &amp;(mtc-&gt;av_delay), size);</a>
+<a name="ln194">      tlvs += size;</a>
+<a name="ln195">    }</a>
+<a name="ln196"> </a>
+<a name="ln197">  /* TE_SUBTLV_MM_DELAY */</a>
+<a name="ln198">  if (SUBTLV_TYPE(mtc-&gt;mm_delay) != 0)</a>
+<a name="ln199">    {</a>
+<a name="ln200">      size = SUBTLV_SIZE (&amp;(mtc-&gt;mm_delay.header));</a>
+<a name="ln201">      memcpy(tlvs, &amp;(mtc-&gt;mm_delay), size);</a>
+<a name="ln202">      tlvs += size;</a>
+<a name="ln203">    }</a>
+<a name="ln204"> </a>
+<a name="ln205">  /* TE_SUBTLV_DELAY_VAR */</a>
+<a name="ln206">  if (SUBTLV_TYPE(mtc-&gt;delay_var) != 0)</a>
+<a name="ln207">    {</a>
+<a name="ln208">      size = SUBTLV_SIZE (&amp;(mtc-&gt;delay_var.header));</a>
+<a name="ln209">      memcpy(tlvs, &amp;(mtc-&gt;delay_var), size);</a>
+<a name="ln210">      tlvs += size;</a>
+<a name="ln211">    }</a>
+<a name="ln212"> </a>
+<a name="ln213">  /* TE_SUBTLV_PKT_LOSS */</a>
+<a name="ln214">  if (SUBTLV_TYPE(mtc-&gt;pkt_loss) != 0)</a>
+<a name="ln215">    {</a>
+<a name="ln216">      size = SUBTLV_SIZE (&amp;(mtc-&gt;pkt_loss.header));</a>
+<a name="ln217">      memcpy(tlvs, &amp;(mtc-&gt;pkt_loss), size);</a>
+<a name="ln218">      tlvs += size;</a>
+<a name="ln219">    }</a>
+<a name="ln220"> </a>
+<a name="ln221">  /* TE_SUBTLV_RES_BW */</a>
+<a name="ln222">  if (SUBTLV_TYPE(mtc-&gt;res_bw) != 0)</a>
+<a name="ln223">    {</a>
+<a name="ln224">      size = SUBTLV_SIZE (&amp;(mtc-&gt;res_bw.header));</a>
+<a name="ln225">      memcpy(tlvs, &amp;(mtc-&gt;res_bw), size);</a>
+<a name="ln226">      tlvs += size;</a>
+<a name="ln227">    }</a>
+<a name="ln228"> </a>
+<a name="ln229">  /* TE_SUBTLV_AVA_BW */</a>
+<a name="ln230">  if (SUBTLV_TYPE(mtc-&gt;ava_bw) != 0)</a>
+<a name="ln231">    {</a>
+<a name="ln232">      size = SUBTLV_SIZE (&amp;(mtc-&gt;ava_bw.header));</a>
+<a name="ln233">      memcpy(tlvs, &amp;(mtc-&gt;ava_bw), size);</a>
+<a name="ln234">      tlvs += size;</a>
+<a name="ln235">    }</a>
+<a name="ln236"> </a>
+<a name="ln237">  /* TE_SUBTLV_USE_BW */</a>
+<a name="ln238">  if (SUBTLV_TYPE(mtc-&gt;use_bw) != 0)</a>
+<a name="ln239">    {</a>
+<a name="ln240">      size = SUBTLV_SIZE (&amp;(mtc-&gt;use_bw.header));</a>
+<a name="ln241">      memcpy(tlvs, &amp;(mtc-&gt;use_bw), size);</a>
+<a name="ln242">      tlvs += size;</a>
+<a name="ln243">    }</a>
+<a name="ln244"> </a>
+<a name="ln245">  /* Update SubTLVs length */</a>
+<a name="ln246">  mtc-&gt;length = subtlvs_len(mtc);</a>
+<a name="ln247"> </a>
+<a name="ln248">  zlog_debug(&quot;ISIS MPLS-TE: Add %d bytes length SubTLVs&quot;, mtc-&gt;length);</a>
+<a name="ln249"> </a>
+<a name="ln250">  return mtc-&gt;length;</a>
+<a name="ln251">}</a>
+<a name="ln252"> </a>
+<a name="ln253">/* Compute total Sub-TLVs size */</a>
+<a name="ln254">u_char</a>
+<a name="ln255">subtlvs_len (struct mpls_te_circuit *mtc)</a>
+<a name="ln256">{</a>
+<a name="ln257">  int length = 0;</a>
+<a name="ln258"> </a>
+<a name="ln259">  /* Sanity Check */</a>
+<a name="ln260">  if (mtc == NULL)</a>
+<a name="ln261">    return 0;</a>
+<a name="ln262"> </a>
+<a name="ln263">  /* TE_SUBTLV_ADMIN_GRP */</a>
+<a name="ln264">  if (SUBTLV_TYPE(mtc-&gt;admin_grp) != 0)</a>
+<a name="ln265">    length += SUBTLV_SIZE (&amp;(mtc-&gt;admin_grp.header));</a>
+<a name="ln266"> </a>
+<a name="ln267">  /* TE_SUBTLV_LLRI */</a>
+<a name="ln268">  if (SUBTLV_TYPE(mtc-&gt;llri) != 0)</a>
+<a name="ln269">    length += SUBTLV_SIZE (&amp;mtc-&gt;llri.header);</a>
+<a name="ln270"> </a>
+<a name="ln271">  /* TE_SUBTLV_LCLIF_IPADDR */</a>
+<a name="ln272">  if (SUBTLV_TYPE(mtc-&gt;local_ipaddr) != 0)</a>
+<a name="ln273">    length += SUBTLV_SIZE (&amp;mtc-&gt;local_ipaddr.header);</a>
+<a name="ln274"> </a>
+<a name="ln275">  /* TE_SUBTLV_RMTIF_IPADDR */</a>
+<a name="ln276">  if (SUBTLV_TYPE(mtc-&gt;rmt_ipaddr) != 0)</a>
+<a name="ln277">    length += SUBTLV_SIZE (&amp;mtc-&gt;rmt_ipaddr.header);</a>
+<a name="ln278"> </a>
+<a name="ln279">  /* TE_SUBTLV_MAX_BW */</a>
+<a name="ln280">  if (SUBTLV_TYPE(mtc-&gt;max_bw) != 0)</a>
+<a name="ln281">    length += SUBTLV_SIZE (&amp;mtc-&gt;max_bw.header);</a>
+<a name="ln282"> </a>
+<a name="ln283">  /* TE_SUBTLV_MAX_RSV_BW */</a>
+<a name="ln284">  if (SUBTLV_TYPE(mtc-&gt;max_rsv_bw) != 0)</a>
+<a name="ln285">    length += SUBTLV_SIZE (&amp;mtc-&gt;max_rsv_bw.header);</a>
+<a name="ln286"> </a>
+<a name="ln287">  /* TE_SUBTLV_UNRSV_BW */</a>
+<a name="ln288">  if (SUBTLV_TYPE(mtc-&gt;unrsv_bw) != 0)</a>
+<a name="ln289">    length += SUBTLV_SIZE (&amp;mtc-&gt;unrsv_bw.header);</a>
+<a name="ln290"> </a>
+<a name="ln291">  /* TE_SUBTLV_TE_METRIC */</a>
+<a name="ln292">  if (SUBTLV_TYPE(mtc-&gt;te_metric) != 0)</a>
+<a name="ln293">    length += SUBTLV_SIZE (&amp;mtc-&gt;te_metric.header);</a>
+<a name="ln294"> </a>
+<a name="ln295">  /* TE_SUBTLV_AV_DELAY */</a>
+<a name="ln296">  if (SUBTLV_TYPE(mtc-&gt;av_delay) != 0)</a>
+<a name="ln297">    length += SUBTLV_SIZE (&amp;mtc-&gt;av_delay.header);</a>
+<a name="ln298"> </a>
+<a name="ln299">  /* TE_SUBTLV_MM_DELAY */</a>
+<a name="ln300">  if (SUBTLV_TYPE(mtc-&gt;mm_delay) != 0)</a>
+<a name="ln301">    length += SUBTLV_SIZE (&amp;mtc-&gt;mm_delay.header);</a>
+<a name="ln302"> </a>
+<a name="ln303">  /* TE_SUBTLV_DELAY_VAR */</a>
+<a name="ln304">  if (SUBTLV_TYPE(mtc-&gt;delay_var) != 0)</a>
+<a name="ln305">    length += SUBTLV_SIZE (&amp;mtc-&gt;delay_var.header);</a>
+<a name="ln306"> </a>
+<a name="ln307">  /* TE_SUBTLV_PKT_LOSS */</a>
+<a name="ln308">  if (SUBTLV_TYPE(mtc-&gt;pkt_loss) != 0)</a>
+<a name="ln309">    length += SUBTLV_SIZE (&amp;mtc-&gt;pkt_loss.header);</a>
+<a name="ln310"> </a>
+<a name="ln311">  /* TE_SUBTLV_RES_BW */</a>
+<a name="ln312">  if (SUBTLV_TYPE(mtc-&gt;res_bw) != 0)</a>
+<a name="ln313">    length += SUBTLV_SIZE (&amp;mtc-&gt;res_bw.header);</a>
+<a name="ln314"> </a>
+<a name="ln315">  /* TE_SUBTLV_AVA_BW */</a>
+<a name="ln316">  if (SUBTLV_TYPE(mtc-&gt;ava_bw) != 0)</a>
+<a name="ln317">    length += SUBTLV_SIZE (&amp;mtc-&gt;ava_bw.header);</a>
+<a name="ln318"> </a>
+<a name="ln319">  /* TE_SUBTLV_USE_BW */</a>
+<a name="ln320">  if (SUBTLV_TYPE(mtc-&gt;use_bw) != 0)</a>
+<a name="ln321">    length += SUBTLV_SIZE (&amp;mtc-&gt;use_bw.header);</a>
+<a name="ln322"> </a>
+<a name="ln323">  /* Check that length is lower than the MAXIMUM SUBTLV size i.e. 256 */</a>
+<a name="ln324">  if (length &gt; MAX_SUBTLV_SIZE)</a>
+<a name="ln325">    {</a>
+<a name="ln326">      mtc-&gt;length = 0;</a>
+<a name="ln327">      return 0;</a>
+<a name="ln328">    }</a>
+<a name="ln329"> </a>
+<a name="ln330">  mtc-&gt;length = (u_char)length;</a>
+<a name="ln331"> </a>
+<a name="ln332">  return mtc-&gt;length;</a>
+<a name="ln333">}</a>
+<a name="ln334"> </a>
+<a name="ln335">/* Following are various functions to set MPLS TE parameters */</a>
+<a name="ln336">static void</a>
+<a name="ln337">set_circuitparams_admin_grp (struct mpls_te_circuit *mtc, u_int32_t admingrp)</a>
+<a name="ln338">{</a>
+<a name="ln339">  SUBTLV_TYPE(mtc-&gt;admin_grp) = TE_SUBTLV_ADMIN_GRP;</a>
+<a name="ln340">  SUBTLV_LEN(mtc-&gt;admin_grp)  = SUBTLV_DEF_SIZE;</a>
+<a name="ln341">  mtc-&gt;admin_grp.value        = htonl(admingrp);</a>
+<a name="ln342">  return;</a>
+<a name="ln343">}</a>
+<a name="ln344"> </a>
+<a name="ln345">static void  __attribute__ ((unused))</a>
+<a name="ln346">set_circuitparams_llri (struct mpls_te_circuit *mtc, u_int32_t local, u_int32_t remote)</a>
+<a name="ln347">{</a>
+<a name="ln348">  SUBTLV_TYPE(mtc-&gt;llri) = TE_SUBTLV_LLRI;</a>
+<a name="ln349">  SUBTLV_LEN(mtc-&gt;llri)  = TE_SUBTLV_LLRI_SIZE;</a>
+<a name="ln350">  mtc-&gt;llri.local        = htonl(local);</a>
+<a name="ln351">  mtc-&gt;llri.remote       = htonl(remote);</a>
+<a name="ln352">}</a>
+<a name="ln353"> </a>
+<a name="ln354">void</a>
+<a name="ln355">set_circuitparams_local_ipaddr (struct mpls_te_circuit *mtc, struct in_addr addr)</a>
+<a name="ln356">{</a>
+<a name="ln357"> </a>
+<a name="ln358">  SUBTLV_TYPE(mtc-&gt;local_ipaddr) = TE_SUBTLV_LOCAL_IPADDR;</a>
+<a name="ln359">  SUBTLV_LEN(mtc-&gt;local_ipaddr)  = SUBTLV_DEF_SIZE;</a>
+<a name="ln360">  mtc-&gt;local_ipaddr.value.s_addr = addr.s_addr;</a>
+<a name="ln361">  return;</a>
+<a name="ln362">}</a>
+<a name="ln363"> </a>
+<a name="ln364">void</a>
+<a name="ln365">set_circuitparams_rmt_ipaddr (struct mpls_te_circuit *mtc, struct in_addr addr)</a>
+<a name="ln366">{</a>
+<a name="ln367"> </a>
+<a name="ln368">  SUBTLV_TYPE(mtc-&gt;rmt_ipaddr) = TE_SUBTLV_RMT_IPADDR;</a>
+<a name="ln369">  SUBTLV_LEN(mtc-&gt;rmt_ipaddr)  = SUBTLV_DEF_SIZE;</a>
+<a name="ln370">  mtc-&gt;rmt_ipaddr.value.s_addr = addr.s_addr;</a>
+<a name="ln371">  return;</a>
+<a name="ln372">}</a>
+<a name="ln373"> </a>
+<a name="ln374">static void</a>
+<a name="ln375">set_circuitparams_max_bw (struct mpls_te_circuit *mtc, float fp)</a>
+<a name="ln376">{</a>
+<a name="ln377">  SUBTLV_TYPE(mtc-&gt;max_bw) = TE_SUBTLV_MAX_BW;</a>
+<a name="ln378">  SUBTLV_LEN(mtc-&gt;max_bw)  = SUBTLV_DEF_SIZE;</a>
+<a name="ln379">  mtc-&gt;max_bw.value = htonf(fp);</a>
+<a name="ln380">  return;</a>
+<a name="ln381">}</a>
+<a name="ln382"> </a>
+<a name="ln383">static void</a>
+<a name="ln384">set_circuitparams_max_rsv_bw (struct mpls_te_circuit *mtc, float fp)</a>
+<a name="ln385">{</a>
+<a name="ln386">  SUBTLV_TYPE(mtc-&gt;max_rsv_bw) = TE_SUBTLV_MAX_RSV_BW;</a>
+<a name="ln387">  SUBTLV_LEN(mtc-&gt;max_rsv_bw)  = SUBTLV_DEF_SIZE;</a>
+<a name="ln388">  mtc-&gt;max_rsv_bw.value = htonf(fp);</a>
+<a name="ln389">  return;</a>
+<a name="ln390">}</a>
+<a name="ln391"> </a>
+<a name="ln392">static void</a>
+<a name="ln393">set_circuitparams_unrsv_bw (struct mpls_te_circuit *mtc, int priority, float fp)</a>
+<a name="ln394">{</a>
+<a name="ln395">  /* Note that TLV-length field is the size of array. */</a>
+<a name="ln396">  SUBTLV_TYPE(mtc-&gt;unrsv_bw) = TE_SUBTLV_UNRSV_BW;</a>
+<a name="ln397">  SUBTLV_LEN(mtc-&gt;unrsv_bw)  = TE_SUBTLV_UNRSV_SIZE;</a>
+<a name="ln398">  mtc-&gt;unrsv_bw.value[priority] = htonf(fp);</a>
+<a name="ln399">  return;</a>
+<a name="ln400">}</a>
+<a name="ln401"> </a>
+<a name="ln402">static void</a>
+<a name="ln403">set_circuitparams_te_metric (struct mpls_te_circuit *mtc, u_int32_t te_metric)</a>
+<a name="ln404">{</a>
+<a name="ln405">  SUBTLV_TYPE(mtc-&gt;te_metric) = TE_SUBTLV_TE_METRIC;</a>
+<a name="ln406">  SUBTLV_LEN(mtc-&gt;te_metric)  = TE_SUBTLV_TE_METRIC_SIZE;</a>
+<a name="ln407">  mtc-&gt;te_metric.value[0] = (te_metric &gt;&gt; 16) &amp; 0xFF;</a>
+<a name="ln408">  mtc-&gt;te_metric.value[1] = (te_metric  &gt;&gt; 8) &amp; 0xFF;</a>
+<a name="ln409">  mtc-&gt;te_metric.value[2] = te_metric &amp; 0xFF;</a>
+<a name="ln410">  return;</a>
+<a name="ln411">}</a>
+<a name="ln412"> </a>
+<a name="ln413">static void</a>
+<a name="ln414">set_circuitparams_inter_as (struct mpls_te_circuit *mtc, struct in_addr addr, u_int32_t as)</a>
+<a name="ln415">{</a>
+<a name="ln416"> </a>
+<a name="ln417">  /* Set the Remote ASBR IP address and then the associated AS number */</a>
+<a name="ln418">  SUBTLV_TYPE(mtc-&gt;rip) = TE_SUBTLV_RIP;</a>
+<a name="ln419">  SUBTLV_LEN(mtc-&gt;rip)  = SUBTLV_DEF_SIZE;</a>
+<a name="ln420">  mtc-&gt;rip.value.s_addr = addr.s_addr;</a>
+<a name="ln421"> </a>
+<a name="ln422">  SUBTLV_TYPE(mtc-&gt;ras) = TE_SUBTLV_RAS;</a>
+<a name="ln423">  SUBTLV_LEN(mtc-&gt;ras)  = SUBTLV_DEF_SIZE;</a>
+<a name="ln424">  mtc-&gt;ras.value        = htonl(as);</a>
+<a name="ln425">}</a>
+<a name="ln426"> </a>
+<a name="ln427">static void</a>
+<a name="ln428">unset_circuitparams_inter_as (struct mpls_te_circuit *mtc)</a>
+<a name="ln429">{</a>
+<a name="ln430"> </a>
+<a name="ln431">  /* Reset the Remote ASBR IP address and then the associated AS number */</a>
+<a name="ln432">  SUBTLV_TYPE(mtc-&gt;rip) = 0;</a>
+<a name="ln433">  SUBTLV_LEN(mtc-&gt;rip)  = 0;</a>
+<a name="ln434">  mtc-&gt;rip.value.s_addr = 0;</a>
+<a name="ln435"> </a>
+<a name="ln436">  SUBTLV_TYPE(mtc-&gt;ras) = 0;</a>
+<a name="ln437">  SUBTLV_LEN(mtc-&gt;ras)  = 0;</a>
+<a name="ln438">  mtc-&gt;ras.value        = 0;</a>
+<a name="ln439">}</a>
+<a name="ln440"> </a>
+<a name="ln441">static void</a>
+<a name="ln442">set_circuitparams_av_delay (struct mpls_te_circuit *mtc, u_int32_t delay, u_char anormal)</a>
+<a name="ln443">{</a>
+<a name="ln444">  u_int32_t tmp;</a>
+<a name="ln445">  /* Note that TLV-length field is the size of array. */</a>
+<a name="ln446">  SUBTLV_TYPE(mtc-&gt;av_delay) = TE_SUBTLV_AV_DELAY;</a>
+<a name="ln447">  SUBTLV_LEN(mtc-&gt;av_delay)  = SUBTLV_DEF_SIZE;</a>
+<a name="ln448">  tmp = delay &amp; TE_EXT_MASK;</a>
+<a name="ln449">  if (anormal)</a>
+<a name="ln450">    tmp |= TE_EXT_ANORMAL;</a>
+<a name="ln451">  mtc-&gt;av_delay.value = htonl(tmp);</a>
+<a name="ln452">  return;</a>
+<a name="ln453">}</a>
+<a name="ln454"> </a>
+<a name="ln455">static void</a>
+<a name="ln456">set_circuitparams_mm_delay (struct mpls_te_circuit *mtc, u_int32_t low, u_int32_t high, u_char anormal)</a>
+<a name="ln457">{</a>
+<a name="ln458">  u_int32_t tmp;</a>
+<a name="ln459">  /* Note that TLV-length field is the size of array. */</a>
+<a name="ln460">  SUBTLV_TYPE(mtc-&gt;mm_delay) = TE_SUBTLV_MM_DELAY;</a>
+<a name="ln461">  SUBTLV_LEN(mtc-&gt;mm_delay)  = TE_SUBTLV_MM_DELAY_SIZE;</a>
+<a name="ln462">  tmp = low &amp; TE_EXT_MASK;</a>
+<a name="ln463">  if (anormal)</a>
+<a name="ln464">    tmp |= TE_EXT_ANORMAL;</a>
+<a name="ln465">  mtc-&gt;mm_delay.low = htonl(tmp);</a>
+<a name="ln466">  mtc-&gt;mm_delay.high = htonl(high);</a>
+<a name="ln467">  return;</a>
+<a name="ln468">}</a>
+<a name="ln469"> </a>
+<a name="ln470">static void</a>
+<a name="ln471">set_circuitparams_delay_var (struct mpls_te_circuit *mtc, u_int32_t jitter)</a>
+<a name="ln472">{</a>
+<a name="ln473">  /* Note that TLV-length field is the size of array. */</a>
+<a name="ln474">  SUBTLV_TYPE(mtc-&gt;delay_var) = TE_SUBTLV_DELAY_VAR;</a>
+<a name="ln475">  SUBTLV_LEN(mtc-&gt;delay_var)  = SUBTLV_DEF_SIZE;</a>
+<a name="ln476">  mtc-&gt;delay_var.value        = htonl(jitter &amp; TE_EXT_MASK);</a>
+<a name="ln477">  return;</a>
+<a name="ln478">}</a>
+<a name="ln479"> </a>
+<a name="ln480">static void</a>
+<a name="ln481">set_circuitparams_pkt_loss (struct mpls_te_circuit *mtc, u_int32_t loss, u_char anormal)</a>
+<a name="ln482">{</a>
+<a name="ln483">  u_int32_t tmp;</a>
+<a name="ln484">  /* Note that TLV-length field is the size of array. */</a>
+<a name="ln485">  SUBTLV_TYPE(mtc-&gt;pkt_loss) = TE_SUBTLV_PKT_LOSS;</a>
+<a name="ln486">  SUBTLV_LEN(mtc-&gt;pkt_loss)  = SUBTLV_DEF_SIZE;</a>
+<a name="ln487">  tmp = loss &amp; TE_EXT_MASK;</a>
+<a name="ln488">  if (anormal)</a>
+<a name="ln489">    tmp |= TE_EXT_ANORMAL;</a>
+<a name="ln490">  mtc-&gt;pkt_loss.value = htonl(tmp);</a>
+<a name="ln491">  return;</a>
+<a name="ln492">}</a>
+<a name="ln493"> </a>
+<a name="ln494">static void</a>
+<a name="ln495">set_circuitparams_res_bw (struct mpls_te_circuit *mtc, float fp)</a>
+<a name="ln496">{</a>
+<a name="ln497">  /* Note that TLV-length field is the size of array. */</a>
+<a name="ln498">  SUBTLV_TYPE(mtc-&gt;res_bw) = TE_SUBTLV_RES_BW;</a>
+<a name="ln499">  SUBTLV_LEN(mtc-&gt;res_bw)  = SUBTLV_DEF_SIZE;</a>
+<a name="ln500">  mtc-&gt;res_bw.value = htonf(fp);</a>
+<a name="ln501">  return;</a>
+<a name="ln502">}</a>
+<a name="ln503"> </a>
+<a name="ln504">static void</a>
+<a name="ln505">set_circuitparams_ava_bw (struct mpls_te_circuit *mtc, float fp)</a>
+<a name="ln506">{</a>
+<a name="ln507">  /* Note that TLV-length field is the size of array. */</a>
+<a name="ln508">  SUBTLV_TYPE(mtc-&gt;ava_bw) = TE_SUBTLV_AVA_BW;</a>
+<a name="ln509">  SUBTLV_LEN(mtc-&gt;ava_bw)  = SUBTLV_DEF_SIZE;</a>
+<a name="ln510">  mtc-&gt;ava_bw.value = htonf(fp);</a>
+<a name="ln511">  return;</a>
+<a name="ln512">}</a>
+<a name="ln513"> </a>
+<a name="ln514">static void</a>
+<a name="ln515">set_circuitparams_use_bw (struct mpls_te_circuit *mtc, float fp)</a>
+<a name="ln516">{</a>
+<a name="ln517">  /* Note that TLV-length field is the size of array. */</a>
+<a name="ln518">  SUBTLV_TYPE(mtc-&gt;use_bw) = TE_SUBTLV_USE_BW;</a>
+<a name="ln519">  SUBTLV_LEN(mtc-&gt;use_bw)  = SUBTLV_DEF_SIZE;</a>
+<a name="ln520">  mtc-&gt;use_bw.value = htonf(fp);</a>
+<a name="ln521">  return;</a>
+<a name="ln522">}</a>
+<a name="ln523"> </a>
+<a name="ln524">/* Main initialization / update function of the MPLS TE Circuit context */</a>
+<a name="ln525">/* Call when interface TE Link parameters are modified */</a>
+<a name="ln526">void</a>
+<a name="ln527">isis_link_params_update (struct isis_circuit *circuit, struct interface *ifp)</a>
+<a name="ln528">{</a>
+<a name="ln529">  int i;</a>
+<a name="ln530">  struct prefix_ipv4 *addr;</a>
+<a name="ln531">  struct mpls_te_circuit *mtc;</a>
+<a name="ln532"> </a>
+<a name="ln533">  /* Sanity Check */</a>
+<a name="ln534">  if ((circuit == NULL) || (ifp == NULL))</a>
+<a name="ln535">      return;</a>
+<a name="ln536"> </a>
+<a name="ln537">  zlog_info (&quot;MPLS-TE: Initialize circuit parameters for interface %s&quot;, ifp-&gt;name);</a>
+<a name="ln538">  </a>
+<a name="ln539">  /* Check if MPLS TE Circuit context has not been already created */</a>
+<a name="ln540">  if (circuit-&gt;mtc == NULL)</a>
+<a name="ln541">      circuit-&gt;mtc = mpls_te_circuit_new();</a>
+<a name="ln542"> </a>
+<a name="ln543">  mtc = circuit-&gt;mtc;</a>
+<a name="ln544"> </a>
+<a name="ln545">  /* Fulfil MTC TLV from ifp TE Link parameters */</a>
+<a name="ln546">  if (HAS_LINK_PARAMS(ifp))</a>
+<a name="ln547">    {</a>
+<a name="ln548">      mtc-&gt;status = enable;</a>
+<a name="ln549">      /* STD_TE metrics */</a>
+<a name="ln550">      if (IS_PARAM_SET(ifp-&gt;link_params, LP_ADM_GRP))</a>
+<a name="ln551">        set_circuitparams_admin_grp (mtc, ifp-&gt;link_params-&gt;admin_grp);</a>
+<a name="ln552">      else</a>
+<a name="ln553">        SUBTLV_TYPE(mtc-&gt;admin_grp) = 0;</a>
+<a name="ln554"> </a>
+<a name="ln555">      /* If not already set, register local IP addr from ip_addr list if it exists */</a>
+<a name="ln556">      if (SUBTLV_TYPE(mtc-&gt;local_ipaddr) == 0)</a>
+<a name="ln557">        {</a>
+<a name="ln558">          if (circuit-&gt;ip_addrs != NULL &amp;&amp; listcount(circuit-&gt;ip_addrs) != 0)</a>
+<a name="ln559">            {</a>
+<a name="ln560">              addr = (struct prefix_ipv4 *)listgetdata ((struct listnode *)listhead (circuit-&gt;ip_addrs));</a>
+<a name="ln561">              set_circuitparams_local_ipaddr (mtc, addr-&gt;prefix);</a>
+<a name="ln562">            }</a>
+<a name="ln563">        }</a>
+<a name="ln564"> </a>
+<a name="ln565">      /* If not already set, try to determine Remote IP addr if circuit is P2P */</a>
+<a name="ln566">      if ((SUBTLV_TYPE(mtc-&gt;rmt_ipaddr) == 0) &amp;&amp; (circuit-&gt;circ_type == CIRCUIT_T_P2P))</a>
+<a name="ln567">        {</a>
+<a name="ln568">          struct isis_adjacency *adj = circuit-&gt;u.p2p.neighbor;</a>
+<a name="ln569">          if (adj-&gt;ipv4_addrs != NULL &amp;&amp; listcount(adj-&gt;ipv4_addrs) != 0)</a>
+<a name="ln570">            {</a>
+<a name="ln571">              struct in_addr *ip_addr;</a>
+<a name="ln572">              ip_addr = (struct in_addr *)listgetdata ((struct listnode *)listhead (adj-&gt;ipv4_addrs));</a>
+<a name="ln573">              set_circuitparams_rmt_ipaddr (mtc, *ip_addr);</a>
+<a name="ln574">            }</a>
+<a name="ln575">        }</a>
+<a name="ln576"> </a>
+<a name="ln577">      if (IS_PARAM_SET(ifp-&gt;link_params, LP_MAX_BW))</a>
+<a name="ln578">        set_circuitparams_max_bw (mtc, ifp-&gt;link_params-&gt;max_bw);</a>
+<a name="ln579">      else</a>
+<a name="ln580">        SUBTLV_TYPE(mtc-&gt;max_bw) = 0;</a>
+<a name="ln581"> </a>
+<a name="ln582">      if (IS_PARAM_SET(ifp-&gt;link_params, LP_MAX_RSV_BW))</a>
+<a name="ln583">        set_circuitparams_max_rsv_bw (mtc, ifp-&gt;link_params-&gt;max_rsv_bw);</a>
+<a name="ln584">      else</a>
+<a name="ln585">        SUBTLV_TYPE(mtc-&gt;max_rsv_bw) = 0;</a>
+<a name="ln586"> </a>
+<a name="ln587">      if (IS_PARAM_SET(ifp-&gt;link_params, LP_UNRSV_BW))</a>
+<a name="ln588">        for (i = 0; i &lt; MAX_CLASS_TYPE; i++)</a>
+<a name="ln589">          set_circuitparams_unrsv_bw (mtc, i, ifp-&gt;link_params-&gt;unrsv_bw[i]);</a>
+<a name="ln590">      else</a>
+<a name="ln591">        SUBTLV_TYPE(mtc-&gt;unrsv_bw) = 0;</a>
+<a name="ln592"> </a>
+<a name="ln593">      if (IS_PARAM_SET(ifp-&gt;link_params, LP_TE))</a>
+<a name="ln594">        set_circuitparams_te_metric(mtc, ifp-&gt;link_params-&gt;te_metric);</a>
+<a name="ln595">      else</a>
+<a name="ln596">        SUBTLV_TYPE(mtc-&gt;te_metric) = 0;</a>
+<a name="ln597"> </a>
+<a name="ln598">      /* TE metric Extensions */</a>
+<a name="ln599">      if (IS_PARAM_SET(ifp-&gt;link_params, LP_DELAY))</a>
+<a name="ln600">        set_circuitparams_av_delay(mtc, ifp-&gt;link_params-&gt;av_delay, 0);</a>
+<a name="ln601">      else</a>
+<a name="ln602">        SUBTLV_TYPE(mtc-&gt;av_delay) = 0;</a>
+<a name="ln603"> </a>
+<a name="ln604">      if (IS_PARAM_SET(ifp-&gt;link_params, LP_MM_DELAY))</a>
+<a name="ln605">        set_circuitparams_mm_delay(mtc, ifp-&gt;link_params-&gt;min_delay, ifp-&gt;link_params-&gt;max_delay, 0);</a>
+<a name="ln606">      else</a>
+<a name="ln607">        SUBTLV_TYPE(mtc-&gt;mm_delay) = 0;</a>
+<a name="ln608"> </a>
+<a name="ln609">      if (IS_PARAM_SET(ifp-&gt;link_params, LP_DELAY_VAR))</a>
+<a name="ln610">        set_circuitparams_delay_var(mtc, ifp-&gt;link_params-&gt;delay_var);</a>
+<a name="ln611">      else</a>
+<a name="ln612">        SUBTLV_TYPE(mtc-&gt;delay_var) = 0;</a>
+<a name="ln613"> </a>
+<a name="ln614">      if (IS_PARAM_SET(ifp-&gt;link_params, LP_PKT_LOSS))</a>
+<a name="ln615">        set_circuitparams_pkt_loss(mtc, ifp-&gt;link_params-&gt;pkt_loss, 0);</a>
+<a name="ln616">      else</a>
+<a name="ln617">        SUBTLV_TYPE(mtc-&gt;pkt_loss) = 0;</a>
+<a name="ln618"> </a>
+<a name="ln619">      if (IS_PARAM_SET(ifp-&gt;link_params, LP_RES_BW))</a>
+<a name="ln620">        set_circuitparams_res_bw(mtc, ifp-&gt;link_params-&gt;res_bw);</a>
+<a name="ln621">      else</a>
+<a name="ln622">        SUBTLV_TYPE(mtc-&gt;res_bw) = 0;</a>
+<a name="ln623"> </a>
+<a name="ln624">      if (IS_PARAM_SET(ifp-&gt;link_params, LP_AVA_BW))</a>
+<a name="ln625">        set_circuitparams_ava_bw(mtc, ifp-&gt;link_params-&gt;ava_bw);</a>
+<a name="ln626">      else</a>
+<a name="ln627">        SUBTLV_TYPE(mtc-&gt;ava_bw) = 0;</a>
+<a name="ln628"> </a>
+<a name="ln629">      if (IS_PARAM_SET(ifp-&gt;link_params, LP_USE_BW))</a>
+<a name="ln630">        set_circuitparams_use_bw(mtc, ifp-&gt;link_params-&gt;use_bw);</a>
+<a name="ln631">      else</a>
+<a name="ln632">        SUBTLV_TYPE(mtc-&gt;use_bw) = 0;</a>
+<a name="ln633"> </a>
+<a name="ln634">      /* INTER_AS */</a>
+<a name="ln635">      if (IS_PARAM_SET(ifp-&gt;link_params, LP_RMT_AS))</a>
+<a name="ln636">        set_circuitparams_inter_as(mtc, ifp-&gt;link_params-&gt;rmt_ip, ifp-&gt;link_params-&gt;rmt_as);</a>
+<a name="ln637">      else</a>
+<a name="ln638">        /* reset inter-as TE params */</a>
+<a name="ln639">        unset_circuitparams_inter_as (mtc);</a>
+<a name="ln640"> </a>
+<a name="ln641">      /* Compute total length of SUB TLVs */</a>
+<a name="ln642">      mtc-&gt;length = subtlvs_len(mtc);</a>
+<a name="ln643"> </a>
+<a name="ln644">    }</a>
+<a name="ln645">  else</a>
+<a name="ln646">    mtc-&gt;status = disable;</a>
+<a name="ln647"> </a>
+<a name="ln648">  /* Finally Update LSP */</a>
+<a name="ln649">#if 0</a>
+<a name="ln650">  if (IS_MPLS_TE(isisMplsTE) &amp;&amp; circuit-&gt;area)</a>
+<a name="ln651">       lsp_regenerate_schedule (circuit-&gt;area, circuit-&gt;is_type, 0);</a>
+<a name="ln652">#endif</a>
+<a name="ln653">  return;</a>
+<a name="ln654">}</a>
+<a name="ln655"> </a>
+<a name="ln656">void</a>
+<a name="ln657">isis_mpls_te_update (struct interface *ifp)</a>
+<a name="ln658">{</a>
+<a name="ln659">  struct isis_circuit *circuit;</a>
+<a name="ln660"> </a>
+<a name="ln661">  /* Sanity Check */</a>
+<a name="ln662">  if (ifp == NULL)</a>
+<a name="ln663">    return;</a>
+<a name="ln664"> </a>
+<a name="ln665">  /* Get circuit context from interface */</a>
+<a name="ln666">  if ((circuit = circuit_scan_by_ifp(ifp)) == NULL)</a>
+<a name="ln667">    return;</a>
+<a name="ln668"> </a>
+<a name="ln669">  /* Update TE TLVs ... */</a>
+<a name="ln670">  isis_link_params_update(circuit, ifp);</a>
+<a name="ln671"> </a>
+<a name="ln672">  /* ... and LSP */</a>
+<a name="ln673">  if (IS_MPLS_TE(isisMplsTE) &amp;&amp; circuit-&gt;area)</a>
+<a name="ln674">     lsp_regenerate_schedule (circuit-&gt;area, circuit-&gt;is_type, 0);</a>
+<a name="ln675"> </a>
+<a name="ln676">  return;</a>
+<a name="ln677">}</a>
+<a name="ln678"> </a>
+<a name="ln679">/*------------------------------------------------------------------------*</a>
+<a name="ln680"> * Followings are vty session control functions.</a>
+<a name="ln681"> *------------------------------------------------------------------------*/</a>
+<a name="ln682"> </a>
+<a name="ln683">static u_char</a>
+<a name="ln684">show_vty_subtlv_admin_grp (struct vty *vty, struct te_subtlv_admin_grp *tlv)</a>
+<a name="ln685">{</a>
+<a name="ln686"> </a>
+<a name="ln687">  if (vty != NULL)</a>
+<a name="ln688">    vty_out (vty, &quot;    Administrative Group: 0x%x%s&quot;,</a>
+<a name="ln689">             (u_int32_t) ntohl (tlv-&gt;value), VTY_NEWLINE);</a>
+<a name="ln690">  else</a>
+<a name="ln691">    zlog_debug (&quot;      Administrative Group: 0x%x&quot;,</a>
+<a name="ln692">                (u_int32_t) ntohl (tlv-&gt;value));</a>
+<a name="ln693"> </a>
+<a name="ln694">  return (SUBTLV_HDR_SIZE + SUBTLV_DEF_SIZE);</a>
+<a name="ln695">}</a>
+<a name="ln696"> </a>
+<a name="ln697">static u_char</a>
+<a name="ln698">show_vty_subtlv_llri (struct vty *vty, struct te_subtlv_llri *tlv)</a>
+<a name="ln699">{</a>
+<a name="ln700">  if (vty != NULL)</a>
+<a name="ln701">    {</a>
+<a name="ln702">      vty_out (vty, &quot;    Link Local  ID: %d%s&quot;, (u_int32_t) ntohl (tlv-&gt;local),</a>
+<a name="ln703">               VTY_NEWLINE);</a>
+<a name="ln704">      vty_out (vty, &quot;    Link Remote ID: %d%s&quot;, (u_int32_t) ntohl (tlv-&gt;remote),</a>
+<a name="ln705">               VTY_NEWLINE);</a>
+<a name="ln706">    }</a>
+<a name="ln707">  else</a>
+<a name="ln708">    {</a>
+<a name="ln709">      zlog_debug (&quot;      Link Local  ID: %d&quot;, (u_int32_t) ntohl (tlv-&gt;local));</a>
+<a name="ln710">      zlog_debug (&quot;      Link Remote ID: %d&quot;, (u_int32_t) ntohl (tlv-&gt;remote));</a>
+<a name="ln711">    }</a>
+<a name="ln712"> </a>
+<a name="ln713">  return (SUBTLV_HDR_SIZE + TE_SUBTLV_LLRI_SIZE);</a>
+<a name="ln714">}</a>
+<a name="ln715"> </a>
+<a name="ln716">static u_char</a>
+<a name="ln717">show_vty_subtlv_local_ipaddr (struct vty *vty, struct te_subtlv_local_ipaddr *tlv)</a>
+<a name="ln718">{</a>
+<a name="ln719">  if (vty != NULL)</a>
+<a name="ln720">    vty_out (vty, &quot;    Local Interface IP Address(es): %s%s&quot;, inet_ntoa (tlv-&gt;value), VTY_NEWLINE);</a>
+<a name="ln721">  else</a>
+<a name="ln722">    zlog_debug (&quot;      Local Interface IP Address(es): %s&quot;, inet_ntoa (tlv-&gt;value));</a>
+<a name="ln723"> </a>
+<a name="ln724">  return (SUBTLV_HDR_SIZE + SUBTLV_DEF_SIZE);</a>
+<a name="ln725">}</a>
+<a name="ln726"> </a>
+<a name="ln727">static u_char</a>
+<a name="ln728">show_vty_subtlv_rmt_ipaddr (struct vty *vty, struct te_subtlv_rmt_ipaddr *tlv)</a>
+<a name="ln729">{</a>
+<a name="ln730">  if (vty != NULL)</a>
+<a name="ln731">    vty_out (vty, &quot;    Remote Interface IP Address(es): %s%s&quot;, inet_ntoa (tlv-&gt;value), VTY_NEWLINE);</a>
+<a name="ln732">  else</a>
+<a name="ln733">    zlog_debug (&quot;      Remote Interface IP Address(es): %s&quot;, inet_ntoa (tlv-&gt;value));</a>
+<a name="ln734"> </a>
+<a name="ln735">  return (SUBTLV_HDR_SIZE + SUBTLV_DEF_SIZE);</a>
+<a name="ln736">}</a>
+<a name="ln737"> </a>
+<a name="ln738">static u_char</a>
+<a name="ln739">show_vty_subtlv_max_bw (struct vty *vty, struct te_subtlv_max_bw *tlv)</a>
+<a name="ln740">{</a>
+<a name="ln741">  float fval;</a>
+<a name="ln742"> </a>
+<a name="ln743">  fval = ntohf (tlv-&gt;value);</a>
+<a name="ln744"> </a>
+<a name="ln745">  if (vty != NULL)</a>
+<a name="ln746">    vty_out (vty, &quot;    Maximum Bandwidth: %g (Bytes/sec)%s&quot;, fval, VTY_NEWLINE);</a>
+<a name="ln747">  else</a>
+<a name="ln748">    zlog_debug (&quot;      Maximum Bandwidth: %g (Bytes/sec)&quot;, fval);</a>
+<a name="ln749"> </a>
+<a name="ln750">  return (SUBTLV_HDR_SIZE + SUBTLV_DEF_SIZE);</a>
+<a name="ln751">}</a>
+<a name="ln752"> </a>
+<a name="ln753">static u_char</a>
+<a name="ln754">show_vty_subtlv_max_rsv_bw (struct vty *vty, struct te_subtlv_max_rsv_bw *tlv)</a>
+<a name="ln755">{</a>
+<a name="ln756">  float fval;</a>
+<a name="ln757"> </a>
+<a name="ln758">  fval = ntohf (tlv-&gt;value);</a>
+<a name="ln759"> </a>
+<a name="ln760">  if (vty != NULL)</a>
+<a name="ln761">    vty_out (vty, &quot;    Maximum Reservable Bandwidth: %g (Bytes/sec)%s&quot;, fval,</a>
+<a name="ln762">             VTY_NEWLINE);</a>
+<a name="ln763">  else</a>
+<a name="ln764">    zlog_debug (&quot;      Maximum Reservable Bandwidth: %g (Bytes/sec)&quot;, fval);</a>
+<a name="ln765"> </a>
+<a name="ln766">  return (SUBTLV_HDR_SIZE + SUBTLV_DEF_SIZE);</a>
+<a name="ln767">}</a>
+<a name="ln768"> </a>
+<a name="ln769">static u_char</a>
+<a name="ln770">show_vty_subtlv_unrsv_bw (struct vty *vty, struct te_subtlv_unrsv_bw *tlv)</a>
+<a name="ln771">{</a>
+<a name="ln772">  float fval1, fval2;</a>
+<a name="ln773">  int i;</a>
+<a name="ln774"> </a>
+<a name="ln775">  if (vty != NULL)</a>
+<a name="ln776">    vty_out (vty, &quot;    Unreserved Bandwidth:%s&quot;,VTY_NEWLINE);</a>
+<a name="ln777">  else</a>
+<a name="ln778">    zlog_debug (&quot;      Unreserved Bandwidth:&quot;);</a>
+<a name="ln779"> </a>
+<a name="ln780">  for (i = 0; i &lt; MAX_CLASS_TYPE; i+=2)</a>
+<a name="ln781">    {</a>
+<a name="ln782">      fval1 = ntohf (tlv-&gt;value[i]);</a>
+<a name="ln783">      fval2 = ntohf (tlv-&gt;value[i+1]);</a>
+<a name="ln784">      if (vty != NULL)</a>
+<a name="ln785">        vty_out (vty, &quot;      [%d]: %g (Bytes/sec),\t[%d]: %g (Bytes/sec)%s&quot;, i, fval1, i+1, fval2, VTY_NEWLINE);</a>
+<a name="ln786">      else</a>
+<a name="ln787">        zlog_debug (&quot;        [%d]: %g (Bytes/sec),\t[%d]: %g (Bytes/sec)&quot;, i, fval1, i+1, fval2);</a>
+<a name="ln788">    }</a>
+<a name="ln789"> </a>
+<a name="ln790">  return (SUBTLV_HDR_SIZE + TE_SUBTLV_UNRSV_SIZE);</a>
+<a name="ln791">}</a>
+<a name="ln792"> </a>
+<a name="ln793">static u_char</a>
+<a name="ln794">show_vty_subtlv_te_metric (struct vty *vty, struct te_subtlv_te_metric *tlv)</a>
+<a name="ln795">{</a>
+<a name="ln796">  u_int32_t te_metric;</a>
+<a name="ln797"> </a>
+<a name="ln798">  te_metric = tlv-&gt;value[2] | tlv-&gt;value[1] &lt;&lt; 8 | tlv-&gt;value[0] &lt;&lt; 16;</a>
+<a name="ln799">  if (vty != NULL)</a>
+<a name="ln800">    vty_out (vty, &quot;    Traffic Engineering Metric: %u%s&quot;, te_metric, VTY_NEWLINE);</a>
+<a name="ln801">  else</a>
+<a name="ln802">    zlog_debug (&quot;      Traffic Engineering Metric: %u&quot;, te_metric);</a>
+<a name="ln803"> </a>
+<a name="ln804">  return (SUBTLV_HDR_SIZE + SUBTLV_DEF_SIZE);</a>
+<a name="ln805">}</a>
+<a name="ln806"> </a>
+<a name="ln807">static u_char</a>
+<a name="ln808">show_vty_subtlv_ras (struct vty *vty, struct te_subtlv_ras *tlv)</a>
+<a name="ln809">{</a>
+<a name="ln810">  if (vty != NULL)</a>
+<a name="ln811">    vty_out (vty, &quot;    Inter-AS TE Remote AS number: %u%s&quot;, ntohl (tlv-&gt;value), VTY_NEWLINE);</a>
+<a name="ln812">  else</a>
+<a name="ln813">    zlog_debug (&quot;      Inter-AS TE Remote AS number: %u&quot;, ntohl (tlv-&gt;value));</a>
+<a name="ln814"> </a>
+<a name="ln815">  return (SUBTLV_HDR_SIZE + SUBTLV_DEF_SIZE);</a>
+<a name="ln816">}</a>
+<a name="ln817"> </a>
+<a name="ln818">static u_char</a>
+<a name="ln819">show_vty_subtlv_rip (struct vty *vty, struct te_subtlv_rip *tlv)</a>
+<a name="ln820">{</a>
+<a name="ln821">  if (vty != NULL)</a>
+<a name="ln822">    vty_out (vty, &quot;    Inter-AS TE Remote ASBR IP address: %s%s&quot;, inet_ntoa (tlv-&gt;value), VTY_NEWLINE);</a>
+<a name="ln823">  else</a>
+<a name="ln824">    zlog_debug (&quot;      Inter-AS TE Remote ASBR IP address: %s&quot;, inet_ntoa (tlv-&gt;value));</a>
+<a name="ln825"> </a>
+<a name="ln826">  return (SUBTLV_HDR_SIZE + SUBTLV_DEF_SIZE);</a>
+<a name="ln827">}</a>
+<a name="ln828"> </a>
+<a name="ln829">static u_char</a>
+<a name="ln830">show_vty_subtlv_av_delay (struct vty *vty, struct te_subtlv_av_delay *tlv)</a>
+<a name="ln831">{</a>
+<a name="ln832">  u_int32_t delay;</a>
+<a name="ln833">  u_int32_t A;</a>
+<a name="ln834"> </a>
+<a name="ln835">  delay = (u_int32_t) ntohl (tlv-&gt;value) &amp; TE_EXT_MASK;</a>
+<a name="ln836">  A = (u_int32_t) ntohl (tlv-&gt;value) &amp; TE_EXT_ANORMAL;</a>
+<a name="ln837"> </a>
+<a name="ln838">  if (vty != NULL)</a>
+<a name="ln839">    vty_out (vty, &quot;    %s Average Link Delay: %d (micro-sec)%s&quot;, A ? &quot;Anomalous&quot; : &quot;Normal&quot;, delay, VTY_NEWLINE);</a>
+<a name="ln840">  else</a>
+<a name="ln841">    zlog_debug (&quot;      %s Average Link Delay: %d (micro-sec)&quot;, A ? &quot;Anomalous&quot; : &quot;Normal&quot;, delay);</a>
+<a name="ln842"> </a>
+<a name="ln843">  return (SUBTLV_HDR_SIZE + SUBTLV_DEF_SIZE);</a>
+<a name="ln844">}</a>
+<a name="ln845"> </a>
+<a name="ln846">static u_char</a>
+<a name="ln847">show_vty_subtlv_mm_delay (struct vty *vty, struct te_subtlv_mm_delay *tlv)</a>
+<a name="ln848">{</a>
+<a name="ln849">  u_int32_t low, high;</a>
+<a name="ln850">  u_int32_t A;</a>
+<a name="ln851"> </a>
+<a name="ln852">  low = (u_int32_t) ntohl (tlv-&gt;low) &amp; TE_EXT_MASK;</a>
+<a name="ln853">  A = (u_int32_t) ntohl (tlv-&gt;low) &amp; TE_EXT_ANORMAL;</a>
+<a name="ln854">  high = (u_int32_t) ntohl (tlv-&gt;high) &amp; TE_EXT_MASK;</a>
+<a name="ln855"> </a>
+<a name="ln856">  if (vty != NULL)</a>
+<a name="ln857">    vty_out (vty, &quot;    %s Min/Max Link Delay: %d / %d (micro-sec)%s&quot;, A ? &quot;Anomalous&quot; : &quot;Normal&quot;, low, high, VTY_NEWLINE);</a>
+<a name="ln858">  else</a>
+<a name="ln859">    zlog_debug (&quot;      %s Min/Max Link Delay: %d / %d (micro-sec)&quot;, A ? &quot;Anomalous&quot; : &quot;Normal&quot;, low, high);</a>
+<a name="ln860"> </a>
+<a name="ln861">  return (SUBTLV_HDR_SIZE + SUBTLV_DEF_SIZE);</a>
+<a name="ln862">}</a>
+<a name="ln863"> </a>
+<a name="ln864">static u_char</a>
+<a name="ln865">show_vty_subtlv_delay_var (struct vty *vty, struct te_subtlv_delay_var *tlv)</a>
+<a name="ln866">{</a>
+<a name="ln867">  u_int32_t jitter;</a>
+<a name="ln868"> </a>
+<a name="ln869">  jitter = (u_int32_t) ntohl (tlv-&gt;value) &amp; TE_EXT_MASK;</a>
+<a name="ln870"> </a>
+<a name="ln871">  if (vty != NULL)</a>
+<a name="ln872">    vty_out (vty, &quot;    Delay Variation: %d (micro-sec)%s&quot;, jitter, VTY_NEWLINE);</a>
+<a name="ln873">  else</a>
+<a name="ln874">    zlog_debug (&quot;      Delay Variation: %d (micro-sec)&quot;, jitter);</a>
+<a name="ln875"> </a>
+<a name="ln876">  return (SUBTLV_HDR_SIZE + SUBTLV_DEF_SIZE);</a>
+<a name="ln877">}</a>
+<a name="ln878"> </a>
+<a name="ln879">static u_char</a>
+<a name="ln880">show_vty_subtlv_pkt_loss (struct vty *vty, struct te_subtlv_pkt_loss *tlv)</a>
+<a name="ln881">{</a>
+<a name="ln882">  u_int32_t loss;</a>
+<a name="ln883">  u_int32_t A;</a>
+<a name="ln884">  float fval;</a>
+<a name="ln885"> </a>
+<a name="ln886">  loss = (u_int32_t) ntohl (tlv-&gt;value) &amp; TE_EXT_MASK;</a>
+<a name="ln887">  fval = (float) (loss * LOSS_PRECISION);</a>
+<a name="ln888">  A = (u_int32_t) ntohl (tlv-&gt;value) &amp; TE_EXT_ANORMAL;</a>
+<a name="ln889"> </a>
+<a name="ln890">  if (vty != NULL)</a>
+<a name="ln891">    vty_out (vty, &quot;    %s Link Packet Loss: %g (%%)%s&quot;, A ? &quot;Anomalous&quot; : &quot;Normal&quot;, fval, VTY_NEWLINE);</a>
+<a name="ln892">  else</a>
+<a name="ln893">    zlog_debug (&quot;      %s Link Packet Loss: %g (%%)&quot;, A ? &quot;Anomalous&quot; : &quot;Normal&quot;, fval);</a>
+<a name="ln894"> </a>
+<a name="ln895">  return (SUBTLV_HDR_SIZE + SUBTLV_DEF_SIZE);</a>
+<a name="ln896">}</a>
+<a name="ln897"> </a>
+<a name="ln898">static u_char</a>
+<a name="ln899">show_vty_subtlv_res_bw (struct vty *vty, struct te_subtlv_res_bw *tlv)</a>
+<a name="ln900">{</a>
+<a name="ln901">  float fval;</a>
+<a name="ln902"> </a>
+<a name="ln903">  fval = ntohf(tlv-&gt;value);</a>
+<a name="ln904"> </a>
+<a name="ln905">  if (vty != NULL)</a>
+<a name="ln906">    vty_out (vty, &quot;    Unidirectional Residual Bandwidth: %g (Bytes/sec)%s&quot;, fval, VTY_NEWLINE);</a>
+<a name="ln907">  else</a>
+<a name="ln908">    zlog_debug (&quot;      Unidirectional Residual Bandwidth: %g (Bytes/sec)&quot;, fval);</a>
+<a name="ln909"> </a>
+<a name="ln910">  return (SUBTLV_HDR_SIZE + SUBTLV_DEF_SIZE);</a>
+<a name="ln911">}</a>
+<a name="ln912"> </a>
+<a name="ln913">static u_char</a>
+<a name="ln914">show_vty_subtlv_ava_bw (struct vty *vty, struct te_subtlv_ava_bw *tlv)</a>
+<a name="ln915">{</a>
+<a name="ln916">  float fval;</a>
+<a name="ln917"> </a>
+<a name="ln918">  fval = ntohf (tlv-&gt;value);</a>
+<a name="ln919"> </a>
+<a name="ln920">  if (vty != NULL)</a>
+<a name="ln921">    vty_out (vty, &quot;    Unidirectional Available Bandwidth: %g (Bytes/sec)%s&quot;, fval, VTY_NEWLINE);</a>
+<a name="ln922">  else</a>
+<a name="ln923">    zlog_debug (&quot;      Unidirectional Available Bandwidth: %g (Bytes/sec)&quot;, fval);</a>
+<a name="ln924"> </a>
+<a name="ln925">  return (SUBTLV_HDR_SIZE + SUBTLV_DEF_SIZE);</a>
+<a name="ln926">}</a>
+<a name="ln927"> </a>
+<a name="ln928">static u_char</a>
+<a name="ln929">show_vty_subtlv_use_bw (struct vty *vty, struct te_subtlv_use_bw *tlv)</a>
+<a name="ln930">{</a>
+<a name="ln931">  float fval;</a>
+<a name="ln932"> </a>
+<a name="ln933">  fval = ntohf (tlv-&gt;value);</a>
+<a name="ln934"> </a>
+<a name="ln935">  if (vty != NULL)</a>
+<a name="ln936">    vty_out (vty, &quot;    Unidirectional Utilized Bandwidth: %g (Bytes/sec)%s&quot;, fval, VTY_NEWLINE);</a>
+<a name="ln937">  else</a>
+<a name="ln938">    zlog_debug (&quot;      Unidirectional Utilized Bandwidth: %g (Bytes/sec)&quot;, fval);</a>
+<a name="ln939"> </a>
+<a name="ln940">  return (SUBTLV_HDR_SIZE + SUBTLV_DEF_SIZE);</a>
+<a name="ln941">}</a>
+<a name="ln942"> </a>
+<a name="ln943">static u_char</a>
+<a name="ln944">show_vty_unknown_tlv (struct vty *vty, struct subtlv_header *tlvh)</a>
+<a name="ln945">{</a>
+<a name="ln946">  int i, rtn = 1;</a>
+<a name="ln947">  u_char *v = (u_char *)tlvh;</a>
+<a name="ln948"> </a>
+<a name="ln949">  if (vty != NULL)</a>
+<a name="ln950">    {</a>
+<a name="ln951">      if (tlvh-&gt;length != 0)</a>
+<a name="ln952">        {</a>
+<a name="ln953">          vty_out (vty, &quot;    Unknown TLV: [type(%#.2x), length(%#.2x)]%s&quot;,</a>
+<a name="ln954">              tlvh-&gt;type, tlvh-&gt;length, VTY_NEWLINE);</a>
+<a name="ln955">          vty_out(vty, &quot;       Dump: [00]&quot;);</a>
+<a name="ln956">          rtn = 1;          /* initialize end of line counter */</a>
+<a name="ln957">          for (i = 0; i &lt; tlvh-&gt;length; i++)</a>
+<a name="ln958">            {</a>
+<a name="ln959">              vty_out (vty, &quot; %#.2x&quot;, v[i]);</a>
+<a name="ln960">              if (rtn == 8)</a>
+<a name="ln961">                {</a>
+<a name="ln962">                  vty_out (vty, &quot;%s             [%.2x]&quot;, VTY_NEWLINE, i + 1);</a>
+<a name="ln963">                  rtn = 1;</a>
+<a name="ln964">                }</a>
+<a name="ln965">              else</a>
+<a name="ln966">                rtn++;</a>
+<a name="ln967">            }</a>
+<a name="ln968">          vty_out (vty, &quot;%s&quot;, VTY_NEWLINE);</a>
+<a name="ln969">        }</a>
+<a name="ln970">      else</a>
+<a name="ln971">        vty_out (vty, &quot;    Unknown TLV: [type(%#.2x), length(%#.2x)]%s&quot;,</a>
+<a name="ln972">            tlvh-&gt;type, tlvh-&gt;length, VTY_NEWLINE);</a>
+<a name="ln973">    }</a>
+<a name="ln974">  else</a>
+<a name="ln975">    {</a>
+<a name="ln976">      zlog_debug (&quot;      Unknown TLV: [type(%#.2x), length(%#.2x)]&quot;,</a>
+<a name="ln977">          tlvh-&gt;type, tlvh-&gt;length);</a>
+<a name="ln978">    }</a>
+<a name="ln979"> </a>
+<a name="ln980">  return SUBTLV_SIZE(tlvh);</a>
+<a name="ln981">}</a>
+<a name="ln982"> </a>
+<a name="ln983">/* Main Show function */</a>
+<a name="ln984">void</a>
+<a name="ln985">mpls_te_print_detail(struct vty *vty, struct te_is_neigh *te)</a>
+<a name="ln986">{</a>
+<a name="ln987">  struct subtlv_header *tlvh, *next;</a>
+<a name="ln988">  u_int16_t sum = 0;</a>
+<a name="ln989"> </a>
+<a name="ln990">  zlog_debug (&quot;ISIS MPLS-TE: Show database TE detail&quot;);</a>
+<a name="ln991"> </a>
+<a name="ln992">  if (te-&gt;sub_tlvs == NULL)</a>
+<a name="ln993">    return;</a>
+<a name="ln994"> </a>
+<a name="ln995">  tlvh = (struct subtlv_header *)te-&gt;sub_tlvs;</a>
+<a name="ln996"> </a>
+<a name="ln997">  for (; sum &lt; te-&gt;sub_tlvs_length; tlvh = (next ? next : SUBTLV_HDR_NEXT (tlvh)))</a>
+<a name="ln998">    {</a>
+<a name="ln999">      next = NULL;</a>
+<a name="ln1000"> </a>
+<a name="ln1001">      switch (tlvh-&gt;type)</a>
+<a name="ln1002">      {</a>
+<a name="ln1003">      case TE_SUBTLV_ADMIN_GRP:</a>
+<a name="ln1004">        sum += show_vty_subtlv_admin_grp (vty, (struct te_subtlv_admin_grp *)tlvh);</a>
+<a name="ln1005">        break;</a>
+<a name="ln1006">      case TE_SUBTLV_LLRI:</a>
+<a name="ln1007">        sum += show_vty_subtlv_llri (vty, (struct te_subtlv_llri *)tlvh);</a>
+<a name="ln1008">        break;</a>
+<a name="ln1009">      case TE_SUBTLV_LOCAL_IPADDR:</a>
+<a name="ln1010">        sum += show_vty_subtlv_local_ipaddr (vty, (struct te_subtlv_local_ipaddr *)tlvh);</a>
+<a name="ln1011">        break;</a>
+<a name="ln1012">      case TE_SUBTLV_RMT_IPADDR:</a>
+<a name="ln1013">        sum += show_vty_subtlv_rmt_ipaddr (vty, (struct te_subtlv_rmt_ipaddr *)tlvh);</a>
+<a name="ln1014">        break;</a>
+<a name="ln1015">      case TE_SUBTLV_MAX_BW:</a>
+<a name="ln1016">        sum += show_vty_subtlv_max_bw (vty, (struct te_subtlv_max_bw *)tlvh);</a>
+<a name="ln1017">        break;</a>
+<a name="ln1018">      case TE_SUBTLV_MAX_RSV_BW:</a>
+<a name="ln1019">        sum += show_vty_subtlv_max_rsv_bw (vty, (struct te_subtlv_max_rsv_bw *)tlvh);</a>
+<a name="ln1020">        break;</a>
+<a name="ln1021">      case TE_SUBTLV_UNRSV_BW:</a>
+<a name="ln1022">        sum += show_vty_subtlv_unrsv_bw (vty, (struct te_subtlv_unrsv_bw *)tlvh);</a>
+<a name="ln1023">        break;</a>
+<a name="ln1024">      case TE_SUBTLV_TE_METRIC:</a>
+<a name="ln1025">        sum += show_vty_subtlv_te_metric (vty, (struct te_subtlv_te_metric *)tlvh);</a>
+<a name="ln1026">        break;</a>
+<a name="ln1027">      case TE_SUBTLV_RAS:</a>
+<a name="ln1028">        sum += show_vty_subtlv_ras (vty, (struct te_subtlv_ras *)tlvh);</a>
+<a name="ln1029">        break;</a>
+<a name="ln1030">      case TE_SUBTLV_RIP:</a>
+<a name="ln1031">        sum += show_vty_subtlv_rip (vty, (struct te_subtlv_rip *)tlvh);</a>
+<a name="ln1032">        break;</a>
+<a name="ln1033">      case TE_SUBTLV_AV_DELAY:</a>
+<a name="ln1034">        sum += show_vty_subtlv_av_delay (vty, (struct te_subtlv_av_delay *)tlvh);</a>
+<a name="ln1035">        break;</a>
+<a name="ln1036">      case TE_SUBTLV_MM_DELAY:</a>
+<a name="ln1037">        sum += show_vty_subtlv_mm_delay (vty, (struct te_subtlv_mm_delay *)tlvh);</a>
+<a name="ln1038">        break;</a>
+<a name="ln1039">      case TE_SUBTLV_DELAY_VAR:</a>
+<a name="ln1040">        sum += show_vty_subtlv_delay_var (vty, (struct te_subtlv_delay_var *)tlvh);</a>
+<a name="ln1041">        break;</a>
+<a name="ln1042">      case TE_SUBTLV_PKT_LOSS:</a>
+<a name="ln1043">        sum += show_vty_subtlv_pkt_loss (vty, (struct te_subtlv_pkt_loss *)tlvh);</a>
+<a name="ln1044">        break;</a>
+<a name="ln1045">      case TE_SUBTLV_RES_BW:</a>
+<a name="ln1046">        sum += show_vty_subtlv_res_bw (vty, (struct te_subtlv_res_bw *)tlvh);</a>
+<a name="ln1047">        break;</a>
+<a name="ln1048">      case TE_SUBTLV_AVA_BW:</a>
+<a name="ln1049">        sum += show_vty_subtlv_ava_bw (vty, (struct te_subtlv_ava_bw *)tlvh);</a>
+<a name="ln1050">        break;</a>
+<a name="ln1051">      case TE_SUBTLV_USE_BW:</a>
+<a name="ln1052">        sum += show_vty_subtlv_use_bw (vty, (struct te_subtlv_use_bw *)tlvh);</a>
+<a name="ln1053">        break;</a>
+<a name="ln1054">      default:</a>
+<a name="ln1055">        sum += show_vty_unknown_tlv (vty, tlvh);</a>
+<a name="ln1056">        break;</a>
+<a name="ln1057">      }</a>
+<a name="ln1058">    }</a>
+<a name="ln1059">  return;</a>
+<a name="ln1060">}</a>
+<a name="ln1061"> </a>
+<a name="ln1062">/* Specific MPLS TE router parameters write function */</a>
+<a name="ln1063">void</a>
+<a name="ln1064">isis_mpls_te_config_write_router (struct vty *vty)</a>
+<a name="ln1065">{</a>
+<a name="ln1066"> </a>
+<a name="ln1067">  zlog_debug (&quot;ISIS MPLS-TE: Write ISIS router configuration&quot;);</a>
+<a name="ln1068"> </a>
+<a name="ln1069">  if (IS_MPLS_TE(isisMplsTE))</a>
+<a name="ln1070">    {</a>
+<a name="ln1071">      vty_out (vty, &quot;  mpls-te on%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1072">      vty_out (vty, &quot;  mpls-te router-address %s%s&quot;,</a>
+<a name="ln1073">               inet_ntoa (isisMplsTE.router_id), VTY_NEWLINE);</a>
+<a name="ln1074">    }</a>
+<a name="ln1075"> </a>
+<a name="ln1076">  return;</a>
+<a name="ln1077">}</a>
+<a name="ln1078"> </a>
+<a name="ln1079"> </a>
+<a name="ln1080">/*------------------------------------------------------------------------*</a>
+<a name="ln1081"> * Followings are vty command functions.</a>
+<a name="ln1082"> *------------------------------------------------------------------------*/</a>
+<a name="ln1083"> </a>
+<a name="ln1084">DEFUN (isis_mpls_te_on,</a>
+<a name="ln1085">       isis_mpls_te_on_cmd,</a>
+<a name="ln1086">       &quot;mpls-te on&quot;,</a>
+<a name="ln1087">       MPLS_TE_STR</a>
+<a name="ln1088">       &quot;Enable MPLS-TE functionality\n&quot;)</a>
+<a name="ln1089">{</a>
+<a name="ln1090">  struct listnode *node;</a>
+<a name="ln1091">  struct isis_circuit *circuit;</a>
+<a name="ln1092"> </a>
+<a name="ln1093">  if (IS_MPLS_TE(isisMplsTE))</a>
+<a name="ln1094">    return CMD_SUCCESS;</a>
+<a name="ln1095"> </a>
+<a name="ln1096">  if (IS_DEBUG_ISIS(DEBUG_TE))</a>
+<a name="ln1097">    zlog_debug (&quot;ISIS MPLS-TE: OFF -&gt; ON&quot;);</a>
+<a name="ln1098"> </a>
+<a name="ln1099">  isisMplsTE.status = enable;</a>
+<a name="ln1100"> </a>
+<a name="ln1101">  /*</a>
+<a name="ln1102">   * Following code is intended to handle two cases;</a>
+<a name="ln1103">   *</a>
+<a name="ln1104">   * 1) MPLS-TE was disabled at startup time, but now become enabled.</a>
+<a name="ln1105">   * In this case, we must enable MPLS-TE Circuit regarding interface MPLS_TE flag</a>
+<a name="ln1106">   * 2) MPLS-TE was once enabled then disabled, and now enabled again.</a>
+<a name="ln1107">   */</a>
+<a name="ln1108">  for (ALL_LIST_ELEMENTS_RO (isisMplsTE.cir_list, node, circuit))</a>
+<a name="ln1109">    {</a>
+<a name="ln1110">      if (circuit-&gt;mtc == NULL || IS_FLOOD_AS (circuit-&gt;mtc-&gt;type))</a>
+<a name="ln1111">        continue;</a>
+<a name="ln1112"> </a>
+<a name="ln1113">      if ((circuit-&gt;mtc-&gt;status == disable)</a>
+<a name="ln1114">          &amp;&amp; HAS_LINK_PARAMS(circuit-&gt;interface))</a>
+<a name="ln1115">        circuit-&gt;mtc-&gt;status = enable;</a>
+<a name="ln1116">      else</a>
+<a name="ln1117">        continue;</a>
+<a name="ln1118"> </a>
+<a name="ln1119">      /* Reoriginate STD_TE &amp; GMPLS circuits */</a>
+<a name="ln1120">      if (circuit-&gt;area)</a>
+<a name="ln1121">        lsp_regenerate_schedule (circuit-&gt;area, circuit-&gt;is_type, 0);</a>
+<a name="ln1122">    }</a>
+<a name="ln1123"> </a>
+<a name="ln1124">  return CMD_SUCCESS;</a>
+<a name="ln1125">}</a>
+<a name="ln1126"> </a>
+<a name="ln1127">DEFUN (no_isis_mpls_te_on,</a>
+<a name="ln1128">       no_isis_mpls_te_on_cmd,</a>
+<a name="ln1129">       &quot;no mpls-te&quot;,</a>
+<a name="ln1130">       NO_STR</a>
+<a name="ln1131">       &quot;Disable the MPLS-TE functionality\n&quot;)</a>
+<a name="ln1132">{</a>
+<a name="ln1133">  struct listnode *node;</a>
+<a name="ln1134">  struct isis_circuit *circuit;</a>
+<a name="ln1135"> </a>
+<a name="ln1136">  if (isisMplsTE.status == disable)</a>
+<a name="ln1137">    return CMD_SUCCESS;</a>
+<a name="ln1138"> </a>
+<a name="ln1139">  if (IS_DEBUG_ISIS(DEBUG_TE))</a>
+<a name="ln1140">    zlog_debug (&quot;ISIS MPLS-TE: ON -&gt; OFF&quot;);</a>
+<a name="ln1141"> </a>
+<a name="ln1142">  isisMplsTE.status = disable;</a>
+<a name="ln1143"> </a>
+<a name="ln1144">  /* Flush LSP if circuit engage */</a>
+<a name="ln1145">  for (ALL_LIST_ELEMENTS_RO (isisMplsTE.cir_list, node, circuit))</a>
+<a name="ln1146">    {</a>
+<a name="ln1147">      if (circuit-&gt;mtc == NULL || (circuit-&gt;mtc-&gt;status == disable))</a>
+<a name="ln1148">        continue;</a>
+<a name="ln1149"> </a>
+<a name="ln1150">      /* disable MPLS_TE Circuit */</a>
+<a name="ln1151">      circuit-&gt;mtc-&gt;status = disable;</a>
+<a name="ln1152"> </a>
+<a name="ln1153">      /* Re-originate circuit without STD_TE &amp; GMPLS parameters */</a>
+<a name="ln1154">      if (circuit-&gt;area)</a>
+<a name="ln1155">        lsp_regenerate_schedule (circuit-&gt;area, circuit-&gt;is_type, 0);</a>
+<a name="ln1156">    }</a>
+<a name="ln1157"> </a>
+<a name="ln1158">  return CMD_SUCCESS;</a>
+<a name="ln1159">}</a>
+<a name="ln1160"> </a>
+<a name="ln1161">DEFUN (isis_mpls_te_router_addr,</a>
+<a name="ln1162">       isis_mpls_te_router_addr_cmd,</a>
+<a name="ln1163">       &quot;mpls-te router-address A.B.C.D&quot;,</a>
+<a name="ln1164">       MPLS_TE_STR</a>
+<a name="ln1165">       &quot;Stable IP address of the advertising router\n&quot;</a>
+<a name="ln1166">       &quot;MPLS-TE router address in IPv4 address format\n&quot;)</a>
+<a name="ln1167">{</a>
+<a name="ln1168">  struct in_addr value;</a>
+<a name="ln1169">  struct listnode *node;</a>
+<a name="ln1170">  struct isis_area *area;</a>
+<a name="ln1171"> </a>
+<a name="ln1172">  if (! inet_aton (argv[0], &amp;value))</a>
+<a name="ln1173">    {</a>
+<a name="ln1174">      vty_out (vty, &quot;Please specify Router-Addr by A.B.C.D%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1175">      return CMD_WARNING;</a>
+<a name="ln1176">    }</a>
+<a name="ln1177"> </a>
+<a name="ln1178">  isisMplsTE.router_id.s_addr = value.s_addr;</a>
+<a name="ln1179"> </a>
+<a name="ln1180">  if (isisMplsTE.status == disable)</a>
+<a name="ln1181">    return CMD_SUCCESS;</a>
+<a name="ln1182"> </a>
+<a name="ln1183">  /* Update main Router ID in isis global structure */</a>
+<a name="ln1184">  isis-&gt;router_id = value.s_addr;</a>
+<a name="ln1185">  /* And re-schedule LSP update */</a>
+<a name="ln1186">  for (ALL_LIST_ELEMENTS_RO (isis-&gt;area_list, node, area))</a>
+<a name="ln1187">    if (listcount (area-&gt;area_addrs) &gt; 0)</a>
+<a name="ln1188">      lsp_regenerate_schedule (area, area-&gt;is_type, 0);</a>
+<a name="ln1189"> </a>
+<a name="ln1190">  return CMD_SUCCESS;</a>
+<a name="ln1191">}</a>
+<a name="ln1192"> </a>
+<a name="ln1193">DEFUN (isis_mpls_te_inter_as,</a>
+<a name="ln1194">       isis_mpls_te_inter_as_cmd,</a>
+<a name="ln1195">       &quot;mpls-te inter-as (level-1|level-1-2|level-2-only)&quot;,</a>
+<a name="ln1196">       MPLS_TE_STR</a>
+<a name="ln1197">       &quot;Configure MPLS-TE Inter-AS support\n&quot;</a>
+<a name="ln1198">       &quot;AREA native mode self originate INTER-AS LSP with L1 only flooding scope)\n&quot;</a>
+<a name="ln1199">       &quot;AREA native mode self originate INTER-AS LSP with L1 and L2 flooding scope)\n&quot;</a>
+<a name="ln1200">       &quot;AS native mode self originate INTER-AS LSP with L2 only flooding scope\n&quot;)</a>
+<a name="ln1201">{</a>
+<a name="ln1202">  vty_out (vty, &quot;Not yet supported%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1203">  return CMD_SUCCESS;</a>
+<a name="ln1204">}</a>
+<a name="ln1205"> </a>
+<a name="ln1206">DEFUN (no_isis_mpls_te_inter_as,</a>
+<a name="ln1207">       no_isis_mpls_te_inter_as_cmd,</a>
+<a name="ln1208">       &quot;no mpls-te inter-as&quot;,</a>
+<a name="ln1209">       NO_STR</a>
+<a name="ln1210">       &quot;Disable the MPLS-TE functionality\n&quot;</a>
+<a name="ln1211">       &quot;Disable MPLS-TE Inter-AS support\n&quot;)</a>
+<a name="ln1212">{</a>
+<a name="ln1213"> </a>
+<a name="ln1214">  vty_out (vty, &quot;Not yet supported%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1215">  return CMD_SUCCESS;</a>
+<a name="ln1216">}</a>
+<a name="ln1217"> </a>
+<a name="ln1218">DEFUN (show_isis_mpls_te_router,</a>
+<a name="ln1219">       show_isis_mpls_te_router_cmd,</a>
+<a name="ln1220">       &quot;show isis mpls-te router&quot;,</a>
+<a name="ln1221">       SHOW_STR</a>
+<a name="ln1222">       ISIS_STR</a>
+<a name="ln1223">       MPLS_TE_STR</a>
+<a name="ln1224">       &quot;Router information\n&quot;)</a>
+<a name="ln1225">{</a>
+<a name="ln1226">  if (IS_MPLS_TE(isisMplsTE))</a>
+<a name="ln1227">    {</a>
+<a name="ln1228">      vty_out (vty, &quot;--- MPLS-TE router parameters ---%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1229"> </a>
+<a name="ln1230">      if (vty != NULL)</a>
+<a name="ln1231">        {</a>
+<a name="ln1232">          if (ntohs (isisMplsTE.router_id.s_addr) != 0)</a>
+<a name="ln1233">            vty_out (vty, &quot;  Router-Address: %s%s&quot;, inet_ntoa (isisMplsTE.router_id), VTY_NEWLINE);</a>
+<a name="ln1234">          else</a>
+<a name="ln1235">            vty_out (vty, &quot;  N/A%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1236">        }</a>
+<a name="ln1237">    }</a>
+<a name="ln1238">  else</a>
+<a name="ln1239">    vty_out (vty, &quot;  MPLS-TE is disable on this router%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1240"> </a>
+<a name="ln1241">  return CMD_SUCCESS;</a>
+<a name="ln1242">}</a>
+<a name="ln1243"> </a>
+<a name="ln1244">static void</a>
+<a name="ln1245">show_mpls_te_sub (struct vty *vty, struct interface *ifp)</a>
+<a name="ln1246">{</a>
+<a name="ln1247">  struct mpls_te_circuit *mtc;</a>
+<a name="ln1248"> </a>
+<a name="ln1249">  if ((IS_MPLS_TE(isisMplsTE))</a>
+<a name="ln1250">      &amp;&amp;  ((mtc = lookup_mpls_params_by_ifp (ifp)) != NULL))</a>
+<a name="ln1251">    {</a>
+<a name="ln1252">      /* Continue only if interface is not passive or support Inter-AS TEv2 */</a>
+<a name="ln1253">      if (mtc-&gt;status != enable)</a>
+<a name="ln1254">        {</a>
+<a name="ln1255">          if (IS_INTER_AS(mtc-&gt;type))</a>
+<a name="ln1256">            {</a>
+<a name="ln1257">              vty_out (vty, &quot;-- Inter-AS TEv2 link parameters for %s --%s&quot;,</a>
+<a name="ln1258">                       ifp-&gt;name, VTY_NEWLINE);</a>
+<a name="ln1259">            }</a>
+<a name="ln1260">          else</a>
+<a name="ln1261">            {</a>
+<a name="ln1262">              /* MPLS-TE is not activate on this interface */</a>
+<a name="ln1263">              /* or this interface is passive and Inter-AS TEv2 is not activate */</a>
+<a name="ln1264">              vty_out (vty, &quot;  %s: MPLS-TE is disabled on this interface%s&quot;,</a>
+<a name="ln1265">                       ifp-&gt;name, VTY_NEWLINE);</a>
+<a name="ln1266">              return;</a>
+<a name="ln1267">            }</a>
+<a name="ln1268">        }</a>
+<a name="ln1269">      else</a>
+<a name="ln1270">        {</a>
+<a name="ln1271">          vty_out (vty, &quot;-- MPLS-TE link parameters for %s --%s&quot;,</a>
+<a name="ln1272">                   ifp-&gt;name, VTY_NEWLINE);</a>
+<a name="ln1273">        }</a>
+<a name="ln1274"> </a>
+<a name="ln1275">      show_vty_subtlv_admin_grp (vty, &amp;mtc-&gt;admin_grp);</a>
+<a name="ln1276"> </a>
+<a name="ln1277">      if (SUBTLV_TYPE(mtc-&gt;local_ipaddr) != 0)</a>
+<a name="ln1278">        show_vty_subtlv_local_ipaddr (vty, &amp;mtc-&gt;local_ipaddr);</a>
+<a name="ln1279">      if (SUBTLV_TYPE(mtc-&gt;rmt_ipaddr) != 0)</a>
+<a name="ln1280">        show_vty_subtlv_rmt_ipaddr (vty, &amp;mtc-&gt;rmt_ipaddr);</a>
+<a name="ln1281"> </a>
+<a name="ln1282">      show_vty_subtlv_max_bw (vty, &amp;mtc-&gt;max_bw);</a>
+<a name="ln1283">      show_vty_subtlv_max_rsv_bw (vty, &amp;mtc-&gt;max_rsv_bw);</a>
+<a name="ln1284">      show_vty_subtlv_unrsv_bw (vty, &amp;mtc-&gt;unrsv_bw);</a>
+<a name="ln1285">      show_vty_subtlv_te_metric (vty, &amp;mtc-&gt;te_metric);</a>
+<a name="ln1286"> </a>
+<a name="ln1287">      if (IS_INTER_AS(mtc-&gt;type))</a>
+<a name="ln1288">        {</a>
+<a name="ln1289">          if (SUBTLV_TYPE(mtc-&gt;ras) != 0)</a>
+<a name="ln1290">            show_vty_subtlv_ras (vty, &amp;mtc-&gt;ras);</a>
+<a name="ln1291">          if (SUBTLV_TYPE(mtc-&gt;rip) != 0)</a>
+<a name="ln1292">            show_vty_subtlv_rip (vty, &amp;mtc-&gt;rip);</a>
+<a name="ln1293">        }</a>
+<a name="ln1294"> </a>
+<a name="ln1295">      show_vty_subtlv_av_delay (vty, &amp;mtc-&gt;av_delay);</a>
+<a name="ln1296">      show_vty_subtlv_mm_delay (vty, &amp;mtc-&gt;mm_delay);</a>
+<a name="ln1297">      show_vty_subtlv_delay_var (vty, &amp;mtc-&gt;delay_var);</a>
+<a name="ln1298">      show_vty_subtlv_pkt_loss (vty, &amp;mtc-&gt;pkt_loss);</a>
+<a name="ln1299">      show_vty_subtlv_res_bw (vty, &amp;mtc-&gt;res_bw);</a>
+<a name="ln1300">      show_vty_subtlv_ava_bw (vty, &amp;mtc-&gt;ava_bw);</a>
+<a name="ln1301">      show_vty_subtlv_use_bw (vty, &amp;mtc-&gt;use_bw);</a>
+<a name="ln1302">      vty_out (vty, &quot;---------------%s%s&quot;, VTY_NEWLINE, VTY_NEWLINE);</a>
+<a name="ln1303">    }</a>
+<a name="ln1304">  else</a>
+<a name="ln1305">    {</a>
+<a name="ln1306">      vty_out (vty, &quot;  %s: MPLS-TE is disabled on this interface%s&quot;,</a>
+<a name="ln1307">               ifp-&gt;name, VTY_NEWLINE);</a>
+<a name="ln1308">    }</a>
+<a name="ln1309"> </a>
+<a name="ln1310">  return;</a>
+<a name="ln1311">}</a>
+<a name="ln1312"> </a>
+<a name="ln1313">DEFUN (show_isis_mpls_te_interface,</a>
+<a name="ln1314">       show_isis_mpls_te_interface_cmd,</a>
+<a name="ln1315">       &quot;show isis mpls-te interface [INTERFACE]&quot;,</a>
+<a name="ln1316">       SHOW_STR</a>
+<a name="ln1317">       ISIS_STR</a>
+<a name="ln1318">       MPLS_TE_STR</a>
+<a name="ln1319">       &quot;Interface information\n&quot;</a>
+<a name="ln1320">       &quot;Interface name\n&quot;)</a>
+<a name="ln1321">{</a>
+<a name="ln1322">  struct interface *ifp;</a>
+<a name="ln1323">  struct listnode *node;</a>
+<a name="ln1324"> </a>
+<a name="ln1325">  /* Show All Interfaces. */</a>
+<a name="ln1326">  if (argc == 0)</a>
+<a name="ln1327">    {</a>
+<a name="ln1328">      for (ALL_LIST_ELEMENTS_RO (iflist, node, ifp))</a>
+<a name="ln1329">        show_mpls_te_sub (vty, ifp);</a>
+<a name="ln1330">    }</a>
+<a name="ln1331">  /* Interface name is specified. */</a>
+<a name="ln1332">  else</a>
+<a name="ln1333">    {</a>
+<a name="ln1334">      if ((ifp = if_lookup_by_name (argv[0])) == NULL)</a>
+<a name="ln1335">        vty_out (vty, &quot;No such interface name%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1336">      else</a>
+<a name="ln1337">        show_mpls_te_sub (vty, ifp);</a>
+<a name="ln1338">    }</a>
+<a name="ln1339"> </a>
+<a name="ln1340">  return CMD_SUCCESS;</a>
+<a name="ln1341">}</a>
+<a name="ln1342"> </a>
+<a name="ln1343">/* Initialize MPLS_TE */</a>
+<a name="ln1344">void</a>
+<a name="ln1345">isis_mpls_te_init (void)</a>
+<a name="ln1346">{</a>
+<a name="ln1347"> </a>
+<a name="ln1348">  zlog_debug(&quot;ISIS MPLS-TE: Initialize&quot;);</a>
+<a name="ln1349"> </a>
+<a name="ln1350">  /* Initialize MPLS_TE structure */</a>
+<a name="ln1351">  isisMplsTE.status = disable;</a>
+<a name="ln1352">  isisMplsTE.level = 0;</a>
+<a name="ln1353">  isisMplsTE.inter_as = off;</a>
+<a name="ln1354">  isisMplsTE.interas_areaid.s_addr = 0;</a>
+<a name="ln1355">  isisMplsTE.cir_list = list_new();</a>
+<a name="ln1356">  isisMplsTE.router_id.s_addr = 0;</a>
+<a name="ln1357">  </a>
+<a name="ln1358">  /* Register new VTY commands */</a>
+<a name="ln1359">  install_element (VIEW_NODE, &amp;show_isis_mpls_te_router_cmd);</a>
+<a name="ln1360">  install_element (VIEW_NODE, &amp;show_isis_mpls_te_interface_cmd);</a>
+<a name="ln1361"> </a>
+<a name="ln1362">  install_element (ISIS_NODE, &amp;isis_mpls_te_on_cmd);</a>
+<a name="ln1363">  install_element (ISIS_NODE, &amp;no_isis_mpls_te_on_cmd);</a>
+<a name="ln1364">  install_element (ISIS_NODE, &amp;isis_mpls_te_router_addr_cmd);</a>
+<a name="ln1365">  install_element (ISIS_NODE, &amp;isis_mpls_te_inter_as_cmd);</a>
+<a name="ln1366">  install_element (ISIS_NODE, &amp;no_isis_mpls_te_inter_as_cmd);</a>
+<a name="ln1367"> </a>
+<a name="ln1368">  return;</a>
+<a name="ln1369">}</a>
+<a name="ln1370"> </a>
+
+</code></pre>
+<div class="balloon" rel="12"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1042/" target="_blank">V1042</a> This file is marked with copyleft license, which requires you to open the derived source code.</p></div>
+<div class="balloon" rel="992"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v600/" target="_blank">V600</a> Consider inspecting the condition. The 'te->sub_tlvs' pointer is always not equal to NULL.</p></div>
+<div class="balloon" rel="997"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v547/" target="_blank">V547</a> Expression 'next' is always false.</p></div>
+<div class="balloon" rel="1228"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v595/" target="_blank">V595</a> The 'vty' pointer was utilized before it was verified against nullptr. Check lines: 1228, 1230.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

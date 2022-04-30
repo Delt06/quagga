@@ -1,0 +1,2769 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>bgp_packet.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.5.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/* BGP packet management routine.</a>
+<a name="ln2">   Copyright (C) 1999 Kunihiro Ishiguro</a>
+<a name="ln3"> </a>
+<a name="ln4">This file is part of GNU Zebra.</a>
+<a name="ln5"> </a>
+<a name="ln6">GNU Zebra is free software; you can redistribute it and/or modify it</a>
+<a name="ln7">under the terms of the GNU General Public License as published by the</a>
+<a name="ln8">Free Software Foundation; either version 2, or (at your option) any</a>
+<a name="ln9">later version.</a>
+<a name="ln10"> </a>
+<a name="ln11">GNU Zebra is distributed in the hope that it will be useful, but</a>
+<a name="ln12">WITHOUT ANY WARRANTY; without even the implied warranty of</a>
+<a name="ln13">MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU</a>
+<a name="ln14">General Public License for more details.</a>
+<a name="ln15"> </a>
+<a name="ln16">You should have received a copy of the GNU General Public License</a>
+<a name="ln17">along with GNU Zebra; see the file COPYING.  If not, write to the Free</a>
+<a name="ln18">Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA</a>
+<a name="ln19">02111-1307, USA.  */</a>
+<a name="ln20"> </a>
+<a name="ln21">#include &lt;zebra.h&gt;</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &quot;thread.h&quot;</a>
+<a name="ln24">#include &quot;stream.h&quot;</a>
+<a name="ln25">#include &quot;network.h&quot;</a>
+<a name="ln26">#include &quot;prefix.h&quot;</a>
+<a name="ln27">#include &quot;command.h&quot;</a>
+<a name="ln28">#include &quot;log.h&quot;</a>
+<a name="ln29">#include &quot;memory.h&quot;</a>
+<a name="ln30">#include &quot;sockunion.h&quot;		/* for inet_ntop () */</a>
+<a name="ln31">#include &quot;sockopt.h&quot;</a>
+<a name="ln32">#include &quot;linklist.h&quot;</a>
+<a name="ln33">#include &quot;plist.h&quot;</a>
+<a name="ln34">#include &quot;filter.h&quot;</a>
+<a name="ln35"> </a>
+<a name="ln36">#include &quot;bgpd/bgpd.h&quot;</a>
+<a name="ln37">#include &quot;bgpd/bgp_table.h&quot;</a>
+<a name="ln38">#include &quot;bgpd/bgp_dump.h&quot;</a>
+<a name="ln39">#include &quot;bgpd/bgp_attr.h&quot;</a>
+<a name="ln40">#include &quot;bgpd/bgp_debug.h&quot;</a>
+<a name="ln41">#include &quot;bgpd/bgp_fsm.h&quot;</a>
+<a name="ln42">#include &quot;bgpd/bgp_route.h&quot;</a>
+<a name="ln43">#include &quot;bgpd/bgp_packet.h&quot;</a>
+<a name="ln44">#include &quot;bgpd/bgp_open.h&quot;</a>
+<a name="ln45">#include &quot;bgpd/bgp_aspath.h&quot;</a>
+<a name="ln46">#include &quot;bgpd/bgp_community.h&quot;</a>
+<a name="ln47">#include &quot;bgpd/bgp_ecommunity.h&quot;</a>
+<a name="ln48">#include &quot;bgpd/bgp_network.h&quot;</a>
+<a name="ln49">#include &quot;bgpd/bgp_mplsvpn.h&quot;</a>
+<a name="ln50">#include &quot;bgpd/bgp_encap.h&quot;</a>
+<a name="ln51">#include &quot;bgpd/bgp_advertise.h&quot;</a>
+<a name="ln52">#include &quot;bgpd/bgp_vty.h&quot;</a>
+<a name="ln53"> </a>
+<a name="ln54">int stream_put_prefix (struct stream *, struct prefix *);</a>
+<a name="ln55"> </a>
+<a name="ln56">/* Set up BGP packet marker and packet type. */</a>
+<a name="ln57">static int</a>
+<a name="ln58">bgp_packet_set_marker (struct stream *s, u_char type)</a>
+<a name="ln59">{</a>
+<a name="ln60">  int i;</a>
+<a name="ln61"> </a>
+<a name="ln62">  /* Fill in marker. */</a>
+<a name="ln63">  for (i = 0; i &lt; BGP_MARKER_SIZE; i++)</a>
+<a name="ln64">    stream_putc (s, 0xff);</a>
+<a name="ln65"> </a>
+<a name="ln66">  /* Dummy total length. This field is should be filled in later on. */</a>
+<a name="ln67">  stream_putw (s, 0);</a>
+<a name="ln68"> </a>
+<a name="ln69">  /* BGP packet type. */</a>
+<a name="ln70">  stream_putc (s, type);</a>
+<a name="ln71"> </a>
+<a name="ln72">  /* Return current stream size. */</a>
+<a name="ln73">  return stream_get_endp (s);</a>
+<a name="ln74">}</a>
+<a name="ln75"> </a>
+<a name="ln76">/* Set BGP packet header size entry.  If size is zero then use current</a>
+<a name="ln77">   stream size. */</a>
+<a name="ln78">static int</a>
+<a name="ln79">bgp_packet_set_size (struct stream *s)</a>
+<a name="ln80">{</a>
+<a name="ln81">  int cp;</a>
+<a name="ln82"> </a>
+<a name="ln83">  /* Preserve current pointer. */</a>
+<a name="ln84">  cp = stream_get_endp (s);</a>
+<a name="ln85">  stream_putw_at (s, BGP_MARKER_SIZE, cp);</a>
+<a name="ln86"> </a>
+<a name="ln87">  return cp;</a>
+<a name="ln88">}</a>
+<a name="ln89"> </a>
+<a name="ln90">/* Add new packet to the peer. */</a>
+<a name="ln91">static void</a>
+<a name="ln92">bgp_packet_add (struct peer *peer, struct stream *s)</a>
+<a name="ln93">{</a>
+<a name="ln94">  /* Add packet to the end of list. */</a>
+<a name="ln95">  stream_fifo_push (peer-&gt;obuf, s);</a>
+<a name="ln96">}</a>
+<a name="ln97"> </a>
+<a name="ln98">/* Free first packet. */</a>
+<a name="ln99">static void</a>
+<a name="ln100">bgp_packet_delete (struct peer *peer)</a>
+<a name="ln101">{</a>
+<a name="ln102">  stream_free (stream_fifo_pop (peer-&gt;obuf));</a>
+<a name="ln103">}</a>
+<a name="ln104"> </a>
+<a name="ln105">/* Check file descriptor whether connect is established. */</a>
+<a name="ln106">static void</a>
+<a name="ln107">bgp_connect_check (struct peer *peer)</a>
+<a name="ln108">{</a>
+<a name="ln109">  int status;</a>
+<a name="ln110">  socklen_t slen;</a>
+<a name="ln111">  int ret;</a>
+<a name="ln112"> </a>
+<a name="ln113">  /* Anyway I have to reset read and write thread. */</a>
+<a name="ln114">  BGP_READ_OFF (peer-&gt;t_read);</a>
+<a name="ln115">  BGP_WRITE_OFF (peer-&gt;t_write);</a>
+<a name="ln116"> </a>
+<a name="ln117">  /* Check file descriptor. */</a>
+<a name="ln118">  slen = sizeof (status);</a>
+<a name="ln119">  ret = getsockopt(peer-&gt;fd, SOL_SOCKET, SO_ERROR, (void *) &amp;status, &amp;slen);</a>
+<a name="ln120"> </a>
+<a name="ln121">  /* If getsockopt is fail, this is fatal error. */</a>
+<a name="ln122">  if (ret &lt; 0)</a>
+<a name="ln123">    {</a>
+<a name="ln124">      zlog (peer-&gt;log, LOG_INFO, &quot;can't get sockopt for nonblocking connect&quot;);</a>
+<a name="ln125">      BGP_EVENT_ADD (peer, TCP_fatal_error);</a>
+<a name="ln126">      return;</a>
+<a name="ln127">    }      </a>
+<a name="ln128"> </a>
+<a name="ln129">  /* When status is 0 then TCP connection is established. */</a>
+<a name="ln130">  if (status == 0)</a>
+<a name="ln131">    {</a>
+<a name="ln132">      BGP_EVENT_ADD (peer, TCP_connection_open);</a>
+<a name="ln133">    }</a>
+<a name="ln134">  else</a>
+<a name="ln135">    {</a>
+<a name="ln136">      if (BGP_DEBUG (events, EVENTS))</a>
+<a name="ln137">	  plog_debug (peer-&gt;log, &quot;%s [Event] Connect failed (%s)&quot;,</a>
+<a name="ln138">		     peer-&gt;host, safe_strerror (errno));</a>
+<a name="ln139">      BGP_EVENT_ADD (peer, TCP_connection_open_failed);</a>
+<a name="ln140">    }</a>
+<a name="ln141">}</a>
+<a name="ln142"> </a>
+<a name="ln143">/* Make BGP update packet.  */</a>
+<a name="ln144">static struct stream *</a>
+<a name="ln145">bgp_update_packet (struct peer *peer, afi_t afi, safi_t safi)</a>
+<a name="ln146">{</a>
+<a name="ln147">  struct stream *s;</a>
+<a name="ln148">  struct stream *snlri;</a>
+<a name="ln149">  struct bgp_adj_out *adj;</a>
+<a name="ln150">  struct bgp_advertise *adv;</a>
+<a name="ln151">  struct stream *packet;</a>
+<a name="ln152">  struct bgp_node *rn = NULL;</a>
+<a name="ln153">  struct bgp_info *binfo = NULL;</a>
+<a name="ln154">  bgp_size_t total_attr_len = 0;</a>
+<a name="ln155">  unsigned long attrlen_pos = 0;</a>
+<a name="ln156">  int space_remaining = 0;</a>
+<a name="ln157">  int space_needed = 0;</a>
+<a name="ln158">  size_t mpattrlen_pos = 0;</a>
+<a name="ln159">  size_t mpattr_pos = 0;</a>
+<a name="ln160"> </a>
+<a name="ln161">  s = peer-&gt;work;</a>
+<a name="ln162">  stream_reset (s);</a>
+<a name="ln163">  snlri = peer-&gt;scratch;</a>
+<a name="ln164">  stream_reset (snlri);</a>
+<a name="ln165"> </a>
+<a name="ln166">  adv = BGP_ADV_FIFO_HEAD (&amp;peer-&gt;sync[afi][safi]-&gt;update);</a>
+<a name="ln167"> </a>
+<a name="ln168">  while (adv)</a>
+<a name="ln169">    {</a>
+<a name="ln170">      assert (adv-&gt;rn);</a>
+<a name="ln171">      rn = adv-&gt;rn;</a>
+<a name="ln172">      adj = adv-&gt;adj;</a>
+<a name="ln173">      if (adv-&gt;binfo)</a>
+<a name="ln174">        binfo = adv-&gt;binfo;</a>
+<a name="ln175"> </a>
+<a name="ln176">      space_remaining = STREAM_CONCAT_REMAIN (s, snlri, STREAM_SIZE(s)) -</a>
+<a name="ln177">                        BGP_MAX_PACKET_SIZE_OVERFLOW;</a>
+<a name="ln178">      space_needed = BGP_NLRI_LENGTH + bgp_packet_mpattr_prefix_size (afi, safi, &amp;rn-&gt;p);</a>
+<a name="ln179"> </a>
+<a name="ln180">      /* When remaining space can't include NLRI and it's length.  */</a>
+<a name="ln181">      if (space_remaining &lt; space_needed)</a>
+<a name="ln182">	break;</a>
+<a name="ln183"> </a>
+<a name="ln184">      /* If packet is empty, set attribute. */</a>
+<a name="ln185">      if (stream_empty (s))</a>
+<a name="ln186">	{</a>
+<a name="ln187">	  struct prefix_rd *prd = NULL;</a>
+<a name="ln188">	  u_char *tag = NULL;</a>
+<a name="ln189">	  struct peer *from = NULL;</a>
+<a name="ln190"> </a>
+<a name="ln191">	  if (rn-&gt;prn)</a>
+<a name="ln192">	    prd = (struct prefix_rd *) &amp;rn-&gt;prn-&gt;p;</a>
+<a name="ln193">          if (binfo)</a>
+<a name="ln194">            {</a>
+<a name="ln195">              from = binfo-&gt;peer;</a>
+<a name="ln196">              if (binfo-&gt;extra)</a>
+<a name="ln197">                tag = binfo-&gt;extra-&gt;tag;</a>
+<a name="ln198">            }</a>
+<a name="ln199"> </a>
+<a name="ln200">	  /* 1: Write the BGP message header - 16 bytes marker, 2 bytes length,</a>
+<a name="ln201">	   * one byte message type.</a>
+<a name="ln202">	   */</a>
+<a name="ln203">	  bgp_packet_set_marker (s, BGP_MSG_UPDATE);</a>
+<a name="ln204"> </a>
+<a name="ln205">	  /* 2: withdrawn routes length */</a>
+<a name="ln206">	  stream_putw (s, 0);</a>
+<a name="ln207"> </a>
+<a name="ln208">	  /* 3: total attributes length - attrlen_pos stores the position */</a>
+<a name="ln209">	  attrlen_pos = stream_get_endp (s);</a>
+<a name="ln210">	  stream_putw (s, 0);</a>
+<a name="ln211"> </a>
+<a name="ln212">	  /* 4: if there is MP_REACH_NLRI attribute, that should be the first</a>
+<a name="ln213">	   * attribute, according to draft-ietf-idr-error-handling. Save the</a>
+<a name="ln214">	   * position.</a>
+<a name="ln215">	   */</a>
+<a name="ln216">	  mpattr_pos = stream_get_endp(s);</a>
+<a name="ln217"> </a>
+<a name="ln218">	  /* 5: Encode all the attributes, except MP_REACH_NLRI attr. */</a>
+<a name="ln219">	  total_attr_len = bgp_packet_attribute (NULL, peer, s,</a>
+<a name="ln220">	                                         adv-&gt;baa-&gt;attr,</a>
+<a name="ln221">                                                 ((afi == AFI_IP &amp;&amp; safi == SAFI_UNICAST) ?</a>
+<a name="ln222">                                                  &amp;rn-&gt;p : NULL),</a>
+<a name="ln223">                                                 afi, safi,</a>
+<a name="ln224">	                                         from, prd, tag);</a>
+<a name="ln225">          space_remaining = STREAM_CONCAT_REMAIN (s, snlri, STREAM_SIZE(s)) -</a>
+<a name="ln226">                            BGP_MAX_PACKET_SIZE_OVERFLOW;</a>
+<a name="ln227">          space_needed = BGP_NLRI_LENGTH + bgp_packet_mpattr_prefix_size (afi, safi, &amp;rn-&gt;p);;</a>
+<a name="ln228"> </a>
+<a name="ln229">          /* If the attributes alone do not leave any room for NLRI then</a>
+<a name="ln230">           * return */</a>
+<a name="ln231">          if (space_remaining &lt; space_needed)</a>
+<a name="ln232">            {</a>
+<a name="ln233">              zlog_err (&quot;%s cannot send UPDATE, the attributes do not leave &quot;</a>
+<a name="ln234">                        &quot;room for NLRI&quot;, peer-&gt;host);</a>
+<a name="ln235">              /* Flush the FIFO update queue */</a>
+<a name="ln236">              while (adv)</a>
+<a name="ln237">                adv = bgp_advertise_clean (peer, adv-&gt;adj, afi, safi);</a>
+<a name="ln238">              return NULL;</a>
+<a name="ln239">            } </a>
+<a name="ln240"> </a>
+<a name="ln241">	}</a>
+<a name="ln242"> </a>
+<a name="ln243">      if (afi == AFI_IP &amp;&amp; safi == SAFI_UNICAST)</a>
+<a name="ln244">	stream_put_prefix (s, &amp;rn-&gt;p);</a>
+<a name="ln245">      else</a>
+<a name="ln246">	{</a>
+<a name="ln247">	  /* Encode the prefix in MP_REACH_NLRI attribute */</a>
+<a name="ln248">	  struct prefix_rd *prd = NULL;</a>
+<a name="ln249">	  u_char *tag = NULL;</a>
+<a name="ln250"> </a>
+<a name="ln251">	  if (rn-&gt;prn)</a>
+<a name="ln252">	    prd = (struct prefix_rd *) &amp;rn-&gt;prn-&gt;p;</a>
+<a name="ln253">	  if (binfo &amp;&amp; binfo-&gt;extra)</a>
+<a name="ln254">	    tag = binfo-&gt;extra-&gt;tag;</a>
+<a name="ln255"> </a>
+<a name="ln256">	  if (stream_empty(snlri))</a>
+<a name="ln257">	    mpattrlen_pos = bgp_packet_mpattr_start(snlri, afi, safi,</a>
+<a name="ln258">						    adv-&gt;baa-&gt;attr);</a>
+<a name="ln259">	  bgp_packet_mpattr_prefix(snlri, afi, safi, &amp;rn-&gt;p, prd, tag);</a>
+<a name="ln260">	}</a>
+<a name="ln261">      if (BGP_DEBUG (update, UPDATE_OUT))</a>
+<a name="ln262">        {</a>
+<a name="ln263">          char buf[INET6_BUFSIZ];</a>
+<a name="ln264"> </a>
+<a name="ln265">          zlog (peer-&gt;log, LOG_DEBUG, &quot;%s send UPDATE %s/%d&quot;,</a>
+<a name="ln266">                peer-&gt;host,</a>
+<a name="ln267">                inet_ntop (rn-&gt;p.family, &amp;(rn-&gt;p.u.prefix), buf, INET6_BUFSIZ),</a>
+<a name="ln268">                rn-&gt;p.prefixlen);</a>
+<a name="ln269">        }</a>
+<a name="ln270"> </a>
+<a name="ln271">      /* Synchnorize attribute.  */</a>
+<a name="ln272">      if (adj-&gt;attr)</a>
+<a name="ln273">	bgp_attr_unintern (&amp;adj-&gt;attr);</a>
+<a name="ln274">      else</a>
+<a name="ln275">	peer-&gt;scount[afi][safi]++;</a>
+<a name="ln276"> </a>
+<a name="ln277">      adj-&gt;attr = bgp_attr_intern (adv-&gt;baa-&gt;attr);</a>
+<a name="ln278"> </a>
+<a name="ln279">      adv = bgp_advertise_clean (peer, adj, afi, safi);</a>
+<a name="ln280">    }</a>
+<a name="ln281"> </a>
+<a name="ln282">  if (! stream_empty (s))</a>
+<a name="ln283">    {</a>
+<a name="ln284">      if (!stream_empty(snlri))</a>
+<a name="ln285">	{</a>
+<a name="ln286">	  bgp_packet_mpattr_end(snlri, mpattrlen_pos);</a>
+<a name="ln287">	  total_attr_len += stream_get_endp(snlri);</a>
+<a name="ln288">	}</a>
+<a name="ln289"> </a>
+<a name="ln290">      /* set the total attribute length correctly */</a>
+<a name="ln291">      stream_putw_at (s, attrlen_pos, total_attr_len);</a>
+<a name="ln292"> </a>
+<a name="ln293">      if (!stream_empty(snlri))</a>
+<a name="ln294">	packet = stream_dupcat(s, snlri, mpattr_pos);</a>
+<a name="ln295">      else</a>
+<a name="ln296">	packet = stream_dup (s);</a>
+<a name="ln297">      bgp_packet_set_size (packet);</a>
+<a name="ln298">      bgp_packet_add (peer, packet);</a>
+<a name="ln299">      BGP_WRITE_ON (peer-&gt;t_write, bgp_write, peer-&gt;fd);</a>
+<a name="ln300">      stream_reset (s);</a>
+<a name="ln301">      stream_reset (snlri);</a>
+<a name="ln302">      return packet;</a>
+<a name="ln303">    }</a>
+<a name="ln304">  return NULL;</a>
+<a name="ln305">}</a>
+<a name="ln306"> </a>
+<a name="ln307">static struct stream *</a>
+<a name="ln308">bgp_update_packet_eor (struct peer *peer, afi_t afi, safi_t safi)</a>
+<a name="ln309">{</a>
+<a name="ln310">  struct stream *s;</a>
+<a name="ln311"> </a>
+<a name="ln312">  if (DISABLE_BGP_ANNOUNCE)</a>
+<a name="ln313">    return NULL;</a>
+<a name="ln314"> </a>
+<a name="ln315">  if (BGP_DEBUG (normal, NORMAL))</a>
+<a name="ln316">    zlog_debug (&quot;send End-of-RIB for %s to %s&quot;, afi_safi_print (afi, safi), peer-&gt;host);</a>
+<a name="ln317"> </a>
+<a name="ln318">  s = stream_new (BGP_MAX_PACKET_SIZE);</a>
+<a name="ln319"> </a>
+<a name="ln320">  /* Make BGP update packet. */</a>
+<a name="ln321">  bgp_packet_set_marker (s, BGP_MSG_UPDATE);</a>
+<a name="ln322"> </a>
+<a name="ln323">  /* Unfeasible Routes Length */</a>
+<a name="ln324">  stream_putw (s, 0);</a>
+<a name="ln325"> </a>
+<a name="ln326">  if (afi == AFI_IP &amp;&amp; safi == SAFI_UNICAST)</a>
+<a name="ln327">    {</a>
+<a name="ln328">      /* Total Path Attribute Length */</a>
+<a name="ln329">      stream_putw (s, 0);</a>
+<a name="ln330">    }</a>
+<a name="ln331">  else</a>
+<a name="ln332">    {</a>
+<a name="ln333">      /* Total Path Attribute Length */</a>
+<a name="ln334">      stream_putw (s, 6);</a>
+<a name="ln335">      stream_putc (s, BGP_ATTR_FLAG_OPTIONAL);</a>
+<a name="ln336">      stream_putc (s, BGP_ATTR_MP_UNREACH_NLRI);</a>
+<a name="ln337">      stream_putc (s, 3);</a>
+<a name="ln338">      stream_putw (s, afi);</a>
+<a name="ln339">      stream_putc (s, safi);</a>
+<a name="ln340">    }</a>
+<a name="ln341"> </a>
+<a name="ln342">  bgp_packet_set_size (s);</a>
+<a name="ln343">  bgp_packet_add (peer, s);</a>
+<a name="ln344">  return s;</a>
+<a name="ln345">}</a>
+<a name="ln346"> </a>
+<a name="ln347">/* Make BGP withdraw packet.  */</a>
+<a name="ln348">/* For ipv4 unicast:</a>
+<a name="ln349">   16-octet marker | 2-octet length | 1-octet type |</a>
+<a name="ln350">    2-octet withdrawn route length | withdrawn prefixes | 2-octet attrlen (=0)</a>
+<a name="ln351">*/</a>
+<a name="ln352">/* For other afi/safis:</a>
+<a name="ln353">   16-octet marker | 2-octet length | 1-octet type |</a>
+<a name="ln354">    2-octet withdrawn route length (=0) | 2-octet attrlen |</a>
+<a name="ln355">     mp_unreach attr type | attr len | afi | safi | withdrawn prefixes</a>
+<a name="ln356">*/</a>
+<a name="ln357">static struct stream *</a>
+<a name="ln358">bgp_withdraw_packet (struct peer *peer, afi_t afi, safi_t safi)</a>
+<a name="ln359">{</a>
+<a name="ln360">  struct stream *s;</a>
+<a name="ln361">  struct stream *packet;</a>
+<a name="ln362">  struct bgp_adj_out *adj;</a>
+<a name="ln363">  struct bgp_advertise *adv;</a>
+<a name="ln364">  struct bgp_node *rn;</a>
+<a name="ln365">  bgp_size_t unfeasible_len;</a>
+<a name="ln366">  bgp_size_t total_attr_len;</a>
+<a name="ln367">  size_t mp_start = 0;</a>
+<a name="ln368">  size_t attrlen_pos = 0;</a>
+<a name="ln369">  size_t mplen_pos = 0;</a>
+<a name="ln370">  u_char first_time = 1;</a>
+<a name="ln371">  int space_remaining = 0;</a>
+<a name="ln372">  int space_needed = 0;</a>
+<a name="ln373"> </a>
+<a name="ln374">  s = peer-&gt;work;</a>
+<a name="ln375">  stream_reset (s);</a>
+<a name="ln376"> </a>
+<a name="ln377">  while ((adv = BGP_ADV_FIFO_HEAD (&amp;peer-&gt;sync[afi][safi]-&gt;withdraw)) != NULL)</a>
+<a name="ln378">    {</a>
+<a name="ln379">      assert (adv-&gt;rn);</a>
+<a name="ln380">      adj = adv-&gt;adj;</a>
+<a name="ln381">      rn = adv-&gt;rn;</a>
+<a name="ln382"> </a>
+<a name="ln383">      space_remaining = STREAM_REMAIN (s) -</a>
+<a name="ln384">                        BGP_MAX_PACKET_SIZE_OVERFLOW;</a>
+<a name="ln385">      space_needed = (BGP_NLRI_LENGTH + BGP_TOTAL_ATTR_LEN +</a>
+<a name="ln386">                      bgp_packet_mpattr_prefix_size (afi, safi, &amp;rn-&gt;p));</a>
+<a name="ln387"> </a>
+<a name="ln388">      if (space_remaining &lt; space_needed)</a>
+<a name="ln389">	break;</a>
+<a name="ln390"> </a>
+<a name="ln391">      if (stream_empty (s))</a>
+<a name="ln392">	{</a>
+<a name="ln393">	  bgp_packet_set_marker (s, BGP_MSG_UPDATE);</a>
+<a name="ln394">	  stream_putw (s, 0); /* unfeasible routes length */</a>
+<a name="ln395">	}</a>
+<a name="ln396">      else</a>
+<a name="ln397">	first_time = 0;</a>
+<a name="ln398"> </a>
+<a name="ln399">      if (afi == AFI_IP &amp;&amp; safi == SAFI_UNICAST)</a>
+<a name="ln400">	stream_put_prefix (s, &amp;rn-&gt;p);</a>
+<a name="ln401">      else</a>
+<a name="ln402">	{</a>
+<a name="ln403">	  struct prefix_rd *prd = NULL;</a>
+<a name="ln404"> </a>
+<a name="ln405">	  if (rn-&gt;prn)</a>
+<a name="ln406">	    prd = (struct prefix_rd *) &amp;rn-&gt;prn-&gt;p;</a>
+<a name="ln407"> </a>
+<a name="ln408">	  /* If first time, format the MP_UNREACH header */</a>
+<a name="ln409">	  if (first_time)</a>
+<a name="ln410">	    {</a>
+<a name="ln411">	      attrlen_pos = stream_get_endp (s);</a>
+<a name="ln412">	      /* total attr length = 0 for now. reevaluate later */</a>
+<a name="ln413">	      stream_putw (s, 0);</a>
+<a name="ln414">	      mp_start = stream_get_endp (s);</a>
+<a name="ln415">	      mplen_pos = bgp_packet_mpunreach_start(s, afi, safi);</a>
+<a name="ln416">	    }</a>
+<a name="ln417"> </a>
+<a name="ln418">	  bgp_packet_mpunreach_prefix(s, &amp;rn-&gt;p, afi, safi, prd, NULL);</a>
+<a name="ln419">	}</a>
+<a name="ln420"> </a>
+<a name="ln421">      if (BGP_DEBUG (update, UPDATE_OUT))</a>
+<a name="ln422">        {</a>
+<a name="ln423">          char buf[INET6_BUFSIZ];</a>
+<a name="ln424"> </a>
+<a name="ln425">          zlog (peer-&gt;log, LOG_DEBUG, &quot;%s send UPDATE %s/%d -- unreachable&quot;,</a>
+<a name="ln426">                peer-&gt;host,</a>
+<a name="ln427">                inet_ntop (rn-&gt;p.family, &amp;(rn-&gt;p.u.prefix), buf, INET6_BUFSIZ),</a>
+<a name="ln428">                rn-&gt;p.prefixlen);</a>
+<a name="ln429">        }</a>
+<a name="ln430"> </a>
+<a name="ln431">      peer-&gt;scount[afi][safi]--;</a>
+<a name="ln432"> </a>
+<a name="ln433">      bgp_adj_out_remove (rn, adj, peer, afi, safi);</a>
+<a name="ln434">      bgp_unlock_node (rn);</a>
+<a name="ln435">    }</a>
+<a name="ln436"> </a>
+<a name="ln437">  if (! stream_empty (s))</a>
+<a name="ln438">    {</a>
+<a name="ln439">      if (afi == AFI_IP &amp;&amp; safi == SAFI_UNICAST)</a>
+<a name="ln440">	{</a>
+<a name="ln441">	  unfeasible_len</a>
+<a name="ln442">	    = stream_get_endp (s) - BGP_HEADER_SIZE - BGP_UNFEASIBLE_LEN;</a>
+<a name="ln443">	  stream_putw_at (s, BGP_HEADER_SIZE, unfeasible_len);</a>
+<a name="ln444">	  stream_putw (s, 0);</a>
+<a name="ln445">	}</a>
+<a name="ln446">      else</a>
+<a name="ln447">	{</a>
+<a name="ln448">	  /* Set the mp_unreach attr's length */</a>
+<a name="ln449">	  bgp_packet_mpunreach_end(s, mplen_pos);</a>
+<a name="ln450"> </a>
+<a name="ln451">	  /* Set total path attribute length. */</a>
+<a name="ln452">	  total_attr_len = stream_get_endp(s) - mp_start;</a>
+<a name="ln453">	  stream_putw_at (s, attrlen_pos, total_attr_len);</a>
+<a name="ln454">	}</a>
+<a name="ln455">      bgp_packet_set_size (s);</a>
+<a name="ln456">      packet = stream_dup (s);</a>
+<a name="ln457">      bgp_packet_add (peer, packet);</a>
+<a name="ln458">      stream_reset (s);</a>
+<a name="ln459">      return packet;</a>
+<a name="ln460">    }</a>
+<a name="ln461"> </a>
+<a name="ln462">  return NULL;</a>
+<a name="ln463">}</a>
+<a name="ln464"> </a>
+<a name="ln465">void</a>
+<a name="ln466">bgp_default_update_send (struct peer *peer, struct attr *attr,</a>
+<a name="ln467">			 afi_t afi, safi_t safi, struct peer *from)</a>
+<a name="ln468">{</a>
+<a name="ln469">  struct stream *s;</a>
+<a name="ln470">  struct prefix p;</a>
+<a name="ln471">  unsigned long pos;</a>
+<a name="ln472">  bgp_size_t total_attr_len;</a>
+<a name="ln473"> </a>
+<a name="ln474">  if (DISABLE_BGP_ANNOUNCE)</a>
+<a name="ln475">    return;</a>
+<a name="ln476"> </a>
+<a name="ln477">  if (afi == AFI_IP)</a>
+<a name="ln478">    str2prefix (&quot;0.0.0.0/0&quot;, &amp;p);</a>
+<a name="ln479">  else </a>
+<a name="ln480">    str2prefix (&quot;::/0&quot;, &amp;p);</a>
+<a name="ln481"> </a>
+<a name="ln482">  /* Logging the attribute. */</a>
+<a name="ln483">  if (BGP_DEBUG (update, UPDATE_OUT))</a>
+<a name="ln484">    {</a>
+<a name="ln485">      char attrstr[BUFSIZ];</a>
+<a name="ln486">      char buf[INET6_BUFSIZ];</a>
+<a name="ln487">      attrstr[0] = '\0';</a>
+<a name="ln488"> </a>
+<a name="ln489">      bgp_dump_attr (peer, attr, attrstr, BUFSIZ);</a>
+<a name="ln490">      zlog (peer-&gt;log, LOG_DEBUG, &quot;%s send UPDATE %s/%d %s&quot;,</a>
+<a name="ln491">	    peer-&gt;host, inet_ntop(p.family, &amp;(p.u.prefix), buf, INET6_BUFSIZ),</a>
+<a name="ln492">	    p.prefixlen, attrstr);</a>
+<a name="ln493">    }</a>
+<a name="ln494"> </a>
+<a name="ln495">  s = stream_new (BGP_MAX_PACKET_SIZE);</a>
+<a name="ln496"> </a>
+<a name="ln497">  /* Make BGP update packet. */</a>
+<a name="ln498">  bgp_packet_set_marker (s, BGP_MSG_UPDATE);</a>
+<a name="ln499"> </a>
+<a name="ln500">  /* Unfeasible Routes Length. */</a>
+<a name="ln501">  stream_putw (s, 0);</a>
+<a name="ln502"> </a>
+<a name="ln503">  /* Make place for total attribute length.  */</a>
+<a name="ln504">  pos = stream_get_endp (s);</a>
+<a name="ln505">  stream_putw (s, 0);</a>
+<a name="ln506">  total_attr_len = bgp_packet_attribute (NULL, peer, s, attr, &amp;p, afi, safi, from, NULL, NULL);</a>
+<a name="ln507"> </a>
+<a name="ln508">  /* Set Total Path Attribute Length. */</a>
+<a name="ln509">  stream_putw_at (s, pos, total_attr_len);</a>
+<a name="ln510"> </a>
+<a name="ln511">  /* NLRI set. */</a>
+<a name="ln512">  if (p.family == AF_INET &amp;&amp; safi == SAFI_UNICAST)</a>
+<a name="ln513">    stream_put_prefix (s, &amp;p);</a>
+<a name="ln514"> </a>
+<a name="ln515">  /* Set size. */</a>
+<a name="ln516">  bgp_packet_set_size (s);</a>
+<a name="ln517"> </a>
+<a name="ln518">  /* Dump packet if debug option is set. */</a>
+<a name="ln519">#ifdef DEBUG</a>
+<a name="ln520">  /* bgp_packet_dump (packet); */</a>
+<a name="ln521">#endif /* DEBUG */</a>
+<a name="ln522"> </a>
+<a name="ln523">  /* Add packet to the peer. */</a>
+<a name="ln524">  bgp_packet_add (peer, s);</a>
+<a name="ln525"> </a>
+<a name="ln526">  BGP_WRITE_ON (peer-&gt;t_write, bgp_write, peer-&gt;fd);</a>
+<a name="ln527">}</a>
+<a name="ln528"> </a>
+<a name="ln529">void</a>
+<a name="ln530">bgp_default_withdraw_send (struct peer *peer, afi_t afi, safi_t safi)</a>
+<a name="ln531">{</a>
+<a name="ln532">  struct stream *s;</a>
+<a name="ln533">  struct prefix p;</a>
+<a name="ln534">  unsigned long attrlen_pos = 0;</a>
+<a name="ln535">  unsigned long cp;</a>
+<a name="ln536">  bgp_size_t unfeasible_len;</a>
+<a name="ln537">  bgp_size_t total_attr_len;</a>
+<a name="ln538">  size_t mp_start = 0;</a>
+<a name="ln539">  size_t mplen_pos = 0;</a>
+<a name="ln540"> </a>
+<a name="ln541">  if (DISABLE_BGP_ANNOUNCE)</a>
+<a name="ln542">    return;</a>
+<a name="ln543"> </a>
+<a name="ln544">  if (afi == AFI_IP)</a>
+<a name="ln545">    str2prefix (&quot;0.0.0.0/0&quot;, &amp;p);</a>
+<a name="ln546">  else </a>
+<a name="ln547">    str2prefix (&quot;::/0&quot;, &amp;p);</a>
+<a name="ln548"> </a>
+<a name="ln549">  total_attr_len = 0;</a>
+<a name="ln550"> </a>
+<a name="ln551">  if (BGP_DEBUG (update, UPDATE_OUT))</a>
+<a name="ln552">    {</a>
+<a name="ln553">      char buf[INET6_BUFSIZ];</a>
+<a name="ln554"> </a>
+<a name="ln555">      zlog (peer-&gt;log, LOG_DEBUG, &quot;%s send UPDATE %s/%d -- unreachable&quot;,</a>
+<a name="ln556">            peer-&gt;host, inet_ntop(p.family, &amp;(p.u.prefix), buf, INET6_BUFSIZ),</a>
+<a name="ln557">            p.prefixlen);</a>
+<a name="ln558">    }</a>
+<a name="ln559"> </a>
+<a name="ln560">  s = stream_new (BGP_MAX_PACKET_SIZE);</a>
+<a name="ln561"> </a>
+<a name="ln562">  /* Make BGP update packet. */</a>
+<a name="ln563">  bgp_packet_set_marker (s, BGP_MSG_UPDATE);</a>
+<a name="ln564"> </a>
+<a name="ln565">  /* Unfeasible Routes Length. */;</a>
+<a name="ln566">  cp = stream_get_endp (s);</a>
+<a name="ln567">  stream_putw (s, 0);</a>
+<a name="ln568"> </a>
+<a name="ln569">  /* Withdrawn Routes. */</a>
+<a name="ln570">  if (p.family == AF_INET &amp;&amp; safi == SAFI_UNICAST)</a>
+<a name="ln571">    {</a>
+<a name="ln572">      stream_put_prefix (s, &amp;p);</a>
+<a name="ln573"> </a>
+<a name="ln574">      unfeasible_len = stream_get_endp (s) - cp - 2;</a>
+<a name="ln575"> </a>
+<a name="ln576">      /* Set unfeasible len.  */</a>
+<a name="ln577">      stream_putw_at (s, cp, unfeasible_len);</a>
+<a name="ln578"> </a>
+<a name="ln579">      /* Set total path attribute length. */</a>
+<a name="ln580">      stream_putw (s, 0);</a>
+<a name="ln581">    }</a>
+<a name="ln582">  else</a>
+<a name="ln583">    {</a>
+<a name="ln584">      attrlen_pos = stream_get_endp (s);</a>
+<a name="ln585">      stream_putw (s, 0);</a>
+<a name="ln586">      mp_start = stream_get_endp (s);</a>
+<a name="ln587">      mplen_pos = bgp_packet_mpunreach_start(s, afi, safi);</a>
+<a name="ln588">      bgp_packet_mpunreach_prefix(s, &amp;p, afi, safi, NULL, NULL);</a>
+<a name="ln589"> </a>
+<a name="ln590">      /* Set the mp_unreach attr's length */</a>
+<a name="ln591">      bgp_packet_mpunreach_end(s, mplen_pos);</a>
+<a name="ln592"> </a>
+<a name="ln593">      /* Set total path attribute length. */</a>
+<a name="ln594">      total_attr_len = stream_get_endp(s) - mp_start;</a>
+<a name="ln595">      stream_putw_at (s, attrlen_pos, total_attr_len);</a>
+<a name="ln596">    }</a>
+<a name="ln597"> </a>
+<a name="ln598">  bgp_packet_set_size (s);</a>
+<a name="ln599"> </a>
+<a name="ln600">  /* Add packet to the peer. */</a>
+<a name="ln601">  bgp_packet_add (peer, s);</a>
+<a name="ln602"> </a>
+<a name="ln603">  BGP_WRITE_ON (peer-&gt;t_write, bgp_write, peer-&gt;fd);</a>
+<a name="ln604">}</a>
+<a name="ln605"> </a>
+<a name="ln606">/* Get next packet to be written.  */</a>
+<a name="ln607">static struct stream *</a>
+<a name="ln608">bgp_write_packet (struct peer *peer)</a>
+<a name="ln609">{</a>
+<a name="ln610">  afi_t afi;</a>
+<a name="ln611">  safi_t safi;</a>
+<a name="ln612">  struct stream *s = NULL;</a>
+<a name="ln613">  struct bgp_advertise *adv;</a>
+<a name="ln614"> </a>
+<a name="ln615">  s = stream_fifo_head (peer-&gt;obuf);</a>
+<a name="ln616">  if (s)</a>
+<a name="ln617">    return s;</a>
+<a name="ln618"> </a>
+<a name="ln619">  for (afi = AFI_IP; afi &lt; AFI_MAX; afi++)</a>
+<a name="ln620">    for (safi = SAFI_UNICAST; safi &lt; SAFI_MAX; safi++)</a>
+<a name="ln621">      {</a>
+<a name="ln622">	adv = BGP_ADV_FIFO_HEAD (&amp;peer-&gt;sync[afi][safi]-&gt;withdraw);</a>
+<a name="ln623">	if (adv)</a>
+<a name="ln624">	  {</a>
+<a name="ln625">	    s = bgp_withdraw_packet (peer, afi, safi);</a>
+<a name="ln626">	    if (s)</a>
+<a name="ln627">	      return s;</a>
+<a name="ln628">	  }</a>
+<a name="ln629">      }</a>
+<a name="ln630">    </a>
+<a name="ln631">  for (afi = AFI_IP; afi &lt; AFI_MAX; afi++)</a>
+<a name="ln632">    for (safi = SAFI_UNICAST; safi &lt; SAFI_MAX; safi++)</a>
+<a name="ln633">      {</a>
+<a name="ln634">	adv = BGP_ADV_FIFO_HEAD (&amp;peer-&gt;sync[afi][safi]-&gt;update);</a>
+<a name="ln635">	if (adv)</a>
+<a name="ln636">	  {</a>
+<a name="ln637">            if (adv-&gt;binfo &amp;&amp; adv-&gt;binfo-&gt;uptime &lt; peer-&gt;synctime)</a>
+<a name="ln638">	      {</a>
+<a name="ln639">		if (CHECK_FLAG (adv-&gt;binfo-&gt;peer-&gt;cap, PEER_CAP_RESTART_RCV)</a>
+<a name="ln640">		    &amp;&amp; CHECK_FLAG (adv-&gt;binfo-&gt;peer-&gt;cap, PEER_CAP_RESTART_ADV)</a>
+<a name="ln641">		    &amp;&amp; ! (CHECK_FLAG (adv-&gt;binfo-&gt;peer-&gt;cap,</a>
+<a name="ln642">                                      PEER_CAP_RESTART_BIT_RCV) &amp;&amp;</a>
+<a name="ln643">		          CHECK_FLAG (adv-&gt;binfo-&gt;peer-&gt;cap,</a>
+<a name="ln644">                                      PEER_CAP_RESTART_BIT_ADV))</a>
+<a name="ln645">		    &amp;&amp; ! CHECK_FLAG (adv-&gt;binfo-&gt;flags, BGP_INFO_STALE)</a>
+<a name="ln646">		    &amp;&amp; safi != SAFI_MPLS_VPN)</a>
+<a name="ln647">		  {</a>
+<a name="ln648">		    if (CHECK_FLAG (adv-&gt;binfo-&gt;peer-&gt;af_sflags[afi][safi],</a>
+<a name="ln649">			PEER_STATUS_EOR_RECEIVED))</a>
+<a name="ln650">		      s = bgp_update_packet (peer, afi, safi);</a>
+<a name="ln651">		  }</a>
+<a name="ln652">		else</a>
+<a name="ln653">		  s = bgp_update_packet (peer, afi, safi);</a>
+<a name="ln654">	      }</a>
+<a name="ln655"> </a>
+<a name="ln656">	    if (s)</a>
+<a name="ln657">	      return s;</a>
+<a name="ln658">	  }</a>
+<a name="ln659"> </a>
+<a name="ln660">	if (CHECK_FLAG (peer-&gt;cap, PEER_CAP_RESTART_RCV))</a>
+<a name="ln661">	  {</a>
+<a name="ln662">	    if (peer-&gt;afc_nego[afi][safi] &amp;&amp; peer-&gt;synctime</a>
+<a name="ln663">		&amp;&amp; ! CHECK_FLAG (peer-&gt;af_sflags[afi][safi], PEER_STATUS_EOR_SEND)</a>
+<a name="ln664">		&amp;&amp; safi != SAFI_MPLS_VPN)</a>
+<a name="ln665">	      {</a>
+<a name="ln666">		SET_FLAG (peer-&gt;af_sflags[afi][safi], PEER_STATUS_EOR_SEND);</a>
+<a name="ln667">		return bgp_update_packet_eor (peer, afi, safi);</a>
+<a name="ln668">	      }</a>
+<a name="ln669">	  }</a>
+<a name="ln670">      }</a>
+<a name="ln671"> </a>
+<a name="ln672">  return NULL;</a>
+<a name="ln673">}</a>
+<a name="ln674"> </a>
+<a name="ln675">/* Is there partially written packet or updates we can send right</a>
+<a name="ln676">   now.  */</a>
+<a name="ln677">static int</a>
+<a name="ln678">bgp_write_proceed (struct peer *peer)</a>
+<a name="ln679">{</a>
+<a name="ln680">  afi_t afi;</a>
+<a name="ln681">  safi_t safi;</a>
+<a name="ln682">  struct bgp_advertise *adv;</a>
+<a name="ln683"> </a>
+<a name="ln684">  if (stream_fifo_head (peer-&gt;obuf))</a>
+<a name="ln685">    return 1;</a>
+<a name="ln686"> </a>
+<a name="ln687">  for (afi = AFI_IP; afi &lt; AFI_MAX; afi++)</a>
+<a name="ln688">    for (safi = SAFI_UNICAST; safi &lt; SAFI_MAX; safi++)</a>
+<a name="ln689">      if (FIFO_HEAD (&amp;peer-&gt;sync[afi][safi]-&gt;withdraw))</a>
+<a name="ln690">	return 1;</a>
+<a name="ln691"> </a>
+<a name="ln692">  for (afi = AFI_IP; afi &lt; AFI_MAX; afi++)</a>
+<a name="ln693">    for (safi = SAFI_UNICAST; safi &lt; SAFI_MAX; safi++)</a>
+<a name="ln694">      if ((adv = BGP_ADV_FIFO_HEAD (&amp;peer-&gt;sync[afi][safi]-&gt;update)) != NULL)</a>
+<a name="ln695">	if (adv-&gt;binfo-&gt;uptime &lt; peer-&gt;synctime)</a>
+<a name="ln696">	  return 1;</a>
+<a name="ln697"> </a>
+<a name="ln698">  return 0;</a>
+<a name="ln699">}</a>
+<a name="ln700"> </a>
+<a name="ln701">/* Write packet to the peer. */</a>
+<a name="ln702">int</a>
+<a name="ln703">bgp_write (struct thread *thread)</a>
+<a name="ln704">{</a>
+<a name="ln705">  struct peer *peer;</a>
+<a name="ln706">  u_char type;</a>
+<a name="ln707">  struct stream *s; </a>
+<a name="ln708">  int num;</a>
+<a name="ln709">  unsigned int count = 0;</a>
+<a name="ln710"> </a>
+<a name="ln711">  /* Yes first of all get peer pointer. */</a>
+<a name="ln712">  peer = THREAD_ARG (thread);</a>
+<a name="ln713">  peer-&gt;t_write = NULL;</a>
+<a name="ln714"> </a>
+<a name="ln715">  /* For non-blocking IO check. */</a>
+<a name="ln716">  if (peer-&gt;status == Connect)</a>
+<a name="ln717">    {</a>
+<a name="ln718">      bgp_connect_check (peer);</a>
+<a name="ln719">      return 0;</a>
+<a name="ln720">    }</a>
+<a name="ln721"> </a>
+<a name="ln722">  s = bgp_write_packet (peer);</a>
+<a name="ln723">  if (!s)</a>
+<a name="ln724">    return 0;	/* nothing to send */</a>
+<a name="ln725"> </a>
+<a name="ln726">  sockopt_cork (peer-&gt;fd, 1);</a>
+<a name="ln727"> </a>
+<a name="ln728">  /* Nonblocking write until TCP output buffer is full.  */</a>
+<a name="ln729">  do</a>
+<a name="ln730">    {</a>
+<a name="ln731">      int writenum;</a>
+<a name="ln732"> </a>
+<a name="ln733">      /* Number of bytes to be sent.  */</a>
+<a name="ln734">      writenum = stream_get_endp (s) - stream_get_getp (s);</a>
+<a name="ln735"> </a>
+<a name="ln736">      /* Call write() system call.  */</a>
+<a name="ln737">      num = write (peer-&gt;fd, STREAM_PNT (s), writenum);</a>
+<a name="ln738">      if (num &lt; 0)</a>
+<a name="ln739">	{</a>
+<a name="ln740">	  /* write failed either retry needed or error */</a>
+<a name="ln741">	  if (ERRNO_IO_RETRY(errno))</a>
+<a name="ln742">		break;</a>
+<a name="ln743"> </a>
+<a name="ln744">          BGP_EVENT_ADD (peer, TCP_fatal_error);</a>
+<a name="ln745">	  return 0;</a>
+<a name="ln746">	}</a>
+<a name="ln747"> </a>
+<a name="ln748">      if (num != writenum)</a>
+<a name="ln749">	{</a>
+<a name="ln750">	  /* Partial write */</a>
+<a name="ln751">	  stream_forward_getp (s, num);</a>
+<a name="ln752">	  break;</a>
+<a name="ln753">	}</a>
+<a name="ln754"> </a>
+<a name="ln755">      /* Retrieve BGP packet type. */</a>
+<a name="ln756">      stream_set_getp (s, BGP_MARKER_SIZE + 2);</a>
+<a name="ln757">      type = stream_getc (s);</a>
+<a name="ln758"> </a>
+<a name="ln759">      switch (type)</a>
+<a name="ln760">	{</a>
+<a name="ln761">	case BGP_MSG_OPEN:</a>
+<a name="ln762">	  peer-&gt;open_out++;</a>
+<a name="ln763">	  break;</a>
+<a name="ln764">	case BGP_MSG_UPDATE:</a>
+<a name="ln765">	  peer-&gt;update_out++;</a>
+<a name="ln766">	  break;</a>
+<a name="ln767">	case BGP_MSG_NOTIFY:</a>
+<a name="ln768">	  peer-&gt;notify_out++;</a>
+<a name="ln769"> </a>
+<a name="ln770">	  /* Flush any existing events */</a>
+<a name="ln771">	  BGP_EVENT_ADD (peer, BGP_Stop_with_error);</a>
+<a name="ln772">	  goto done;</a>
+<a name="ln773"> </a>
+<a name="ln774">	case BGP_MSG_KEEPALIVE:</a>
+<a name="ln775">	  peer-&gt;keepalive_out++;</a>
+<a name="ln776">	  break;</a>
+<a name="ln777">	case BGP_MSG_ROUTE_REFRESH_NEW:</a>
+<a name="ln778">	case BGP_MSG_ROUTE_REFRESH_OLD:</a>
+<a name="ln779">	  peer-&gt;refresh_out++;</a>
+<a name="ln780">	  break;</a>
+<a name="ln781">	case BGP_MSG_CAPABILITY:</a>
+<a name="ln782">	  peer-&gt;dynamic_cap_out++;</a>
+<a name="ln783">	  break;</a>
+<a name="ln784">	}</a>
+<a name="ln785"> </a>
+<a name="ln786">      /* OK we send packet so delete it. */</a>
+<a name="ln787">      bgp_packet_delete (peer);</a>
+<a name="ln788">    }</a>
+<a name="ln789">  while (++count &lt; BGP_WRITE_PACKET_MAX &amp;&amp;</a>
+<a name="ln790">	 (s = bgp_write_packet (peer)) != NULL);</a>
+<a name="ln791">  </a>
+<a name="ln792">  if (bgp_write_proceed (peer))</a>
+<a name="ln793">    BGP_WRITE_ON (peer-&gt;t_write, bgp_write, peer-&gt;fd);</a>
+<a name="ln794"> </a>
+<a name="ln795"> done:</a>
+<a name="ln796">  sockopt_cork (peer-&gt;fd, 0);</a>
+<a name="ln797">  return 0;</a>
+<a name="ln798">}</a>
+<a name="ln799"> </a>
+<a name="ln800">/* This is only for sending NOTIFICATION message to neighbor. */</a>
+<a name="ln801">static int</a>
+<a name="ln802">bgp_write_notify (struct peer *peer)</a>
+<a name="ln803">{</a>
+<a name="ln804">  int ret, val;</a>
+<a name="ln805">  u_char type;</a>
+<a name="ln806">  struct stream *s; </a>
+<a name="ln807"> </a>
+<a name="ln808">  /* There should be at least one packet. */</a>
+<a name="ln809">  s = stream_fifo_head (peer-&gt;obuf);</a>
+<a name="ln810">  if (!s)</a>
+<a name="ln811">    return 0;</a>
+<a name="ln812">  assert (stream_get_endp (s) &gt;= BGP_HEADER_SIZE);</a>
+<a name="ln813"> </a>
+<a name="ln814">  /* Stop collecting data within the socket */</a>
+<a name="ln815">  sockopt_cork (peer-&gt;fd, 0);</a>
+<a name="ln816"> </a>
+<a name="ln817">  /* socket is in nonblocking mode, if we can't deliver the NOTIFY, well,</a>
+<a name="ln818">   * we only care about getting a clean shutdown at this point. */</a>
+<a name="ln819">  ret = write (peer-&gt;fd, STREAM_DATA (s), stream_get_endp (s));</a>
+<a name="ln820"> </a>
+<a name="ln821">  /* only connection reset/close gets counted as TCP_fatal_error, failure</a>
+<a name="ln822">   * to write the entire NOTIFY doesn't get different FSM treatment */</a>
+<a name="ln823">  if (ret &lt;= 0)</a>
+<a name="ln824">    {</a>
+<a name="ln825">      BGP_EVENT_ADD (peer, TCP_fatal_error);</a>
+<a name="ln826">      return 0;</a>
+<a name="ln827">    }</a>
+<a name="ln828"> </a>
+<a name="ln829">  /* Disable Nagle, make NOTIFY packet go out right away */</a>
+<a name="ln830">  val = 1;</a>
+<a name="ln831">  (void) setsockopt (peer-&gt;fd, IPPROTO_TCP, TCP_NODELAY,</a>
+<a name="ln832">                            (char *) &amp;val, sizeof (val));</a>
+<a name="ln833"> </a>
+<a name="ln834">  /* Retrieve BGP packet type. */</a>
+<a name="ln835">  stream_set_getp (s, BGP_MARKER_SIZE + 2);</a>
+<a name="ln836">  type = stream_getc (s);</a>
+<a name="ln837"> </a>
+<a name="ln838">  assert (type == BGP_MSG_NOTIFY);</a>
+<a name="ln839"> </a>
+<a name="ln840">  /* Type should be notify. */</a>
+<a name="ln841">  peer-&gt;notify_out++;</a>
+<a name="ln842"> </a>
+<a name="ln843">  BGP_EVENT_ADD (peer, BGP_Stop_with_error);</a>
+<a name="ln844"> </a>
+<a name="ln845">  return 0;</a>
+<a name="ln846">}</a>
+<a name="ln847"> </a>
+<a name="ln848">/* Make keepalive packet and send it to the peer. */</a>
+<a name="ln849">void</a>
+<a name="ln850">bgp_keepalive_send (struct peer *peer)</a>
+<a name="ln851">{</a>
+<a name="ln852">  struct stream *s;</a>
+<a name="ln853">  int length;</a>
+<a name="ln854"> </a>
+<a name="ln855">  s = stream_new (BGP_MAX_PACKET_SIZE);</a>
+<a name="ln856"> </a>
+<a name="ln857">  /* Make keepalive packet. */</a>
+<a name="ln858">  bgp_packet_set_marker (s, BGP_MSG_KEEPALIVE);</a>
+<a name="ln859"> </a>
+<a name="ln860">  /* Set packet size. */</a>
+<a name="ln861">  length = bgp_packet_set_size (s);</a>
+<a name="ln862"> </a>
+<a name="ln863">  /* Dump packet if debug option is set. */</a>
+<a name="ln864">  /* bgp_packet_dump (s); */</a>
+<a name="ln865"> </a>
+<a name="ln866">  if (BGP_DEBUG (keepalive, KEEPALIVE))  </a>
+<a name="ln867">    zlog_debug (&quot;%s sending KEEPALIVE&quot;, peer-&gt;host); </a>
+<a name="ln868">  if (BGP_DEBUG (normal, NORMAL))</a>
+<a name="ln869">    zlog_debug (&quot;%s send message type %d, length (incl. header) %d&quot;,</a>
+<a name="ln870">               peer-&gt;host, BGP_MSG_KEEPALIVE, length);</a>
+<a name="ln871"> </a>
+<a name="ln872">  /* Add packet to the peer. */</a>
+<a name="ln873">  bgp_packet_add (peer, s);</a>
+<a name="ln874"> </a>
+<a name="ln875">  BGP_WRITE_ON (peer-&gt;t_write, bgp_write, peer-&gt;fd);</a>
+<a name="ln876">}</a>
+<a name="ln877"> </a>
+<a name="ln878">/* Make open packet and send it to the peer. */</a>
+<a name="ln879">void</a>
+<a name="ln880">bgp_open_send (struct peer *peer)</a>
+<a name="ln881">{</a>
+<a name="ln882">  struct stream *s;</a>
+<a name="ln883">  int length;</a>
+<a name="ln884">  u_int16_t send_holdtime;</a>
+<a name="ln885">  as_t local_as;</a>
+<a name="ln886"> </a>
+<a name="ln887">  if (CHECK_FLAG (peer-&gt;config, PEER_CONFIG_TIMER))</a>
+<a name="ln888">    send_holdtime = peer-&gt;holdtime;</a>
+<a name="ln889">  else</a>
+<a name="ln890">    send_holdtime = peer-&gt;bgp-&gt;default_holdtime;</a>
+<a name="ln891"> </a>
+<a name="ln892">  /* local-as Change */</a>
+<a name="ln893">  if (peer-&gt;change_local_as)</a>
+<a name="ln894">    local_as = peer-&gt;change_local_as; </a>
+<a name="ln895">  else</a>
+<a name="ln896">    local_as = peer-&gt;local_as; </a>
+<a name="ln897"> </a>
+<a name="ln898">  s = stream_new (BGP_MAX_PACKET_SIZE);</a>
+<a name="ln899"> </a>
+<a name="ln900">  /* Make open packet. */</a>
+<a name="ln901">  bgp_packet_set_marker (s, BGP_MSG_OPEN);</a>
+<a name="ln902"> </a>
+<a name="ln903">  /* Set open packet values. */</a>
+<a name="ln904">  stream_putc (s, BGP_VERSION_4);        /* BGP version */</a>
+<a name="ln905">  stream_putw (s, (local_as &lt;= BGP_AS_MAX) ? (u_int16_t) local_as </a>
+<a name="ln906">                                           : BGP_AS_TRANS);</a>
+<a name="ln907">  stream_putw (s, send_holdtime);     	 /* Hold Time */</a>
+<a name="ln908">  stream_put_in_addr (s, &amp;peer-&gt;local_id); /* BGP Identifier */</a>
+<a name="ln909"> </a>
+<a name="ln910">  /* Set capability code. */</a>
+<a name="ln911">  bgp_open_capability (s, peer);</a>
+<a name="ln912"> </a>
+<a name="ln913">  /* Set BGP packet length. */</a>
+<a name="ln914">  length = bgp_packet_set_size (s);</a>
+<a name="ln915"> </a>
+<a name="ln916">  if (BGP_DEBUG (normal, NORMAL))</a>
+<a name="ln917">    zlog_debug (&quot;%s sending OPEN, version %d, my as %u, holdtime %d, id %s&quot;, </a>
+<a name="ln918">	       peer-&gt;host, BGP_VERSION_4, local_as,</a>
+<a name="ln919">	       send_holdtime, inet_ntoa (peer-&gt;local_id));</a>
+<a name="ln920"> </a>
+<a name="ln921">  if (BGP_DEBUG (normal, NORMAL))</a>
+<a name="ln922">    zlog_debug (&quot;%s send message type %d, length (incl. header) %d&quot;,</a>
+<a name="ln923">	       peer-&gt;host, BGP_MSG_OPEN, length);</a>
+<a name="ln924"> </a>
+<a name="ln925">  /* Dump packet if debug option is set. */</a>
+<a name="ln926">  /* bgp_packet_dump (s); */</a>
+<a name="ln927"> </a>
+<a name="ln928">  /* Add packet to the peer. */</a>
+<a name="ln929">  bgp_packet_add (peer, s);</a>
+<a name="ln930"> </a>
+<a name="ln931">  BGP_WRITE_ON (peer-&gt;t_write, bgp_write, peer-&gt;fd);</a>
+<a name="ln932">}</a>
+<a name="ln933"> </a>
+<a name="ln934">/* Send BGP notify packet with data potion. */</a>
+<a name="ln935">void</a>
+<a name="ln936">bgp_notify_send_with_data (struct peer *peer, u_char code, u_char sub_code,</a>
+<a name="ln937">			   u_char *data, size_t datalen)</a>
+<a name="ln938">{</a>
+<a name="ln939">  struct stream *s;</a>
+<a name="ln940">  int length;</a>
+<a name="ln941"> </a>
+<a name="ln942">  /* Allocate new stream. */</a>
+<a name="ln943">  s = stream_new (BGP_MAX_PACKET_SIZE);</a>
+<a name="ln944"> </a>
+<a name="ln945">  /* Make nitify packet. */</a>
+<a name="ln946">  bgp_packet_set_marker (s, BGP_MSG_NOTIFY);</a>
+<a name="ln947"> </a>
+<a name="ln948">  /* Set notify packet values. */</a>
+<a name="ln949">  stream_putc (s, code);        /* BGP notify code */</a>
+<a name="ln950">  stream_putc (s, sub_code);	/* BGP notify sub_code */</a>
+<a name="ln951"> </a>
+<a name="ln952">  /* If notify data is present. */</a>
+<a name="ln953">  if (data)</a>
+<a name="ln954">    stream_write (s, data, datalen);</a>
+<a name="ln955">  </a>
+<a name="ln956">  /* Set BGP packet length. */</a>
+<a name="ln957">  length = bgp_packet_set_size (s);</a>
+<a name="ln958">  </a>
+<a name="ln959">  /* Add packet to the peer. */</a>
+<a name="ln960">  stream_fifo_clean (peer-&gt;obuf);</a>
+<a name="ln961">  bgp_packet_add (peer, s);</a>
+<a name="ln962"> </a>
+<a name="ln963">  /* For debug */</a>
+<a name="ln964">  {</a>
+<a name="ln965">    struct bgp_notify bgp_notify;</a>
+<a name="ln966">    int first = 0;</a>
+<a name="ln967">    int i;</a>
+<a name="ln968">    char c[4];</a>
+<a name="ln969"> </a>
+<a name="ln970">    bgp_notify.code = code;</a>
+<a name="ln971">    bgp_notify.subcode = sub_code;</a>
+<a name="ln972">    bgp_notify.data = NULL;</a>
+<a name="ln973">    bgp_notify.length = length - BGP_MSG_NOTIFY_MIN_SIZE;</a>
+<a name="ln974">    </a>
+<a name="ln975">    if (bgp_notify.length)</a>
+<a name="ln976">      {</a>
+<a name="ln977">	bgp_notify.data = XMALLOC (MTYPE_TMP, bgp_notify.length * 3);</a>
+<a name="ln978">	for (i = 0; i &lt; bgp_notify.length; i++)</a>
+<a name="ln979">	  if (first)</a>
+<a name="ln980">	    {</a>
+<a name="ln981">	      sprintf (c, &quot; %02x&quot;, data[i]);</a>
+<a name="ln982">	      strcat (bgp_notify.data, c);</a>
+<a name="ln983">	    }</a>
+<a name="ln984">	  else</a>
+<a name="ln985">	    {</a>
+<a name="ln986">	      first = 1;</a>
+<a name="ln987">	      sprintf (c, &quot;%02x&quot;, data[i]);</a>
+<a name="ln988">	      strcpy (bgp_notify.data, c);</a>
+<a name="ln989">	    }</a>
+<a name="ln990">      }</a>
+<a name="ln991">    bgp_notify_print (peer, &amp;bgp_notify, &quot;sending&quot;);</a>
+<a name="ln992"> </a>
+<a name="ln993">    if (bgp_notify.data)</a>
+<a name="ln994">      {</a>
+<a name="ln995">        XFREE (MTYPE_TMP, bgp_notify.data);</a>
+<a name="ln996">        bgp_notify.data = NULL;</a>
+<a name="ln997">        bgp_notify.length = 0;</a>
+<a name="ln998">      }</a>
+<a name="ln999">  }</a>
+<a name="ln1000"> </a>
+<a name="ln1001">  if (BGP_DEBUG (normal, NORMAL))</a>
+<a name="ln1002">    zlog_debug (&quot;%s send message type %d, length (incl. header) %d&quot;,</a>
+<a name="ln1003">	       peer-&gt;host, BGP_MSG_NOTIFY, length);</a>
+<a name="ln1004"> </a>
+<a name="ln1005">  /* peer reset cause */</a>
+<a name="ln1006">  if (sub_code != BGP_NOTIFY_CEASE_CONFIG_CHANGE)</a>
+<a name="ln1007">    {</a>
+<a name="ln1008">      if (sub_code == BGP_NOTIFY_CEASE_ADMIN_RESET)</a>
+<a name="ln1009">      {</a>
+<a name="ln1010">        peer-&gt;last_reset = PEER_DOWN_USER_RESET;</a>
+<a name="ln1011">        zlog_info (&quot;Notification sent to neighbor %s:%u: User reset&quot;,</a>
+<a name="ln1012">                   peer-&gt;host, sockunion_get_port (&amp;peer-&gt;su));</a>
+<a name="ln1013">      }</a>
+<a name="ln1014">      else if (sub_code == BGP_NOTIFY_CEASE_ADMIN_SHUTDOWN)</a>
+<a name="ln1015">      {</a>
+<a name="ln1016">        peer-&gt;last_reset = PEER_DOWN_USER_SHUTDOWN;</a>
+<a name="ln1017">        zlog_info (&quot;Notification sent to neighbor %s:%u shutdown&quot;,</a>
+<a name="ln1018">                    peer-&gt;host, sockunion_get_port (&amp;peer-&gt;su));</a>
+<a name="ln1019">      }</a>
+<a name="ln1020">      else</a>
+<a name="ln1021">      {</a>
+<a name="ln1022">        peer-&gt;last_reset = PEER_DOWN_NOTIFY_SEND;</a>
+<a name="ln1023">        zlog_info (&quot;Notification sent to neighbor %s:%u: type %u/%u&quot;,</a>
+<a name="ln1024">                   peer-&gt;host, sockunion_get_port (&amp;peer-&gt;su),</a>
+<a name="ln1025">                   code, sub_code);</a>
+<a name="ln1026">      }</a>
+<a name="ln1027">    }</a>
+<a name="ln1028">  else</a>
+<a name="ln1029">     zlog_info (&quot;Notification sent to neighbor %s:%u: configuration change&quot;,</a>
+<a name="ln1030">                peer-&gt;host, sockunion_get_port (&amp;peer-&gt;su));</a>
+<a name="ln1031"> </a>
+<a name="ln1032">  /* Call immediately. */</a>
+<a name="ln1033">  BGP_WRITE_OFF (peer-&gt;t_write);</a>
+<a name="ln1034"> </a>
+<a name="ln1035">  bgp_write_notify (peer);</a>
+<a name="ln1036">}</a>
+<a name="ln1037"> </a>
+<a name="ln1038">/* Send BGP notify packet. */</a>
+<a name="ln1039">void</a>
+<a name="ln1040">bgp_notify_send (struct peer *peer, u_char code, u_char sub_code)</a>
+<a name="ln1041">{</a>
+<a name="ln1042">  bgp_notify_send_with_data (peer, code, sub_code, NULL, 0);</a>
+<a name="ln1043">}</a>
+<a name="ln1044"> </a>
+<a name="ln1045">/* Send route refresh message to the peer. */</a>
+<a name="ln1046">void</a>
+<a name="ln1047">bgp_route_refresh_send (struct peer *peer, afi_t afi, safi_t safi,</a>
+<a name="ln1048">			u_char orf_type, u_char when_to_refresh, int remove)</a>
+<a name="ln1049">{</a>
+<a name="ln1050">  struct stream *s;</a>
+<a name="ln1051">  int length;</a>
+<a name="ln1052">  struct bgp_filter *filter;</a>
+<a name="ln1053">  int orf_refresh = 0;</a>
+<a name="ln1054"> </a>
+<a name="ln1055">  if (DISABLE_BGP_ANNOUNCE)</a>
+<a name="ln1056">    return;</a>
+<a name="ln1057"> </a>
+<a name="ln1058">  filter = &amp;peer-&gt;filter[afi][safi];</a>
+<a name="ln1059"> </a>
+<a name="ln1060">  /* Adjust safi code. */</a>
+<a name="ln1061">  if (safi == SAFI_MPLS_VPN)</a>
+<a name="ln1062">    safi = SAFI_MPLS_LABELED_VPN;</a>
+<a name="ln1063">  </a>
+<a name="ln1064">  s = stream_new (BGP_MAX_PACKET_SIZE);</a>
+<a name="ln1065"> </a>
+<a name="ln1066">  /* Make BGP update packet. */</a>
+<a name="ln1067">  if (CHECK_FLAG (peer-&gt;cap, PEER_CAP_REFRESH_NEW_RCV))</a>
+<a name="ln1068">    bgp_packet_set_marker (s, BGP_MSG_ROUTE_REFRESH_NEW);</a>
+<a name="ln1069">  else</a>
+<a name="ln1070">    bgp_packet_set_marker (s, BGP_MSG_ROUTE_REFRESH_OLD);</a>
+<a name="ln1071"> </a>
+<a name="ln1072">  /* Encode Route Refresh message. */</a>
+<a name="ln1073">  stream_putw (s, afi);</a>
+<a name="ln1074">  stream_putc (s, 0);</a>
+<a name="ln1075">  stream_putc (s, safi);</a>
+<a name="ln1076"> </a>
+<a name="ln1077">  if (orf_type == ORF_TYPE_PREFIX</a>
+<a name="ln1078">      || orf_type == ORF_TYPE_PREFIX_OLD)</a>
+<a name="ln1079">    if (remove || filter-&gt;plist[FILTER_IN].plist)</a>
+<a name="ln1080">      {</a>
+<a name="ln1081">	u_int16_t orf_len;</a>
+<a name="ln1082">	unsigned long orfp;</a>
+<a name="ln1083"> </a>
+<a name="ln1084">	orf_refresh = 1; </a>
+<a name="ln1085">	stream_putc (s, when_to_refresh);</a>
+<a name="ln1086">	stream_putc (s, orf_type);</a>
+<a name="ln1087">	orfp = stream_get_endp (s);</a>
+<a name="ln1088">	stream_putw (s, 0);</a>
+<a name="ln1089"> </a>
+<a name="ln1090">	if (remove)</a>
+<a name="ln1091">	  {</a>
+<a name="ln1092">	    UNSET_FLAG (peer-&gt;af_sflags[afi][safi], PEER_STATUS_ORF_PREFIX_SEND);</a>
+<a name="ln1093">	    stream_putc (s, ORF_COMMON_PART_REMOVE_ALL);</a>
+<a name="ln1094">	    if (BGP_DEBUG (normal, NORMAL))</a>
+<a name="ln1095">	      zlog_debug (&quot;%s sending REFRESH_REQ to remove ORF(%d) (%s) for afi/safi: %d/%d&quot;, </a>
+<a name="ln1096">			 peer-&gt;host, orf_type,</a>
+<a name="ln1097">			 (when_to_refresh == REFRESH_DEFER ? &quot;defer&quot; : &quot;immediate&quot;),</a>
+<a name="ln1098">			 afi, safi);</a>
+<a name="ln1099">	  }</a>
+<a name="ln1100">	else</a>
+<a name="ln1101">	  {</a>
+<a name="ln1102">	    SET_FLAG (peer-&gt;af_sflags[afi][safi], PEER_STATUS_ORF_PREFIX_SEND);</a>
+<a name="ln1103">	    prefix_bgp_orf_entry (s, filter-&gt;plist[FILTER_IN].plist,</a>
+<a name="ln1104">				  ORF_COMMON_PART_ADD, ORF_COMMON_PART_PERMIT,</a>
+<a name="ln1105">				  ORF_COMMON_PART_DENY);</a>
+<a name="ln1106">	    if (BGP_DEBUG (normal, NORMAL))</a>
+<a name="ln1107">	      zlog_debug (&quot;%s sending REFRESH_REQ with pfxlist ORF(%d) (%s) for afi/safi: %d/%d&quot;, </a>
+<a name="ln1108">			 peer-&gt;host, orf_type,</a>
+<a name="ln1109">			 (when_to_refresh == REFRESH_DEFER ? &quot;defer&quot; : &quot;immediate&quot;),</a>
+<a name="ln1110">			 afi, safi);</a>
+<a name="ln1111">	  }</a>
+<a name="ln1112"> </a>
+<a name="ln1113">	/* Total ORF Entry Len. */</a>
+<a name="ln1114">	orf_len = stream_get_endp (s) - orfp - 2;</a>
+<a name="ln1115">	stream_putw_at (s, orfp, orf_len);</a>
+<a name="ln1116">      }</a>
+<a name="ln1117"> </a>
+<a name="ln1118">  /* Set packet size. */</a>
+<a name="ln1119">  length = bgp_packet_set_size (s);</a>
+<a name="ln1120"> </a>
+<a name="ln1121">  if (BGP_DEBUG (normal, NORMAL))</a>
+<a name="ln1122">    {</a>
+<a name="ln1123">      if (! orf_refresh)</a>
+<a name="ln1124">	zlog_debug (&quot;%s sending REFRESH_REQ for afi/safi: %d/%d&quot;, </a>
+<a name="ln1125">		   peer-&gt;host, afi, safi);</a>
+<a name="ln1126">      zlog_debug (&quot;%s send message type %d, length (incl. header) %d&quot;,</a>
+<a name="ln1127">		 peer-&gt;host, CHECK_FLAG (peer-&gt;cap, PEER_CAP_REFRESH_NEW_RCV) ?</a>
+<a name="ln1128">		 BGP_MSG_ROUTE_REFRESH_NEW : BGP_MSG_ROUTE_REFRESH_OLD, length);</a>
+<a name="ln1129">    }</a>
+<a name="ln1130"> </a>
+<a name="ln1131">  /* Add packet to the peer. */</a>
+<a name="ln1132">  bgp_packet_add (peer, s);</a>
+<a name="ln1133"> </a>
+<a name="ln1134">  BGP_WRITE_ON (peer-&gt;t_write, bgp_write, peer-&gt;fd);</a>
+<a name="ln1135">}</a>
+<a name="ln1136"> </a>
+<a name="ln1137">/* Send capability message to the peer. */</a>
+<a name="ln1138">void</a>
+<a name="ln1139">bgp_capability_send (struct peer *peer, afi_t afi, safi_t safi,</a>
+<a name="ln1140">		     int capability_code, int action)</a>
+<a name="ln1141">{</a>
+<a name="ln1142">  struct stream *s;</a>
+<a name="ln1143">  int length;</a>
+<a name="ln1144"> </a>
+<a name="ln1145">  /* Adjust safi code. */</a>
+<a name="ln1146">  if (safi == SAFI_MPLS_VPN)</a>
+<a name="ln1147">    safi = SAFI_MPLS_LABELED_VPN;</a>
+<a name="ln1148"> </a>
+<a name="ln1149">  s = stream_new (BGP_MAX_PACKET_SIZE);</a>
+<a name="ln1150"> </a>
+<a name="ln1151">  /* Make BGP update packet. */</a>
+<a name="ln1152">  bgp_packet_set_marker (s, BGP_MSG_CAPABILITY);</a>
+<a name="ln1153"> </a>
+<a name="ln1154">  /* Encode MP_EXT capability. */</a>
+<a name="ln1155">  if (capability_code == CAPABILITY_CODE_MP)</a>
+<a name="ln1156">    {</a>
+<a name="ln1157">      stream_putc (s, action);</a>
+<a name="ln1158">      stream_putc (s, CAPABILITY_CODE_MP);</a>
+<a name="ln1159">      stream_putc (s, CAPABILITY_CODE_MP_LEN);</a>
+<a name="ln1160">      stream_putw (s, afi);</a>
+<a name="ln1161">      stream_putc (s, 0);</a>
+<a name="ln1162">      stream_putc (s, safi);</a>
+<a name="ln1163"> </a>
+<a name="ln1164">      if (BGP_DEBUG (normal, NORMAL))</a>
+<a name="ln1165">        zlog_debug (&quot;%s sending CAPABILITY has %s MP_EXT CAP for afi/safi: %d/%d&quot;,</a>
+<a name="ln1166">		   peer-&gt;host, action == CAPABILITY_ACTION_SET ?</a>
+<a name="ln1167">		   &quot;Advertising&quot; : &quot;Removing&quot;, afi, safi);</a>
+<a name="ln1168">    }</a>
+<a name="ln1169"> </a>
+<a name="ln1170">  /* Set packet size. */</a>
+<a name="ln1171">  length = bgp_packet_set_size (s);</a>
+<a name="ln1172"> </a>
+<a name="ln1173"> </a>
+<a name="ln1174">  /* Add packet to the peer. */</a>
+<a name="ln1175">  bgp_packet_add (peer, s);</a>
+<a name="ln1176"> </a>
+<a name="ln1177">  if (BGP_DEBUG (normal, NORMAL))</a>
+<a name="ln1178">    zlog_debug (&quot;%s send message type %d, length (incl. header) %d&quot;,</a>
+<a name="ln1179">	       peer-&gt;host, BGP_MSG_CAPABILITY, length);</a>
+<a name="ln1180"> </a>
+<a name="ln1181">  BGP_WRITE_ON (peer-&gt;t_write, bgp_write, peer-&gt;fd);</a>
+<a name="ln1182">}</a>
+<a name="ln1183"> </a>
+<a name="ln1184">/* RFC1771 6.8 Connection collision detection. */</a>
+<a name="ln1185">static int</a>
+<a name="ln1186">bgp_collision_detect (struct peer *new, struct in_addr remote_id)</a>
+<a name="ln1187">{</a>
+<a name="ln1188">  struct peer *peer;</a>
+<a name="ln1189">  struct listnode *node, *nnode;</a>
+<a name="ln1190">  struct bgp *bgp;</a>
+<a name="ln1191"> </a>
+<a name="ln1192">  bgp = bgp_get_default ();</a>
+<a name="ln1193">  if (! bgp)</a>
+<a name="ln1194">    return 0;</a>
+<a name="ln1195">  </a>
+<a name="ln1196">  /* Upon receipt of an OPEN message, the local system must examine</a>
+<a name="ln1197">     all of its connections that are in the OpenConfirm state.  A BGP</a>
+<a name="ln1198">     speaker may also examine connections in an OpenSent state if it</a>
+<a name="ln1199">     knows the BGP Identifier of the peer by means outside of the</a>
+<a name="ln1200">     protocol.  If among these connections there is a connection to a</a>
+<a name="ln1201">     remote BGP speaker whose BGP Identifier equals the one in the</a>
+<a name="ln1202">     OPEN message, then the local system performs the following</a>
+<a name="ln1203">     collision resolution procedure: */</a>
+<a name="ln1204"> </a>
+<a name="ln1205">  for (ALL_LIST_ELEMENTS (bgp-&gt;peer, node, nnode, peer))</a>
+<a name="ln1206">    {</a>
+<a name="ln1207">      if (peer == new)</a>
+<a name="ln1208">        continue;</a>
+<a name="ln1209">      if (!sockunion_same (&amp;peer-&gt;su, &amp;new-&gt;su))</a>
+<a name="ln1210">        continue;</a>
+<a name="ln1211">      </a>
+<a name="ln1212">      /* Unless allowed via configuration, a connection collision with an</a>
+<a name="ln1213">         existing BGP connection that is in the Established state causes</a>
+<a name="ln1214">         closing of the newly created connection. */</a>
+<a name="ln1215">      if (peer-&gt;status == Established)</a>
+<a name="ln1216">        {</a>
+<a name="ln1217">          /* GR may do things slightly differently to classic RFC .  Punt to</a>
+<a name="ln1218">           * open_receive, see below </a>
+<a name="ln1219">           */</a>
+<a name="ln1220">          if (CHECK_FLAG (peer-&gt;sflags, PEER_STATUS_NSF_MODE))</a>
+<a name="ln1221">            continue;</a>
+<a name="ln1222">          </a>
+<a name="ln1223">          if (new-&gt;fd &gt;= 0)</a>
+<a name="ln1224">            {</a>
+<a name="ln1225">              if (BGP_DEBUG (events, EVENTS))</a>
+<a name="ln1226">                 zlog_debug (&quot;%s:%u Existing Established peer, sending NOTIFY&quot;,</a>
+<a name="ln1227">                             new-&gt;host, sockunion_get_port (&amp;new-&gt;su));</a>
+<a name="ln1228">              bgp_notify_send (new, BGP_NOTIFY_CEASE, </a>
+<a name="ln1229">                               BGP_NOTIFY_CEASE_COLLISION_RESOLUTION);</a>
+<a name="ln1230">            }</a>
+<a name="ln1231">          return -1;</a>
+<a name="ln1232">        }</a>
+<a name="ln1233">      </a>
+<a name="ln1234">      /* Note: Quagga historically orders explicitly only on the processing</a>
+<a name="ln1235">       * of the Opens, treating 'new' as the passive, inbound and connection</a>
+<a name="ln1236">       * and 'peer' as the active outbound connection.</a>
+<a name="ln1237">       */</a>
+<a name="ln1238">       </a>
+<a name="ln1239">      /* The local_id is always set, so we can match the given remote-ID</a>
+<a name="ln1240">       * from the OPEN against both OpenConfirm and OpenSent peers.</a>
+<a name="ln1241">       */</a>
+<a name="ln1242">      if (peer-&gt;status == OpenConfirm || peer-&gt;status == OpenSent)</a>
+<a name="ln1243">	{</a>
+<a name="ln1244">	  struct peer *out = peer;</a>
+<a name="ln1245">	  struct peer *in = new;</a>
+<a name="ln1246">	  int ret_close_out = 1, ret_close_in = -1;</a>
+<a name="ln1247">	  </a>
+<a name="ln1248">	  if (!CHECK_FLAG (new-&gt;sflags, PEER_STATUS_ACCEPT_PEER))</a>
+<a name="ln1249">	    {</a>
+<a name="ln1250">	      out = new;</a>
+<a name="ln1251">	      ret_close_out = -1;</a>
+<a name="ln1252">	      in = peer;</a>
+<a name="ln1253">	      ret_close_in = 1;</a>
+<a name="ln1254">	    }</a>
+<a name="ln1255">          </a>
+<a name="ln1256">	  /* 1. The BGP Identifier of the local system is compared to</a>
+<a name="ln1257">	     the BGP Identifier of the remote system (as specified in</a>
+<a name="ln1258">	     the OPEN message). */</a>
+<a name="ln1259"> </a>
+<a name="ln1260">	  if (ntohl (peer-&gt;local_id.s_addr) &lt; ntohl (remote_id.s_addr))</a>
+<a name="ln1261">	    {</a>
+<a name="ln1262">	      /* 2. If the value of the local BGP Identifier is less</a>
+<a name="ln1263">		 than the remote one, the local system closes BGP</a>
+<a name="ln1264">		 connection that already exists (the one that is</a>
+<a name="ln1265">		 already in the OpenConfirm state), and accepts BGP</a>
+<a name="ln1266">		 connection initiated by the remote system. */</a>
+<a name="ln1267"> </a>
+<a name="ln1268">	      if (out-&gt;fd &gt;= 0)</a>
+<a name="ln1269">	        {</a>
+<a name="ln1270">	          if (BGP_DEBUG (events, EVENTS))</a>
+<a name="ln1271">	             zlog_debug (&quot;%s Collision resolution, remote ID higher,&quot;</a>
+<a name="ln1272">	                         &quot; closing outbound&quot;, peer-&gt;host);</a>
+<a name="ln1273">		  bgp_notify_send (out, BGP_NOTIFY_CEASE, </a>
+<a name="ln1274">		                   BGP_NOTIFY_CEASE_COLLISION_RESOLUTION);</a>
+<a name="ln1275">                }</a>
+<a name="ln1276">	      return ret_close_out;</a>
+<a name="ln1277">	    }</a>
+<a name="ln1278">	  else</a>
+<a name="ln1279">	    {</a>
+<a name="ln1280">	      /* 3. Otherwise, the local system closes newly created</a>
+<a name="ln1281">		 BGP connection (the one associated with the newly</a>
+<a name="ln1282">		 received OPEN message), and continues to use the</a>
+<a name="ln1283">		 existing one (the one that is already in the</a>
+<a name="ln1284">		 OpenConfirm state). */</a>
+<a name="ln1285"> </a>
+<a name="ln1286">	      if (in-&gt;fd &gt;= 0)</a>
+<a name="ln1287">	        {</a>
+<a name="ln1288">	          if (BGP_DEBUG (events, EVENTS))</a>
+<a name="ln1289">	             zlog_debug (&quot;%s Collision resolution, local ID higher,&quot;</a>
+<a name="ln1290">	                         &quot; closing inbound&quot;, peer-&gt;host);</a>
+<a name="ln1291"> </a>
+<a name="ln1292">                  bgp_notify_send (in, BGP_NOTIFY_CEASE, </a>
+<a name="ln1293">			           BGP_NOTIFY_CEASE_COLLISION_RESOLUTION);</a>
+<a name="ln1294">                }</a>
+<a name="ln1295">	      return ret_close_in;</a>
+<a name="ln1296">	    }</a>
+<a name="ln1297">	}</a>
+<a name="ln1298">    }</a>
+<a name="ln1299">  return 0;</a>
+<a name="ln1300">}</a>
+<a name="ln1301"> </a>
+<a name="ln1302">static int</a>
+<a name="ln1303">bgp_open_receive (struct peer *peer, bgp_size_t size)</a>
+<a name="ln1304">{</a>
+<a name="ln1305">  int ret;</a>
+<a name="ln1306">  u_char version;</a>
+<a name="ln1307">  u_char optlen;</a>
+<a name="ln1308">  u_int16_t holdtime;</a>
+<a name="ln1309">  u_int16_t send_holdtime;</a>
+<a name="ln1310">  as_t remote_as;</a>
+<a name="ln1311">  as_t as4 = 0;</a>
+<a name="ln1312">  struct peer *realpeer;</a>
+<a name="ln1313">  struct in_addr remote_id;</a>
+<a name="ln1314">  int mp_capability;</a>
+<a name="ln1315">  u_int8_t notify_data_remote_as[2];</a>
+<a name="ln1316">  u_int8_t notify_data_remote_id[4];</a>
+<a name="ln1317"> </a>
+<a name="ln1318">  realpeer = NULL;</a>
+<a name="ln1319">  </a>
+<a name="ln1320">  /* Parse open packet. */</a>
+<a name="ln1321">  version = stream_getc (peer-&gt;ibuf);</a>
+<a name="ln1322">  memcpy (notify_data_remote_as, stream_pnt (peer-&gt;ibuf), 2);</a>
+<a name="ln1323">  remote_as  = stream_getw (peer-&gt;ibuf);</a>
+<a name="ln1324">  holdtime = stream_getw (peer-&gt;ibuf);</a>
+<a name="ln1325">  memcpy (notify_data_remote_id, stream_pnt (peer-&gt;ibuf), 4);</a>
+<a name="ln1326">  remote_id.s_addr = stream_get_ipv4 (peer-&gt;ibuf);</a>
+<a name="ln1327"> </a>
+<a name="ln1328">  /* Receive OPEN message log  */</a>
+<a name="ln1329">  if (BGP_DEBUG (normal, NORMAL))</a>
+<a name="ln1330">    zlog_debug (&quot;%s rcv OPEN, version %d, remote-as (in open) %u,&quot;</a>
+<a name="ln1331">                &quot; holdtime %d, id %s, %sbound connection&quot;,</a>
+<a name="ln1332">	        peer-&gt;host, version, remote_as, holdtime,</a>
+<a name="ln1333">	        inet_ntoa (remote_id),</a>
+<a name="ln1334">	        CHECK_FLAG(peer-&gt;sflags, PEER_STATUS_ACCEPT_PEER)</a>
+<a name="ln1335">	          ? &quot;in&quot; : &quot;out&quot;);</a>
+<a name="ln1336">  </a>
+<a name="ln1337">  /* BEGIN to read the capability here, but dont do it yet */</a>
+<a name="ln1338">  mp_capability = 0;</a>
+<a name="ln1339">  optlen = stream_getc (peer-&gt;ibuf);</a>
+<a name="ln1340">  </a>
+<a name="ln1341">  if (optlen != 0)</a>
+<a name="ln1342">    {</a>
+<a name="ln1343">      /* We need the as4 capability value *right now* because</a>
+<a name="ln1344">       * if it is there, we have not got the remote_as yet, and without</a>
+<a name="ln1345">       * that we do not know which peer is connecting to us now.</a>
+<a name="ln1346">       */ </a>
+<a name="ln1347">      as4 = peek_for_as4_capability (peer, optlen);</a>
+<a name="ln1348">    }</a>
+<a name="ln1349">  </a>
+<a name="ln1350">  /* Just in case we have a silly peer who sends AS4 capability set to 0 */</a>
+<a name="ln1351">  if (CHECK_FLAG (peer-&gt;cap, PEER_CAP_AS4_RCV) &amp;&amp; !as4)</a>
+<a name="ln1352">    {</a>
+<a name="ln1353">      zlog_err (&quot;%s bad OPEN, got AS4 capability, but AS4 set to 0&quot;,</a>
+<a name="ln1354">                peer-&gt;host);</a>
+<a name="ln1355">      bgp_notify_send (peer, BGP_NOTIFY_OPEN_ERR,</a>
+<a name="ln1356">                       BGP_NOTIFY_OPEN_BAD_PEER_AS);</a>
+<a name="ln1357">      return -1;</a>
+<a name="ln1358">    }</a>
+<a name="ln1359">  </a>
+<a name="ln1360">  if (remote_as == BGP_AS_TRANS)</a>
+<a name="ln1361">    {</a>
+<a name="ln1362">	  /* Take the AS4 from the capability.  We must have received the</a>
+<a name="ln1363">	   * capability now!  Otherwise we have a asn16 peer who uses</a>
+<a name="ln1364">	   * BGP_AS_TRANS, for some unknown reason.</a>
+<a name="ln1365">	   */</a>
+<a name="ln1366">      if (as4 == BGP_AS_TRANS)</a>
+<a name="ln1367">        {</a>
+<a name="ln1368">          zlog_err (&quot;%s [AS4] NEW speaker using AS_TRANS for AS4, not allowed&quot;,</a>
+<a name="ln1369">                    peer-&gt;host);</a>
+<a name="ln1370">          bgp_notify_send (peer, BGP_NOTIFY_OPEN_ERR,</a>
+<a name="ln1371">                 BGP_NOTIFY_OPEN_BAD_PEER_AS);</a>
+<a name="ln1372">          return -1;</a>
+<a name="ln1373">        }</a>
+<a name="ln1374">      </a>
+<a name="ln1375">      if (!as4 &amp;&amp; BGP_DEBUG (as4, AS4))</a>
+<a name="ln1376">        zlog_debug (&quot;%s [AS4] OPEN remote_as is AS_TRANS, but no AS4.&quot;</a>
+<a name="ln1377">                    &quot; Odd, but proceeding.&quot;, peer-&gt;host);</a>
+<a name="ln1378">      else if (as4 &lt; BGP_AS_MAX &amp;&amp; BGP_DEBUG (as4, AS4))</a>
+<a name="ln1379">        zlog_debug (&quot;%s [AS4] OPEN remote_as is AS_TRANS, but AS4 (%u) fits &quot;</a>
+<a name="ln1380">                    &quot;in 2-bytes, very odd peer.&quot;, peer-&gt;host, as4);</a>
+<a name="ln1381">      if (as4)</a>
+<a name="ln1382">        remote_as = as4;</a>
+<a name="ln1383">    } </a>
+<a name="ln1384">  else </a>
+<a name="ln1385">    {</a>
+<a name="ln1386">      /* We may have a partner with AS4 who has an asno &lt; BGP_AS_MAX */</a>
+<a name="ln1387">      /* If we have got the capability, peer-&gt;as4cap must match remote_as */</a>
+<a name="ln1388">      if (CHECK_FLAG (peer-&gt;cap, PEER_CAP_AS4_RCV)</a>
+<a name="ln1389">          &amp;&amp; as4 != remote_as)</a>
+<a name="ln1390">        {</a>
+<a name="ln1391">	  /* raise error, log this, close session */</a>
+<a name="ln1392">	  zlog_err (&quot;%s bad OPEN, got AS4 capability, but remote_as %u&quot;</a>
+<a name="ln1393">	            &quot; mismatch with 16bit 'myasn' %u in open&quot;,</a>
+<a name="ln1394">	            peer-&gt;host, as4, remote_as);</a>
+<a name="ln1395">	  bgp_notify_send (peer, BGP_NOTIFY_OPEN_ERR,</a>
+<a name="ln1396">			   BGP_NOTIFY_OPEN_BAD_PEER_AS);</a>
+<a name="ln1397">	  return -1;</a>
+<a name="ln1398">	}</a>
+<a name="ln1399">    }</a>
+<a name="ln1400"> </a>
+<a name="ln1401">  /* Lookup peer from Open packet. */</a>
+<a name="ln1402">  if (CHECK_FLAG (peer-&gt;sflags, PEER_STATUS_ACCEPT_PEER))</a>
+<a name="ln1403">    {</a>
+<a name="ln1404">      int as = 0;</a>
+<a name="ln1405"> </a>
+<a name="ln1406">      realpeer = peer_lookup_with_open (&amp;peer-&gt;su, remote_as, &amp;remote_id, &amp;as);</a>
+<a name="ln1407"> </a>
+<a name="ln1408">      if (! realpeer)</a>
+<a name="ln1409">	{</a>
+<a name="ln1410">	  /* Peer's source IP address is check in bgp_accept(), so this</a>
+<a name="ln1411">	     must be AS number mismatch or remote-id configuration</a>
+<a name="ln1412">	     mismatch. */</a>
+<a name="ln1413">	  if (as)</a>
+<a name="ln1414">	    {</a>
+<a name="ln1415">	      if (BGP_DEBUG (normal, NORMAL))</a>
+<a name="ln1416">		zlog_debug (&quot;%s bad OPEN, wrong router identifier %s&quot;,</a>
+<a name="ln1417">			    peer-&gt;host, inet_ntoa (remote_id));</a>
+<a name="ln1418">	      bgp_notify_send_with_data (peer, BGP_NOTIFY_OPEN_ERR, </a>
+<a name="ln1419">					 BGP_NOTIFY_OPEN_BAD_BGP_IDENT,</a>
+<a name="ln1420">					 notify_data_remote_id, 4);</a>
+<a name="ln1421">	    }</a>
+<a name="ln1422">	  else</a>
+<a name="ln1423">	    {</a>
+<a name="ln1424">	      if (BGP_DEBUG (normal, NORMAL))</a>
+<a name="ln1425">		zlog_debug (&quot;%s bad OPEN, remote AS is %u, expected %u&quot;,</a>
+<a name="ln1426">			    peer-&gt;host, remote_as, peer-&gt;as);</a>
+<a name="ln1427">	      bgp_notify_send_with_data (peer, BGP_NOTIFY_OPEN_ERR,</a>
+<a name="ln1428">					 BGP_NOTIFY_OPEN_BAD_PEER_AS,</a>
+<a name="ln1429">					 notify_data_remote_as, 2);</a>
+<a name="ln1430">	    }</a>
+<a name="ln1431">	  return -1;</a>
+<a name="ln1432">	}</a>
+<a name="ln1433">    }</a>
+<a name="ln1434"> </a>
+<a name="ln1435">  /* When collision is detected and this peer is closed.  Retrun</a>
+<a name="ln1436">     immidiately. */</a>
+<a name="ln1437">  ret = bgp_collision_detect (peer, remote_id);</a>
+<a name="ln1438">  if (ret &lt; 0)</a>
+<a name="ln1439">    return ret;</a>
+<a name="ln1440"> </a>
+<a name="ln1441">  /* Bit hacky */</a>
+<a name="ln1442">  if (CHECK_FLAG (peer-&gt;sflags, PEER_STATUS_ACCEPT_PEER))</a>
+<a name="ln1443">    { </a>
+<a name="ln1444">      /* Connection FSM state is intertwined with our peer configuration</a>
+<a name="ln1445">       * (the RFC encourages this a bit).  At _this_ point we have a</a>
+<a name="ln1446">       * 'realpeer' which represents the configuration and any earlier FSM</a>
+<a name="ln1447">       * (outbound, unless the remote side has opened two connections to</a>
+<a name="ln1448">       * us), and a 'peer' which here represents an inbound connection that</a>
+<a name="ln1449">       * has not yet been reconciled with a 'realpeer'.  </a>
+<a name="ln1450">       * </a>
+<a name="ln1451">       * As 'peer' has just sent an OPEN that reconciliation must now</a>
+<a name="ln1452">       * happen, as only the 'realpeer' can ever proceed to Established.</a>
+<a name="ln1453">       *</a>
+<a name="ln1454">       * bgp_collision_detect should have resolved any collisions with</a>
+<a name="ln1455">       * realpeers that are in states OpenSent, OpenConfirm or Established,</a>
+<a name="ln1456">       * and may have sent a notify on the 'realpeer' connection. </a>
+<a name="ln1457">       * bgp_accept will have rejected any connections where the 'realpeer'</a>
+<a name="ln1458">       * is in Idle or &gt;Established (though, that status may have changed</a>
+<a name="ln1459">       * since).</a>
+<a name="ln1460">       *</a>
+<a name="ln1461">       * Need to finish off any reconciliation here, and ensure that</a>
+<a name="ln1462">       * 'realpeer' is left holding any needed state from the appropriate</a>
+<a name="ln1463">       * connection (fd, buffers, etc.), and any state from the other</a>
+<a name="ln1464">       * connection is cleaned up.</a>
+<a name="ln1465">       */</a>
+<a name="ln1466"> </a>
+<a name="ln1467">      /* Is realpeer in some globally-down state, that precludes any and all</a>
+<a name="ln1468">       * connections (Idle, Clearing, Deleted, etc.)?</a>
+<a name="ln1469">       */</a>
+<a name="ln1470">      if (realpeer-&gt;status == Idle || realpeer-&gt;status &gt; Established)</a>
+<a name="ln1471">        {</a>
+<a name="ln1472">          if (BGP_DEBUG (events, EVENTS))</a>
+<a name="ln1473">            zlog_debug (&quot;%s peer status is %s, closing the new connection&quot;,</a>
+<a name="ln1474">                        realpeer-&gt;host, </a>
+<a name="ln1475">                        LOOKUP (bgp_status_msg, realpeer-&gt;status));</a>
+<a name="ln1476">          return -1;</a>
+<a name="ln1477">        }</a>
+<a name="ln1478">      </a>
+<a name="ln1479">      /* GR does things differently, and prefers any new connection attempts</a>
+<a name="ln1480">       * over an Established one (why not just rely on KEEPALIVE and avoid</a>
+<a name="ln1481">       * having to special case this?) */</a>
+<a name="ln1482">      if (realpeer-&gt;status == Established</a>
+<a name="ln1483">	    &amp;&amp; CHECK_FLAG (realpeer-&gt;sflags, PEER_STATUS_NSF_MODE))</a>
+<a name="ln1484">	{</a>
+<a name="ln1485">	  realpeer-&gt;last_reset = PEER_DOWN_NSF_CLOSE_SESSION;</a>
+<a name="ln1486">	  SET_FLAG (realpeer-&gt;sflags, PEER_STATUS_NSF_WAIT);</a>
+<a name="ln1487">	}</a>
+<a name="ln1488">      else if (ret == 0) </a>
+<a name="ln1489"> 	{</a>
+<a name="ln1490"> 	  /* If we're here, RFC collision-detect did not reconcile the</a>
+<a name="ln1491"> 	   * connections, and the 'realpeer' is still available.  So</a>
+<a name="ln1492"> 	   * 'realpeer' must be 'Active' or 'Connect'.</a>
+<a name="ln1493"> 	   *</a>
+<a name="ln1494"> 	   * According to the RFC we should just let this connection (of the</a>
+<a name="ln1495"> 	   * accepted 'peer') continue on to Established if the other</a>
+<a name="ln1496"> 	   * onnection (the 'realpeer') is in a more larval state, and</a>
+<a name="ln1497"> 	   * reconcile them when OPEN is sent on the 'realpeer'.</a>
+<a name="ln1498"> 	   *</a>
+<a name="ln1499"> 	   * However, the accepted 'peer' must be reconciled with 'peer' at</a>
+<a name="ln1500"> 	   * this point, due to the implementation, if 'peer' is to be able</a>
+<a name="ln1501"> 	   * to proceed.  So it should be allowed to go to Established, as</a>
+<a name="ln1502"> 	   * long as the 'realpeer' was in Active or Connect state - which</a>
+<a name="ln1503"> 	   * /should/ be the case if we're here.</a>
+<a name="ln1504"> 	   *</a>
+<a name="ln1505"> 	   * So we should only need to sanity check that that is the case</a>
+<a name="ln1506"> 	   * here, and allow the code to get on with transferring the 'peer'</a>
+<a name="ln1507"> 	   * connection state over.</a>
+<a name="ln1508"> 	   */</a>
+<a name="ln1509">          if (realpeer-&gt;status != Active &amp;&amp; realpeer-&gt;status != Connect)</a>
+<a name="ln1510">            {</a>
+<a name="ln1511">              if (BGP_DEBUG (events, EVENTS))</a>
+<a name="ln1512">                zlog_warn (&quot;%s real peer status should be Active or Connect,&quot;</a>
+<a name="ln1513">                            &quot; but is %s&quot;,</a>
+<a name="ln1514">                            realpeer-&gt;host, </a>
+<a name="ln1515">                            LOOKUP (bgp_status_msg, realpeer-&gt;status));</a>
+<a name="ln1516">	      bgp_notify_send (realpeer, BGP_NOTIFY_CEASE,</a>
+<a name="ln1517">			       BGP_NOTIFY_CEASE_COLLISION_RESOLUTION);</a>
+<a name="ln1518">            }</a>
+<a name="ln1519"> 	}</a>
+<a name="ln1520"> </a>
+<a name="ln1521">      if (BGP_DEBUG (events, EVENTS))</a>
+<a name="ln1522">	zlog_debug (&quot;%s:%u [Event] Transfer accept BGP peer to real (state %s)&quot;,</a>
+<a name="ln1523">		   peer-&gt;host, sockunion_get_port (&amp;peer-&gt;su), </a>
+<a name="ln1524">		   LOOKUP (bgp_status_msg, realpeer-&gt;status));</a>
+<a name="ln1525"> </a>
+<a name="ln1526">      bgp_stop (realpeer);</a>
+<a name="ln1527">      </a>
+<a name="ln1528">      /* Transfer file descriptor. */</a>
+<a name="ln1529">      realpeer-&gt;fd = peer-&gt;fd;</a>
+<a name="ln1530">      peer-&gt;fd = -1;</a>
+<a name="ln1531"> </a>
+<a name="ln1532">      /* Transfer input buffer. */</a>
+<a name="ln1533">      stream_free (realpeer-&gt;ibuf);</a>
+<a name="ln1534">      realpeer-&gt;ibuf = peer-&gt;ibuf;</a>
+<a name="ln1535">      realpeer-&gt;packet_size = peer-&gt;packet_size;</a>
+<a name="ln1536">      peer-&gt;ibuf = NULL;</a>
+<a name="ln1537">      </a>
+<a name="ln1538">      /* Transfer output buffer, there may be an OPEN queued to send */</a>
+<a name="ln1539">      stream_fifo_free (realpeer-&gt;obuf);</a>
+<a name="ln1540">      realpeer-&gt;obuf = peer-&gt;obuf;</a>
+<a name="ln1541">      peer-&gt;obuf = NULL;</a>
+<a name="ln1542">      </a>
+<a name="ln1543">      bool open_deferred</a>
+<a name="ln1544">        = CHECK_FLAG (peer-&gt;sflags, PEER_STATUS_OPEN_DEFERRED);</a>
+<a name="ln1545">      </a>
+<a name="ln1546">      /* Transfer status. */</a>
+<a name="ln1547">      realpeer-&gt;status = peer-&gt;status;</a>
+<a name="ln1548">      bgp_stop (peer);</a>
+<a name="ln1549">      </a>
+<a name="ln1550">      /* peer pointer change */</a>
+<a name="ln1551">      peer = realpeer;</a>
+<a name="ln1552">      </a>
+<a name="ln1553">      if (peer-&gt;fd &lt; 0)</a>
+<a name="ln1554">	{</a>
+<a name="ln1555">	  zlog_err (&quot;bgp_open_receive peer's fd is negative value %d&quot;,</a>
+<a name="ln1556">		    peer-&gt;fd);</a>
+<a name="ln1557">	  return -1;</a>
+<a name="ln1558">	}</a>
+<a name="ln1559">      BGP_READ_ON (peer-&gt;t_read, bgp_read, peer-&gt;fd);</a>
+<a name="ln1560">      if (stream_fifo_head (peer-&gt;obuf))</a>
+<a name="ln1561">        BGP_WRITE_ON (peer-&gt;t_write, bgp_write, peer-&gt;fd);</a>
+<a name="ln1562">      </a>
+<a name="ln1563">      /* hack: we may defer OPEN on accept peers, when there seems to be a</a>
+<a name="ln1564">       * realpeer in progress, when an accept peer connection is opened. This</a>
+<a name="ln1565">       * is to avoid interoperability issues, with test/conformance tools</a>
+<a name="ln1566">       * particularly. See bgp_fsm.c::bgp_connect_success</a>
+<a name="ln1567">       *</a>
+<a name="ln1568">       * If OPEN was deferred there, then we must send it now.</a>
+<a name="ln1569">       */</a>
+<a name="ln1570">      if (open_deferred)</a>
+<a name="ln1571">        bgp_open_send (peer);</a>
+<a name="ln1572">    }</a>
+<a name="ln1573"> </a>
+<a name="ln1574">  /* remote router-id check. */</a>
+<a name="ln1575">  if (remote_id.s_addr == 0</a>
+<a name="ln1576">      || IPV4_CLASS_DE (ntohl (remote_id.s_addr))</a>
+<a name="ln1577">      || ntohl (peer-&gt;local_id.s_addr) == ntohl (remote_id.s_addr))</a>
+<a name="ln1578">    {</a>
+<a name="ln1579">      if (BGP_DEBUG (normal, NORMAL))</a>
+<a name="ln1580">	zlog_debug (&quot;%s bad OPEN, wrong router identifier %s&quot;,</a>
+<a name="ln1581">		   peer-&gt;host, inet_ntoa (remote_id));</a>
+<a name="ln1582">      bgp_notify_send_with_data (peer, </a>
+<a name="ln1583">				 BGP_NOTIFY_OPEN_ERR, </a>
+<a name="ln1584">				 BGP_NOTIFY_OPEN_BAD_BGP_IDENT,</a>
+<a name="ln1585">				 notify_data_remote_id, 4);</a>
+<a name="ln1586">      return -1;</a>
+<a name="ln1587">    }</a>
+<a name="ln1588"> </a>
+<a name="ln1589">  /* Set remote router-id */</a>
+<a name="ln1590">  peer-&gt;remote_id = remote_id;</a>
+<a name="ln1591"> </a>
+<a name="ln1592">  /* Peer BGP version check. */</a>
+<a name="ln1593">  if (version != BGP_VERSION_4)</a>
+<a name="ln1594">    {</a>
+<a name="ln1595">      u_int16_t maxver = htons(BGP_VERSION_4);</a>
+<a name="ln1596">      /* XXX this reply may not be correct if version &lt; 4  XXX */</a>
+<a name="ln1597">      if (BGP_DEBUG (normal, NORMAL))</a>
+<a name="ln1598">	zlog_debug (&quot;%s bad protocol version, remote requested %d, local request %d&quot;,</a>
+<a name="ln1599">		   peer-&gt;host, version, BGP_VERSION_4);</a>
+<a name="ln1600">      /* Data must be in network byte order here */</a>
+<a name="ln1601">      bgp_notify_send_with_data (peer, </a>
+<a name="ln1602">				 BGP_NOTIFY_OPEN_ERR, </a>
+<a name="ln1603">				 BGP_NOTIFY_OPEN_UNSUP_VERSION,</a>
+<a name="ln1604">				 (u_int8_t *) &amp;maxver, 2);</a>
+<a name="ln1605">      return -1;</a>
+<a name="ln1606">    }</a>
+<a name="ln1607"> </a>
+<a name="ln1608">  /* Check neighbor as number. */</a>
+<a name="ln1609">  if (remote_as != peer-&gt;as)</a>
+<a name="ln1610">    {</a>
+<a name="ln1611">      if (BGP_DEBUG (normal, NORMAL))</a>
+<a name="ln1612">	zlog_debug (&quot;%s bad OPEN, remote AS is %u, expected %u&quot;,</a>
+<a name="ln1613">		   peer-&gt;host, remote_as, peer-&gt;as);</a>
+<a name="ln1614">      bgp_notify_send_with_data (peer, </a>
+<a name="ln1615">				 BGP_NOTIFY_OPEN_ERR, </a>
+<a name="ln1616">				 BGP_NOTIFY_OPEN_BAD_PEER_AS,</a>
+<a name="ln1617">				 notify_data_remote_as, 2);</a>
+<a name="ln1618">      return -1;</a>
+<a name="ln1619">    }</a>
+<a name="ln1620"> </a>
+<a name="ln1621">  /* From the rfc: Upon receipt of an OPEN message, a BGP speaker MUST</a>
+<a name="ln1622">     calculate the value of the Hold Timer by using the smaller of its</a>
+<a name="ln1623">     configured Hold Time and the Hold Time received in the OPEN message.</a>
+<a name="ln1624">     The Hold Time MUST be either zero or at least three seconds.  An</a>
+<a name="ln1625">     implementation may reject connections on the basis of the Hold Time. */</a>
+<a name="ln1626"> </a>
+<a name="ln1627">  if (holdtime &lt; 3 &amp;&amp; holdtime != 0)</a>
+<a name="ln1628">    {</a>
+<a name="ln1629">      uint16_t netholdtime = htons (holdtime);</a>
+<a name="ln1630">      bgp_notify_send_with_data (peer,</a>
+<a name="ln1631">		                 BGP_NOTIFY_OPEN_ERR,</a>
+<a name="ln1632">		                 BGP_NOTIFY_OPEN_UNACEP_HOLDTIME,</a>
+<a name="ln1633">                                 (u_int8_t *) &amp;netholdtime, 2);</a>
+<a name="ln1634">      return -1;</a>
+<a name="ln1635">    }</a>
+<a name="ln1636">    </a>
+<a name="ln1637">  /* From the rfc: A reasonable maximum time between KEEPALIVE messages</a>
+<a name="ln1638">     would be one third of the Hold Time interval.  KEEPALIVE messages</a>
+<a name="ln1639">     MUST NOT be sent more frequently than one per second.  An</a>
+<a name="ln1640">     implementation MAY adjust the rate at which it sends KEEPALIVE</a>
+<a name="ln1641">     messages as a function of the Hold Time interval. */</a>
+<a name="ln1642"> </a>
+<a name="ln1643">  if (CHECK_FLAG (peer-&gt;config, PEER_CONFIG_TIMER))</a>
+<a name="ln1644">    send_holdtime = peer-&gt;holdtime;</a>
+<a name="ln1645">  else</a>
+<a name="ln1646">    send_holdtime = peer-&gt;bgp-&gt;default_holdtime;</a>
+<a name="ln1647"> </a>
+<a name="ln1648">  if (holdtime &lt; send_holdtime)</a>
+<a name="ln1649">    peer-&gt;v_holdtime = holdtime;</a>
+<a name="ln1650">  else</a>
+<a name="ln1651">    peer-&gt;v_holdtime = send_holdtime;</a>
+<a name="ln1652"> </a>
+<a name="ln1653">  peer-&gt;v_keepalive = peer-&gt;v_holdtime / 3;</a>
+<a name="ln1654"> </a>
+<a name="ln1655">  /* Open option part parse. */</a>
+<a name="ln1656">  if (optlen != 0) </a>
+<a name="ln1657">    {</a>
+<a name="ln1658">      if ((ret = bgp_open_option_parse (peer, optlen, &amp;mp_capability)) &lt; 0)</a>
+<a name="ln1659">        {</a>
+<a name="ln1660">          bgp_notify_send (peer,</a>
+<a name="ln1661">                 BGP_NOTIFY_OPEN_ERR,</a>
+<a name="ln1662">                 BGP_NOTIFY_OPEN_UNSPECIFIC);</a>
+<a name="ln1663">	  return ret;</a>
+<a name="ln1664">        }</a>
+<a name="ln1665">    }</a>
+<a name="ln1666">  else</a>
+<a name="ln1667">    {</a>
+<a name="ln1668">      if (BGP_DEBUG (normal, NORMAL))</a>
+<a name="ln1669">	zlog_debug (&quot;%s rcvd OPEN w/ OPTION parameter len: 0&quot;,</a>
+<a name="ln1670">		   peer-&gt;host);</a>
+<a name="ln1671">    }</a>
+<a name="ln1672"> </a>
+<a name="ln1673">  /* </a>
+<a name="ln1674">   * Assume that the peer supports the locally configured set of</a>
+<a name="ln1675">   * AFI/SAFIs if the peer did not send us any Mulitiprotocol</a>
+<a name="ln1676">   * capabilities, or if 'override-capability' is configured.</a>
+<a name="ln1677">   */</a>
+<a name="ln1678">  if (! mp_capability ||</a>
+<a name="ln1679">      CHECK_FLAG (peer-&gt;flags, PEER_FLAG_OVERRIDE_CAPABILITY))</a>
+<a name="ln1680">    {</a>
+<a name="ln1681">      peer-&gt;afc_nego[AFI_IP][SAFI_UNICAST] = peer-&gt;afc[AFI_IP][SAFI_UNICAST];</a>
+<a name="ln1682">      peer-&gt;afc_nego[AFI_IP][SAFI_MULTICAST] = peer-&gt;afc[AFI_IP][SAFI_MULTICAST];</a>
+<a name="ln1683">      peer-&gt;afc_nego[AFI_IP6][SAFI_UNICAST] = peer-&gt;afc[AFI_IP6][SAFI_UNICAST];</a>
+<a name="ln1684">      peer-&gt;afc_nego[AFI_IP6][SAFI_MULTICAST] = peer-&gt;afc[AFI_IP6][SAFI_MULTICAST];</a>
+<a name="ln1685">    }</a>
+<a name="ln1686"> </a>
+<a name="ln1687">  /* Get sockname. */</a>
+<a name="ln1688">  bgp_getsockname (peer);</a>
+<a name="ln1689">  peer-&gt;rtt = sockopt_tcp_rtt (peer-&gt;fd);</a>
+<a name="ln1690"> </a>
+<a name="ln1691">  BGP_EVENT_ADD (peer, Receive_OPEN_message);</a>
+<a name="ln1692"> </a>
+<a name="ln1693">  peer-&gt;packet_size = 0;</a>
+<a name="ln1694">  if (peer-&gt;ibuf)</a>
+<a name="ln1695">    stream_reset (peer-&gt;ibuf);</a>
+<a name="ln1696"> </a>
+<a name="ln1697">  return 0;</a>
+<a name="ln1698">}</a>
+<a name="ln1699"> </a>
+<a name="ln1700">/* Frontend for NLRI parsing, to fan-out to AFI/SAFI specific parsers */</a>
+<a name="ln1701">int</a>
+<a name="ln1702">bgp_nlri_parse (struct peer *peer, struct attr *attr, struct bgp_nlri *packet)</a>
+<a name="ln1703">{</a>
+<a name="ln1704">  switch (packet-&gt;safi)</a>
+<a name="ln1705">    {</a>
+<a name="ln1706">      case SAFI_UNICAST:</a>
+<a name="ln1707">      case SAFI_MULTICAST:</a>
+<a name="ln1708">        return bgp_nlri_parse_ip (peer, attr, packet);</a>
+<a name="ln1709">      case SAFI_MPLS_VPN:</a>
+<a name="ln1710">      case SAFI_MPLS_LABELED_VPN:</a>
+<a name="ln1711">        return bgp_nlri_parse_vpn (peer, attr, packet);</a>
+<a name="ln1712">      case SAFI_ENCAP:</a>
+<a name="ln1713">        return bgp_nlri_parse_encap (peer, attr, packet);</a>
+<a name="ln1714">    }</a>
+<a name="ln1715">  return -1;</a>
+<a name="ln1716">}</a>
+<a name="ln1717"> </a>
+<a name="ln1718">/* Parse BGP Update packet and make attribute object. */</a>
+<a name="ln1719">static int</a>
+<a name="ln1720">bgp_update_receive (struct peer *peer, bgp_size_t size)</a>
+<a name="ln1721">{</a>
+<a name="ln1722">  int ret, nlri_ret;</a>
+<a name="ln1723">  u_char *end;</a>
+<a name="ln1724">  struct stream *s;</a>
+<a name="ln1725">  struct attr attr;</a>
+<a name="ln1726">  struct attr_extra extra;</a>
+<a name="ln1727">  bgp_size_t attribute_len;</a>
+<a name="ln1728">  bgp_size_t update_len;</a>
+<a name="ln1729">  bgp_size_t withdraw_len;</a>
+<a name="ln1730">  int i;</a>
+<a name="ln1731">  </a>
+<a name="ln1732">  enum NLRI_TYPES {</a>
+<a name="ln1733">    NLRI_UPDATE,</a>
+<a name="ln1734">    NLRI_WITHDRAW,</a>
+<a name="ln1735">    NLRI_MP_UPDATE,</a>
+<a name="ln1736">    NLRI_MP_WITHDRAW,</a>
+<a name="ln1737">    NLRI_TYPE_MAX,</a>
+<a name="ln1738">  };</a>
+<a name="ln1739">  struct bgp_nlri nlris[NLRI_TYPE_MAX];</a>
+<a name="ln1740"> </a>
+<a name="ln1741">  /* Status must be Established. */</a>
+<a name="ln1742">  if (peer-&gt;status != Established) </a>
+<a name="ln1743">    {</a>
+<a name="ln1744">      zlog_err (&quot;%s [FSM] Update packet received under status %s&quot;,</a>
+<a name="ln1745">		peer-&gt;host, LOOKUP (bgp_status_msg, peer-&gt;status));</a>
+<a name="ln1746">      bgp_notify_send (peer, BGP_NOTIFY_FSM_ERR, 0);</a>
+<a name="ln1747">      return -1;</a>
+<a name="ln1748">    }</a>
+<a name="ln1749"> </a>
+<a name="ln1750">  /* Set initial values. */</a>
+<a name="ln1751">  memset (&amp;attr, 0, sizeof (struct attr));</a>
+<a name="ln1752">  memset (&amp;extra, 0, sizeof (struct attr_extra));</a>
+<a name="ln1753">  memset (&amp;nlris, 0, sizeof nlris);</a>
+<a name="ln1754"> </a>
+<a name="ln1755">  attr.extra = &amp;extra;</a>
+<a name="ln1756"> </a>
+<a name="ln1757">  s = peer-&gt;ibuf;</a>
+<a name="ln1758">  end = stream_pnt (s) + size;</a>
+<a name="ln1759"> </a>
+<a name="ln1760">  /* RFC1771 6.3 If the Unfeasible Routes Length or Total Attribute</a>
+<a name="ln1761">     Length is too large (i.e., if Unfeasible Routes Length + Total</a>
+<a name="ln1762">     Attribute Length + 23 exceeds the message Length), then the Error</a>
+<a name="ln1763">     Subcode is set to Malformed Attribute List.  */</a>
+<a name="ln1764">  if (stream_pnt (s) + 2 &gt; end)</a>
+<a name="ln1765">    {</a>
+<a name="ln1766">      zlog_err (&quot;%s [Error] Update packet error&quot;</a>
+<a name="ln1767">		&quot; (packet length is short for unfeasible length)&quot;,</a>
+<a name="ln1768">		peer-&gt;host);</a>
+<a name="ln1769">      bgp_notify_send (peer, BGP_NOTIFY_UPDATE_ERR, </a>
+<a name="ln1770">		       BGP_NOTIFY_UPDATE_MAL_ATTR);</a>
+<a name="ln1771">      return -1;</a>
+<a name="ln1772">    }</a>
+<a name="ln1773"> </a>
+<a name="ln1774">  /* Unfeasible Route Length. */</a>
+<a name="ln1775">  withdraw_len = stream_getw (s);</a>
+<a name="ln1776"> </a>
+<a name="ln1777">  /* Unfeasible Route Length check. */</a>
+<a name="ln1778">  if (stream_pnt (s) + withdraw_len &gt; end)</a>
+<a name="ln1779">    {</a>
+<a name="ln1780">      zlog_err (&quot;%s [Error] Update packet error&quot;</a>
+<a name="ln1781">		&quot; (packet unfeasible length overflow %d)&quot;,</a>
+<a name="ln1782">		peer-&gt;host, withdraw_len);</a>
+<a name="ln1783">      bgp_notify_send (peer, BGP_NOTIFY_UPDATE_ERR, </a>
+<a name="ln1784">		       BGP_NOTIFY_UPDATE_MAL_ATTR);</a>
+<a name="ln1785">      return -1;</a>
+<a name="ln1786">    }</a>
+<a name="ln1787"> </a>
+<a name="ln1788">  /* Unfeasible Route packet format check. */</a>
+<a name="ln1789">  if (withdraw_len &gt; 0)</a>
+<a name="ln1790">    {</a>
+<a name="ln1791">      nlris[NLRI_WITHDRAW].afi = AFI_IP;</a>
+<a name="ln1792">      nlris[NLRI_WITHDRAW].safi = SAFI_UNICAST;</a>
+<a name="ln1793">      nlris[NLRI_WITHDRAW].nlri = stream_pnt (s);</a>
+<a name="ln1794">      nlris[NLRI_WITHDRAW].length = withdraw_len;</a>
+<a name="ln1795">      </a>
+<a name="ln1796">      if (BGP_DEBUG (packet, PACKET_RECV))</a>
+<a name="ln1797">	zlog_debug (&quot;%s [Update:RECV] Unfeasible NLRI received&quot;, peer-&gt;host);</a>
+<a name="ln1798"> </a>
+<a name="ln1799">      stream_forward_getp (s, withdraw_len);</a>
+<a name="ln1800">    }</a>
+<a name="ln1801">  </a>
+<a name="ln1802">  /* Attribute total length check. */</a>
+<a name="ln1803">  if (stream_pnt (s) + 2 &gt; end)</a>
+<a name="ln1804">    {</a>
+<a name="ln1805">      zlog_warn (&quot;%s [Error] Packet Error&quot;</a>
+<a name="ln1806">		 &quot; (update packet is short for attribute length)&quot;,</a>
+<a name="ln1807">		 peer-&gt;host);</a>
+<a name="ln1808">      bgp_notify_send (peer, BGP_NOTIFY_UPDATE_ERR, </a>
+<a name="ln1809">		       BGP_NOTIFY_UPDATE_MAL_ATTR);</a>
+<a name="ln1810">      return -1;</a>
+<a name="ln1811">    }</a>
+<a name="ln1812"> </a>
+<a name="ln1813">  /* Fetch attribute total length. */</a>
+<a name="ln1814">  attribute_len = stream_getw (s);</a>
+<a name="ln1815"> </a>
+<a name="ln1816">  /* Attribute length check. */</a>
+<a name="ln1817">  if (stream_pnt (s) + attribute_len &gt; end)</a>
+<a name="ln1818">    {</a>
+<a name="ln1819">      zlog_warn (&quot;%s [Error] Packet Error&quot;</a>
+<a name="ln1820">		 &quot; (update packet attribute length overflow %d)&quot;,</a>
+<a name="ln1821">		 peer-&gt;host, attribute_len);</a>
+<a name="ln1822">      bgp_notify_send (peer, BGP_NOTIFY_UPDATE_ERR, </a>
+<a name="ln1823">		       BGP_NOTIFY_UPDATE_MAL_ATTR);</a>
+<a name="ln1824">      return -1;</a>
+<a name="ln1825">    }</a>
+<a name="ln1826">  </a>
+<a name="ln1827">  /* Certain attribute parsing errors should not be considered bad enough</a>
+<a name="ln1828">   * to reset the session for, most particularly any partial/optional</a>
+<a name="ln1829">   * attributes that have 'tunneled' over speakers that don't understand</a>
+<a name="ln1830">   * them. Instead we withdraw only the prefix concerned.</a>
+<a name="ln1831">   * </a>
+<a name="ln1832">   * Complicates the flow a little though..</a>
+<a name="ln1833">   */</a>
+<a name="ln1834">  bgp_attr_parse_ret_t attr_parse_ret = BGP_ATTR_PARSE_PROCEED;</a>
+<a name="ln1835">  /* This define morphs the update case into a withdraw when lower levels</a>
+<a name="ln1836">   * have signalled an error condition where this is best.</a>
+<a name="ln1837">   */</a>
+<a name="ln1838">#define NLRI_ATTR_ARG (attr_parse_ret != BGP_ATTR_PARSE_WITHDRAW ? &amp;attr : NULL)</a>
+<a name="ln1839"> </a>
+<a name="ln1840">  /* Parse attribute when it exists. */</a>
+<a name="ln1841">  if (attribute_len)</a>
+<a name="ln1842">    {</a>
+<a name="ln1843">      attr_parse_ret = bgp_attr_parse (peer, &amp;attr, attribute_len, </a>
+<a name="ln1844">			    &amp;nlris[NLRI_MP_UPDATE], &amp;nlris[NLRI_MP_WITHDRAW]);</a>
+<a name="ln1845">      if (attr_parse_ret == BGP_ATTR_PARSE_ERROR)</a>
+<a name="ln1846">	{</a>
+<a name="ln1847">	  bgp_attr_unintern_sub (&amp;attr);</a>
+<a name="ln1848">          bgp_attr_flush (&amp;attr);</a>
+<a name="ln1849">	  return -1;</a>
+<a name="ln1850">	}</a>
+<a name="ln1851">    }</a>
+<a name="ln1852">  </a>
+<a name="ln1853">  /* Logging the attribute. */</a>
+<a name="ln1854">  if (attr_parse_ret == BGP_ATTR_PARSE_WITHDRAW</a>
+<a name="ln1855">      || BGP_DEBUG (update, UPDATE_IN))</a>
+<a name="ln1856">    {</a>
+<a name="ln1857">      char attrstr[BUFSIZ];</a>
+<a name="ln1858">      attrstr[0] = '\0';</a>
+<a name="ln1859"> </a>
+<a name="ln1860">      ret= bgp_dump_attr (peer, &amp;attr, attrstr, BUFSIZ);</a>
+<a name="ln1861">      int lvl = (attr_parse_ret == BGP_ATTR_PARSE_WITHDRAW)</a>
+<a name="ln1862">                 ? LOG_ERR : LOG_DEBUG;</a>
+<a name="ln1863">      </a>
+<a name="ln1864">      if (attr_parse_ret == BGP_ATTR_PARSE_WITHDRAW)</a>
+<a name="ln1865">        zlog (peer-&gt;log, LOG_ERR,</a>
+<a name="ln1866">              &quot;%s rcvd UPDATE with errors in attr(s)!! Withdrawing route.&quot;,</a>
+<a name="ln1867">              peer-&gt;host);</a>
+<a name="ln1868"> </a>
+<a name="ln1869">      if (ret)</a>
+<a name="ln1870">	zlog (peer-&gt;log, lvl, &quot;%s rcvd UPDATE w/ attr: %s&quot;,</a>
+<a name="ln1871">	      peer-&gt;host, attrstr);</a>
+<a name="ln1872">    }</a>
+<a name="ln1873">  </a>
+<a name="ln1874">  /* Network Layer Reachability Information. */</a>
+<a name="ln1875">  update_len = end - stream_pnt (s);</a>
+<a name="ln1876"> </a>
+<a name="ln1877">  if (update_len)</a>
+<a name="ln1878">    {</a>
+<a name="ln1879">      /* Set NLRI portion to structure. */</a>
+<a name="ln1880">      nlris[NLRI_UPDATE].afi = AFI_IP;</a>
+<a name="ln1881">      nlris[NLRI_UPDATE].safi = SAFI_UNICAST;</a>
+<a name="ln1882">      nlris[NLRI_UPDATE].nlri = stream_pnt (s);</a>
+<a name="ln1883">      nlris[NLRI_UPDATE].length = update_len;</a>
+<a name="ln1884">      </a>
+<a name="ln1885">      stream_forward_getp (s, update_len);</a>
+<a name="ln1886">    }</a>
+<a name="ln1887">  </a>
+<a name="ln1888">  /* Parse any given NLRIs */</a>
+<a name="ln1889">  for (i = NLRI_UPDATE; i &lt; NLRI_TYPE_MAX; i++)</a>
+<a name="ln1890">    {</a>
+<a name="ln1891">      if (!nlris[i].nlri) continue;</a>
+<a name="ln1892">      </a>
+<a name="ln1893">      /* We use afi and safi as indices into tables and what not.  It would</a>
+<a name="ln1894">       * be impossible, at this time, to support unknown afi/safis.  And</a>
+<a name="ln1895">       * anyway, the peer needs to be configured to enable the afi/safi</a>
+<a name="ln1896">       * explicitly which requires UI support.</a>
+<a name="ln1897">       *</a>
+<a name="ln1898">       * Ignore unknown afi/safi NLRIs.</a>
+<a name="ln1899">       *</a>
+<a name="ln1900">       * Note: this means nlri[x].afi/safi still can not be trusted for</a>
+<a name="ln1901">       * indexing later in this function!</a>
+<a name="ln1902">       *</a>
+<a name="ln1903">       * Note2: This will also remap the wire code-point for VPN safi to the</a>
+<a name="ln1904">       * internal safi_t point, as needs be.</a>
+<a name="ln1905">       */</a>
+<a name="ln1906">      if (!bgp_afi_safi_valid_indices (nlris[i].afi, &amp;nlris[i].safi))</a>
+<a name="ln1907">        {</a>
+<a name="ln1908">          plog_info (peer-&gt;log,</a>
+<a name="ln1909">                     &quot;%s [Info] UPDATE with unsupported AFI/SAFI %u/%u&quot;,</a>
+<a name="ln1910">                     peer-&gt;host, nlris[i].afi, nlris[i].safi);</a>
+<a name="ln1911">          continue;</a>
+<a name="ln1912">        }</a>
+<a name="ln1913">      </a>
+<a name="ln1914">      /* NLRI is processed only when the peer is configured specific</a>
+<a name="ln1915">         Address Family and Subsequent Address Family. */</a>
+<a name="ln1916">      if (!peer-&gt;afc[nlris[i].afi][nlris[i].safi])</a>
+<a name="ln1917">        {</a>
+<a name="ln1918">          plog_info (peer-&gt;log,</a>
+<a name="ln1919">                     &quot;%s [Info] UPDATE for non-enabled AFI/SAFI %u/%u&quot;,</a>
+<a name="ln1920">                     peer-&gt;host, nlris[i].afi, nlris[i].safi);</a>
+<a name="ln1921">          continue;</a>
+<a name="ln1922">        }</a>
+<a name="ln1923">      </a>
+<a name="ln1924">      /* EoR handled later */</a>
+<a name="ln1925">      if (nlris[i].length == 0)</a>
+<a name="ln1926">        continue;</a>
+<a name="ln1927">      </a>
+<a name="ln1928">      switch (i)</a>
+<a name="ln1929">        {</a>
+<a name="ln1930">          case NLRI_UPDATE:</a>
+<a name="ln1931">          case NLRI_MP_UPDATE:</a>
+<a name="ln1932">            nlri_ret = bgp_nlri_parse (peer, NLRI_ATTR_ARG, &amp;nlris[i]);</a>
+<a name="ln1933">            break;</a>
+<a name="ln1934">          case NLRI_WITHDRAW:</a>
+<a name="ln1935">          case NLRI_MP_WITHDRAW:</a>
+<a name="ln1936">            nlri_ret = bgp_nlri_parse (peer, NULL, &amp;nlris[i]);</a>
+<a name="ln1937">        }</a>
+<a name="ln1938">      </a>
+<a name="ln1939">      if (nlri_ret &lt; 0)</a>
+<a name="ln1940">        {</a>
+<a name="ln1941">          plog_err (peer-&gt;log, </a>
+<a name="ln1942">                    &quot;%s [Error] Error parsing NLRI&quot;, peer-&gt;host);</a>
+<a name="ln1943">          if (peer-&gt;status == Established)</a>
+<a name="ln1944">            bgp_notify_send (peer, BGP_NOTIFY_UPDATE_ERR,</a>
+<a name="ln1945">                             i &lt;= NLRI_WITHDRAW </a>
+<a name="ln1946">                               ? BGP_NOTIFY_UPDATE_INVAL_NETWORK</a>
+<a name="ln1947">                               : BGP_NOTIFY_UPDATE_OPT_ATTR_ERR);</a>
+<a name="ln1948">          bgp_attr_unintern_sub (&amp;attr);</a>
+<a name="ln1949">          return -1;</a>
+<a name="ln1950">        }</a>
+<a name="ln1951">    }</a>
+<a name="ln1952">  </a>
+<a name="ln1953">  /* EoR checks.</a>
+<a name="ln1954">   *</a>
+<a name="ln1955">   * Non-MP IPv4/Unicast EoR is a completely empty UPDATE</a>
+<a name="ln1956">   * and MP EoR should have only an empty MP_UNREACH</a>
+<a name="ln1957">   */</a>
+<a name="ln1958">  if (!update_len &amp;&amp; !withdraw_len</a>
+<a name="ln1959">      &amp;&amp; nlris[NLRI_MP_UPDATE].length == 0)</a>
+<a name="ln1960">    {</a>
+<a name="ln1961">      afi_t afi = 0;</a>
+<a name="ln1962">      safi_t safi;</a>
+<a name="ln1963">      </a>
+<a name="ln1964">      /* Non-MP IPv4/Unicast is a completely empty UPDATE - already</a>
+<a name="ln1965">       * checked update and withdraw NLRI lengths are 0.</a>
+<a name="ln1966">       */ </a>
+<a name="ln1967">      if (!attribute_len)</a>
+<a name="ln1968">        {</a>
+<a name="ln1969">          afi = AFI_IP;</a>
+<a name="ln1970">          safi = SAFI_UNICAST;</a>
+<a name="ln1971">        }</a>
+<a name="ln1972">      /* otherwise MP AFI/SAFI is an empty update, other than an empty</a>
+<a name="ln1973">       * MP_UNREACH_NLRI attr (with an AFI/SAFI we recognise).</a>
+<a name="ln1974">       */</a>
+<a name="ln1975">      else if (attr.flag == BGP_ATTR_MP_UNREACH_NLRI</a>
+<a name="ln1976">               &amp;&amp; nlris[NLRI_MP_WITHDRAW].length == 0</a>
+<a name="ln1977">               &amp;&amp; bgp_afi_safi_valid_indices (nlris[NLRI_MP_WITHDRAW].afi,</a>
+<a name="ln1978">                                              &amp;nlris[NLRI_MP_WITHDRAW].safi))</a>
+<a name="ln1979">        {</a>
+<a name="ln1980">          afi = nlris[NLRI_MP_WITHDRAW].afi;</a>
+<a name="ln1981">          safi = nlris[NLRI_MP_WITHDRAW].safi;</a>
+<a name="ln1982">        }</a>
+<a name="ln1983">      </a>
+<a name="ln1984">      if (afi &amp;&amp; peer-&gt;afc[afi][safi])</a>
+<a name="ln1985">        {</a>
+<a name="ln1986">	  /* End-of-RIB received */</a>
+<a name="ln1987">	  SET_FLAG (peer-&gt;af_sflags[afi][safi],</a>
+<a name="ln1988">		    PEER_STATUS_EOR_RECEIVED);</a>
+<a name="ln1989"> </a>
+<a name="ln1990">	  /* NSF delete stale route */</a>
+<a name="ln1991">	  if (peer-&gt;nsf[afi][safi])</a>
+<a name="ln1992">	    bgp_clear_stale_route (peer, afi, safi);</a>
+<a name="ln1993"> </a>
+<a name="ln1994">	  if (BGP_DEBUG (normal, NORMAL))</a>
+<a name="ln1995">	    zlog (peer-&gt;log, LOG_DEBUG, &quot;rcvd End-of-RIB for %s from %s&quot;,</a>
+<a name="ln1996">		  peer-&gt;host, afi_safi_print (afi, safi));</a>
+<a name="ln1997">        }</a>
+<a name="ln1998">    }</a>
+<a name="ln1999">  </a>
+<a name="ln2000">  /* Everything is done.  We unintern temporary structures which</a>
+<a name="ln2001">     interned in bgp_attr_parse(). */</a>
+<a name="ln2002">  bgp_attr_unintern_sub (&amp;attr);</a>
+<a name="ln2003">  bgp_attr_flush (&amp;attr);</a>
+<a name="ln2004"> </a>
+<a name="ln2005">  /* If peering is stopped due to some reason, do not generate BGP</a>
+<a name="ln2006">     event.  */</a>
+<a name="ln2007">  if (peer-&gt;status != Established)</a>
+<a name="ln2008">    return 0;</a>
+<a name="ln2009"> </a>
+<a name="ln2010">  /* Increment packet counter. */</a>
+<a name="ln2011">  peer-&gt;update_in++;</a>
+<a name="ln2012">  peer-&gt;update_time = bgp_clock ();</a>
+<a name="ln2013"> </a>
+<a name="ln2014">  /* Rearm holdtime timer */</a>
+<a name="ln2015">  BGP_TIMER_OFF (peer-&gt;t_holdtime);</a>
+<a name="ln2016">  bgp_timer_set (peer);</a>
+<a name="ln2017"> </a>
+<a name="ln2018">  return 0;</a>
+<a name="ln2019">}</a>
+<a name="ln2020"> </a>
+<a name="ln2021">/* Notify message treatment function. */</a>
+<a name="ln2022">static void</a>
+<a name="ln2023">bgp_notify_receive (struct peer *peer, bgp_size_t size)</a>
+<a name="ln2024">{</a>
+<a name="ln2025">  struct bgp_notify bgp_notify;</a>
+<a name="ln2026"> </a>
+<a name="ln2027">  if (peer-&gt;notify.data)</a>
+<a name="ln2028">    {</a>
+<a name="ln2029">      XFREE (MTYPE_TMP, peer-&gt;notify.data);</a>
+<a name="ln2030">      peer-&gt;notify.data = NULL;</a>
+<a name="ln2031">      peer-&gt;notify.length = 0;</a>
+<a name="ln2032">    }</a>
+<a name="ln2033"> </a>
+<a name="ln2034">  bgp_notify.code = stream_getc (peer-&gt;ibuf);</a>
+<a name="ln2035">  bgp_notify.subcode = stream_getc (peer-&gt;ibuf);</a>
+<a name="ln2036">  bgp_notify.length = size - 2;</a>
+<a name="ln2037">  bgp_notify.data = NULL;</a>
+<a name="ln2038"> </a>
+<a name="ln2039">  /* Preserv notify code and sub code. */</a>
+<a name="ln2040">  peer-&gt;notify.code = bgp_notify.code;</a>
+<a name="ln2041">  peer-&gt;notify.subcode = bgp_notify.subcode;</a>
+<a name="ln2042">  /* For further diagnostic record returned Data. */</a>
+<a name="ln2043">  if (bgp_notify.length)</a>
+<a name="ln2044">    {</a>
+<a name="ln2045">      peer-&gt;notify.length = size - 2;</a>
+<a name="ln2046">      peer-&gt;notify.data = XMALLOC (MTYPE_TMP, size - 2);</a>
+<a name="ln2047">      memcpy (peer-&gt;notify.data, stream_pnt (peer-&gt;ibuf), size - 2);</a>
+<a name="ln2048">    }</a>
+<a name="ln2049"> </a>
+<a name="ln2050">  /* For debug */</a>
+<a name="ln2051">  {</a>
+<a name="ln2052">    int i;</a>
+<a name="ln2053">    int first = 0;</a>
+<a name="ln2054">    char c[4];</a>
+<a name="ln2055"> </a>
+<a name="ln2056">    if (bgp_notify.length)</a>
+<a name="ln2057">      {</a>
+<a name="ln2058">	bgp_notify.data = XMALLOC (MTYPE_TMP, bgp_notify.length * 3);</a>
+<a name="ln2059">	for (i = 0; i &lt; bgp_notify.length; i++)</a>
+<a name="ln2060">	  if (first)</a>
+<a name="ln2061">	    {</a>
+<a name="ln2062">	      sprintf (c, &quot; %02x&quot;, stream_getc (peer-&gt;ibuf));</a>
+<a name="ln2063">	      strcat (bgp_notify.data, c);</a>
+<a name="ln2064">	    }</a>
+<a name="ln2065">	  else</a>
+<a name="ln2066">	    {</a>
+<a name="ln2067">	      first = 1;</a>
+<a name="ln2068">	      sprintf (c, &quot;%02x&quot;, stream_getc (peer-&gt;ibuf));</a>
+<a name="ln2069">	      strcpy (bgp_notify.data, c);</a>
+<a name="ln2070">	    }</a>
+<a name="ln2071">      }</a>
+<a name="ln2072"> </a>
+<a name="ln2073">    bgp_notify_print(peer, &amp;bgp_notify, &quot;received&quot;);</a>
+<a name="ln2074">    if (bgp_notify.data)</a>
+<a name="ln2075">      {</a>
+<a name="ln2076">        XFREE (MTYPE_TMP, bgp_notify.data);</a>
+<a name="ln2077">        bgp_notify.data = NULL;</a>
+<a name="ln2078">        bgp_notify.length = 0;</a>
+<a name="ln2079">      }</a>
+<a name="ln2080">  }</a>
+<a name="ln2081"> </a>
+<a name="ln2082">  /* peer count update */</a>
+<a name="ln2083">  peer-&gt;notify_in++;</a>
+<a name="ln2084"> </a>
+<a name="ln2085">  if (peer-&gt;status == Established)</a>
+<a name="ln2086">    peer-&gt;last_reset = PEER_DOWN_NOTIFY_RECEIVED;</a>
+<a name="ln2087"> </a>
+<a name="ln2088">  /* We have to check for Notify with Unsupported Optional Parameter.</a>
+<a name="ln2089">     in that case we fallback to open without the capability option.</a>
+<a name="ln2090">     But this done in bgp_stop. We just mark it here to avoid changing</a>
+<a name="ln2091">     the fsm tables.  */</a>
+<a name="ln2092">  if (bgp_notify.code == BGP_NOTIFY_OPEN_ERR &amp;&amp;</a>
+<a name="ln2093">      bgp_notify.subcode == BGP_NOTIFY_OPEN_UNSUP_PARAM )</a>
+<a name="ln2094">    UNSET_FLAG (peer-&gt;sflags, PEER_STATUS_CAPABILITY_OPEN);</a>
+<a name="ln2095"> </a>
+<a name="ln2096">  BGP_EVENT_ADD (peer, Receive_NOTIFICATION_message);</a>
+<a name="ln2097">}</a>
+<a name="ln2098"> </a>
+<a name="ln2099">/* Keepalive treatment function -- get keepalive send keepalive */</a>
+<a name="ln2100">static void</a>
+<a name="ln2101">bgp_keepalive_receive (struct peer *peer, bgp_size_t size)</a>
+<a name="ln2102">{</a>
+<a name="ln2103">  if (BGP_DEBUG (keepalive, KEEPALIVE))  </a>
+<a name="ln2104">    zlog_debug (&quot;%s KEEPALIVE rcvd&quot;, peer-&gt;host); </a>
+<a name="ln2105">  </a>
+<a name="ln2106">  BGP_EVENT_ADD (peer, Receive_KEEPALIVE_message);</a>
+<a name="ln2107">}</a>
+<a name="ln2108"> </a>
+<a name="ln2109">/* Route refresh message is received. */</a>
+<a name="ln2110">static void</a>
+<a name="ln2111">bgp_route_refresh_receive (struct peer *peer, bgp_size_t size)</a>
+<a name="ln2112">{</a>
+<a name="ln2113">  afi_t afi;</a>
+<a name="ln2114">  safi_t safi;</a>
+<a name="ln2115">  struct stream *s;</a>
+<a name="ln2116"> </a>
+<a name="ln2117">  /* If peer does not have the capability, send notification. */</a>
+<a name="ln2118">  if (! CHECK_FLAG (peer-&gt;cap, PEER_CAP_REFRESH_ADV))</a>
+<a name="ln2119">    {</a>
+<a name="ln2120">      plog_err (peer-&gt;log, &quot;%s [Error] BGP route refresh is not enabled&quot;,</a>
+<a name="ln2121">		peer-&gt;host);</a>
+<a name="ln2122">      bgp_notify_send (peer,</a>
+<a name="ln2123">		       BGP_NOTIFY_HEADER_ERR,</a>
+<a name="ln2124">		       BGP_NOTIFY_HEADER_BAD_MESTYPE);</a>
+<a name="ln2125">      return;</a>
+<a name="ln2126">    }</a>
+<a name="ln2127"> </a>
+<a name="ln2128">  /* Status must be Established. */</a>
+<a name="ln2129">  if (peer-&gt;status != Established) </a>
+<a name="ln2130">    {</a>
+<a name="ln2131">      plog_err (peer-&gt;log,</a>
+<a name="ln2132">		&quot;%s [Error] Route refresh packet received under status %s&quot;,</a>
+<a name="ln2133">		peer-&gt;host, LOOKUP (bgp_status_msg, peer-&gt;status));</a>
+<a name="ln2134">      bgp_notify_send (peer, BGP_NOTIFY_FSM_ERR, 0);</a>
+<a name="ln2135">      return;</a>
+<a name="ln2136">    }</a>
+<a name="ln2137"> </a>
+<a name="ln2138">  s = peer-&gt;ibuf;</a>
+<a name="ln2139">  </a>
+<a name="ln2140">  /* Parse packet. */</a>
+<a name="ln2141">  afi = stream_getw (s);</a>
+<a name="ln2142">  /* reserved byte */</a>
+<a name="ln2143">  stream_getc (s);</a>
+<a name="ln2144">  safi = stream_getc (s);</a>
+<a name="ln2145"> </a>
+<a name="ln2146">  if (BGP_DEBUG (normal, NORMAL))</a>
+<a name="ln2147">    zlog_debug (&quot;%s rcvd REFRESH_REQ for afi/safi: %d/%d&quot;,</a>
+<a name="ln2148">	       peer-&gt;host, afi, safi);</a>
+<a name="ln2149"> </a>
+<a name="ln2150">  /* Check AFI and SAFI. */</a>
+<a name="ln2151">  if ((afi != AFI_IP &amp;&amp; afi != AFI_IP6)</a>
+<a name="ln2152">      || (safi != SAFI_UNICAST &amp;&amp; safi != SAFI_MULTICAST</a>
+<a name="ln2153">	  &amp;&amp; safi != SAFI_MPLS_LABELED_VPN))</a>
+<a name="ln2154">    {</a>
+<a name="ln2155">      if (BGP_DEBUG (normal, NORMAL))</a>
+<a name="ln2156">	{</a>
+<a name="ln2157">	  zlog_debug (&quot;%s REFRESH_REQ for unrecognized afi/safi: %d/%d - ignored&quot;,</a>
+<a name="ln2158">		     peer-&gt;host, afi, safi);</a>
+<a name="ln2159">	}</a>
+<a name="ln2160">      return;</a>
+<a name="ln2161">    }</a>
+<a name="ln2162"> </a>
+<a name="ln2163">  /* Adjust safi code. */</a>
+<a name="ln2164">  if (safi == SAFI_MPLS_LABELED_VPN)</a>
+<a name="ln2165">    safi = SAFI_MPLS_VPN;</a>
+<a name="ln2166"> </a>
+<a name="ln2167">  if (size != BGP_MSG_ROUTE_REFRESH_MIN_SIZE - BGP_HEADER_SIZE)</a>
+<a name="ln2168">    {</a>
+<a name="ln2169">      u_char *end;</a>
+<a name="ln2170">      u_char when_to_refresh;</a>
+<a name="ln2171">      u_char orf_type;</a>
+<a name="ln2172">      u_int16_t orf_len;</a>
+<a name="ln2173"> </a>
+<a name="ln2174">      if (size - (BGP_MSG_ROUTE_REFRESH_MIN_SIZE - BGP_HEADER_SIZE) &lt; 5)</a>
+<a name="ln2175">        {</a>
+<a name="ln2176">          zlog_info (&quot;%s ORF route refresh length error&quot;, peer-&gt;host);</a>
+<a name="ln2177">          bgp_notify_send (peer, BGP_NOTIFY_CEASE, 0);</a>
+<a name="ln2178">          return;</a>
+<a name="ln2179">        }</a>
+<a name="ln2180"> </a>
+<a name="ln2181">      when_to_refresh = stream_getc (s);</a>
+<a name="ln2182">      end = stream_pnt (s) + (size - 5);</a>
+<a name="ln2183"> </a>
+<a name="ln2184">      while ((stream_pnt (s) + 2) &lt; end)</a>
+<a name="ln2185">	{</a>
+<a name="ln2186">	  orf_type = stream_getc (s); </a>
+<a name="ln2187">	  orf_len = stream_getw (s);</a>
+<a name="ln2188">	  </a>
+<a name="ln2189">	  /* orf_len in bounds? */</a>
+<a name="ln2190">	  if ((stream_pnt (s) + orf_len) &gt; end)</a>
+<a name="ln2191">	    break; /* XXX: Notify instead?? */</a>
+<a name="ln2192">	  if (orf_type == ORF_TYPE_PREFIX</a>
+<a name="ln2193">	      || orf_type == ORF_TYPE_PREFIX_OLD)</a>
+<a name="ln2194">	    {</a>
+<a name="ln2195">	      uint8_t *p_pnt = stream_pnt (s);</a>
+<a name="ln2196">	      uint8_t *p_end = stream_pnt (s) + orf_len;</a>
+<a name="ln2197">	      struct orf_prefix orfp;</a>
+<a name="ln2198">	      u_char common = 0;</a>
+<a name="ln2199">	      u_int32_t seq;</a>
+<a name="ln2200">	      int psize;</a>
+<a name="ln2201">	      char name[BUFSIZ];</a>
+<a name="ln2202">	      int ret;</a>
+<a name="ln2203"> </a>
+<a name="ln2204">	      if (BGP_DEBUG (normal, NORMAL))</a>
+<a name="ln2205">		{</a>
+<a name="ln2206">		  zlog_debug (&quot;%s rcvd Prefixlist ORF(%d) length %d&quot;,</a>
+<a name="ln2207">			     peer-&gt;host, orf_type, orf_len);</a>
+<a name="ln2208">		}</a>
+<a name="ln2209"> </a>
+<a name="ln2210">              /* we're going to read at least 1 byte of common ORF header,</a>
+<a name="ln2211">               * and 7 bytes of ORF Address-filter entry from the stream</a>
+<a name="ln2212">               */</a>
+<a name="ln2213">              if (orf_len &lt; 7)</a>
+<a name="ln2214">                break; </a>
+<a name="ln2215">                </a>
+<a name="ln2216">	      /* ORF prefix-list name */</a>
+<a name="ln2217">	      sprintf (name, &quot;%s.%d.%d&quot;, peer-&gt;host, afi, safi);</a>
+<a name="ln2218"> </a>
+<a name="ln2219">	      while (p_pnt &lt; p_end)</a>
+<a name="ln2220">		{</a>
+<a name="ln2221">                  /* If the ORF entry is malformed, want to read as much of it</a>
+<a name="ln2222">                   * as possible without going beyond the bounds of the entry,</a>
+<a name="ln2223">                   * to maximise debug information.</a>
+<a name="ln2224">                   */</a>
+<a name="ln2225">		  int ok;</a>
+<a name="ln2226">		  memset (&amp;orfp, 0, sizeof (struct orf_prefix));</a>
+<a name="ln2227">		  common = *p_pnt++;</a>
+<a name="ln2228">		  /* after ++: p_pnt &lt;= p_end */</a>
+<a name="ln2229">		  if (common &amp; ORF_COMMON_PART_REMOVE_ALL)</a>
+<a name="ln2230">		    {</a>
+<a name="ln2231">		      if (BGP_DEBUG (normal, NORMAL))</a>
+<a name="ln2232">			zlog_debug (&quot;%s rcvd Remove-All pfxlist ORF request&quot;, peer-&gt;host);</a>
+<a name="ln2233">		      prefix_bgp_orf_remove_all (afi, name);</a>
+<a name="ln2234">		      break;</a>
+<a name="ln2235">		    }</a>
+<a name="ln2236">		  ok = ((size_t)(p_end - p_pnt) &gt;= sizeof(u_int32_t)) ;</a>
+<a name="ln2237">		  if (ok)</a>
+<a name="ln2238">		    {</a>
+<a name="ln2239">		      memcpy (&amp;seq, p_pnt, sizeof (u_int32_t));</a>
+<a name="ln2240">                      p_pnt += sizeof (u_int32_t);</a>
+<a name="ln2241">                      orfp.seq = ntohl (seq);</a>
+<a name="ln2242">		    }</a>
+<a name="ln2243">		  else</a>
+<a name="ln2244">		    p_pnt = p_end ;</a>
+<a name="ln2245"> </a>
+<a name="ln2246">		  if ((ok = (p_pnt &lt; p_end)))</a>
+<a name="ln2247">		    orfp.ge = *p_pnt++ ;      /* value checked in prefix_bgp_orf_set() */</a>
+<a name="ln2248">		  if ((ok = (p_pnt &lt; p_end)))</a>
+<a name="ln2249">		    orfp.le = *p_pnt++ ;      /* value checked in prefix_bgp_orf_set() */</a>
+<a name="ln2250">		  if ((ok = (p_pnt &lt; p_end)))</a>
+<a name="ln2251">		    orfp.p.prefixlen = *p_pnt++ ;</a>
+<a name="ln2252">		  orfp.p.family = afi2family (afi);   /* afi checked already  */</a>
+<a name="ln2253"> </a>
+<a name="ln2254">		  psize = PSIZE (orfp.p.prefixlen);   /* 0 if not ok          */</a>
+<a name="ln2255">		  if (psize &gt; prefix_blen(&amp;orfp.p))   /* valid for family ?   */</a>
+<a name="ln2256">		    {</a>
+<a name="ln2257">		      ok = 0 ;</a>
+<a name="ln2258">		      psize = prefix_blen(&amp;orfp.p) ;</a>
+<a name="ln2259">		    }</a>
+<a name="ln2260">		  if (psize &gt; (p_end - p_pnt))        /* valid for packet ?   */</a>
+<a name="ln2261">		    {</a>
+<a name="ln2262">		      ok = 0 ;</a>
+<a name="ln2263">		      psize = p_end - p_pnt ;</a>
+<a name="ln2264">		    }</a>
+<a name="ln2265"> </a>
+<a name="ln2266">		  if (psize &gt; 0)</a>
+<a name="ln2267">		    memcpy (&amp;orfp.p.u.prefix, p_pnt, psize);</a>
+<a name="ln2268">		  p_pnt += psize;</a>
+<a name="ln2269"> </a>
+<a name="ln2270">		  if (BGP_DEBUG (normal, NORMAL))</a>
+<a name="ln2271">		    {</a>
+<a name="ln2272">		      char buf[INET6_BUFSIZ];</a>
+<a name="ln2273"> </a>
+<a name="ln2274">		      zlog_debug (&quot;%s rcvd %s %s seq %u %s/%d ge %d le %d%s&quot;,</a>
+<a name="ln2275">			         peer-&gt;host,</a>
+<a name="ln2276">			         (common &amp; ORF_COMMON_PART_REMOVE ? &quot;Remove&quot; : &quot;Add&quot;),</a>
+<a name="ln2277">			         (common &amp; ORF_COMMON_PART_DENY ? &quot;deny&quot; : &quot;permit&quot;),</a>
+<a name="ln2278">			         orfp.seq,</a>
+<a name="ln2279">			         inet_ntop (orfp.p.family, &amp;orfp.p.u.prefix, buf, INET6_BUFSIZ),</a>
+<a name="ln2280">			         orfp.p.prefixlen, orfp.ge, orfp.le,</a>
+<a name="ln2281">			         ok ? &quot;&quot; : &quot; MALFORMED&quot;);</a>
+<a name="ln2282">		    }</a>
+<a name="ln2283"> </a>
+<a name="ln2284">		  if (ok)</a>
+<a name="ln2285">		    ret = prefix_bgp_orf_set (name, afi, &amp;orfp,</a>
+<a name="ln2286">				   (common &amp; ORF_COMMON_PART_DENY ? 0 : 1 ),</a>
+<a name="ln2287">				   (common &amp; ORF_COMMON_PART_REMOVE ? 0 : 1));</a>
+<a name="ln2288">                  </a>
+<a name="ln2289">		  if (!ok || (ok &amp;&amp; ret != CMD_SUCCESS))</a>
+<a name="ln2290">		    {</a>
+<a name="ln2291">		      if (BGP_DEBUG (normal, NORMAL))</a>
+<a name="ln2292">			zlog_debug (&quot;%s Received misformatted prefixlist ORF.&quot;</a>
+<a name="ln2293">			            &quot; Remove All pfxlist&quot;, peer-&gt;host);</a>
+<a name="ln2294">		      prefix_bgp_orf_remove_all (afi, name);</a>
+<a name="ln2295">		      break;</a>
+<a name="ln2296">		    }</a>
+<a name="ln2297">		}</a>
+<a name="ln2298">	      peer-&gt;orf_plist[afi][safi] =</a>
+<a name="ln2299">			 prefix_bgp_orf_lookup (afi, name);</a>
+<a name="ln2300">	    }</a>
+<a name="ln2301">	  stream_forward_getp (s, orf_len);</a>
+<a name="ln2302">	}</a>
+<a name="ln2303">      if (BGP_DEBUG (normal, NORMAL))</a>
+<a name="ln2304">	zlog_debug (&quot;%s rcvd Refresh %s ORF request&quot;, peer-&gt;host,</a>
+<a name="ln2305">		   when_to_refresh == REFRESH_DEFER ? &quot;Defer&quot; : &quot;Immediate&quot;);</a>
+<a name="ln2306">      if (when_to_refresh == REFRESH_DEFER)</a>
+<a name="ln2307">	return;</a>
+<a name="ln2308">    }</a>
+<a name="ln2309"> </a>
+<a name="ln2310">  /* First update is deferred until ORF or ROUTE-REFRESH is received */</a>
+<a name="ln2311">  if (CHECK_FLAG (peer-&gt;af_sflags[afi][safi], PEER_STATUS_ORF_WAIT_REFRESH))</a>
+<a name="ln2312">    UNSET_FLAG (peer-&gt;af_sflags[afi][safi], PEER_STATUS_ORF_WAIT_REFRESH);</a>
+<a name="ln2313"> </a>
+<a name="ln2314">  /* Perform route refreshment to the peer */</a>
+<a name="ln2315">  bgp_announce_route (peer, afi, safi);</a>
+<a name="ln2316">}</a>
+<a name="ln2317"> </a>
+<a name="ln2318">static int</a>
+<a name="ln2319">bgp_capability_msg_parse (struct peer *peer, u_char *pnt, bgp_size_t length)</a>
+<a name="ln2320">{</a>
+<a name="ln2321">  u_char *end;</a>
+<a name="ln2322">  struct capability_mp_data mpc;</a>
+<a name="ln2323">  struct capability_header *hdr;</a>
+<a name="ln2324">  u_char action;</a>
+<a name="ln2325">  afi_t afi;</a>
+<a name="ln2326">  safi_t safi;</a>
+<a name="ln2327"> </a>
+<a name="ln2328">  end = pnt + length;</a>
+<a name="ln2329"> </a>
+<a name="ln2330">  /* XXX: Streamify this */</a>
+<a name="ln2331">  for (; pnt &lt; end; pnt += hdr-&gt;length + 3)</a>
+<a name="ln2332">    {      </a>
+<a name="ln2333">      /* We need at least action, capability code and capability length. */</a>
+<a name="ln2334">      if (pnt + 3 &gt; end)</a>
+<a name="ln2335">        {</a>
+<a name="ln2336">          zlog_info (&quot;%s Capability length error&quot;, peer-&gt;host);</a>
+<a name="ln2337">          bgp_notify_send (peer, BGP_NOTIFY_CEASE, 0);</a>
+<a name="ln2338">          return -1;</a>
+<a name="ln2339">        }</a>
+<a name="ln2340">      action = *pnt;</a>
+<a name="ln2341">      hdr = (struct capability_header *)(pnt + 1);</a>
+<a name="ln2342">      </a>
+<a name="ln2343">      /* Action value check.  */</a>
+<a name="ln2344">      if (action != CAPABILITY_ACTION_SET</a>
+<a name="ln2345">	  &amp;&amp; action != CAPABILITY_ACTION_UNSET)</a>
+<a name="ln2346">        {</a>
+<a name="ln2347">          zlog_info (&quot;%s Capability Action Value error %d&quot;,</a>
+<a name="ln2348">		     peer-&gt;host, action);</a>
+<a name="ln2349">          bgp_notify_send (peer, BGP_NOTIFY_CEASE, 0);</a>
+<a name="ln2350">          return -1;</a>
+<a name="ln2351">        }</a>
+<a name="ln2352"> </a>
+<a name="ln2353">      if (BGP_DEBUG (normal, NORMAL))</a>
+<a name="ln2354">	zlog_debug (&quot;%s CAPABILITY has action: %d, code: %u, length %u&quot;,</a>
+<a name="ln2355">		   peer-&gt;host, action, hdr-&gt;code, hdr-&gt;length);</a>
+<a name="ln2356"> </a>
+<a name="ln2357">      /* Capability length check. */</a>
+<a name="ln2358">      if ((pnt + hdr-&gt;length + 3) &gt; end)</a>
+<a name="ln2359">        {</a>
+<a name="ln2360">          zlog_info (&quot;%s Capability length error&quot;, peer-&gt;host);</a>
+<a name="ln2361">          bgp_notify_send (peer, BGP_NOTIFY_CEASE, 0);</a>
+<a name="ln2362">          return -1;</a>
+<a name="ln2363">        }</a>
+<a name="ln2364"> </a>
+<a name="ln2365">      /* Fetch structure to the byte stream. */</a>
+<a name="ln2366">      memcpy (&amp;mpc, pnt + 3, sizeof (struct capability_mp_data));</a>
+<a name="ln2367"> </a>
+<a name="ln2368">      /* We know MP Capability Code. */</a>
+<a name="ln2369">      if (hdr-&gt;code == CAPABILITY_CODE_MP)</a>
+<a name="ln2370">        {</a>
+<a name="ln2371">	  afi = ntohs (mpc.afi);</a>
+<a name="ln2372">	  safi = mpc.safi;</a>
+<a name="ln2373"> </a>
+<a name="ln2374">          /* Ignore capability when override-capability is set. */</a>
+<a name="ln2375">          if (CHECK_FLAG (peer-&gt;flags, PEER_FLAG_OVERRIDE_CAPABILITY))</a>
+<a name="ln2376">	    continue;</a>
+<a name="ln2377">          </a>
+<a name="ln2378">          if (!bgp_afi_safi_valid_indices (afi, &amp;safi))</a>
+<a name="ln2379">            {</a>
+<a name="ln2380">              if (BGP_DEBUG (normal, NORMAL))</a>
+<a name="ln2381">                zlog_debug (&quot;%s Dynamic Capability MP_EXT afi/safi invalid &quot;</a>
+<a name="ln2382">                            &quot;(%u/%u)&quot;, peer-&gt;host, afi, safi);</a>
+<a name="ln2383">              continue;</a>
+<a name="ln2384">            }</a>
+<a name="ln2385">          </a>
+<a name="ln2386">	  /* Address family check.  */</a>
+<a name="ln2387">          if (BGP_DEBUG (normal, NORMAL))</a>
+<a name="ln2388">            zlog_debug (&quot;%s CAPABILITY has %s MP_EXT CAP for afi/safi: %u/%u&quot;,</a>
+<a name="ln2389">                       peer-&gt;host,</a>
+<a name="ln2390">                       action == CAPABILITY_ACTION_SET </a>
+<a name="ln2391">                       ? &quot;Advertising&quot; : &quot;Removing&quot;,</a>
+<a name="ln2392">                       ntohs(mpc.afi) , mpc.safi);</a>
+<a name="ln2393">              </a>
+<a name="ln2394">          if (action == CAPABILITY_ACTION_SET)</a>
+<a name="ln2395">            {</a>
+<a name="ln2396">              peer-&gt;afc_recv[afi][safi] = 1;</a>
+<a name="ln2397">              if (peer-&gt;afc[afi][safi])</a>
+<a name="ln2398">                {</a>
+<a name="ln2399">                  peer-&gt;afc_nego[afi][safi] = 1;</a>
+<a name="ln2400">                  bgp_announce_route (peer, afi, safi);</a>
+<a name="ln2401">                }</a>
+<a name="ln2402">            }</a>
+<a name="ln2403">          else</a>
+<a name="ln2404">            {</a>
+<a name="ln2405">              peer-&gt;afc_recv[afi][safi] = 0;</a>
+<a name="ln2406">              peer-&gt;afc_nego[afi][safi] = 0;</a>
+<a name="ln2407"> </a>
+<a name="ln2408">              if (peer_active_nego (peer))</a>
+<a name="ln2409">                bgp_clear_route (peer, afi, safi, BGP_CLEAR_ROUTE_NORMAL);</a>
+<a name="ln2410">              else</a>
+<a name="ln2411">                BGP_EVENT_ADD (peer, BGP_Stop);</a>
+<a name="ln2412">            }</a>
+<a name="ln2413">        }</a>
+<a name="ln2414">      else</a>
+<a name="ln2415">        {</a>
+<a name="ln2416">          zlog_warn (&quot;%s unrecognized capability code: %d - ignored&quot;,</a>
+<a name="ln2417">                     peer-&gt;host, hdr-&gt;code);</a>
+<a name="ln2418">        }</a>
+<a name="ln2419">    }</a>
+<a name="ln2420">  return 0;</a>
+<a name="ln2421">}</a>
+<a name="ln2422"> </a>
+<a name="ln2423">/* Dynamic Capability is received. </a>
+<a name="ln2424"> *</a>
+<a name="ln2425"> * This is exported for unit-test purposes</a>
+<a name="ln2426"> */</a>
+<a name="ln2427">int</a>
+<a name="ln2428">bgp_capability_receive (struct peer *peer, bgp_size_t size)</a>
+<a name="ln2429">{</a>
+<a name="ln2430">  u_char *pnt;</a>
+<a name="ln2431"> </a>
+<a name="ln2432">  /* Fetch pointer. */</a>
+<a name="ln2433">  pnt = stream_pnt (peer-&gt;ibuf);</a>
+<a name="ln2434"> </a>
+<a name="ln2435">  if (BGP_DEBUG (normal, NORMAL))</a>
+<a name="ln2436">    zlog_debug (&quot;%s rcv CAPABILITY&quot;, peer-&gt;host);</a>
+<a name="ln2437"> </a>
+<a name="ln2438">  /* If peer does not have the capability, send notification. */</a>
+<a name="ln2439">  if (! CHECK_FLAG (peer-&gt;cap, PEER_CAP_DYNAMIC_ADV))</a>
+<a name="ln2440">    {</a>
+<a name="ln2441">      plog_err (peer-&gt;log, &quot;%s [Error] BGP dynamic capability is not enabled&quot;,</a>
+<a name="ln2442">		peer-&gt;host);</a>
+<a name="ln2443">      bgp_notify_send (peer,</a>
+<a name="ln2444">		       BGP_NOTIFY_HEADER_ERR,</a>
+<a name="ln2445">		       BGP_NOTIFY_HEADER_BAD_MESTYPE);</a>
+<a name="ln2446">      return -1;</a>
+<a name="ln2447">    }</a>
+<a name="ln2448"> </a>
+<a name="ln2449">  /* Status must be Established. */</a>
+<a name="ln2450">  if (peer-&gt;status != Established)</a>
+<a name="ln2451">    {</a>
+<a name="ln2452">      plog_err (peer-&gt;log,</a>
+<a name="ln2453">		&quot;%s [Error] Dynamic capability packet received under status %s&quot;, peer-&gt;host, LOOKUP (bgp_status_msg, peer-&gt;status));</a>
+<a name="ln2454">      bgp_notify_send (peer, BGP_NOTIFY_FSM_ERR, 0);</a>
+<a name="ln2455">      return -1;</a>
+<a name="ln2456">    }</a>
+<a name="ln2457"> </a>
+<a name="ln2458">  /* Parse packet. */</a>
+<a name="ln2459">  return bgp_capability_msg_parse (peer, pnt, size);</a>
+<a name="ln2460">}</a>
+<a name="ln2461"> </a>
+<a name="ln2462">/* BGP read utility function. */</a>
+<a name="ln2463">static int</a>
+<a name="ln2464">bgp_read_packet (struct peer *peer)</a>
+<a name="ln2465">{</a>
+<a name="ln2466">  int nbytes;</a>
+<a name="ln2467">  int readsize;</a>
+<a name="ln2468"> </a>
+<a name="ln2469">  readsize = peer-&gt;packet_size - stream_get_endp (peer-&gt;ibuf);</a>
+<a name="ln2470"> </a>
+<a name="ln2471">  /* If size is zero then return. */</a>
+<a name="ln2472">  if (! readsize)</a>
+<a name="ln2473">    return 0;</a>
+<a name="ln2474"> </a>
+<a name="ln2475">  /* Read packet from fd. */</a>
+<a name="ln2476">  nbytes = stream_read_try (peer-&gt;ibuf, peer-&gt;fd, readsize);</a>
+<a name="ln2477"> </a>
+<a name="ln2478">  /* If read byte is smaller than zero then error occurred. */</a>
+<a name="ln2479">  if (nbytes &lt; 0) </a>
+<a name="ln2480">    {</a>
+<a name="ln2481">      /* Transient error should retry */</a>
+<a name="ln2482">      if (nbytes == -2)</a>
+<a name="ln2483">	return -1;</a>
+<a name="ln2484"> </a>
+<a name="ln2485">      plog_err (peer-&gt;log, &quot;%s [Error] bgp_read_packet error: %s&quot;,</a>
+<a name="ln2486">		 peer-&gt;host, safe_strerror (errno));</a>
+<a name="ln2487"> </a>
+<a name="ln2488">      if (peer-&gt;status == Established) </a>
+<a name="ln2489">	{</a>
+<a name="ln2490">	  if (CHECK_FLAG (peer-&gt;sflags, PEER_STATUS_NSF_MODE))</a>
+<a name="ln2491">	    {</a>
+<a name="ln2492">	      peer-&gt;last_reset = PEER_DOWN_NSF_CLOSE_SESSION;</a>
+<a name="ln2493">	      SET_FLAG (peer-&gt;sflags, PEER_STATUS_NSF_WAIT);</a>
+<a name="ln2494">	    }</a>
+<a name="ln2495">	  else</a>
+<a name="ln2496">	    peer-&gt;last_reset = PEER_DOWN_CLOSE_SESSION;</a>
+<a name="ln2497">	}</a>
+<a name="ln2498"> </a>
+<a name="ln2499">      BGP_EVENT_ADD (peer, TCP_fatal_error);</a>
+<a name="ln2500">      return -1;</a>
+<a name="ln2501">    }  </a>
+<a name="ln2502"> </a>
+<a name="ln2503">  /* When read byte is zero : clear bgp peer and return */</a>
+<a name="ln2504">  if (nbytes == 0) </a>
+<a name="ln2505">    {</a>
+<a name="ln2506">      if (BGP_DEBUG (events, EVENTS))</a>
+<a name="ln2507">	plog_debug (peer-&gt;log, &quot;%s [Event] BGP connection closed fd %d&quot;,</a>
+<a name="ln2508">		   peer-&gt;host, peer-&gt;fd);</a>
+<a name="ln2509"> </a>
+<a name="ln2510">      if (peer-&gt;status == Established) </a>
+<a name="ln2511">	{</a>
+<a name="ln2512">	  if (CHECK_FLAG (peer-&gt;sflags, PEER_STATUS_NSF_MODE))</a>
+<a name="ln2513">	    {</a>
+<a name="ln2514">	      peer-&gt;last_reset = PEER_DOWN_NSF_CLOSE_SESSION;</a>
+<a name="ln2515">	      SET_FLAG (peer-&gt;sflags, PEER_STATUS_NSF_WAIT);</a>
+<a name="ln2516">	    }</a>
+<a name="ln2517">	  else</a>
+<a name="ln2518">	    peer-&gt;last_reset = PEER_DOWN_CLOSE_SESSION;</a>
+<a name="ln2519">	}</a>
+<a name="ln2520"> </a>
+<a name="ln2521">      BGP_EVENT_ADD (peer, TCP_connection_closed);</a>
+<a name="ln2522">      return -1;</a>
+<a name="ln2523">    }</a>
+<a name="ln2524"> </a>
+<a name="ln2525">  /* We read partial packet. */</a>
+<a name="ln2526">  if (stream_get_endp (peer-&gt;ibuf) != peer-&gt;packet_size)</a>
+<a name="ln2527">    return -1;</a>
+<a name="ln2528"> </a>
+<a name="ln2529">  return 0;</a>
+<a name="ln2530">}</a>
+<a name="ln2531"> </a>
+<a name="ln2532">/* Marker check. */</a>
+<a name="ln2533">static int</a>
+<a name="ln2534">bgp_marker_all_one (struct stream *s, int length)</a>
+<a name="ln2535">{</a>
+<a name="ln2536">  int i;</a>
+<a name="ln2537"> </a>
+<a name="ln2538">  for (i = 0; i &lt; length; i++)</a>
+<a name="ln2539">    if (s-&gt;data[i] != 0xff)</a>
+<a name="ln2540">      return 0;</a>
+<a name="ln2541"> </a>
+<a name="ln2542">  return 1;</a>
+<a name="ln2543">}</a>
+<a name="ln2544"> </a>
+<a name="ln2545">/* Recent thread time.</a>
+<a name="ln2546">   On same clock base as bgp_clock (MONOTONIC)</a>
+<a name="ln2547">   but can be time of last context switch to bgp_read thread. */</a>
+<a name="ln2548">static time_t</a>
+<a name="ln2549">bgp_recent_clock (void)</a>
+<a name="ln2550">{</a>
+<a name="ln2551">  return recent_relative_time().tv_sec;</a>
+<a name="ln2552">}</a>
+<a name="ln2553"> </a>
+<a name="ln2554">/* Starting point of packet process function. */</a>
+<a name="ln2555">int</a>
+<a name="ln2556">bgp_read (struct thread *thread)</a>
+<a name="ln2557">{</a>
+<a name="ln2558">  int ret;</a>
+<a name="ln2559">  u_char type = 0;</a>
+<a name="ln2560">  struct peer *peer;</a>
+<a name="ln2561">  bgp_size_t size;</a>
+<a name="ln2562">  char notify_data_length[2];</a>
+<a name="ln2563"> </a>
+<a name="ln2564">  /* Yes first of all get peer pointer. */</a>
+<a name="ln2565">  peer = THREAD_ARG (thread);</a>
+<a name="ln2566">  peer-&gt;t_read = NULL;</a>
+<a name="ln2567"> </a>
+<a name="ln2568">  /* For non-blocking IO check. */</a>
+<a name="ln2569">  if (peer-&gt;status == Connect)</a>
+<a name="ln2570">    {</a>
+<a name="ln2571">      bgp_connect_check (peer);</a>
+<a name="ln2572">      goto done;</a>
+<a name="ln2573">    }</a>
+<a name="ln2574">  else</a>
+<a name="ln2575">    {</a>
+<a name="ln2576">      if (peer-&gt;fd &lt; 0)</a>
+<a name="ln2577">	{</a>
+<a name="ln2578">	  zlog_err (&quot;bgp_read peer's fd is negative value %d&quot;, peer-&gt;fd);</a>
+<a name="ln2579">	  return -1;</a>
+<a name="ln2580">	}</a>
+<a name="ln2581">      BGP_READ_ON (peer-&gt;t_read, bgp_read, peer-&gt;fd);</a>
+<a name="ln2582">    }</a>
+<a name="ln2583"> </a>
+<a name="ln2584">  /* Read packet header to determine type of the packet */</a>
+<a name="ln2585">  if (peer-&gt;packet_size == 0)</a>
+<a name="ln2586">    peer-&gt;packet_size = BGP_HEADER_SIZE;</a>
+<a name="ln2587"> </a>
+<a name="ln2588">  if (stream_get_endp (peer-&gt;ibuf) &lt; BGP_HEADER_SIZE)</a>
+<a name="ln2589">    {</a>
+<a name="ln2590">      ret = bgp_read_packet (peer);</a>
+<a name="ln2591"> </a>
+<a name="ln2592">      /* Header read error or partial read packet. */</a>
+<a name="ln2593">      if (ret &lt; 0) </a>
+<a name="ln2594">	goto done;</a>
+<a name="ln2595"> </a>
+<a name="ln2596">      /* Get size and type. */</a>
+<a name="ln2597">      stream_forward_getp (peer-&gt;ibuf, BGP_MARKER_SIZE);</a>
+<a name="ln2598">      memcpy (notify_data_length, stream_pnt (peer-&gt;ibuf), 2);</a>
+<a name="ln2599">      size = stream_getw (peer-&gt;ibuf);</a>
+<a name="ln2600">      type = stream_getc (peer-&gt;ibuf);</a>
+<a name="ln2601"> </a>
+<a name="ln2602">      if (BGP_DEBUG (normal, NORMAL) &amp;&amp; type != 2 &amp;&amp; type != 0)</a>
+<a name="ln2603">	zlog_debug (&quot;%s rcv message type %d, length (excl. header) %d&quot;,</a>
+<a name="ln2604">		   peer-&gt;host, type, size - BGP_HEADER_SIZE);</a>
+<a name="ln2605"> </a>
+<a name="ln2606">      /* Marker check */</a>
+<a name="ln2607">      if (((type == BGP_MSG_OPEN) || (type == BGP_MSG_KEEPALIVE))</a>
+<a name="ln2608">	  &amp;&amp; ! bgp_marker_all_one (peer-&gt;ibuf, BGP_MARKER_SIZE))</a>
+<a name="ln2609">	{</a>
+<a name="ln2610">	  bgp_notify_send (peer,</a>
+<a name="ln2611">			   BGP_NOTIFY_HEADER_ERR, </a>
+<a name="ln2612">			   BGP_NOTIFY_HEADER_NOT_SYNC);</a>
+<a name="ln2613">	  goto done;</a>
+<a name="ln2614">	}</a>
+<a name="ln2615"> </a>
+<a name="ln2616">      /* BGP type check. */</a>
+<a name="ln2617">      if (type != BGP_MSG_OPEN &amp;&amp; type != BGP_MSG_UPDATE </a>
+<a name="ln2618">	  &amp;&amp; type != BGP_MSG_NOTIFY &amp;&amp; type != BGP_MSG_KEEPALIVE </a>
+<a name="ln2619">	  &amp;&amp; type != BGP_MSG_ROUTE_REFRESH_NEW</a>
+<a name="ln2620">	  &amp;&amp; type != BGP_MSG_ROUTE_REFRESH_OLD</a>
+<a name="ln2621">	  &amp;&amp; type != BGP_MSG_CAPABILITY)</a>
+<a name="ln2622">	{</a>
+<a name="ln2623">	  if (BGP_DEBUG (normal, NORMAL))</a>
+<a name="ln2624">	    plog_debug (peer-&gt;log,</a>
+<a name="ln2625">		      &quot;%s unknown message type 0x%02x&quot;,</a>
+<a name="ln2626">		      peer-&gt;host, type);</a>
+<a name="ln2627">	  bgp_notify_send_with_data (peer,</a>
+<a name="ln2628">				     BGP_NOTIFY_HEADER_ERR,</a>
+<a name="ln2629">			 	     BGP_NOTIFY_HEADER_BAD_MESTYPE,</a>
+<a name="ln2630">				     &amp;type, 1);</a>
+<a name="ln2631">	  goto done;</a>
+<a name="ln2632">	}</a>
+<a name="ln2633">      /* Mimimum packet length check. */</a>
+<a name="ln2634">      if ((size &lt; BGP_HEADER_SIZE)</a>
+<a name="ln2635">	  || (size &gt; BGP_MAX_PACKET_SIZE)</a>
+<a name="ln2636">	  || (type == BGP_MSG_OPEN &amp;&amp; size &lt; BGP_MSG_OPEN_MIN_SIZE)</a>
+<a name="ln2637">	  || (type == BGP_MSG_UPDATE &amp;&amp; size &lt; BGP_MSG_UPDATE_MIN_SIZE)</a>
+<a name="ln2638">	  || (type == BGP_MSG_NOTIFY &amp;&amp; size &lt; BGP_MSG_NOTIFY_MIN_SIZE)</a>
+<a name="ln2639">	  || (type == BGP_MSG_KEEPALIVE &amp;&amp; size != BGP_MSG_KEEPALIVE_MIN_SIZE)</a>
+<a name="ln2640">	  || (type == BGP_MSG_ROUTE_REFRESH_NEW &amp;&amp; size &lt; BGP_MSG_ROUTE_REFRESH_MIN_SIZE)</a>
+<a name="ln2641">	  || (type == BGP_MSG_ROUTE_REFRESH_OLD &amp;&amp; size &lt; BGP_MSG_ROUTE_REFRESH_MIN_SIZE)</a>
+<a name="ln2642">	  || (type == BGP_MSG_CAPABILITY &amp;&amp; size &lt; BGP_MSG_CAPABILITY_MIN_SIZE))</a>
+<a name="ln2643">	{</a>
+<a name="ln2644">	  if (BGP_DEBUG (normal, NORMAL))</a>
+<a name="ln2645">	    plog_debug (peer-&gt;log,</a>
+<a name="ln2646">		      &quot;%s bad message length - %d for %s&quot;,</a>
+<a name="ln2647">		      peer-&gt;host, size, </a>
+<a name="ln2648">		      type == 128 ? &quot;ROUTE-REFRESH&quot; :</a>
+<a name="ln2649">		      bgp_type_str[(int) type]);</a>
+<a name="ln2650">	  bgp_notify_send_with_data (peer,</a>
+<a name="ln2651">				     BGP_NOTIFY_HEADER_ERR,</a>
+<a name="ln2652">			  	     BGP_NOTIFY_HEADER_BAD_MESLEN,</a>
+<a name="ln2653">				     (u_char *) notify_data_length, 2);</a>
+<a name="ln2654">	  goto done;</a>
+<a name="ln2655">	}</a>
+<a name="ln2656"> </a>
+<a name="ln2657">      /* Adjust size to message length. */</a>
+<a name="ln2658">      peer-&gt;packet_size = size;</a>
+<a name="ln2659">    }</a>
+<a name="ln2660"> </a>
+<a name="ln2661">  ret = bgp_read_packet (peer);</a>
+<a name="ln2662">  if (ret &lt; 0) </a>
+<a name="ln2663">    goto done;</a>
+<a name="ln2664"> </a>
+<a name="ln2665">  /* Get size and type again. */</a>
+<a name="ln2666">  size = stream_getw_from (peer-&gt;ibuf, BGP_MARKER_SIZE);</a>
+<a name="ln2667">  type = stream_getc_from (peer-&gt;ibuf, BGP_MARKER_SIZE + 2);</a>
+<a name="ln2668"> </a>
+<a name="ln2669">  /* BGP packet dump function. */</a>
+<a name="ln2670">  bgp_dump_packet (peer, type, peer-&gt;ibuf);</a>
+<a name="ln2671">  </a>
+<a name="ln2672">  size = (peer-&gt;packet_size - BGP_HEADER_SIZE);</a>
+<a name="ln2673"> </a>
+<a name="ln2674">  /* Read rest of the packet and call each sort of packet routine */</a>
+<a name="ln2675">  switch (type) </a>
+<a name="ln2676">    {</a>
+<a name="ln2677">    case BGP_MSG_OPEN:</a>
+<a name="ln2678">      peer-&gt;open_in++;</a>
+<a name="ln2679">      bgp_open_receive (peer, size); /* XXX return value ignored! */</a>
+<a name="ln2680">      break;</a>
+<a name="ln2681">    case BGP_MSG_UPDATE:</a>
+<a name="ln2682">      peer-&gt;readtime = bgp_recent_clock ();</a>
+<a name="ln2683">      bgp_update_receive (peer, size);</a>
+<a name="ln2684">      break;</a>
+<a name="ln2685">    case BGP_MSG_NOTIFY:</a>
+<a name="ln2686">      bgp_notify_receive (peer, size);</a>
+<a name="ln2687">      break;</a>
+<a name="ln2688">    case BGP_MSG_KEEPALIVE:</a>
+<a name="ln2689">      peer-&gt;readtime = bgp_recent_clock ();</a>
+<a name="ln2690">      bgp_keepalive_receive (peer, size);</a>
+<a name="ln2691">      break;</a>
+<a name="ln2692">    case BGP_MSG_ROUTE_REFRESH_NEW:</a>
+<a name="ln2693">    case BGP_MSG_ROUTE_REFRESH_OLD:</a>
+<a name="ln2694">      peer-&gt;refresh_in++;</a>
+<a name="ln2695">      bgp_route_refresh_receive (peer, size);</a>
+<a name="ln2696">      break;</a>
+<a name="ln2697">    case BGP_MSG_CAPABILITY:</a>
+<a name="ln2698">      peer-&gt;dynamic_cap_in++;</a>
+<a name="ln2699">      bgp_capability_receive (peer, size);</a>
+<a name="ln2700">      break;</a>
+<a name="ln2701">    }</a>
+<a name="ln2702"> </a>
+<a name="ln2703">  /* Clear input buffer. */</a>
+<a name="ln2704">  peer-&gt;packet_size = 0;</a>
+<a name="ln2705">  if (peer-&gt;ibuf)</a>
+<a name="ln2706">    stream_reset (peer-&gt;ibuf);</a>
+<a name="ln2707"> </a>
+<a name="ln2708"> done:</a>
+<a name="ln2709">  if (CHECK_FLAG (peer-&gt;sflags, PEER_STATUS_ACCEPT_PEER))</a>
+<a name="ln2710">    {</a>
+<a name="ln2711">      if (BGP_DEBUG (events, EVENTS))</a>
+<a name="ln2712">	zlog_debug (&quot;%s [Event] Accepting BGP peer delete&quot;, peer-&gt;host);</a>
+<a name="ln2713">      peer_delete (peer);</a>
+<a name="ln2714">    }</a>
+<a name="ln2715">  return 0;</a>
+<a name="ln2716">}</a>
+
+</code></pre>
+<div class="balloon" rel="7"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1042/" target="_blank">V1042</a> This file is marked with copyleft license, which requires you to open the derived source code.</p></div>
+<div class="balloon" rel="192"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v641/" target="_blank">V641</a> The size of the '& rn->prn->p' buffer is not a multiple of the element size of the type 'struct prefix_rd'.</p></div>
+<div class="balloon" rel="252"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v641/" target="_blank">V641</a> The size of the '& rn->prn->p' buffer is not a multiple of the element size of the type 'struct prefix_rd'.</p></div>
+<div class="balloon" rel="406"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v641/" target="_blank">V641</a> The size of the '& rn->prn->p' buffer is not a multiple of the element size of the type 'struct prefix_rd'.</p></div>
+<div class="balloon" rel="1984"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v768/" target="_blank">V768</a> The variable 'afi' is of enum type. It is odd that it is used as a variable of a Boolean-type.</p></div>
+<div class="balloon" rel="1991"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v614/" target="_blank">V614</a> Potentially uninitialized variable 'safi' used.</p></div>
+<div class="balloon" rel="2289"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v728/" target="_blank">V728</a> An excessive check can be simplified. The '||' operator is surrounded by opposite expressions '!ok' and 'ok'. </p></div>
+<div class="balloon" rel="2672"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v519/" target="_blank">V519</a> The 'size' variable is assigned values twice successively. Perhaps this is a mistake. Check lines: 2666, 2672.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

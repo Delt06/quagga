@@ -1,0 +1,700 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>isis_dlpi.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.5.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * IS-IS Rout(e)ing protocol - isis_dlpi.c</a>
+<a name="ln3"> *</a>
+<a name="ln4"> * Copyright (C) 2001,2002    Sampo Saaristo</a>
+<a name="ln5"> *                            Tampere University of Technology      </a>
+<a name="ln6"> *                            Institute of Communications Engineering</a>
+<a name="ln7"> *</a>
+<a name="ln8"> * This program is free software; you can redistribute it and/or modify it </a>
+<a name="ln9"> * under the terms of the GNU General Public Licenseas published by the Free </a>
+<a name="ln10"> * Software Foundation; either version 2 of the License, or (at your option) </a>
+<a name="ln11"> * any later version.</a>
+<a name="ln12"> *</a>
+<a name="ln13"> * This program is distributed in the hope that it will be useful,but WITHOUT </a>
+<a name="ln14"> * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or </a>
+<a name="ln15"> * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for </a>
+<a name="ln16"> * more details.</a>
+<a name="ln17"> </a>
+<a name="ln18"> * You should have received a copy of the GNU General Public License along </a>
+<a name="ln19"> * with this program; if not, write to the Free Software Foundation, Inc., </a>
+<a name="ln20"> * 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.</a>
+<a name="ln21"> */</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &lt;zebra.h&gt;</a>
+<a name="ln24">#if ISIS_METHOD == ISIS_METHOD_DLPI</a>
+<a name="ln25">#include &lt;net/if.h&gt;</a>
+<a name="ln26">#include &lt;netinet/if_ether.h&gt;</a>
+<a name="ln27">#include &lt;sys/types.h&gt;</a>
+<a name="ln28">#include &lt;unistd.h&gt;</a>
+<a name="ln29">#include &lt;fcntl.h&gt;</a>
+<a name="ln30">#include &lt;stropts.h&gt;</a>
+<a name="ln31">#include &lt;poll.h&gt;</a>
+<a name="ln32">#include &lt;sys/dlpi.h&gt;</a>
+<a name="ln33">#include &lt;sys/pfmod.h&gt;</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &quot;log.h&quot;</a>
+<a name="ln36">#include &quot;network.h&quot;</a>
+<a name="ln37">#include &quot;stream.h&quot;</a>
+<a name="ln38">#include &quot;if.h&quot;</a>
+<a name="ln39"> </a>
+<a name="ln40">#include &quot;isisd/dict.h&quot;</a>
+<a name="ln41">#include &quot;isisd/include-netbsd/iso.h&quot;</a>
+<a name="ln42">#include &quot;isisd/isis_constants.h&quot;</a>
+<a name="ln43">#include &quot;isisd/isis_common.h&quot;</a>
+<a name="ln44">#include &quot;isisd/isis_circuit.h&quot;</a>
+<a name="ln45">#include &quot;isisd/isis_flags.h&quot;</a>
+<a name="ln46">#include &quot;isisd/isisd.h&quot;</a>
+<a name="ln47">#include &quot;isisd/isis_network.h&quot;</a>
+<a name="ln48"> </a>
+<a name="ln49">#include &quot;privs.h&quot;</a>
+<a name="ln50"> </a>
+<a name="ln51">extern struct zebra_privs_t isisd_privs;</a>
+<a name="ln52"> </a>
+<a name="ln53">static t_uscalar_t dlpi_ctl[1024];	/* DLPI control messages */</a>
+<a name="ln54"> </a>
+<a name="ln55">/*</a>
+<a name="ln56"> * Table 9 - Architectural constants for use with ISO 8802 subnetworks</a>
+<a name="ln57"> * ISO 10589 - 8.4.8</a>
+<a name="ln58"> */</a>
+<a name="ln59"> </a>
+<a name="ln60">u_char ALL_L1_ISS[6] = { 0x01, 0x80, 0xC2, 0x00, 0x00, 0x14 };</a>
+<a name="ln61">u_char ALL_L2_ISS[6] = { 0x01, 0x80, 0xC2, 0x00, 0x00, 0x15 };</a>
+<a name="ln62">u_char ALL_ISS[6] = { 0x09, 0x00, 0x2B, 0x00, 0x00, 0x05 };</a>
+<a name="ln63">u_char ALL_ESS[6] = { 0x09, 0x00, 0x2B, 0x00, 0x00, 0x04 };</a>
+<a name="ln64"> </a>
+<a name="ln65">static u_char sock_buff[8192];</a>
+<a name="ln66"> </a>
+<a name="ln67">static u_short pf_filter[] =</a>
+<a name="ln68">{</a>
+<a name="ln69">  ENF_PUSHWORD + 0,		/* Get the SSAP/DSAP values */</a>
+<a name="ln70">  ENF_PUSHLIT | ENF_CAND,	/* Check them */</a>
+<a name="ln71">  ISO_SAP | (ISO_SAP &lt;&lt; 8),</a>
+<a name="ln72">  ENF_PUSHWORD + 1,		/* Get the control value */</a>
+<a name="ln73">  ENF_PUSHLIT | ENF_AND,	/* Isolate it */</a>
+<a name="ln74">#ifdef _BIG_ENDIAN</a>
+<a name="ln75">  0xFF00,</a>
+<a name="ln76">#else</a>
+<a name="ln77">  0x00FF,</a>
+<a name="ln78">#endif</a>
+<a name="ln79">  ENF_PUSHLIT | ENF_CAND,	/* Test for expected value */</a>
+<a name="ln80">#ifdef _BIG_ENDIAN</a>
+<a name="ln81">  0x0300</a>
+<a name="ln82">#else</a>
+<a name="ln83">  0x0003</a>
+<a name="ln84">#endif</a>
+<a name="ln85">};</a>
+<a name="ln86"> </a>
+<a name="ln87">/*</a>
+<a name="ln88"> * We would like to use something like libdlpi here, but that's not present on</a>
+<a name="ln89"> * all versions of Solaris or on any non-Solaris system, so it's nowhere near</a>
+<a name="ln90"> * as portable as we'd like.  Thus, we use the standards-conformant DLPI</a>
+<a name="ln91"> * interfaces plus the (optional; not needed) Solaris packet filter module.</a>
+<a name="ln92"> */</a>
+<a name="ln93"> </a>
+<a name="ln94">static int</a>
+<a name="ln95">dlpisend (int fd, const void *cbuf, size_t cbuflen,</a>
+<a name="ln96">  const void *dbuf, size_t dbuflen, int flags)</a>
+<a name="ln97">{</a>
+<a name="ln98">  const struct strbuf *ctlptr = NULL;</a>
+<a name="ln99">  const struct strbuf *dataptr = NULL;</a>
+<a name="ln100">  struct strbuf ctlbuf, databuf;</a>
+<a name="ln101">  int rv;</a>
+<a name="ln102"> </a>
+<a name="ln103">  if (cbuf != NULL)</a>
+<a name="ln104">    {</a>
+<a name="ln105">      memset (&amp;ctlbuf, 0, sizeof (ctlbuf));</a>
+<a name="ln106">      ctlbuf.len = cbuflen;</a>
+<a name="ln107">      ctlbuf.buf = (void *)cbuf;</a>
+<a name="ln108">      ctlptr = &amp;ctlbuf;</a>
+<a name="ln109">    }</a>
+<a name="ln110"> </a>
+<a name="ln111">  if (dbuf != NULL)</a>
+<a name="ln112">    {</a>
+<a name="ln113">      memset (&amp;databuf, 0, sizeof (databuf));</a>
+<a name="ln114">      databuf.len = dbuflen;</a>
+<a name="ln115">      databuf.buf = (void *)dbuf;</a>
+<a name="ln116">      dataptr = &amp;databuf;</a>
+<a name="ln117">    }</a>
+<a name="ln118"> </a>
+<a name="ln119">  /* We assume this doesn't happen often and isn't operationally significant */</a>
+<a name="ln120">  rv = putmsg(fd, ctlptr, dataptr, flags);</a>
+<a name="ln121">  if (rv == -1 &amp;&amp; dbuf == NULL)</a>
+<a name="ln122">    {</a>
+<a name="ln123">      /*</a>
+<a name="ln124">       * For actual PDU transmission - recognizable buf dbuf != NULL,</a>
+<a name="ln125">       * the error is passed upwards and should not be printed here.</a>
+<a name="ln126">       */</a>
+<a name="ln127">      zlog_debug (&quot;%s: putmsg: %s&quot;, __func__, safe_strerror (errno));</a>
+<a name="ln128">    }</a>
+<a name="ln129">  return rv;</a>
+<a name="ln130">}</a>
+<a name="ln131"> </a>
+<a name="ln132">static ssize_t</a>
+<a name="ln133">dlpirctl (int fd)</a>
+<a name="ln134">{</a>
+<a name="ln135">  struct pollfd fds[1];</a>
+<a name="ln136">  struct strbuf ctlbuf, databuf;</a>
+<a name="ln137">  int flags, retv;</a>
+<a name="ln138"> </a>
+<a name="ln139">  do</a>
+<a name="ln140">    {</a>
+<a name="ln141">      /* Poll is used here in case the device doesn't speak DLPI correctly */</a>
+<a name="ln142">      memset (fds, 0, sizeof (fds));</a>
+<a name="ln143">      fds[0].fd = fd;</a>
+<a name="ln144">      fds[0].events = POLLIN | POLLPRI;</a>
+<a name="ln145">      if (poll (fds, 1, 1000) &lt;= 0)</a>
+<a name="ln146">	return -1;</a>
+<a name="ln147"> </a>
+<a name="ln148">      memset (&amp;ctlbuf, 0, sizeof (ctlbuf));</a>
+<a name="ln149">      memset (&amp;databuf, 0, sizeof (databuf));</a>
+<a name="ln150">      ctlbuf.maxlen = sizeof (dlpi_ctl);</a>
+<a name="ln151">      ctlbuf.buf = (void *)dlpi_ctl;</a>
+<a name="ln152">      databuf.maxlen = sizeof (sock_buff);</a>
+<a name="ln153">      databuf.buf = (void *)sock_buff;</a>
+<a name="ln154">      flags = 0;</a>
+<a name="ln155">      retv = getmsg (fd, &amp;ctlbuf, &amp;databuf, &amp;flags);</a>
+<a name="ln156"> </a>
+<a name="ln157">      if (retv &lt; 0)</a>
+<a name="ln158">	return -1;</a>
+<a name="ln159">    }</a>
+<a name="ln160">  while (ctlbuf.len == 0);</a>
+<a name="ln161"> </a>
+<a name="ln162">  if (!(retv &amp; MORECTL))</a>
+<a name="ln163">    {</a>
+<a name="ln164">      while (retv &amp; MOREDATA)</a>
+<a name="ln165">	{</a>
+<a name="ln166">	  flags = 0;</a>
+<a name="ln167">	  retv = getmsg (fd, NULL, &amp;databuf, &amp;flags);</a>
+<a name="ln168">	}</a>
+<a name="ln169">      return ctlbuf.len;</a>
+<a name="ln170">    }</a>
+<a name="ln171"> </a>
+<a name="ln172">  while (retv &amp; MORECTL)</a>
+<a name="ln173">    {</a>
+<a name="ln174">      flags = 0;</a>
+<a name="ln175">      retv = getmsg (fd, &amp;ctlbuf, &amp;databuf, &amp;flags);</a>
+<a name="ln176">    }</a>
+<a name="ln177">  return -1;</a>
+<a name="ln178">}</a>
+<a name="ln179"> </a>
+<a name="ln180">static int</a>
+<a name="ln181">dlpiok (int fd, t_uscalar_t oprim)</a>
+<a name="ln182">{</a>
+<a name="ln183">  int retv;</a>
+<a name="ln184">  dl_ok_ack_t *doa = (dl_ok_ack_t *)dlpi_ctl;</a>
+<a name="ln185"> </a>
+<a name="ln186">  retv = dlpirctl (fd);</a>
+<a name="ln187">  if (retv &lt; (ssize_t)DL_OK_ACK_SIZE || doa-&gt;dl_primitive != DL_OK_ACK ||</a>
+<a name="ln188">    doa-&gt;dl_correct_primitive != oprim)</a>
+<a name="ln189">    {</a>
+<a name="ln190">      return -1;</a>
+<a name="ln191">    }</a>
+<a name="ln192">  else</a>
+<a name="ln193">    {</a>
+<a name="ln194">      return 0;</a>
+<a name="ln195">    }</a>
+<a name="ln196">}</a>
+<a name="ln197"> </a>
+<a name="ln198">static int</a>
+<a name="ln199">dlpiinfo (int fd)</a>
+<a name="ln200">{</a>
+<a name="ln201">  dl_info_req_t dir;</a>
+<a name="ln202">  ssize_t retv;</a>
+<a name="ln203"> </a>
+<a name="ln204">  memset (&amp;dir, 0, sizeof (dir));</a>
+<a name="ln205">  dir.dl_primitive = DL_INFO_REQ;</a>
+<a name="ln206">  /* Info_req uses M_PCPROTO. */</a>
+<a name="ln207">  dlpisend (fd, &amp;dir, sizeof (dir), NULL, 0, RS_HIPRI);</a>
+<a name="ln208">  retv = dlpirctl (fd);</a>
+<a name="ln209">  if (retv &lt; (ssize_t)DL_INFO_ACK_SIZE || dlpi_ctl[0] != DL_INFO_ACK)</a>
+<a name="ln210">    return -1;</a>
+<a name="ln211">  else</a>
+<a name="ln212">    return retv;</a>
+<a name="ln213">}</a>
+<a name="ln214"> </a>
+<a name="ln215">static int</a>
+<a name="ln216">dlpiopen (const char *devpath, ssize_t *acklen)</a>
+<a name="ln217">{</a>
+<a name="ln218">  int fd, flags;</a>
+<a name="ln219"> </a>
+<a name="ln220">  fd = open (devpath, O_RDWR | O_NONBLOCK | O_NOCTTY);</a>
+<a name="ln221">  if (fd == -1)</a>
+<a name="ln222">    return -1;</a>
+<a name="ln223"> </a>
+<a name="ln224">  /* All that we want is for the open itself to be non-blocking, not I/O. */</a>
+<a name="ln225">  flags = fcntl (fd, F_GETFL, 0);</a>
+<a name="ln226">  if (flags != -1)</a>
+<a name="ln227">    fcntl (fd, F_SETFL, flags &amp; ~O_NONBLOCK);</a>
+<a name="ln228"> </a>
+<a name="ln229">  /* After opening, ask for information */</a>
+<a name="ln230">  if ((*acklen = dlpiinfo (fd)) == -1)</a>
+<a name="ln231">    {</a>
+<a name="ln232">      close (fd);</a>
+<a name="ln233">      return -1;</a>
+<a name="ln234">    }</a>
+<a name="ln235"> </a>
+<a name="ln236">  return fd;</a>
+<a name="ln237">}</a>
+<a name="ln238"> </a>
+<a name="ln239">static int</a>
+<a name="ln240">dlpiattach (int fd, int unit)</a>
+<a name="ln241">{</a>
+<a name="ln242">  dl_attach_req_t dar;</a>
+<a name="ln243"> </a>
+<a name="ln244">  memset (&amp;dar, 0, sizeof (dar));</a>
+<a name="ln245">  dar.dl_primitive = DL_ATTACH_REQ;</a>
+<a name="ln246">  dar.dl_ppa = unit;</a>
+<a name="ln247">  dlpisend (fd, &amp;dar, sizeof (dar), NULL, 0, 0);</a>
+<a name="ln248">  return dlpiok (fd, dar.dl_primitive);</a>
+<a name="ln249">}</a>
+<a name="ln250"> </a>
+<a name="ln251">static int</a>
+<a name="ln252">dlpibind (int fd)</a>
+<a name="ln253">{</a>
+<a name="ln254">  dl_bind_req_t dbr;</a>
+<a name="ln255">  int retv;</a>
+<a name="ln256">  dl_bind_ack_t *dba = (dl_bind_ack_t *)dlpi_ctl;</a>
+<a name="ln257"> </a>
+<a name="ln258">  memset (&amp;dbr, 0, sizeof (dbr));</a>
+<a name="ln259">  dbr.dl_primitive = DL_BIND_REQ;</a>
+<a name="ln260">  dbr.dl_service_mode = DL_CLDLS;</a>
+<a name="ln261">  dlpisend (fd, &amp;dbr, sizeof (dbr), NULL, 0, 0);</a>
+<a name="ln262"> </a>
+<a name="ln263">  retv = dlpirctl (fd);</a>
+<a name="ln264">  if (retv &lt; (ssize_t)DL_BIND_ACK_SIZE || dba-&gt;dl_primitive != DL_BIND_ACK)</a>
+<a name="ln265">    return -1;</a>
+<a name="ln266">  else</a>
+<a name="ln267">    return 0;</a>
+<a name="ln268">}</a>
+<a name="ln269"> </a>
+<a name="ln270">static int</a>
+<a name="ln271">dlpimcast (int fd, const u_char *mcaddr)</a>
+<a name="ln272">{</a>
+<a name="ln273">  struct {</a>
+<a name="ln274">    dl_enabmulti_req_t der;</a>
+<a name="ln275">    u_char addr[ETHERADDRL];</a>
+<a name="ln276">  } dler;</a>
+<a name="ln277"> </a>
+<a name="ln278">  memset (&amp;dler, 0, sizeof (dler));</a>
+<a name="ln279">  dler.der.dl_primitive = DL_ENABMULTI_REQ;</a>
+<a name="ln280">  dler.der.dl_addr_length = sizeof (dler.addr);</a>
+<a name="ln281">  dler.der.dl_addr_offset = dler.addr - (u_char *)&amp;dler;</a>
+<a name="ln282">  memcpy (dler.addr, mcaddr, sizeof (dler.addr));</a>
+<a name="ln283">  dlpisend (fd, &amp;dler, sizeof (dler), NULL, 0, 0);</a>
+<a name="ln284">  return dlpiok (fd, dler.der.dl_primitive);</a>
+<a name="ln285">}</a>
+<a name="ln286"> </a>
+<a name="ln287">static int</a>
+<a name="ln288">dlpiaddr (int fd, u_char *addr)</a>
+<a name="ln289">{</a>
+<a name="ln290">  dl_phys_addr_req_t dpar;</a>
+<a name="ln291">  dl_phys_addr_ack_t *dpaa = (dl_phys_addr_ack_t *)dlpi_ctl;</a>
+<a name="ln292">  int retv;</a>
+<a name="ln293"> </a>
+<a name="ln294">  memset (&amp;dpar, 0, sizeof (dpar));</a>
+<a name="ln295">  dpar.dl_primitive = DL_PHYS_ADDR_REQ;</a>
+<a name="ln296">  dpar.dl_addr_type = DL_CURR_PHYS_ADDR;</a>
+<a name="ln297">  dlpisend (fd, &amp;dpar, sizeof (dpar), NULL, 0, 0);</a>
+<a name="ln298"> </a>
+<a name="ln299">  retv = dlpirctl (fd);</a>
+<a name="ln300">  if (retv &lt; (ssize_t)DL_PHYS_ADDR_ACK_SIZE</a>
+<a name="ln301">      || dpaa-&gt;dl_primitive != DL_PHYS_ADDR_ACK)</a>
+<a name="ln302">    return -1;</a>
+<a name="ln303"> </a>
+<a name="ln304">  if (dpaa-&gt;dl_addr_offset &lt; DL_PHYS_ADDR_ACK_SIZE ||</a>
+<a name="ln305">    dpaa-&gt;dl_addr_length != ETHERADDRL ||</a>
+<a name="ln306">    dpaa-&gt;dl_addr_offset + dpaa-&gt;dl_addr_length &gt; (size_t)retv)</a>
+<a name="ln307">    return -1;</a>
+<a name="ln308"> </a>
+<a name="ln309">  bcopy((char *)dpaa + dpaa-&gt;dl_addr_offset, addr, ETHERADDRL);</a>
+<a name="ln310">  return 0;</a>
+<a name="ln311">}</a>
+<a name="ln312"> </a>
+<a name="ln313">static int</a>
+<a name="ln314">open_dlpi_dev (struct isis_circuit *circuit)</a>
+<a name="ln315">{</a>
+<a name="ln316">  int fd = -1, unit, retval;</a>
+<a name="ln317">  char devpath[MAXPATHLEN];</a>
+<a name="ln318">  dl_info_ack_t *dia = (dl_info_ack_t *)dlpi_ctl;</a>
+<a name="ln319">  ssize_t acklen;</a>
+<a name="ln320"> </a>
+<a name="ln321">  /* Only broadcast-type are supported at the moment */</a>
+<a name="ln322">  if (circuit-&gt;circ_type != CIRCUIT_T_BROADCAST)</a>
+<a name="ln323">    {</a>
+<a name="ln324">      zlog_warn (&quot;%s: non-broadcast interface %s&quot;, __func__,</a>
+<a name="ln325">	circuit-&gt;interface-&gt;name);</a>
+<a name="ln326">      return ISIS_WARNING;</a>
+<a name="ln327">    }</a>
+<a name="ln328">  </a>
+<a name="ln329">  /* Try the vanity node first, if permitted */</a>
+<a name="ln330">  if (getenv(&quot;DLPI_DEVONLY&quot;) == NULL)</a>
+<a name="ln331">    {</a>
+<a name="ln332">      (void) snprintf (devpath, sizeof(devpath), &quot;/dev/net/%s&quot;,</a>
+<a name="ln333">                      circuit-&gt;interface-&gt;name);</a>
+<a name="ln334">      fd = dlpiopen (devpath, &amp;acklen);</a>
+<a name="ln335">    }</a>
+<a name="ln336">  </a>
+<a name="ln337">  /* Now try as an ordinary Style 1 node */</a>
+<a name="ln338">  if (fd == -1)</a>
+<a name="ln339">    {</a>
+<a name="ln340">      (void) snprintf (devpath, sizeof (devpath), &quot;/dev/%s&quot;,</a>
+<a name="ln341">                      circuit-&gt;interface-&gt;name);</a>
+<a name="ln342">      unit = -1;</a>
+<a name="ln343">      fd = dlpiopen (devpath, &amp;acklen);</a>
+<a name="ln344">    }</a>
+<a name="ln345"> </a>
+<a name="ln346">  /* If that fails, try again as Style 2 */</a>
+<a name="ln347">  if (fd == -1)</a>
+<a name="ln348">    {</a>
+<a name="ln349">      char *cp;</a>
+<a name="ln350"> </a>
+<a name="ln351">      cp = devpath + strlen (devpath);</a>
+<a name="ln352">      while (--cp &gt;= devpath &amp;&amp; isdigit(*cp))</a>
+<a name="ln353">	;</a>
+<a name="ln354">      unit = strtol(cp, NULL, 0);</a>
+<a name="ln355">      *cp = '\0';</a>
+<a name="ln356">      fd = dlpiopen (devpath, &amp;acklen);</a>
+<a name="ln357"> </a>
+<a name="ln358">      /* If that too fails, then the device really doesn't exist */</a>
+<a name="ln359">      if (fd == -1)</a>
+<a name="ln360">	{</a>
+<a name="ln361">	  zlog_warn (&quot;%s: unknown interface %s&quot;, __func__,</a>
+<a name="ln362">	    circuit-&gt;interface-&gt;name);</a>
+<a name="ln363">	  return ISIS_WARNING;</a>
+<a name="ln364">	}</a>
+<a name="ln365"> </a>
+<a name="ln366">      /* Double check the DLPI style */</a>
+<a name="ln367">      if (dia-&gt;dl_provider_style != DL_STYLE2)</a>
+<a name="ln368">	{</a>
+<a name="ln369">	  zlog_warn (&quot;open_dlpi_dev(): interface %s: %s is not style 2&quot;,</a>
+<a name="ln370">	    circuit-&gt;interface-&gt;name, devpath);</a>
+<a name="ln371">	  close (fd);</a>
+<a name="ln372">	  return ISIS_WARNING;</a>
+<a name="ln373">	}</a>
+<a name="ln374"> </a>
+<a name="ln375">      /* If it succeeds, then we need to attach to the unit specified */</a>
+<a name="ln376">      dlpiattach (fd, unit);</a>
+<a name="ln377"> </a>
+<a name="ln378">      /* Reget the information, as it may be different per node */</a>
+<a name="ln379">      if ((acklen = dlpiinfo (fd)) == -1)</a>
+<a name="ln380">	{</a>
+<a name="ln381">	  close (fd);</a>
+<a name="ln382">	  return ISIS_WARNING;</a>
+<a name="ln383">	}</a>
+<a name="ln384">    }</a>
+<a name="ln385">  else</a>
+<a name="ln386">    {</a>
+<a name="ln387">      /* Double check the DLPI style */</a>
+<a name="ln388">      if (dia-&gt;dl_provider_style != DL_STYLE1)</a>
+<a name="ln389">	{</a>
+<a name="ln390">	  zlog_warn (&quot;open_dlpi_dev(): interface %s: %s is not style 1&quot;,</a>
+<a name="ln391">	    circuit-&gt;interface-&gt;name, devpath);</a>
+<a name="ln392">	  close (fd);</a>
+<a name="ln393">	  return ISIS_WARNING;</a>
+<a name="ln394">	}</a>
+<a name="ln395">    }</a>
+<a name="ln396"> </a>
+<a name="ln397">  /* Check that the interface we've got is the kind we expect */</a>
+<a name="ln398">  if ((dia-&gt;dl_sap_length != 2 &amp;&amp; dia-&gt;dl_sap_length != -2) ||</a>
+<a name="ln399">    dia-&gt;dl_service_mode != DL_CLDLS || dia-&gt;dl_addr_length != ETHERADDRL + 2 ||</a>
+<a name="ln400">    dia-&gt;dl_brdcst_addr_length != ETHERADDRL)</a>
+<a name="ln401">    {</a>
+<a name="ln402">      zlog_warn (&quot;%s: unsupported interface type for %s&quot;, __func__,</a>
+<a name="ln403">	circuit-&gt;interface-&gt;name);</a>
+<a name="ln404">      close (fd);</a>
+<a name="ln405">      return ISIS_WARNING;</a>
+<a name="ln406">    }</a>
+<a name="ln407">  switch (dia-&gt;dl_mac_type)</a>
+<a name="ln408">    {</a>
+<a name="ln409">    case DL_CSMACD:</a>
+<a name="ln410">    case DL_ETHER:</a>
+<a name="ln411">    case DL_100VG:</a>
+<a name="ln412">    case DL_100VGTPR:</a>
+<a name="ln413">    case DL_ETH_CSMA:</a>
+<a name="ln414">    case DL_100BT:</a>
+<a name="ln415">      break;</a>
+<a name="ln416">    default:</a>
+<a name="ln417">      zlog_warn (&quot;%s: unexpected mac type on %s: %lld&quot;, __func__,</a>
+<a name="ln418">	circuit-&gt;interface-&gt;name, (long long)dia-&gt;dl_mac_type);</a>
+<a name="ln419">      close (fd);</a>
+<a name="ln420">      return ISIS_WARNING;</a>
+<a name="ln421">    }</a>
+<a name="ln422"> </a>
+<a name="ln423">  circuit-&gt;sap_length = dia-&gt;dl_sap_length;</a>
+<a name="ln424"> </a>
+<a name="ln425">  /*</a>
+<a name="ln426">   * The local hardware address is something that should be provided by way of</a>
+<a name="ln427">   * sockaddr_dl for the interface, but isn't on Solaris.  We set it here based</a>
+<a name="ln428">   * on DLPI's reported address to avoid roto-tilling the world.</a>
+<a name="ln429">   * (Note that isis_circuit_if_add on Solaris doesn't set the snpa.)</a>
+<a name="ln430">   *</a>
+<a name="ln431">   * Unfortunately, GLD is broken and doesn't provide the address after attach,</a>
+<a name="ln432">   * so we need to be careful and use DL_PHYS_ADDR_REQ instead.</a>
+<a name="ln433">   */</a>
+<a name="ln434">  if (dlpiaddr (fd, circuit-&gt;u.bc.snpa) == -1)</a>
+<a name="ln435">    {</a>
+<a name="ln436">      zlog_warn (&quot;open_dlpi_dev(): interface %s: unable to get MAC address&quot;,</a>
+<a name="ln437">	circuit-&gt;interface-&gt;name);</a>
+<a name="ln438">      close (fd);</a>
+<a name="ln439">      return ISIS_WARNING;</a>
+<a name="ln440">    }</a>
+<a name="ln441"> </a>
+<a name="ln442">  /* Now bind to SAP 0.  This gives us 802-type traffic. */</a>
+<a name="ln443">  if (dlpibind (fd) == -1)</a>
+<a name="ln444">    {</a>
+<a name="ln445">      zlog_warn (&quot;%s: cannot bind SAP 0 on %s&quot;, __func__,</a>
+<a name="ln446">	circuit-&gt;interface-&gt;name);</a>
+<a name="ln447">      close (fd);</a>
+<a name="ln448">      return ISIS_WARNING;</a>
+<a name="ln449">    }</a>
+<a name="ln450"> </a>
+<a name="ln451">  /*</a>
+<a name="ln452">   * Join to multicast groups according to</a>
+<a name="ln453">   * 8.4.2 - Broadcast subnetwork IIH PDUs</a>
+<a name="ln454">   */</a>
+<a name="ln455">  retval = 0;</a>
+<a name="ln456">  retval |= dlpimcast (fd, ALL_L1_ISS);</a>
+<a name="ln457">  retval |= dlpimcast (fd, ALL_ISS);</a>
+<a name="ln458">  retval |= dlpimcast (fd, ALL_L2_ISS);</a>
+<a name="ln459"> </a>
+<a name="ln460">  if (retval != 0)</a>
+<a name="ln461">    {</a>
+<a name="ln462">      zlog_warn (&quot;%s: unable to join multicast on %s&quot;, __func__,</a>
+<a name="ln463">	circuit-&gt;interface-&gt;name);</a>
+<a name="ln464">      close (fd);</a>
+<a name="ln465">      return ISIS_WARNING;</a>
+<a name="ln466">    }</a>
+<a name="ln467"> </a>
+<a name="ln468">  /* Push on the packet filter to avoid stray 802 packets */</a>
+<a name="ln469">  if (ioctl (fd, I_PUSH, &quot;pfmod&quot;) == 0)</a>
+<a name="ln470">    {</a>
+<a name="ln471">      struct packetfilt pfil;</a>
+<a name="ln472">      struct strioctl sioc;</a>
+<a name="ln473"> </a>
+<a name="ln474">      pfil.Pf_Priority = 0;</a>
+<a name="ln475">      pfil.Pf_FilterLen = sizeof (pf_filter) / sizeof (u_short);</a>
+<a name="ln476">      memcpy (pfil.Pf_Filter, pf_filter, sizeof (pf_filter));</a>
+<a name="ln477">      /* pfmod does not support transparent ioctls */</a>
+<a name="ln478">      sioc.ic_cmd = PFIOCSETF;</a>
+<a name="ln479">      sioc.ic_timout = 5;</a>
+<a name="ln480">      sioc.ic_len = sizeof (struct packetfilt);</a>
+<a name="ln481">      sioc.ic_dp = (char *)&amp;pfil;</a>
+<a name="ln482">      if (ioctl (fd, I_STR, &amp;sioc) == -1)</a>
+<a name="ln483">         zlog_warn(&quot;%s: could not perform PF_IOCSETF on %s&quot;,</a>
+<a name="ln484">           __func__, circuit-&gt;interface-&gt;name); </a>
+<a name="ln485">    }</a>
+<a name="ln486"> </a>
+<a name="ln487">  circuit-&gt;fd = fd;</a>
+<a name="ln488"> </a>
+<a name="ln489">  return ISIS_OK;</a>
+<a name="ln490">}</a>
+<a name="ln491"> </a>
+<a name="ln492">/*</a>
+<a name="ln493"> * Create the socket and set the tx/rx funcs</a>
+<a name="ln494"> */</a>
+<a name="ln495">int</a>
+<a name="ln496">isis_sock_init (struct isis_circuit *circuit)</a>
+<a name="ln497">{</a>
+<a name="ln498">  int retval = ISIS_OK;</a>
+<a name="ln499"> </a>
+<a name="ln500">  if (isisd_privs.change (ZPRIVS_RAISE))</a>
+<a name="ln501">    zlog_err (&quot;%s: could not raise privs, %s&quot;, __func__, safe_strerror (errno));</a>
+<a name="ln502"> </a>
+<a name="ln503">  retval = open_dlpi_dev (circuit);</a>
+<a name="ln504"> </a>
+<a name="ln505">  if (retval != ISIS_OK)</a>
+<a name="ln506">    {</a>
+<a name="ln507">      zlog_warn (&quot;%s: could not initialize the socket&quot;, __func__);</a>
+<a name="ln508">      goto end;</a>
+<a name="ln509">    }</a>
+<a name="ln510"> </a>
+<a name="ln511">  if (circuit-&gt;circ_type == CIRCUIT_T_BROADCAST)</a>
+<a name="ln512">    {</a>
+<a name="ln513">      circuit-&gt;tx = isis_send_pdu_bcast;</a>
+<a name="ln514">      circuit-&gt;rx = isis_recv_pdu_bcast;</a>
+<a name="ln515">    }</a>
+<a name="ln516">  else</a>
+<a name="ln517">    {</a>
+<a name="ln518">      zlog_warn (&quot;isis_sock_init(): unknown circuit type&quot;);</a>
+<a name="ln519">      retval = ISIS_WARNING;</a>
+<a name="ln520">      goto end;</a>
+<a name="ln521">    }</a>
+<a name="ln522"> </a>
+<a name="ln523">end:</a>
+<a name="ln524">  if (isisd_privs.change (ZPRIVS_LOWER))</a>
+<a name="ln525">    zlog_err (&quot;%s: could not lower privs, %s&quot;, __func__, safe_strerror (errno));</a>
+<a name="ln526"> </a>
+<a name="ln527">  return retval;</a>
+<a name="ln528">}</a>
+<a name="ln529"> </a>
+<a name="ln530">int</a>
+<a name="ln531">isis_recv_pdu_bcast (struct isis_circuit *circuit, u_char * ssnpa)</a>
+<a name="ln532">{</a>
+<a name="ln533">  struct pollfd fds[1];</a>
+<a name="ln534">  struct strbuf ctlbuf, databuf;</a>
+<a name="ln535">  int flags, retv;</a>
+<a name="ln536">  dl_unitdata_ind_t *dui = (dl_unitdata_ind_t *)dlpi_ctl;</a>
+<a name="ln537"> </a>
+<a name="ln538">  memset (fds, 0, sizeof (fds));</a>
+<a name="ln539">  fds[0].fd = circuit-&gt;fd;</a>
+<a name="ln540">  fds[0].events = POLLIN | POLLPRI;</a>
+<a name="ln541">  if (poll (fds, 1, 0) &lt;= 0)</a>
+<a name="ln542">    return ISIS_WARNING;</a>
+<a name="ln543"> </a>
+<a name="ln544">  memset (&amp;ctlbuf, 0, sizeof (ctlbuf));</a>
+<a name="ln545">  memset (&amp;databuf, 0, sizeof (databuf));</a>
+<a name="ln546">  ctlbuf.maxlen = sizeof (dlpi_ctl);</a>
+<a name="ln547">  ctlbuf.buf = (void *)dlpi_ctl;</a>
+<a name="ln548">  databuf.maxlen = sizeof (sock_buff);</a>
+<a name="ln549">  databuf.buf = (void *)sock_buff;</a>
+<a name="ln550">  flags = 0;</a>
+<a name="ln551">  retv = getmsg (circuit-&gt;fd, &amp;ctlbuf, &amp;databuf, &amp;flags);</a>
+<a name="ln552"> </a>
+<a name="ln553">  if (retv &lt; 0)</a>
+<a name="ln554">    {</a>
+<a name="ln555">      zlog_warn (&quot;isis_recv_pdu_bcast: getmsg failed: %s&quot;,</a>
+<a name="ln556">		 safe_strerror (errno));</a>
+<a name="ln557">      return ISIS_WARNING;</a>
+<a name="ln558">    }</a>
+<a name="ln559"> </a>
+<a name="ln560">  if (retv &amp; (MORECTL | MOREDATA))</a>
+<a name="ln561">    {</a>
+<a name="ln562">      while (retv &amp; (MORECTL | MOREDATA))</a>
+<a name="ln563">	{</a>
+<a name="ln564">	  flags = 0;</a>
+<a name="ln565">	  retv = getmsg (circuit-&gt;fd, &amp;ctlbuf, &amp;databuf, &amp;flags);</a>
+<a name="ln566">	}</a>
+<a name="ln567">      return ISIS_WARNING;</a>
+<a name="ln568">    }</a>
+<a name="ln569"> </a>
+<a name="ln570">  if (ctlbuf.len &lt; (ssize_t)DL_UNITDATA_IND_SIZE ||</a>
+<a name="ln571">    dui-&gt;dl_primitive != DL_UNITDATA_IND)</a>
+<a name="ln572">    return ISIS_WARNING;</a>
+<a name="ln573"> </a>
+<a name="ln574">  if (dui-&gt;dl_src_addr_length != ETHERADDRL + 2 ||</a>
+<a name="ln575">    dui-&gt;dl_src_addr_offset &lt; DL_UNITDATA_IND_SIZE ||</a>
+<a name="ln576">    dui-&gt;dl_src_addr_offset + dui-&gt;dl_src_addr_length &gt; (size_t)ctlbuf.len)</a>
+<a name="ln577">    return ISIS_WARNING;</a>
+<a name="ln578"> </a>
+<a name="ln579">  memcpy (ssnpa, (char *)dui + dui-&gt;dl_src_addr_offset +</a>
+<a name="ln580">    (circuit-&gt;sap_length &gt; 0 ? circuit-&gt;sap_length : 0), ETHERADDRL);</a>
+<a name="ln581"> </a>
+<a name="ln582">  if (databuf.len &lt; LLC_LEN || sock_buff[0] != ISO_SAP ||</a>
+<a name="ln583">    sock_buff[1] != ISO_SAP || sock_buff[2] != 3)</a>
+<a name="ln584">    return ISIS_WARNING;</a>
+<a name="ln585"> </a>
+<a name="ln586">  stream_write (circuit-&gt;rcv_stream, sock_buff + LLC_LEN,</a>
+<a name="ln587">                databuf.len - LLC_LEN);</a>
+<a name="ln588">  stream_set_getp (circuit-&gt;rcv_stream, 0);</a>
+<a name="ln589"> </a>
+<a name="ln590">  return ISIS_OK;</a>
+<a name="ln591">}</a>
+<a name="ln592"> </a>
+<a name="ln593">int</a>
+<a name="ln594">isis_send_pdu_bcast (struct isis_circuit *circuit, int level)</a>
+<a name="ln595">{</a>
+<a name="ln596">  dl_unitdata_req_t *dur = (dl_unitdata_req_t *)dlpi_ctl;</a>
+<a name="ln597">  char *dstaddr;</a>
+<a name="ln598">  u_short *dstsap;</a>
+<a name="ln599">  int buflen;</a>
+<a name="ln600">  int rv;</a>
+<a name="ln601"> </a>
+<a name="ln602">  buflen = stream_get_endp (circuit-&gt;snd_stream) + LLC_LEN;</a>
+<a name="ln603">  if ((size_t)buflen &gt; sizeof (sock_buff))</a>
+<a name="ln604">    {</a>
+<a name="ln605">      zlog_warn (&quot;isis_send_pdu_bcast: sock_buff size %zu is less than &quot;</a>
+<a name="ln606">		 &quot;output pdu size %d on circuit %s&quot;,</a>
+<a name="ln607">		 sizeof (sock_buff), buflen, circuit-&gt;interface-&gt;name);</a>
+<a name="ln608">      return ISIS_WARNING;</a>
+<a name="ln609">    }</a>
+<a name="ln610"> </a>
+<a name="ln611">  stream_set_getp (circuit-&gt;snd_stream, 0);</a>
+<a name="ln612"> </a>
+<a name="ln613">  memset (dur, 0, sizeof (*dur));</a>
+<a name="ln614">  dur-&gt;dl_primitive = DL_UNITDATA_REQ;</a>
+<a name="ln615">  dur-&gt;dl_dest_addr_length = ETHERADDRL + 2;</a>
+<a name="ln616">  dur-&gt;dl_dest_addr_offset = sizeof (*dur);</a>
+<a name="ln617"> </a>
+<a name="ln618">  dstaddr = (char *)(dur + 1);</a>
+<a name="ln619">  if (circuit-&gt;sap_length &lt; 0)</a>
+<a name="ln620">    {</a>
+<a name="ln621">      dstsap = (u_short *)(dstaddr + ETHERADDRL);</a>
+<a name="ln622">    }</a>
+<a name="ln623">  else</a>
+<a name="ln624">    {</a>
+<a name="ln625">      dstsap = (u_short *)dstaddr;</a>
+<a name="ln626">      dstaddr += circuit-&gt;sap_length;</a>
+<a name="ln627">    }</a>
+<a name="ln628">  if (level == 1)</a>
+<a name="ln629">    memcpy (dstaddr, ALL_L1_ISS, ETHERADDRL);</a>
+<a name="ln630">  else</a>
+<a name="ln631">    memcpy (dstaddr, ALL_L2_ISS, ETHERADDRL);</a>
+<a name="ln632">  /* Note: DLPI SAP values are in host byte order */</a>
+<a name="ln633">  *dstsap = buflen;</a>
+<a name="ln634"> </a>
+<a name="ln635">  sock_buff[0] = ISO_SAP;</a>
+<a name="ln636">  sock_buff[1] = ISO_SAP;</a>
+<a name="ln637">  sock_buff[2] = 0x03;</a>
+<a name="ln638">  memcpy (sock_buff + LLC_LEN, circuit-&gt;snd_stream-&gt;data,</a>
+<a name="ln639">	  stream_get_endp (circuit-&gt;snd_stream));</a>
+<a name="ln640">  rv = dlpisend(circuit-&gt;fd, dur, sizeof (*dur) + dur-&gt;dl_dest_addr_length,</a>
+<a name="ln641">                sock_buff, buflen, 0);</a>
+<a name="ln642">  if (rv &lt; 0)</a>
+<a name="ln643">    {</a>
+<a name="ln644">      zlog_warn(&quot;IS-IS dlpi: could not transmit packet on %s: %s&quot;,</a>
+<a name="ln645">                circuit-&gt;interface-&gt;name, safe_strerror(errno));</a>
+<a name="ln646">      if (ERRNO_IO_RETRY(errno))</a>
+<a name="ln647">        return ISIS_WARNING;</a>
+<a name="ln648">      return ISIS_ERROR;</a>
+<a name="ln649">    }</a>
+<a name="ln650"> </a>
+<a name="ln651">  return ISIS_OK;</a>
+<a name="ln652">}</a>
+<a name="ln653"> </a>
+<a name="ln654">#endif /* ISIS_METHOD == ISIS_METHOD_DLPI */</a>
+
+</code></pre>
+<div class="balloon" rel="15"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1042/" target="_blank">V1042</a> This file is marked with copyleft license, which requires you to open the derived source code.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

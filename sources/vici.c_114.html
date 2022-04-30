@@ -1,0 +1,549 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>vici.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.5.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/* strongSwan VICI protocol implementation for NHRP</a>
+<a name="ln2"> * Copyright (c) 2014-2015 Timo Teräs</a>
+<a name="ln3"> *</a>
+<a name="ln4"> * This file is free software: you may copy, redistribute and/or modify</a>
+<a name="ln5"> * it under the terms of the GNU General Public License as published by</a>
+<a name="ln6"> * the Free Software Foundation, either version 2 of the License, or</a>
+<a name="ln7"> * (at your option) any later version.</a>
+<a name="ln8"> */</a>
+<a name="ln9"> </a>
+<a name="ln10">#include &lt;string.h&gt;</a>
+<a name="ln11">#include &lt;sys/socket.h&gt;</a>
+<a name="ln12">#include &lt;sys/un.h&gt;</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &quot;thread.h&quot;</a>
+<a name="ln15">#include &quot;zbuf.h&quot;</a>
+<a name="ln16">#include &quot;log.h&quot;</a>
+<a name="ln17">#include &quot;nhrpd.h&quot;</a>
+<a name="ln18"> </a>
+<a name="ln19">#include &quot;vici.h&quot;</a>
+<a name="ln20"> </a>
+<a name="ln21">#define ERRNO_IO_RETRY(EN) (((EN) == EAGAIN) || ((EN) == EWOULDBLOCK) || ((EN) == EINTR))</a>
+<a name="ln22"> </a>
+<a name="ln23">struct blob {</a>
+<a name="ln24">	char *ptr;</a>
+<a name="ln25">	int len;</a>
+<a name="ln26">};</a>
+<a name="ln27"> </a>
+<a name="ln28">static int blob_equal(const struct blob *b, const char *str)</a>
+<a name="ln29">{</a>
+<a name="ln30">	if (b-&gt;len != (int) strlen(str)) return 0;</a>
+<a name="ln31">	return memcmp(b-&gt;ptr, str, b-&gt;len) == 0;</a>
+<a name="ln32">}</a>
+<a name="ln33"> </a>
+<a name="ln34">static int blob2buf(const struct blob *b, char *buf, size_t n)</a>
+<a name="ln35">{</a>
+<a name="ln36">	if (b-&gt;len &gt;= (int) n) return 0;</a>
+<a name="ln37">	memcpy(buf, b-&gt;ptr, b-&gt;len);</a>
+<a name="ln38">	buf[b-&gt;len] = 0;</a>
+<a name="ln39">	return 1;</a>
+<a name="ln40">}</a>
+<a name="ln41"> </a>
+<a name="ln42">struct vici_conn {</a>
+<a name="ln43">	struct thread *t_reconnect, *t_read, *t_write;</a>
+<a name="ln44">	struct zbuf ibuf;</a>
+<a name="ln45">	struct zbuf_queue obuf;</a>
+<a name="ln46">	int fd;</a>
+<a name="ln47">	uint8_t ibuf_data[VICI_MAX_MSGLEN];</a>
+<a name="ln48">};</a>
+<a name="ln49"> </a>
+<a name="ln50">struct vici_message_ctx {</a>
+<a name="ln51">	const char *sections[8];</a>
+<a name="ln52">	int nsections;</a>
+<a name="ln53">};</a>
+<a name="ln54"> </a>
+<a name="ln55">static int vici_reconnect(struct thread *t);</a>
+<a name="ln56">static void vici_submit_request(struct vici_conn *vici, const char *name, ...);</a>
+<a name="ln57"> </a>
+<a name="ln58">static void vici_zbuf_puts(struct zbuf *obuf, const char *str)</a>
+<a name="ln59">{</a>
+<a name="ln60">	size_t len = strlen(str);</a>
+<a name="ln61">	zbuf_put8(obuf, len);</a>
+<a name="ln62">	zbuf_put(obuf, str, len);</a>
+<a name="ln63">}</a>
+<a name="ln64"> </a>
+<a name="ln65">static void vici_connection_error(struct vici_conn *vici)</a>
+<a name="ln66">{</a>
+<a name="ln67">	nhrp_vc_reset();</a>
+<a name="ln68"> </a>
+<a name="ln69">	THREAD_OFF(vici-&gt;t_read);</a>
+<a name="ln70">	THREAD_OFF(vici-&gt;t_write);</a>
+<a name="ln71">	zbuf_reset(&amp;vici-&gt;ibuf);</a>
+<a name="ln72">	zbufq_reset(&amp;vici-&gt;obuf);</a>
+<a name="ln73"> </a>
+<a name="ln74">	close(vici-&gt;fd);</a>
+<a name="ln75">	vici-&gt;fd = -1;</a>
+<a name="ln76">	THREAD_TIMER_ON(master, vici-&gt;t_reconnect, vici_reconnect, vici, 2);</a>
+<a name="ln77">}</a>
+<a name="ln78"> </a>
+<a name="ln79">static void vici_parse_message(</a>
+<a name="ln80">	struct vici_conn *vici, struct zbuf *msg,</a>
+<a name="ln81">	void (*parser)(struct vici_message_ctx *ctx, enum vici_type_t msgtype, const struct blob *key, const struct blob *val),</a>
+<a name="ln82">	struct vici_message_ctx *ctx)</a>
+<a name="ln83">{</a>
+<a name="ln84">	uint8_t *type;</a>
+<a name="ln85">	struct blob key;</a>
+<a name="ln86">	struct blob val;</a>
+<a name="ln87"> </a>
+<a name="ln88">	while ((type = zbuf_may_pull(msg, uint8_t)) != NULL) {</a>
+<a name="ln89">		switch (*type) {</a>
+<a name="ln90">		case VICI_SECTION_START:</a>
+<a name="ln91">			key.len = zbuf_get8(msg);</a>
+<a name="ln92">			key.ptr = zbuf_pulln(msg, key.len);</a>
+<a name="ln93">			debugf(NHRP_DEBUG_VICI, &quot;VICI: Section start '%.*s'&quot;, key.len, key.ptr);</a>
+<a name="ln94">			parser(ctx, *type, &amp;key, NULL);</a>
+<a name="ln95">			ctx-&gt;nsections++;</a>
+<a name="ln96">			break;</a>
+<a name="ln97">		case VICI_SECTION_END:</a>
+<a name="ln98">			debugf(NHRP_DEBUG_VICI, &quot;VICI: Section end&quot;);</a>
+<a name="ln99">			parser(ctx, *type, NULL, NULL);</a>
+<a name="ln100">			ctx-&gt;nsections--;</a>
+<a name="ln101">			break;</a>
+<a name="ln102">		case VICI_KEY_VALUE:</a>
+<a name="ln103">			key.len = zbuf_get8(msg);</a>
+<a name="ln104">			key.ptr = zbuf_pulln(msg, key.len);</a>
+<a name="ln105">			val.len = zbuf_get_be16(msg);</a>
+<a name="ln106">			val.ptr = zbuf_pulln(msg, val.len);</a>
+<a name="ln107">			debugf(NHRP_DEBUG_VICI, &quot;VICI: Key '%.*s'='%.*s'&quot;, key.len, key.ptr, val.len, val.ptr);</a>
+<a name="ln108">			parser(ctx, *type, &amp;key, &amp;val);</a>
+<a name="ln109">			break;</a>
+<a name="ln110">		case VICI_LIST_START:</a>
+<a name="ln111">			key.len = zbuf_get8(msg);</a>
+<a name="ln112">			key.ptr = zbuf_pulln(msg, key.len);</a>
+<a name="ln113">			debugf(NHRP_DEBUG_VICI, &quot;VICI: List start '%.*s'&quot;, key.len, key.ptr);</a>
+<a name="ln114">			break;</a>
+<a name="ln115">		case VICI_LIST_ITEM:</a>
+<a name="ln116">			val.len = zbuf_get_be16(msg);</a>
+<a name="ln117">			val.ptr = zbuf_pulln(msg, val.len);</a>
+<a name="ln118">			debugf(NHRP_DEBUG_VICI, &quot;VICI: List item: '%.*s'&quot;, val.len, val.ptr);</a>
+<a name="ln119">			parser(ctx, *type, &amp;key, &amp;val);</a>
+<a name="ln120">			break;</a>
+<a name="ln121">		case VICI_LIST_END:</a>
+<a name="ln122">			debugf(NHRP_DEBUG_VICI, &quot;VICI: List end&quot;);</a>
+<a name="ln123">			break;</a>
+<a name="ln124">		default:</a>
+<a name="ln125">			debugf(NHRP_DEBUG_VICI, &quot;VICI: Unsupported message component type %d&quot;, *type);</a>
+<a name="ln126">			return;</a>
+<a name="ln127">		}</a>
+<a name="ln128">	}</a>
+<a name="ln129">}</a>
+<a name="ln130"> </a>
+<a name="ln131">struct handle_sa_ctx {</a>
+<a name="ln132">	struct vici_message_ctx msgctx;</a>
+<a name="ln133">	int event;</a>
+<a name="ln134">	int child_ok;</a>
+<a name="ln135">	int kill_ikesa;</a>
+<a name="ln136">	uint32_t child_uniqueid, ike_uniqueid;</a>
+<a name="ln137">	struct {</a>
+<a name="ln138">		union sockunion host;</a>
+<a name="ln139">		struct blob id, cert;</a>
+<a name="ln140">	} local, remote;</a>
+<a name="ln141">};</a>
+<a name="ln142"> </a>
+<a name="ln143">static void parse_sa_message(</a>
+<a name="ln144">	struct vici_message_ctx *ctx,</a>
+<a name="ln145">	enum vici_type_t msgtype,</a>
+<a name="ln146">	const struct blob *key, const struct blob *val)</a>
+<a name="ln147">{</a>
+<a name="ln148">	struct handle_sa_ctx *sactx = container_of(ctx, struct handle_sa_ctx, msgctx);</a>
+<a name="ln149">	struct nhrp_vc *vc;</a>
+<a name="ln150">	char buf[512];</a>
+<a name="ln151"> </a>
+<a name="ln152">	switch (msgtype) {</a>
+<a name="ln153">	case VICI_SECTION_START:</a>
+<a name="ln154">		if (ctx-&gt;nsections == 3) {</a>
+<a name="ln155">			/* Begin of child-sa section, reset child vars */</a>
+<a name="ln156">			sactx-&gt;child_uniqueid = 0;</a>
+<a name="ln157">			sactx-&gt;child_ok = 0;</a>
+<a name="ln158">		}</a>
+<a name="ln159">		break;</a>
+<a name="ln160">	case VICI_SECTION_END:</a>
+<a name="ln161">		if (ctx-&gt;nsections == 3) {</a>
+<a name="ln162">			/* End of child-sa section, update nhrp_vc */</a>
+<a name="ln163">			int up = sactx-&gt;child_ok || sactx-&gt;event == 1;</a>
+<a name="ln164">			if (up) {</a>
+<a name="ln165">				vc = nhrp_vc_get(&amp;sactx-&gt;local.host, &amp;sactx-&gt;remote.host, up);</a>
+<a name="ln166">				if (vc) {</a>
+<a name="ln167">					blob2buf(&amp;sactx-&gt;local.id, vc-&gt;local.id, sizeof(vc-&gt;local.id));</a>
+<a name="ln168">					if (blob2buf(&amp;sactx-&gt;local.cert, (char*)vc-&gt;local.cert, sizeof(vc-&gt;local.cert)))</a>
+<a name="ln169">						vc-&gt;local.certlen = sactx-&gt;local.cert.len;</a>
+<a name="ln170">					blob2buf(&amp;sactx-&gt;remote.id, vc-&gt;remote.id, sizeof(vc-&gt;remote.id));</a>
+<a name="ln171">					if (blob2buf(&amp;sactx-&gt;remote.cert, (char*)vc-&gt;remote.cert, sizeof(vc-&gt;remote.cert)))</a>
+<a name="ln172">						vc-&gt;remote.certlen = sactx-&gt;remote.cert.len;</a>
+<a name="ln173">					sactx-&gt;kill_ikesa |= nhrp_vc_ipsec_updown(sactx-&gt;child_uniqueid, vc);</a>
+<a name="ln174">				}</a>
+<a name="ln175">			} else {</a>
+<a name="ln176">				nhrp_vc_ipsec_updown(sactx-&gt;child_uniqueid, 0);</a>
+<a name="ln177">			}</a>
+<a name="ln178">		}</a>
+<a name="ln179">		break;</a>
+<a name="ln180">	default:</a>
+<a name="ln181">		switch (key-&gt;ptr[0]) {</a>
+<a name="ln182">		case 'l':</a>
+<a name="ln183">			if (blob_equal(key, &quot;local-host&quot;) &amp;&amp; ctx-&gt;nsections == 1) {</a>
+<a name="ln184">				if (blob2buf(val, buf, sizeof(buf)))</a>
+<a name="ln185">					str2sockunion(buf, &amp;sactx-&gt;local.host);</a>
+<a name="ln186">			} else if (blob_equal(key, &quot;local-id&quot;) &amp;&amp; ctx-&gt;nsections == 1) {</a>
+<a name="ln187">				sactx-&gt;local.id = *val;</a>
+<a name="ln188">			} else if (blob_equal(key, &quot;local-cert-data&quot;) &amp;&amp; ctx-&gt;nsections == 1) {</a>
+<a name="ln189">				sactx-&gt;local.cert = *val;</a>
+<a name="ln190">			}</a>
+<a name="ln191">			break;</a>
+<a name="ln192">		case 'r':</a>
+<a name="ln193">			if (blob_equal(key, &quot;remote-host&quot;) &amp;&amp; ctx-&gt;nsections == 1) {</a>
+<a name="ln194">				if (blob2buf(val, buf, sizeof(buf)))</a>
+<a name="ln195">					str2sockunion(buf, &amp;sactx-&gt;remote.host);</a>
+<a name="ln196">			} else if (blob_equal(key, &quot;remote-id&quot;) &amp;&amp; ctx-&gt;nsections == 1) {</a>
+<a name="ln197">				sactx-&gt;remote.id = *val;</a>
+<a name="ln198">			} else if (blob_equal(key, &quot;remote-cert-data&quot;) &amp;&amp; ctx-&gt;nsections == 1) {</a>
+<a name="ln199">				sactx-&gt;remote.cert = *val;</a>
+<a name="ln200">			}</a>
+<a name="ln201">			break;</a>
+<a name="ln202">		case 'u':</a>
+<a name="ln203">			if (blob_equal(key, &quot;uniqueid&quot;) &amp;&amp; blob2buf(val, buf, sizeof(buf))) {</a>
+<a name="ln204">				if (ctx-&gt;nsections == 3)</a>
+<a name="ln205">					sactx-&gt;child_uniqueid = strtoul(buf, NULL, 0);</a>
+<a name="ln206">				else if (ctx-&gt;nsections == 1)</a>
+<a name="ln207">					sactx-&gt;ike_uniqueid = strtoul(buf, NULL, 0);</a>
+<a name="ln208">			}</a>
+<a name="ln209">			break;</a>
+<a name="ln210">		case 's':</a>
+<a name="ln211">			if (blob_equal(key, &quot;state&quot;) &amp;&amp; ctx-&gt;nsections == 3) {</a>
+<a name="ln212">				sactx-&gt;child_ok =</a>
+<a name="ln213">					(sactx-&gt;event == 0 &amp;&amp;</a>
+<a name="ln214">					 (blob_equal(val, &quot;INSTALLED&quot;) ||</a>
+<a name="ln215">					  blob_equal(val, &quot;REKEYED&quot;)));</a>
+<a name="ln216">			}</a>
+<a name="ln217">			break;</a>
+<a name="ln218">		}</a>
+<a name="ln219">		break;</a>
+<a name="ln220">	}</a>
+<a name="ln221">}</a>
+<a name="ln222"> </a>
+<a name="ln223">static void parse_cmd_response(</a>
+<a name="ln224">	struct vici_message_ctx *ctx,</a>
+<a name="ln225">	enum vici_type_t msgtype,</a>
+<a name="ln226">	const struct blob *key, const struct blob *val)</a>
+<a name="ln227">{</a>
+<a name="ln228">	char buf[512];</a>
+<a name="ln229"> </a>
+<a name="ln230">	switch (msgtype) {</a>
+<a name="ln231">	case VICI_KEY_VALUE:</a>
+<a name="ln232">		if (blob_equal(key, &quot;errmsg&quot;) &amp;&amp; blob2buf(val, buf, sizeof(buf)))</a>
+<a name="ln233">			zlog_err(&quot;VICI: strongSwan: %s&quot;, buf);</a>
+<a name="ln234">		break;</a>
+<a name="ln235">	default:</a>
+<a name="ln236">		break;</a>
+<a name="ln237">	}</a>
+<a name="ln238">}</a>
+<a name="ln239"> </a>
+<a name="ln240">static void vici_recv_sa(struct vici_conn *vici, struct zbuf *msg, int event)</a>
+<a name="ln241">{</a>
+<a name="ln242">	char buf[32];</a>
+<a name="ln243">	struct handle_sa_ctx ctx = {</a>
+<a name="ln244">		.event = event,</a>
+<a name="ln245">	};</a>
+<a name="ln246"> </a>
+<a name="ln247">	vici_parse_message(vici, msg, parse_sa_message, &amp;ctx.msgctx);</a>
+<a name="ln248"> </a>
+<a name="ln249">	if (ctx.kill_ikesa &amp;&amp; ctx.ike_uniqueid) {</a>
+<a name="ln250">		debugf(NHRP_DEBUG_COMMON, &quot;VICI: Deleting IKE_SA %u&quot;, ctx.ike_uniqueid);</a>
+<a name="ln251">		snprintf(buf, sizeof buf, &quot;%u&quot;, ctx.ike_uniqueid);</a>
+<a name="ln252">		vici_submit_request(</a>
+<a name="ln253">			vici, &quot;terminate&quot;,</a>
+<a name="ln254">			VICI_KEY_VALUE, &quot;ike-id&quot;, strlen(buf), buf,</a>
+<a name="ln255">			VICI_END);</a>
+<a name="ln256">	}</a>
+<a name="ln257">}</a>
+<a name="ln258"> </a>
+<a name="ln259">static void vici_recv_message(struct vici_conn *vici, struct zbuf *msg)</a>
+<a name="ln260">{</a>
+<a name="ln261">	uint32_t msglen;</a>
+<a name="ln262">	uint8_t msgtype;</a>
+<a name="ln263">	struct blob name;</a>
+<a name="ln264"> </a>
+<a name="ln265">	msglen = zbuf_get_be32(msg);</a>
+<a name="ln266">	msgtype = zbuf_get8(msg);</a>
+<a name="ln267">	debugf(NHRP_DEBUG_VICI, &quot;VICI: Message %d, %d bytes&quot;, msgtype, msglen);</a>
+<a name="ln268"> </a>
+<a name="ln269">	switch (msgtype) {</a>
+<a name="ln270">	case VICI_EVENT:</a>
+<a name="ln271">		name.len = zbuf_get8(msg);</a>
+<a name="ln272">		name.ptr = zbuf_pulln(msg, name.len);</a>
+<a name="ln273"> </a>
+<a name="ln274">		debugf(NHRP_DEBUG_VICI, &quot;VICI: Event '%.*s'&quot;, name.len, name.ptr);</a>
+<a name="ln275">		if (blob_equal(&amp;name, &quot;list-sa&quot;) ||</a>
+<a name="ln276">		    blob_equal(&amp;name, &quot;child-updown&quot;) ||</a>
+<a name="ln277">		    blob_equal(&amp;name, &quot;child-rekey&quot;))</a>
+<a name="ln278">			vici_recv_sa(vici, msg, 0);</a>
+<a name="ln279">		else if (blob_equal(&amp;name, &quot;child-state-installed&quot;) ||</a>
+<a name="ln280">			 blob_equal(&amp;name, &quot;child-state-rekeyed&quot;))</a>
+<a name="ln281">			vici_recv_sa(vici, msg, 1);</a>
+<a name="ln282">		else if (blob_equal(&amp;name, &quot;child-state-destroying&quot;))</a>
+<a name="ln283">			vici_recv_sa(vici, msg, 2);</a>
+<a name="ln284">		break;</a>
+<a name="ln285">	case VICI_CMD_RESPONSE:</a>
+<a name="ln286">		vici_parse_message(vici, msg, parse_cmd_response, 0);</a>
+<a name="ln287">		break;</a>
+<a name="ln288">	case VICI_EVENT_UNKNOWN:</a>
+<a name="ln289">	case VICI_CMD_UNKNOWN:</a>
+<a name="ln290">		zlog_err(&quot;VICI: StrongSwan does not support mandatory events (unpatched?)&quot;);</a>
+<a name="ln291">		break;</a>
+<a name="ln292">	case VICI_EVENT_CONFIRM:</a>
+<a name="ln293">		break;</a>
+<a name="ln294">	default:</a>
+<a name="ln295">		zlog_notice(&quot;VICI: Unrecognized message type %d&quot;, msgtype);</a>
+<a name="ln296">		break;</a>
+<a name="ln297">	}</a>
+<a name="ln298">}</a>
+<a name="ln299"> </a>
+<a name="ln300">static int vici_read(struct thread *t)</a>
+<a name="ln301">{</a>
+<a name="ln302">	struct vici_conn *vici = THREAD_ARG(t);</a>
+<a name="ln303">	struct zbuf *ibuf = &amp;vici-&gt;ibuf;</a>
+<a name="ln304">	struct zbuf pktbuf;</a>
+<a name="ln305"> </a>
+<a name="ln306">	vici-&gt;t_read = NULL;</a>
+<a name="ln307">	if (zbuf_read(ibuf, vici-&gt;fd, (size_t) -1) &lt; 0) {</a>
+<a name="ln308">		vici_connection_error(vici);</a>
+<a name="ln309">		return 0;</a>
+<a name="ln310">	}</a>
+<a name="ln311"> </a>
+<a name="ln312">	/* Process all messages in buffer */</a>
+<a name="ln313">	do {</a>
+<a name="ln314">		uint32_t *hdrlen = zbuf_may_pull(ibuf, uint32_t);</a>
+<a name="ln315">		if (!hdrlen)</a>
+<a name="ln316">			break;</a>
+<a name="ln317">		if (!zbuf_may_pulln(ibuf, ntohl(*hdrlen))) {</a>
+<a name="ln318">			zbuf_reset_head(ibuf, hdrlen);</a>
+<a name="ln319">			break;</a>
+<a name="ln320">		}</a>
+<a name="ln321"> </a>
+<a name="ln322">		/* Handle packet */</a>
+<a name="ln323">		zbuf_init(&amp;pktbuf, hdrlen, htonl(*hdrlen)+4, htonl(*hdrlen)+4);</a>
+<a name="ln324">		vici_recv_message(vici, &amp;pktbuf);</a>
+<a name="ln325">	} while (1);</a>
+<a name="ln326"> </a>
+<a name="ln327">	THREAD_READ_ON(master, vici-&gt;t_read, vici_read, vici, vici-&gt;fd);</a>
+<a name="ln328">	return 0;</a>
+<a name="ln329">}</a>
+<a name="ln330"> </a>
+<a name="ln331">static int vici_write(struct thread *t)</a>
+<a name="ln332">{</a>
+<a name="ln333">	struct vici_conn *vici = THREAD_ARG(t);</a>
+<a name="ln334">	int r;</a>
+<a name="ln335"> </a>
+<a name="ln336">	vici-&gt;t_write = NULL;</a>
+<a name="ln337">	r = zbufq_write(&amp;vici-&gt;obuf, vici-&gt;fd);</a>
+<a name="ln338">	if (r &gt; 0) {</a>
+<a name="ln339">		THREAD_WRITE_ON(master, vici-&gt;t_write, vici_write, vici, vici-&gt;fd);</a>
+<a name="ln340">	} else if (r &lt; 0) {</a>
+<a name="ln341">		vici_connection_error(vici);</a>
+<a name="ln342">	}</a>
+<a name="ln343"> </a>
+<a name="ln344">	return 0;</a>
+<a name="ln345">}</a>
+<a name="ln346"> </a>
+<a name="ln347">static void vici_submit(struct vici_conn *vici, struct zbuf *obuf)</a>
+<a name="ln348">{</a>
+<a name="ln349">	if (vici-&gt;fd &lt; 0) {</a>
+<a name="ln350">		zbuf_free(obuf);</a>
+<a name="ln351">		return;</a>
+<a name="ln352">	}</a>
+<a name="ln353"> </a>
+<a name="ln354">	zbufq_queue(&amp;vici-&gt;obuf, obuf);</a>
+<a name="ln355">	THREAD_WRITE_ON(master, vici-&gt;t_write, vici_write, vici, vici-&gt;fd);</a>
+<a name="ln356">}</a>
+<a name="ln357"> </a>
+<a name="ln358">static void vici_submit_request(struct vici_conn *vici, const char *name, ...)</a>
+<a name="ln359">{</a>
+<a name="ln360">	struct zbuf *obuf;</a>
+<a name="ln361">	uint32_t *hdrlen;</a>
+<a name="ln362">	va_list va;</a>
+<a name="ln363">	size_t len;</a>
+<a name="ln364">	int type;</a>
+<a name="ln365"> </a>
+<a name="ln366">	obuf = zbuf_alloc(256);</a>
+<a name="ln367">	if (!obuf) return;</a>
+<a name="ln368"> </a>
+<a name="ln369">	hdrlen = zbuf_push(obuf, uint32_t);</a>
+<a name="ln370">	zbuf_put8(obuf, VICI_CMD_REQUEST);</a>
+<a name="ln371">	vici_zbuf_puts(obuf, name);</a>
+<a name="ln372"> </a>
+<a name="ln373">	va_start(va, name);</a>
+<a name="ln374">	for (type = va_arg(va, int); type != VICI_END; type = va_arg(va, int)) {</a>
+<a name="ln375">		zbuf_put8(obuf, type);</a>
+<a name="ln376">		switch (type) {</a>
+<a name="ln377">		case VICI_KEY_VALUE:</a>
+<a name="ln378">			vici_zbuf_puts(obuf, va_arg(va, const char *));</a>
+<a name="ln379">			len = va_arg(va, size_t);</a>
+<a name="ln380">			zbuf_put_be16(obuf, len);</a>
+<a name="ln381">			zbuf_put(obuf, va_arg(va, void *), len);</a>
+<a name="ln382">			break;</a>
+<a name="ln383">		case VICI_END:</a>
+<a name="ln384">			break;</a>
+<a name="ln385">		default:</a>
+<a name="ln386">			break;</a>
+<a name="ln387">		}</a>
+<a name="ln388">	}</a>
+<a name="ln389">	va_end(va);</a>
+<a name="ln390">	*hdrlen = htonl(zbuf_used(obuf) - 4);</a>
+<a name="ln391">	vici_submit(vici, obuf);</a>
+<a name="ln392">}</a>
+<a name="ln393"> </a>
+<a name="ln394">static void vici_register_event(struct vici_conn *vici, const char *name)</a>
+<a name="ln395">{</a>
+<a name="ln396">	struct zbuf *obuf;</a>
+<a name="ln397">	uint32_t *hdrlen;</a>
+<a name="ln398">	uint8_t namelen;</a>
+<a name="ln399"> </a>
+<a name="ln400">	namelen = strlen(name);</a>
+<a name="ln401">	obuf = zbuf_alloc(4 + 1 + 1 + namelen);</a>
+<a name="ln402">	if (!obuf) return;</a>
+<a name="ln403"> </a>
+<a name="ln404">	hdrlen = zbuf_push(obuf, uint32_t);</a>
+<a name="ln405">	zbuf_put8(obuf, VICI_EVENT_REGISTER);</a>
+<a name="ln406">	zbuf_put8(obuf, namelen);</a>
+<a name="ln407">	zbuf_put(obuf, name, namelen);</a>
+<a name="ln408">	*hdrlen = htonl(zbuf_used(obuf) - 4);</a>
+<a name="ln409"> </a>
+<a name="ln410">	vici_submit(vici, obuf);</a>
+<a name="ln411">}</a>
+<a name="ln412"> </a>
+<a name="ln413">static int vici_reconnect(struct thread *t)</a>
+<a name="ln414">{</a>
+<a name="ln415">	struct vici_conn *vici = THREAD_ARG(t);</a>
+<a name="ln416">	int fd;</a>
+<a name="ln417"> </a>
+<a name="ln418">	vici-&gt;t_reconnect = NULL;</a>
+<a name="ln419">	if (vici-&gt;fd &gt;= 0) return 0;</a>
+<a name="ln420"> </a>
+<a name="ln421">	fd = sock_open_unix(&quot;/var/run/charon.vici&quot;);</a>
+<a name="ln422">	if (fd &lt; 0) {</a>
+<a name="ln423">		zlog_warn(&quot;%s: failure connecting VICI socket: %s&quot;,</a>
+<a name="ln424">			__PRETTY_FUNCTION__, strerror(errno));</a>
+<a name="ln425">		THREAD_TIMER_ON(master, vici-&gt;t_reconnect, vici_reconnect, vici, 2);</a>
+<a name="ln426">		return 0;</a>
+<a name="ln427">	}</a>
+<a name="ln428"> </a>
+<a name="ln429">	debugf(NHRP_DEBUG_COMMON, &quot;VICI: Connected&quot;);</a>
+<a name="ln430">	vici-&gt;fd = fd;</a>
+<a name="ln431">	THREAD_READ_ON(master, vici-&gt;t_read, vici_read, vici, vici-&gt;fd);</a>
+<a name="ln432"> </a>
+<a name="ln433">	/* Send event subscribtions */</a>
+<a name="ln434">	//vici_register_event(vici, &quot;child-updown&quot;);</a>
+<a name="ln435">	//vici_register_event(vici, &quot;child-rekey&quot;);</a>
+<a name="ln436">	vici_register_event(vici, &quot;child-state-installed&quot;);</a>
+<a name="ln437">	vici_register_event(vici, &quot;child-state-rekeyed&quot;);</a>
+<a name="ln438">	vici_register_event(vici, &quot;child-state-destroying&quot;);</a>
+<a name="ln439">	vici_register_event(vici, &quot;list-sa&quot;);</a>
+<a name="ln440">	vici_submit_request(vici, &quot;list-sas&quot;, VICI_END);</a>
+<a name="ln441"> </a>
+<a name="ln442">	return 0;</a>
+<a name="ln443">}</a>
+<a name="ln444"> </a>
+<a name="ln445">static struct vici_conn vici_connection;</a>
+<a name="ln446"> </a>
+<a name="ln447">void vici_init(void)</a>
+<a name="ln448">{</a>
+<a name="ln449">	struct vici_conn *vici = &amp;vici_connection;</a>
+<a name="ln450"> </a>
+<a name="ln451">	vici-&gt;fd = -1;</a>
+<a name="ln452">	zbuf_init(&amp;vici-&gt;ibuf, vici-&gt;ibuf_data, sizeof(vici-&gt;ibuf_data), 0);</a>
+<a name="ln453">	zbufq_init(&amp;vici-&gt;obuf);</a>
+<a name="ln454">	THREAD_TIMER_MSEC_ON(master, vici-&gt;t_reconnect, vici_reconnect, vici, 10);</a>
+<a name="ln455">}</a>
+<a name="ln456"> </a>
+<a name="ln457">void vici_terminate(void)</a>
+<a name="ln458">{</a>
+<a name="ln459">}</a>
+<a name="ln460"> </a>
+<a name="ln461">void vici_request_vc(const char *profile, union sockunion *src, union sockunion *dst, int prio)</a>
+<a name="ln462">{</a>
+<a name="ln463">	struct vici_conn *vici = &amp;vici_connection;</a>
+<a name="ln464">	char buf[2][SU_ADDRSTRLEN];</a>
+<a name="ln465"> </a>
+<a name="ln466">	sockunion2str(src, buf[0], sizeof buf[0]);</a>
+<a name="ln467">	sockunion2str(dst, buf[1], sizeof buf[1]);</a>
+<a name="ln468"> </a>
+<a name="ln469">	vici_submit_request(</a>
+<a name="ln470">		vici, &quot;initiate&quot;,</a>
+<a name="ln471">		VICI_KEY_VALUE, &quot;child&quot;, strlen(profile), profile,</a>
+<a name="ln472">		VICI_KEY_VALUE, &quot;timeout&quot;, (size_t) 2, &quot;-1&quot;,</a>
+<a name="ln473">		VICI_KEY_VALUE, &quot;async&quot;, (size_t) 1, &quot;1&quot;,</a>
+<a name="ln474">		VICI_KEY_VALUE, &quot;init-limits&quot;, (size_t) 1, prio ? &quot;0&quot; : &quot;1&quot;,</a>
+<a name="ln475">		VICI_KEY_VALUE, &quot;my-host&quot;, strlen(buf[0]), buf[0],</a>
+<a name="ln476">		VICI_KEY_VALUE, &quot;other-host&quot;, strlen(buf[1]), buf[1],</a>
+<a name="ln477">		VICI_END);</a>
+<a name="ln478">}</a>
+<a name="ln479"> </a>
+<a name="ln480">int sock_open_unix(const char *path)</a>
+<a name="ln481">{</a>
+<a name="ln482">	int ret, fd;</a>
+<a name="ln483">	struct sockaddr_un addr;</a>
+<a name="ln484"> </a>
+<a name="ln485">	fd = socket(AF_UNIX, SOCK_STREAM, 0);</a>
+<a name="ln486">	if (fd &lt; 0)</a>
+<a name="ln487">		return -1;</a>
+<a name="ln488"> </a>
+<a name="ln489">	memset(&amp;addr, 0, sizeof (struct sockaddr_un));</a>
+<a name="ln490">	addr.sun_family = AF_UNIX;</a>
+<a name="ln491">	strncpy(addr.sun_path, path, strlen (path));</a>
+<a name="ln492"> </a>
+<a name="ln493">	ret = connect(fd, (struct sockaddr *) &amp;addr, sizeof(addr.sun_family) + strlen(addr.sun_path));</a>
+<a name="ln494">	if (ret &lt; 0) {</a>
+<a name="ln495">		close(fd);</a>
+<a name="ln496">		return -1;</a>
+<a name="ln497">	}</a>
+<a name="ln498"> </a>
+<a name="ln499">	fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);</a>
+<a name="ln500"> </a>
+<a name="ln501">	return fd;</a>
+<a name="ln502">}</a>
+
+</code></pre>
+<div class="balloon" rel="5"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1042/" target="_blank">V1042</a> This file is marked with copyleft license, which requires you to open the derived source code.</p></div>
+<div class="balloon" rel="400"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1029/" target="_blank">V1029</a> Numeric Truncation Error. Return value of the 'strlen' function is written to the 8-bit variable.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

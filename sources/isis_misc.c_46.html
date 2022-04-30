@@ -1,0 +1,680 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>isis_misc.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.5.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * IS-IS Rout(e)ing protocol - isis_misc.h</a>
+<a name="ln3"> *                             Miscellanous routines</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * Copyright (C) 2001,2002   Sampo Saaristo</a>
+<a name="ln6"> *                           Tampere University of Technology      </a>
+<a name="ln7"> *                           Institute of Communications Engineering</a>
+<a name="ln8"> *</a>
+<a name="ln9"> * This program is free software; you can redistribute it and/or modify it </a>
+<a name="ln10"> * under the terms of the GNU General Public Licenseas published by the Free </a>
+<a name="ln11"> * Software Foundation; either version 2 of the License, or (at your option) </a>
+<a name="ln12"> * any later version.</a>
+<a name="ln13"> *</a>
+<a name="ln14"> * This program is distributed in the hope that it will be useful,but WITHOUT </a>
+<a name="ln15"> * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or </a>
+<a name="ln16"> * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for </a>
+<a name="ln17"> * more details.</a>
+<a name="ln18"> </a>
+<a name="ln19"> * You should have received a copy of the GNU General Public License along </a>
+<a name="ln20"> * with this program; if not, write to the Free Software Foundation, Inc., </a>
+<a name="ln21"> * 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.</a>
+<a name="ln22"> */</a>
+<a name="ln23"> </a>
+<a name="ln24">#include &lt;zebra.h&gt;</a>
+<a name="ln25"> </a>
+<a name="ln26">#include &quot;stream.h&quot;</a>
+<a name="ln27">#include &quot;vty.h&quot;</a>
+<a name="ln28">#include &quot;hash.h&quot;</a>
+<a name="ln29">#include &quot;if.h&quot;</a>
+<a name="ln30">#include &quot;command.h&quot;</a>
+<a name="ln31"> </a>
+<a name="ln32">#include &quot;isisd/dict.h&quot;</a>
+<a name="ln33">#include &quot;isisd/isis_constants.h&quot;</a>
+<a name="ln34">#include &quot;isisd/isis_common.h&quot;</a>
+<a name="ln35">#include &quot;isisd/isis_flags.h&quot;</a>
+<a name="ln36">#include &quot;isisd/isis_circuit.h&quot;</a>
+<a name="ln37">#include &quot;isisd/isis_csm.h&quot;</a>
+<a name="ln38">#include &quot;isisd/isisd.h&quot;</a>
+<a name="ln39">#include &quot;isisd/isis_misc.h&quot;</a>
+<a name="ln40"> </a>
+<a name="ln41">#include &quot;isisd/isis_tlv.h&quot;</a>
+<a name="ln42">#include &quot;isisd/isis_lsp.h&quot;</a>
+<a name="ln43">#include &quot;isisd/isis_constants.h&quot;</a>
+<a name="ln44">#include &quot;isisd/isis_adjacency.h&quot;</a>
+<a name="ln45">#include &quot;isisd/isis_dynhn.h&quot;</a>
+<a name="ln46"> </a>
+<a name="ln47">/* staticly assigned vars for printing purposes */</a>
+<a name="ln48">struct in_addr new_prefix;</a>
+<a name="ln49">/* len of xxxx.xxxx.xxxx + place for #0 termination */</a>
+<a name="ln50">char sysid[15];</a>
+<a name="ln51">/* len of xxxx.xxxx.xxxx + place for #0 termination */</a>
+<a name="ln52">char snpa[15];</a>
+<a name="ln53">/* len of xx.xxxx.xxxx.xxxx.xxxx.xxxx.xxxx.xxxx.xxxx.xxxx.xx */</a>
+<a name="ln54">char isonet[51];</a>
+<a name="ln55">/* + place for #0 termination */</a>
+<a name="ln56">/* len of xxxx.xxxx.xxxx.xx.xx + place for #0 termination */</a>
+<a name="ln57">char lspid[21];</a>
+<a name="ln58">/* len of xxYxxMxWxdxxhxxmxxs + place for #0 termination */</a>
+<a name="ln59">char datestring[20];</a>
+<a name="ln60">char nlpidstring[30];</a>
+<a name="ln61"> </a>
+<a name="ln62">/*</a>
+<a name="ln63"> * This converts the isonet to its printable format</a>
+<a name="ln64"> */</a>
+<a name="ln65">const char *</a>
+<a name="ln66">isonet_print (const u_char * from, int len)</a>
+<a name="ln67">{</a>
+<a name="ln68">  int i = 0;</a>
+<a name="ln69">  char *pos = isonet;</a>
+<a name="ln70"> </a>
+<a name="ln71">  if (!from)</a>
+<a name="ln72">    return &quot;unknown&quot;;</a>
+<a name="ln73"> </a>
+<a name="ln74">  while (i &lt; len)</a>
+<a name="ln75">    {</a>
+<a name="ln76">      if (i &amp; 1)</a>
+<a name="ln77">	{</a>
+<a name="ln78">	  sprintf (pos, &quot;%02x&quot;, *(from + i));</a>
+<a name="ln79">	  pos += 2;</a>
+<a name="ln80">	}</a>
+<a name="ln81">      else</a>
+<a name="ln82">	{</a>
+<a name="ln83">	  if (i == (len - 1))</a>
+<a name="ln84">	    {			/* No dot at the end of address */</a>
+<a name="ln85">	      sprintf (pos, &quot;%02x&quot;, *(from + i));</a>
+<a name="ln86">	      pos += 2;</a>
+<a name="ln87">	    }</a>
+<a name="ln88">	  else</a>
+<a name="ln89">	    {</a>
+<a name="ln90">	      sprintf (pos, &quot;%02x.&quot;, *(from + i));</a>
+<a name="ln91">	      pos += 3;</a>
+<a name="ln92">	    }</a>
+<a name="ln93">	}</a>
+<a name="ln94">      i++;</a>
+<a name="ln95">    }</a>
+<a name="ln96">  *(pos) = '\0';</a>
+<a name="ln97">  return isonet;</a>
+<a name="ln98">}</a>
+<a name="ln99"> </a>
+<a name="ln100">/*</a>
+<a name="ln101"> * Returns 0 on error, length of buff on ok</a>
+<a name="ln102"> * extract dot from the dotted str, and insert all the number in a buff </a>
+<a name="ln103"> */</a>
+<a name="ln104">int</a>
+<a name="ln105">dotformat2buff (u_char * buff, const char * dotted)</a>
+<a name="ln106">{</a>
+<a name="ln107">  int dotlen, len = 0;</a>
+<a name="ln108">  const char *pos = dotted;</a>
+<a name="ln109">  u_char number[3];</a>
+<a name="ln110">  int nextdotpos = 2;</a>
+<a name="ln111"> </a>
+<a name="ln112">  number[2] = '\0';</a>
+<a name="ln113">  dotlen = strlen(dotted);</a>
+<a name="ln114">  if (dotlen &gt; 50)</a>
+<a name="ln115">    {</a>
+<a name="ln116">      /* this can't be an iso net, its too long */</a>
+<a name="ln117">      return 0;</a>
+<a name="ln118">    }</a>
+<a name="ln119"> </a>
+<a name="ln120">  while ((pos - dotted) &lt; dotlen &amp;&amp; len &lt; 20)</a>
+<a name="ln121">    {</a>
+<a name="ln122">      if (*pos == '.')</a>
+<a name="ln123">	{</a>
+<a name="ln124">	  /* we expect the . at 2, and than every 5 */</a>
+<a name="ln125">	  if ((pos - dotted) != nextdotpos)</a>
+<a name="ln126">	    {</a>
+<a name="ln127">	      len = 0;</a>
+<a name="ln128">	      break;</a>
+<a name="ln129">	    }</a>
+<a name="ln130">	  nextdotpos += 5;</a>
+<a name="ln131">	  pos++;</a>
+<a name="ln132">	  continue;</a>
+<a name="ln133">	}</a>
+<a name="ln134">      /* we must have at least two chars left here */</a>
+<a name="ln135">      if (dotlen - (pos - dotted) &lt; 2)</a>
+<a name="ln136">	{</a>
+<a name="ln137">	  len = 0;</a>
+<a name="ln138">	  break;</a>
+<a name="ln139">	}</a>
+<a name="ln140"> </a>
+<a name="ln141">      if ((isxdigit ((int) *pos)) &amp;&amp; (isxdigit ((int) *(pos + 1))))</a>
+<a name="ln142">	{</a>
+<a name="ln143">	  memcpy (number, pos, 2);</a>
+<a name="ln144">	  pos += 2;</a>
+<a name="ln145">	}</a>
+<a name="ln146">      else</a>
+<a name="ln147">	{</a>
+<a name="ln148">	  len = 0;</a>
+<a name="ln149">	  break;</a>
+<a name="ln150">	}</a>
+<a name="ln151"> </a>
+<a name="ln152">      *(buff + len) = (char) strtol ((char *)number, NULL, 16);</a>
+<a name="ln153">      len++;</a>
+<a name="ln154">    }</a>
+<a name="ln155"> </a>
+<a name="ln156">  return len;</a>
+<a name="ln157">}</a>
+<a name="ln158"> </a>
+<a name="ln159">/*</a>
+<a name="ln160"> * conversion of XXXX.XXXX.XXXX to memory</a>
+<a name="ln161"> */</a>
+<a name="ln162">int</a>
+<a name="ln163">sysid2buff (u_char * buff, const char * dotted)</a>
+<a name="ln164">{</a>
+<a name="ln165">  int len = 0;</a>
+<a name="ln166">  const char *pos = dotted;</a>
+<a name="ln167">  u_char number[3];</a>
+<a name="ln168"> </a>
+<a name="ln169">  number[2] = '\0';</a>
+<a name="ln170">  // surely not a sysid_string if not 14 length</a>
+<a name="ln171">  if (strlen (dotted) != 14)</a>
+<a name="ln172">    {</a>
+<a name="ln173">      return 0;</a>
+<a name="ln174">    }</a>
+<a name="ln175"> </a>
+<a name="ln176">  while (len &lt; ISIS_SYS_ID_LEN)</a>
+<a name="ln177">    {</a>
+<a name="ln178">      if (*pos == '.')</a>
+<a name="ln179">	{</a>
+<a name="ln180">	  /* the . is not positioned correctly */</a>
+<a name="ln181">	  if (((pos - dotted) != 4) &amp;&amp; ((pos - dotted) != 9))</a>
+<a name="ln182">	    {</a>
+<a name="ln183">	      len = 0;</a>
+<a name="ln184">	      break;</a>
+<a name="ln185">	    }</a>
+<a name="ln186">	  pos++;</a>
+<a name="ln187">	  continue;</a>
+<a name="ln188">	}</a>
+<a name="ln189">      if ((isxdigit ((int) *pos)) &amp;&amp; (isxdigit ((int) *(pos + 1))))</a>
+<a name="ln190">	{</a>
+<a name="ln191">	  memcpy (number, pos, 2);</a>
+<a name="ln192">	  pos += 2;</a>
+<a name="ln193">	}</a>
+<a name="ln194">      else</a>
+<a name="ln195">	{</a>
+<a name="ln196">	  len = 0;</a>
+<a name="ln197">	  break;</a>
+<a name="ln198">	}</a>
+<a name="ln199"> </a>
+<a name="ln200">      *(buff + len) = (char) strtol ((char *)number, NULL, 16);</a>
+<a name="ln201">      len++;</a>
+<a name="ln202">    }</a>
+<a name="ln203"> </a>
+<a name="ln204">  return len;</a>
+<a name="ln205"> </a>
+<a name="ln206">}</a>
+<a name="ln207"> </a>
+<a name="ln208">/*</a>
+<a name="ln209"> * converts the nlpids struct (filled by TLV #129)</a>
+<a name="ln210"> * into a string</a>
+<a name="ln211"> */</a>
+<a name="ln212"> </a>
+<a name="ln213">char *</a>
+<a name="ln214">nlpid2string (struct nlpids *nlpids)</a>
+<a name="ln215">{</a>
+<a name="ln216">  char *pos = nlpidstring;</a>
+<a name="ln217">  int i;</a>
+<a name="ln218"> </a>
+<a name="ln219">  for (i = 0; i &lt; nlpids-&gt;count; i++)</a>
+<a name="ln220">    {</a>
+<a name="ln221">      switch (nlpids-&gt;nlpids[i])</a>
+<a name="ln222">	{</a>
+<a name="ln223">	case NLPID_IP:</a>
+<a name="ln224">	  pos += sprintf (pos, &quot;IPv4&quot;);</a>
+<a name="ln225">	  break;</a>
+<a name="ln226">	case NLPID_IPV6:</a>
+<a name="ln227">	  pos += sprintf (pos, &quot;IPv6&quot;);</a>
+<a name="ln228">	  break;</a>
+<a name="ln229">	case NLPID_SNAP:</a>
+<a name="ln230">	  pos += sprintf (pos, &quot;SNAP&quot;);</a>
+<a name="ln231">	  break;</a>
+<a name="ln232">	case NLPID_CLNP:</a>
+<a name="ln233">	  pos += sprintf (pos, &quot;CLNP&quot;);</a>
+<a name="ln234">	  break;</a>
+<a name="ln235">	case NLPID_ESIS:</a>
+<a name="ln236">	  pos += sprintf (pos, &quot;ES-IS&quot;);</a>
+<a name="ln237">	  break;</a>
+<a name="ln238">	default:</a>
+<a name="ln239">	  pos += sprintf (pos, &quot;unknown&quot;);</a>
+<a name="ln240">	  break;</a>
+<a name="ln241">	}</a>
+<a name="ln242">      if (nlpids-&gt;count - i &gt; 1)</a>
+<a name="ln243">	pos += sprintf (pos, &quot;, &quot;);</a>
+<a name="ln244"> </a>
+<a name="ln245">    }</a>
+<a name="ln246"> </a>
+<a name="ln247">  *(pos) = '\0';</a>
+<a name="ln248"> </a>
+<a name="ln249">  return nlpidstring;</a>
+<a name="ln250">}</a>
+<a name="ln251"> </a>
+<a name="ln252">/*</a>
+<a name="ln253"> *  supports the given af ?</a>
+<a name="ln254"> */</a>
+<a name="ln255">int</a>
+<a name="ln256">speaks (struct nlpids *nlpids, int family)</a>
+<a name="ln257">{</a>
+<a name="ln258">  int i, speaks = 0;</a>
+<a name="ln259"> </a>
+<a name="ln260">  if (nlpids == (struct nlpids *) NULL)</a>
+<a name="ln261">    return speaks;</a>
+<a name="ln262">  for (i = 0; i &lt; nlpids-&gt;count; i++)</a>
+<a name="ln263">    {</a>
+<a name="ln264">      if (family == AF_INET &amp;&amp; nlpids-&gt;nlpids[i] == NLPID_IP)</a>
+<a name="ln265">	speaks = 1;</a>
+<a name="ln266">      if (family == AF_INET6 &amp;&amp; nlpids-&gt;nlpids[i] == NLPID_IPV6)</a>
+<a name="ln267">	speaks = 1;</a>
+<a name="ln268">    }</a>
+<a name="ln269"> </a>
+<a name="ln270">  return speaks;</a>
+<a name="ln271">}</a>
+<a name="ln272"> </a>
+<a name="ln273">/*</a>
+<a name="ln274"> * Returns 0 on error, IS-IS Circuit Type on ok</a>
+<a name="ln275"> */</a>
+<a name="ln276">int</a>
+<a name="ln277">string2circuit_t (const char * str)</a>
+<a name="ln278">{</a>
+<a name="ln279"> </a>
+<a name="ln280">  if (!str)</a>
+<a name="ln281">    return 0;</a>
+<a name="ln282"> </a>
+<a name="ln283">  if (!strcmp (str, &quot;level-1&quot;))</a>
+<a name="ln284">    return IS_LEVEL_1;</a>
+<a name="ln285"> </a>
+<a name="ln286">  if (!strcmp (str, &quot;level-2-only&quot;) || !strcmp (str, &quot;level-2&quot;))</a>
+<a name="ln287">    return IS_LEVEL_2;</a>
+<a name="ln288"> </a>
+<a name="ln289">  if (!strcmp (str, &quot;level-1-2&quot;))</a>
+<a name="ln290">    return IS_LEVEL_1_AND_2;</a>
+<a name="ln291"> </a>
+<a name="ln292">  return 0;</a>
+<a name="ln293">}</a>
+<a name="ln294"> </a>
+<a name="ln295">const char *</a>
+<a name="ln296">circuit_state2string (int state)</a>
+<a name="ln297">{</a>
+<a name="ln298"> </a>
+<a name="ln299">  switch (state)</a>
+<a name="ln300">    {</a>
+<a name="ln301">    case C_STATE_INIT:</a>
+<a name="ln302">      return &quot;Init&quot;;</a>
+<a name="ln303">    case C_STATE_CONF:</a>
+<a name="ln304">      return &quot;Config&quot;;</a>
+<a name="ln305">    case C_STATE_UP:</a>
+<a name="ln306">      return &quot;Up&quot;;</a>
+<a name="ln307">    default:</a>
+<a name="ln308">      return &quot;Unknown&quot;;</a>
+<a name="ln309">    }</a>
+<a name="ln310">  return NULL;</a>
+<a name="ln311">}</a>
+<a name="ln312"> </a>
+<a name="ln313">const char *</a>
+<a name="ln314">circuit_type2string (int type)</a>
+<a name="ln315">{</a>
+<a name="ln316"> </a>
+<a name="ln317">  switch (type)</a>
+<a name="ln318">    {</a>
+<a name="ln319">    case CIRCUIT_T_P2P:</a>
+<a name="ln320">      return &quot;p2p&quot;;</a>
+<a name="ln321">    case CIRCUIT_T_BROADCAST:</a>
+<a name="ln322">      return &quot;lan&quot;;</a>
+<a name="ln323">    case CIRCUIT_T_LOOPBACK:</a>
+<a name="ln324">      return &quot;loopback&quot;;</a>
+<a name="ln325">    default:</a>
+<a name="ln326">      return &quot;Unknown&quot;;</a>
+<a name="ln327">    }</a>
+<a name="ln328">  return NULL;</a>
+<a name="ln329">}</a>
+<a name="ln330"> </a>
+<a name="ln331">const char *</a>
+<a name="ln332">circuit_t2string (int circuit_t)</a>
+<a name="ln333">{</a>
+<a name="ln334">  switch (circuit_t)</a>
+<a name="ln335">    {</a>
+<a name="ln336">    case IS_LEVEL_1:</a>
+<a name="ln337">      return &quot;L1&quot;;</a>
+<a name="ln338">    case IS_LEVEL_2:</a>
+<a name="ln339">      return &quot;L2&quot;;</a>
+<a name="ln340">    case IS_LEVEL_1_AND_2:</a>
+<a name="ln341">      return &quot;L1L2&quot;;</a>
+<a name="ln342">    default:</a>
+<a name="ln343">      return &quot;??&quot;;</a>
+<a name="ln344">    }</a>
+<a name="ln345"> </a>
+<a name="ln346">  return NULL;			/* not reached */</a>
+<a name="ln347">}</a>
+<a name="ln348"> </a>
+<a name="ln349">const char *</a>
+<a name="ln350">syst2string (int type)</a>
+<a name="ln351">{</a>
+<a name="ln352">  switch (type)</a>
+<a name="ln353">    {</a>
+<a name="ln354">    case ISIS_SYSTYPE_ES:</a>
+<a name="ln355">      return &quot;ES&quot;;</a>
+<a name="ln356">    case ISIS_SYSTYPE_IS:</a>
+<a name="ln357">      return &quot;IS&quot;;</a>
+<a name="ln358">    case ISIS_SYSTYPE_L1_IS:</a>
+<a name="ln359">      return &quot;1&quot;;</a>
+<a name="ln360">    case ISIS_SYSTYPE_L2_IS:</a>
+<a name="ln361">      return &quot;2&quot;;</a>
+<a name="ln362">    default:</a>
+<a name="ln363">      return &quot;??&quot;;</a>
+<a name="ln364">    }</a>
+<a name="ln365"> </a>
+<a name="ln366">  return NULL;			/* not reached */</a>
+<a name="ln367">}</a>
+<a name="ln368"> </a>
+<a name="ln369">/*</a>
+<a name="ln370"> * Print functions - we print to static vars</a>
+<a name="ln371"> */</a>
+<a name="ln372">const char *</a>
+<a name="ln373">snpa_print (const u_char * from)</a>
+<a name="ln374">{</a>
+<a name="ln375">  int i = 0;</a>
+<a name="ln376">  u_char *pos = (u_char *)snpa;</a>
+<a name="ln377"> </a>
+<a name="ln378">  if (!from)</a>
+<a name="ln379">    return &quot;unknown&quot;;</a>
+<a name="ln380"> </a>
+<a name="ln381">  while (i &lt; ETH_ALEN - 1)</a>
+<a name="ln382">    {</a>
+<a name="ln383">      if (i &amp; 1)</a>
+<a name="ln384">	{</a>
+<a name="ln385">	  sprintf ((char *)pos, &quot;%02x.&quot;, *(from + i));</a>
+<a name="ln386">	  pos += 3;</a>
+<a name="ln387">	}</a>
+<a name="ln388">      else</a>
+<a name="ln389">	{</a>
+<a name="ln390">	  sprintf ((char *)pos, &quot;%02x&quot;, *(from + i));</a>
+<a name="ln391">	  pos += 2;</a>
+<a name="ln392"> </a>
+<a name="ln393">	}</a>
+<a name="ln394">      i++;</a>
+<a name="ln395">    }</a>
+<a name="ln396"> </a>
+<a name="ln397">  sprintf ((char *)pos, &quot;%02x&quot;, *(from + (ISIS_SYS_ID_LEN - 1)));</a>
+<a name="ln398">  pos += 2;</a>
+<a name="ln399">  *(pos) = '\0';</a>
+<a name="ln400"> </a>
+<a name="ln401">  return snpa;</a>
+<a name="ln402">}</a>
+<a name="ln403"> </a>
+<a name="ln404">const char *</a>
+<a name="ln405">sysid_print (const u_char * from)</a>
+<a name="ln406">{</a>
+<a name="ln407">  int i = 0;</a>
+<a name="ln408">  char *pos = sysid;</a>
+<a name="ln409"> </a>
+<a name="ln410">  if (!from)</a>
+<a name="ln411">    return &quot;unknown&quot;;</a>
+<a name="ln412"> </a>
+<a name="ln413">  while (i &lt; ISIS_SYS_ID_LEN - 1)</a>
+<a name="ln414">    {</a>
+<a name="ln415">      if (i &amp; 1)</a>
+<a name="ln416">	{</a>
+<a name="ln417">	  sprintf (pos, &quot;%02x.&quot;, *(from + i));</a>
+<a name="ln418">	  pos += 3;</a>
+<a name="ln419">	}</a>
+<a name="ln420">      else</a>
+<a name="ln421">	{</a>
+<a name="ln422">	  sprintf (pos, &quot;%02x&quot;, *(from + i));</a>
+<a name="ln423">	  pos += 2;</a>
+<a name="ln424"> </a>
+<a name="ln425">	}</a>
+<a name="ln426">      i++;</a>
+<a name="ln427">    }</a>
+<a name="ln428"> </a>
+<a name="ln429">  sprintf (pos, &quot;%02x&quot;, *(from + (ISIS_SYS_ID_LEN - 1)));</a>
+<a name="ln430">  pos += 2;</a>
+<a name="ln431">  *(pos) = '\0';</a>
+<a name="ln432"> </a>
+<a name="ln433">  return sysid;</a>
+<a name="ln434">}</a>
+<a name="ln435"> </a>
+<a name="ln436">const char *</a>
+<a name="ln437">rawlspid_print (const u_char * from)</a>
+<a name="ln438">{</a>
+<a name="ln439">  char *pos = lspid;</a>
+<a name="ln440">  if (!from)</a>
+<a name="ln441">    return &quot;unknown&quot;;</a>
+<a name="ln442">  memcpy (pos, sysid_print (from), 15);</a>
+<a name="ln443">  pos += 14;</a>
+<a name="ln444">  sprintf (pos, &quot;.%02x&quot;, LSP_PSEUDO_ID (from));</a>
+<a name="ln445">  pos += 3;</a>
+<a name="ln446">  sprintf (pos, &quot;-%02x&quot;, LSP_FRAGMENT (from));</a>
+<a name="ln447">  pos += 3;</a>
+<a name="ln448"> </a>
+<a name="ln449">  *(pos) = '\0';</a>
+<a name="ln450"> </a>
+<a name="ln451">  return lspid;</a>
+<a name="ln452">}</a>
+<a name="ln453"> </a>
+<a name="ln454">const char *</a>
+<a name="ln455">time2string (u_int32_t time)</a>
+<a name="ln456">{</a>
+<a name="ln457">  char *pos = datestring;</a>
+<a name="ln458">  u_int32_t rest;</a>
+<a name="ln459"> </a>
+<a name="ln460">  if (time == 0)</a>
+<a name="ln461">    return &quot;-&quot;;</a>
+<a name="ln462"> </a>
+<a name="ln463">  if (time / SECS_PER_YEAR)</a>
+<a name="ln464">    pos += sprintf (pos, &quot;%uY&quot;, time / SECS_PER_YEAR);</a>
+<a name="ln465">  rest = time % SECS_PER_YEAR;</a>
+<a name="ln466">  if (rest / SECS_PER_MONTH)</a>
+<a name="ln467">    pos += sprintf (pos, &quot;%uM&quot;, rest / SECS_PER_MONTH);</a>
+<a name="ln468">  rest = rest % SECS_PER_MONTH;</a>
+<a name="ln469">  if (rest / SECS_PER_WEEK)</a>
+<a name="ln470">    pos += sprintf (pos, &quot;%uw&quot;, rest / SECS_PER_WEEK);</a>
+<a name="ln471">  rest = rest % SECS_PER_WEEK;</a>
+<a name="ln472">  if (rest / SECS_PER_DAY)</a>
+<a name="ln473">    pos += sprintf (pos, &quot;%ud&quot;, rest / SECS_PER_DAY);</a>
+<a name="ln474">  rest = rest % SECS_PER_DAY;</a>
+<a name="ln475">  if (rest / SECS_PER_HOUR)</a>
+<a name="ln476">    pos += sprintf (pos, &quot;%uh&quot;, rest / SECS_PER_HOUR);</a>
+<a name="ln477">  rest = rest % SECS_PER_HOUR;</a>
+<a name="ln478">  if (rest / SECS_PER_MINUTE)</a>
+<a name="ln479">    pos += sprintf (pos, &quot;%um&quot;, rest / SECS_PER_MINUTE);</a>
+<a name="ln480">  rest = rest % SECS_PER_MINUTE;</a>
+<a name="ln481">  if (rest)</a>
+<a name="ln482">    pos += sprintf (pos, &quot;%us&quot;, rest);</a>
+<a name="ln483"> </a>
+<a name="ln484">  *(pos) = 0;</a>
+<a name="ln485"> </a>
+<a name="ln486">  return datestring;</a>
+<a name="ln487">}</a>
+<a name="ln488"> </a>
+<a name="ln489">/*</a>
+<a name="ln490"> * routine to decrement a timer by a random</a>
+<a name="ln491"> * number</a>
+<a name="ln492"> *</a>
+<a name="ln493"> * first argument is the timer and the second is</a>
+<a name="ln494"> * the jitter</a>
+<a name="ln495"> */</a>
+<a name="ln496">unsigned long</a>
+<a name="ln497">isis_jitter (unsigned long timer, unsigned long jitter)</a>
+<a name="ln498">{</a>
+<a name="ln499">  int j, k;</a>
+<a name="ln500"> </a>
+<a name="ln501">  if (jitter &gt;= 100)</a>
+<a name="ln502">    return timer;</a>
+<a name="ln503"> </a>
+<a name="ln504">  if (timer == 1)</a>
+<a name="ln505">    return timer;</a>
+<a name="ln506">  /* </a>
+<a name="ln507">   * randomizing just the percent value provides</a>
+<a name="ln508">   * no good random numbers - hence the spread</a>
+<a name="ln509">   * to RANDOM_SPREAD (100000), which is ok as</a>
+<a name="ln510">   * most IS-IS timers are no longer than 16 bit</a>
+<a name="ln511">   */</a>
+<a name="ln512"> </a>
+<a name="ln513">  j = 1 + (int) ((RANDOM_SPREAD * random ()) / (RAND_MAX + 1.0));</a>
+<a name="ln514"> </a>
+<a name="ln515">  k = timer - (timer * (100 - jitter)) / 100;</a>
+<a name="ln516"> </a>
+<a name="ln517">  timer = timer - (k * j / RANDOM_SPREAD);</a>
+<a name="ln518"> </a>
+<a name="ln519">  return timer;</a>
+<a name="ln520">}</a>
+<a name="ln521"> </a>
+<a name="ln522">struct in_addr</a>
+<a name="ln523">newprefix2inaddr (u_char * prefix_start, u_char prefix_masklen)</a>
+<a name="ln524">{</a>
+<a name="ln525">  memset (&amp;new_prefix, 0, sizeof (new_prefix));</a>
+<a name="ln526">  memcpy (&amp;new_prefix, prefix_start, (prefix_masklen &amp; 0x3F) ?</a>
+<a name="ln527">	  ((((prefix_masklen &amp; 0x3F) - 1) &gt;&gt; 3) + 1) : 0);</a>
+<a name="ln528">  return new_prefix;</a>
+<a name="ln529">}</a>
+<a name="ln530"> </a>
+<a name="ln531">/*</a>
+<a name="ln532"> * Returns host.name if any, otherwise</a>
+<a name="ln533"> * it returns the system hostname.</a>
+<a name="ln534"> */</a>
+<a name="ln535">const char *</a>
+<a name="ln536">unix_hostname (void)</a>
+<a name="ln537">{</a>
+<a name="ln538">  static struct utsname names;</a>
+<a name="ln539">  const char *hostname;</a>
+<a name="ln540"> </a>
+<a name="ln541">  hostname = host.name;</a>
+<a name="ln542">  if (!hostname)</a>
+<a name="ln543">    {</a>
+<a name="ln544">      uname (&amp;names);</a>
+<a name="ln545">      hostname = names.nodename;</a>
+<a name="ln546">    }</a>
+<a name="ln547"> </a>
+<a name="ln548">  return hostname;</a>
+<a name="ln549">}</a>
+<a name="ln550"> </a>
+<a name="ln551">/*</a>
+<a name="ln552"> * Returns the dynamic hostname associated with the passed system ID.</a>
+<a name="ln553"> * If no dynamic hostname found then returns formatted system ID.</a>
+<a name="ln554"> */</a>
+<a name="ln555">const char *</a>
+<a name="ln556">print_sys_hostname (const u_char *sysid)</a>
+<a name="ln557">{</a>
+<a name="ln558">  struct isis_dynhn *dyn;</a>
+<a name="ln559"> </a>
+<a name="ln560">  if (!sysid)</a>
+<a name="ln561">    return &quot;nullsysid&quot;;</a>
+<a name="ln562"> </a>
+<a name="ln563">  /* For our system ID return our host name */</a>
+<a name="ln564">  if (memcmp(sysid, isis-&gt;sysid, ISIS_SYS_ID_LEN) == 0)</a>
+<a name="ln565">    return unix_hostname();</a>
+<a name="ln566"> </a>
+<a name="ln567">  dyn = dynhn_find_by_id (sysid);</a>
+<a name="ln568">  if (dyn)</a>
+<a name="ln569">    return (const char *)dyn-&gt;name.name;</a>
+<a name="ln570"> </a>
+<a name="ln571">  return sysid_print (sysid);</a>
+<a name="ln572">}</a>
+<a name="ln573"> </a>
+<a name="ln574">/*</a>
+<a name="ln575"> * This function is a generic utility that logs data of given length.</a>
+<a name="ln576"> * Move this to a shared lib so that any protocol can use it.</a>
+<a name="ln577"> */</a>
+<a name="ln578">void</a>
+<a name="ln579">zlog_dump_data (void *data, int len)</a>
+<a name="ln580">{</a>
+<a name="ln581">  int i;</a>
+<a name="ln582">  unsigned char *p;</a>
+<a name="ln583">  unsigned char c;</a>
+<a name="ln584">  char bytestr[4];</a>
+<a name="ln585">  char addrstr[10];</a>
+<a name="ln586">  char hexstr[ 16*3 + 5];</a>
+<a name="ln587">  char charstr[16*1 + 5];</a>
+<a name="ln588"> </a>
+<a name="ln589">  p = data;</a>
+<a name="ln590">  memset (bytestr, 0, sizeof(bytestr));</a>
+<a name="ln591">  memset (addrstr, 0, sizeof(addrstr));</a>
+<a name="ln592">  memset (hexstr, 0, sizeof(hexstr));</a>
+<a name="ln593">  memset (charstr, 0, sizeof(charstr));</a>
+<a name="ln594"> </a>
+<a name="ln595">  for (i = 1; i &lt;= len; i++)</a>
+<a name="ln596">  {</a>
+<a name="ln597">    c = *p;</a>
+<a name="ln598">    if (isalnum (c) == 0)</a>
+<a name="ln599">      c = '.';</a>
+<a name="ln600"> </a>
+<a name="ln601">    /* store address for this line */</a>
+<a name="ln602">    if ((i % 16) == 1)</a>
+<a name="ln603">      snprintf (addrstr, sizeof(addrstr), &quot;%p&quot;, p);</a>
+<a name="ln604"> </a>
+<a name="ln605">    /* store hex str (for left side) */</a>
+<a name="ln606">    snprintf (bytestr, sizeof (bytestr), &quot;%02X &quot;, *p);</a>
+<a name="ln607">    strncat (hexstr, bytestr, sizeof (hexstr) - strlen (hexstr) - 1);</a>
+<a name="ln608"> </a>
+<a name="ln609">    /* store char str (for right side) */</a>
+<a name="ln610">    snprintf (bytestr, sizeof (bytestr), &quot;%c&quot;, c);</a>
+<a name="ln611">    strncat (charstr, bytestr, sizeof (charstr) - strlen (charstr) - 1);</a>
+<a name="ln612"> </a>
+<a name="ln613">    if ((i % 16) == 0)</a>
+<a name="ln614">    {</a>
+<a name="ln615">      /* line completed */</a>
+<a name="ln616">      zlog_debug (&quot;[%8.8s]   %-50.50s  %s&quot;, addrstr, hexstr, charstr);</a>
+<a name="ln617">      hexstr[0] = 0;</a>
+<a name="ln618">      charstr[0] = 0;</a>
+<a name="ln619">    }</a>
+<a name="ln620">    else if ((i % 8) == 0)</a>
+<a name="ln621">    {</a>
+<a name="ln622">      /* half line: add whitespaces */</a>
+<a name="ln623">      strncat (hexstr, &quot;  &quot;, sizeof (hexstr) - strlen (hexstr) - 1);</a>
+<a name="ln624">      strncat (charstr, &quot; &quot;, sizeof (charstr) - strlen (charstr) - 1);</a>
+<a name="ln625">    }</a>
+<a name="ln626">    p++; /* next byte */</a>
+<a name="ln627">  }</a>
+<a name="ln628"> </a>
+<a name="ln629">  /* print rest of buffer if not empty */</a>
+<a name="ln630">  if (strlen (hexstr) &gt; 0)</a>
+<a name="ln631">    zlog_debug (&quot;[%8.8s]   %-50.50s  %s&quot;, addrstr, hexstr, charstr);</a>
+<a name="ln632">  return;</a>
+<a name="ln633">}</a>
+
+</code></pre>
+<div class="balloon" rel="16"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1042/" target="_blank">V1042</a> This file is marked with copyleft license, which requires you to open the derived source code.</p></div>
+<div class="balloon" rel="442"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v512/" target="_blank">V512</a> A call of the 'memcpy' function will lead to underflow of the buffer 'pos'.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

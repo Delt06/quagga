@@ -1,0 +1,1469 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>isis_circuit.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.5.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * IS-IS Rout(e)ing protocol - isis_circuit.h</a>
+<a name="ln3"> *</a>
+<a name="ln4"> * Copyright (C) 2001,2002   Sampo Saaristo</a>
+<a name="ln5"> *                           Tampere University of Technology      </a>
+<a name="ln6"> *                           Institute of Communications Engineering</a>
+<a name="ln7"> *</a>
+<a name="ln8"> * This program is free software; you can redistribute it and/or modify it </a>
+<a name="ln9"> * under the terms of the GNU General Public Licenseas published by the Free </a>
+<a name="ln10"> * Software Foundation; either version 2 of the License, or (at your option) </a>
+<a name="ln11"> * any later version.</a>
+<a name="ln12"> *</a>
+<a name="ln13"> * This program is distributed in the hope that it will be useful,but WITHOUT </a>
+<a name="ln14"> * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or </a>
+<a name="ln15"> * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for </a>
+<a name="ln16"> * more details.</a>
+<a name="ln17"> </a>
+<a name="ln18"> * You should have received a copy of the GNU General Public License along </a>
+<a name="ln19"> * with this program; if not, write to the Free Software Foundation, Inc., </a>
+<a name="ln20"> * 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.</a>
+<a name="ln21"> */</a>
+<a name="ln22">#include &lt;zebra.h&gt;</a>
+<a name="ln23">#ifdef GNU_LINUX</a>
+<a name="ln24">#include &lt;net/ethernet.h&gt;</a>
+<a name="ln25">#else</a>
+<a name="ln26">#include &lt;netinet/if_ether.h&gt;</a>
+<a name="ln27">#endif</a>
+<a name="ln28"> </a>
+<a name="ln29">#ifndef ETHER_ADDR_LEN</a>
+<a name="ln30">#define	ETHER_ADDR_LEN	ETHERADDRL</a>
+<a name="ln31">#endif</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &quot;log.h&quot;</a>
+<a name="ln34">#include &quot;memory.h&quot;</a>
+<a name="ln35">#include &quot;if.h&quot;</a>
+<a name="ln36">#include &quot;linklist.h&quot;</a>
+<a name="ln37">#include &quot;command.h&quot;</a>
+<a name="ln38">#include &quot;thread.h&quot;</a>
+<a name="ln39">#include &quot;vty.h&quot;</a>
+<a name="ln40">#include &quot;hash.h&quot;</a>
+<a name="ln41">#include &quot;prefix.h&quot;</a>
+<a name="ln42">#include &quot;stream.h&quot;</a>
+<a name="ln43"> </a>
+<a name="ln44">#include &quot;isisd/dict.h&quot;</a>
+<a name="ln45">#include &quot;isisd/include-netbsd/iso.h&quot;</a>
+<a name="ln46">#include &quot;isisd/isis_constants.h&quot;</a>
+<a name="ln47">#include &quot;isisd/isis_common.h&quot;</a>
+<a name="ln48">#include &quot;isisd/isis_flags.h&quot;</a>
+<a name="ln49">#include &quot;isisd/isis_circuit.h&quot;</a>
+<a name="ln50">#include &quot;isisd/isis_tlv.h&quot;</a>
+<a name="ln51">#include &quot;isisd/isis_lsp.h&quot;</a>
+<a name="ln52">#include &quot;isisd/isis_pdu.h&quot;</a>
+<a name="ln53">#include &quot;isisd/isis_network.h&quot;</a>
+<a name="ln54">#include &quot;isisd/isis_misc.h&quot;</a>
+<a name="ln55">#include &quot;isisd/isis_constants.h&quot;</a>
+<a name="ln56">#include &quot;isisd/isis_adjacency.h&quot;</a>
+<a name="ln57">#include &quot;isisd/isis_dr.h&quot;</a>
+<a name="ln58">#include &quot;isisd/isisd.h&quot;</a>
+<a name="ln59">#include &quot;isisd/isis_csm.h&quot;</a>
+<a name="ln60">#include &quot;isisd/isis_events.h&quot;</a>
+<a name="ln61">#include &quot;isisd/isis_te.h&quot;</a>
+<a name="ln62"> </a>
+<a name="ln63">/*</a>
+<a name="ln64"> * Prototypes.</a>
+<a name="ln65"> */</a>
+<a name="ln66">int isis_interface_config_write(struct vty *);</a>
+<a name="ln67">int isis_if_new_hook(struct interface *);</a>
+<a name="ln68">int isis_if_delete_hook(struct interface *);</a>
+<a name="ln69"> </a>
+<a name="ln70">struct isis_circuit *</a>
+<a name="ln71">isis_circuit_new ()</a>
+<a name="ln72">{</a>
+<a name="ln73">  struct isis_circuit *circuit;</a>
+<a name="ln74">  int i;</a>
+<a name="ln75"> </a>
+<a name="ln76">  circuit = XCALLOC (MTYPE_ISIS_CIRCUIT, sizeof (struct isis_circuit));</a>
+<a name="ln77">  if (circuit == NULL)</a>
+<a name="ln78">    {</a>
+<a name="ln79">      zlog_err (&quot;Can't malloc isis circuit&quot;);</a>
+<a name="ln80">      return NULL;</a>
+<a name="ln81">    }</a>
+<a name="ln82"> </a>
+<a name="ln83">  /*</a>
+<a name="ln84">   * Default values</a>
+<a name="ln85">   */</a>
+<a name="ln86">  circuit-&gt;is_type = IS_LEVEL_1_AND_2;</a>
+<a name="ln87">  circuit-&gt;flags = 0;</a>
+<a name="ln88">  circuit-&gt;pad_hellos = 1;</a>
+<a name="ln89">  for (i = 0; i &lt; 2; i++)</a>
+<a name="ln90">    {</a>
+<a name="ln91">      circuit-&gt;hello_interval[i] = DEFAULT_HELLO_INTERVAL;</a>
+<a name="ln92">      circuit-&gt;hello_multiplier[i] = DEFAULT_HELLO_MULTIPLIER;</a>
+<a name="ln93">      circuit-&gt;csnp_interval[i] = DEFAULT_CSNP_INTERVAL;</a>
+<a name="ln94">      circuit-&gt;psnp_interval[i] = DEFAULT_PSNP_INTERVAL;</a>
+<a name="ln95">      circuit-&gt;priority[i] = DEFAULT_PRIORITY;</a>
+<a name="ln96">      circuit-&gt;metric[i] = DEFAULT_CIRCUIT_METRIC;</a>
+<a name="ln97">      circuit-&gt;te_metric[i] = DEFAULT_CIRCUIT_METRIC;</a>
+<a name="ln98">    }</a>
+<a name="ln99"> </a>
+<a name="ln100">  circuit-&gt;mtc = mpls_te_circuit_new();</a>
+<a name="ln101"> </a>
+<a name="ln102">  return circuit;</a>
+<a name="ln103">}</a>
+<a name="ln104"> </a>
+<a name="ln105">void</a>
+<a name="ln106">isis_circuit_del (struct isis_circuit *circuit)</a>
+<a name="ln107">{</a>
+<a name="ln108">  if (!circuit)</a>
+<a name="ln109">    return;</a>
+<a name="ln110"> </a>
+<a name="ln111">  isis_circuit_if_unbind (circuit, circuit-&gt;interface);</a>
+<a name="ln112"> </a>
+<a name="ln113">  /* and lastly the circuit itself */</a>
+<a name="ln114">  XFREE (MTYPE_ISIS_CIRCUIT, circuit);</a>
+<a name="ln115"> </a>
+<a name="ln116">  return;</a>
+<a name="ln117">}</a>
+<a name="ln118"> </a>
+<a name="ln119">void</a>
+<a name="ln120">isis_circuit_configure (struct isis_circuit *circuit, struct isis_area *area)</a>
+<a name="ln121">{</a>
+<a name="ln122">  assert (area);</a>
+<a name="ln123">  circuit-&gt;area = area;</a>
+<a name="ln124"> </a>
+<a name="ln125">  /*</a>
+<a name="ln126">   * Whenever the is-type of an area is changed, the is-type of each circuit</a>
+<a name="ln127">   * in that area is updated to a non-empty subset of the area is-type.</a>
+<a name="ln128">   * Inversely, when configuring a new circuit, this property should be</a>
+<a name="ln129">   * ensured as well.</a>
+<a name="ln130">   */</a>
+<a name="ln131">  if (area-&gt;is_type != IS_LEVEL_1_AND_2)</a>
+<a name="ln132">    circuit-&gt;is_type = area-&gt;is_type;</a>
+<a name="ln133"> </a>
+<a name="ln134">  /*</a>
+<a name="ln135">   * Add the circuit into area</a>
+<a name="ln136">   */</a>
+<a name="ln137">  listnode_add (area-&gt;circuit_list, circuit);</a>
+<a name="ln138"> </a>
+<a name="ln139">  circuit-&gt;idx = flags_get_index (&amp;area-&gt;flags);</a>
+<a name="ln140"> </a>
+<a name="ln141">  return;</a>
+<a name="ln142">}</a>
+<a name="ln143"> </a>
+<a name="ln144">void</a>
+<a name="ln145">isis_circuit_deconfigure (struct isis_circuit *circuit, struct isis_area *area)</a>
+<a name="ln146">{</a>
+<a name="ln147">  /* Free the index of SRM and SSN flags */</a>
+<a name="ln148">  flags_free_index (&amp;area-&gt;flags, circuit-&gt;idx);</a>
+<a name="ln149">  circuit-&gt;idx = 0;</a>
+<a name="ln150">  /* Remove circuit from area */</a>
+<a name="ln151">  assert (circuit-&gt;area == area);</a>
+<a name="ln152">  listnode_delete (area-&gt;circuit_list, circuit);</a>
+<a name="ln153">  circuit-&gt;area = NULL;</a>
+<a name="ln154"> </a>
+<a name="ln155">  return;</a>
+<a name="ln156">}</a>
+<a name="ln157"> </a>
+<a name="ln158">struct isis_circuit *</a>
+<a name="ln159">circuit_lookup_by_ifp (struct interface *ifp, struct list *list)</a>
+<a name="ln160">{</a>
+<a name="ln161">  struct isis_circuit *circuit = NULL;</a>
+<a name="ln162">  struct listnode *node;</a>
+<a name="ln163"> </a>
+<a name="ln164">  if (!list)</a>
+<a name="ln165">    return NULL;</a>
+<a name="ln166"> </a>
+<a name="ln167">  for (ALL_LIST_ELEMENTS_RO (list, node, circuit))</a>
+<a name="ln168">    if (circuit-&gt;interface == ifp)</a>
+<a name="ln169">      {</a>
+<a name="ln170">        assert (ifp-&gt;info == circuit);</a>
+<a name="ln171">        return circuit;</a>
+<a name="ln172">      }</a>
+<a name="ln173"> </a>
+<a name="ln174">  return NULL;</a>
+<a name="ln175">}</a>
+<a name="ln176"> </a>
+<a name="ln177">struct isis_circuit *</a>
+<a name="ln178">circuit_scan_by_ifp (struct interface *ifp)</a>
+<a name="ln179">{</a>
+<a name="ln180">  struct isis_area *area;</a>
+<a name="ln181">  struct listnode *node;</a>
+<a name="ln182">  struct isis_circuit *circuit;</a>
+<a name="ln183"> </a>
+<a name="ln184">  if (ifp-&gt;info)</a>
+<a name="ln185">    return (struct isis_circuit *)ifp-&gt;info;</a>
+<a name="ln186"> </a>
+<a name="ln187">  if (isis-&gt;area_list)</a>
+<a name="ln188">    {</a>
+<a name="ln189">      for (ALL_LIST_ELEMENTS_RO (isis-&gt;area_list, node, area))</a>
+<a name="ln190">        {</a>
+<a name="ln191">          circuit = circuit_lookup_by_ifp (ifp, area-&gt;circuit_list);</a>
+<a name="ln192">          if (circuit)</a>
+<a name="ln193">            return circuit;</a>
+<a name="ln194">        }</a>
+<a name="ln195">    }</a>
+<a name="ln196">  return circuit_lookup_by_ifp (ifp, isis-&gt;init_circ_list);</a>
+<a name="ln197">}</a>
+<a name="ln198"> </a>
+<a name="ln199">void</a>
+<a name="ln200">isis_circuit_add_addr (struct isis_circuit *circuit,</a>
+<a name="ln201">		       struct connected *connected)</a>
+<a name="ln202">{</a>
+<a name="ln203">  struct listnode *node;</a>
+<a name="ln204">  struct prefix_ipv4 *ipv4;</a>
+<a name="ln205">  u_char buf[BUFSIZ];</a>
+<a name="ln206">#ifdef HAVE_IPV6</a>
+<a name="ln207">  struct prefix_ipv6 *ipv6;</a>
+<a name="ln208">#endif /* HAVE_IPV6 */</a>
+<a name="ln209"> </a>
+<a name="ln210">  memset (&amp;buf, 0, BUFSIZ);</a>
+<a name="ln211">  if (connected-&gt;address-&gt;family == AF_INET)</a>
+<a name="ln212">    {</a>
+<a name="ln213">      u_int32_t addr = connected-&gt;address-&gt;u.prefix4.s_addr;</a>
+<a name="ln214">      addr = ntohl (addr);</a>
+<a name="ln215">      if (IPV4_NET0(addr) ||</a>
+<a name="ln216">          IPV4_NET127(addr) ||</a>
+<a name="ln217">          IN_CLASSD(addr) ||</a>
+<a name="ln218">          IPV4_LINKLOCAL(addr))</a>
+<a name="ln219">        return;</a>
+<a name="ln220"> </a>
+<a name="ln221">      for (ALL_LIST_ELEMENTS_RO (circuit-&gt;ip_addrs, node, ipv4))</a>
+<a name="ln222">        if (prefix_same ((struct prefix *) ipv4, connected-&gt;address))</a>
+<a name="ln223">          return;</a>
+<a name="ln224"> </a>
+<a name="ln225">      ipv4 = prefix_ipv4_new ();</a>
+<a name="ln226">      ipv4-&gt;prefixlen = connected-&gt;address-&gt;prefixlen;</a>
+<a name="ln227">      ipv4-&gt;prefix = connected-&gt;address-&gt;u.prefix4;</a>
+<a name="ln228">      listnode_add (circuit-&gt;ip_addrs, ipv4);</a>
+<a name="ln229"> </a>
+<a name="ln230">      /* Update MPLS TE Local IP address parameter */</a>
+<a name="ln231">      set_circuitparams_local_ipaddr (circuit-&gt;mtc, ipv4-&gt;prefix);</a>
+<a name="ln232"> </a>
+<a name="ln233">      if (circuit-&gt;area)</a>
+<a name="ln234">        lsp_regenerate_schedule (circuit-&gt;area, circuit-&gt;is_type, 0);</a>
+<a name="ln235"> </a>
+<a name="ln236">#ifdef EXTREME_DEBUG</a>
+<a name="ln237">      prefix2str (connected-&gt;address, buf, BUFSIZ);</a>
+<a name="ln238">      zlog_debug (&quot;Added IP address %s to circuit %d&quot;, buf,</a>
+<a name="ln239">		 circuit-&gt;circuit_id);</a>
+<a name="ln240">#endif /* EXTREME_DEBUG */</a>
+<a name="ln241">    }</a>
+<a name="ln242">#ifdef HAVE_IPV6</a>
+<a name="ln243">  if (connected-&gt;address-&gt;family == AF_INET6)</a>
+<a name="ln244">    {</a>
+<a name="ln245">      if (IN6_IS_ADDR_LOOPBACK(&amp;connected-&gt;address-&gt;u.prefix6))</a>
+<a name="ln246">        return;</a>
+<a name="ln247"> </a>
+<a name="ln248">      for (ALL_LIST_ELEMENTS_RO (circuit-&gt;ipv6_link, node, ipv6))</a>
+<a name="ln249">        if (prefix_same ((struct prefix *) ipv6, connected-&gt;address))</a>
+<a name="ln250">          return;</a>
+<a name="ln251">      for (ALL_LIST_ELEMENTS_RO (circuit-&gt;ipv6_non_link, node, ipv6))</a>
+<a name="ln252">        if (prefix_same ((struct prefix *) ipv6, connected-&gt;address))</a>
+<a name="ln253">          return;</a>
+<a name="ln254"> </a>
+<a name="ln255">      ipv6 = prefix_ipv6_new ();</a>
+<a name="ln256">      ipv6-&gt;prefixlen = connected-&gt;address-&gt;prefixlen;</a>
+<a name="ln257">      ipv6-&gt;prefix = connected-&gt;address-&gt;u.prefix6;</a>
+<a name="ln258"> </a>
+<a name="ln259">      if (IN6_IS_ADDR_LINKLOCAL (&amp;ipv6-&gt;prefix))</a>
+<a name="ln260">	listnode_add (circuit-&gt;ipv6_link, ipv6);</a>
+<a name="ln261">      else</a>
+<a name="ln262">	listnode_add (circuit-&gt;ipv6_non_link, ipv6);</a>
+<a name="ln263">      if (circuit-&gt;area)</a>
+<a name="ln264">        lsp_regenerate_schedule (circuit-&gt;area, circuit-&gt;is_type, 0);</a>
+<a name="ln265"> </a>
+<a name="ln266">#ifdef EXTREME_DEBUG</a>
+<a name="ln267">      prefix2str (connected-&gt;address, buf, BUFSIZ);</a>
+<a name="ln268">      zlog_debug (&quot;Added IPv6 address %s to circuit %d&quot;, buf,</a>
+<a name="ln269">		 circuit-&gt;circuit_id);</a>
+<a name="ln270">#endif /* EXTREME_DEBUG */</a>
+<a name="ln271">    }</a>
+<a name="ln272">#endif /* HAVE_IPV6 */</a>
+<a name="ln273">  return;</a>
+<a name="ln274">}</a>
+<a name="ln275"> </a>
+<a name="ln276">void</a>
+<a name="ln277">isis_circuit_del_addr (struct isis_circuit *circuit,</a>
+<a name="ln278">		       struct connected *connected)</a>
+<a name="ln279">{</a>
+<a name="ln280">  struct prefix_ipv4 *ipv4, *ip = NULL;</a>
+<a name="ln281">  struct listnode *node;</a>
+<a name="ln282">  u_char buf[BUFSIZ];</a>
+<a name="ln283">#ifdef HAVE_IPV6</a>
+<a name="ln284">  struct prefix_ipv6 *ipv6, *ip6 = NULL;</a>
+<a name="ln285">  int found = 0;</a>
+<a name="ln286">#endif /* HAVE_IPV6 */</a>
+<a name="ln287"> </a>
+<a name="ln288">  memset (&amp;buf, 0, BUFSIZ);</a>
+<a name="ln289">  if (connected-&gt;address-&gt;family == AF_INET)</a>
+<a name="ln290">    {</a>
+<a name="ln291">      ipv4 = prefix_ipv4_new ();</a>
+<a name="ln292">      ipv4-&gt;prefixlen = connected-&gt;address-&gt;prefixlen;</a>
+<a name="ln293">      ipv4-&gt;prefix = connected-&gt;address-&gt;u.prefix4;</a>
+<a name="ln294"> </a>
+<a name="ln295">      for (ALL_LIST_ELEMENTS_RO (circuit-&gt;ip_addrs, node, ip))</a>
+<a name="ln296">        if (prefix_same ((struct prefix *) ip, (struct prefix *) ipv4))</a>
+<a name="ln297">          break;</a>
+<a name="ln298"> </a>
+<a name="ln299">      if (ip)</a>
+<a name="ln300">	{</a>
+<a name="ln301">	  listnode_delete (circuit-&gt;ip_addrs, ip);</a>
+<a name="ln302">          if (circuit-&gt;area)</a>
+<a name="ln303">            lsp_regenerate_schedule (circuit-&gt;area, circuit-&gt;is_type, 0);</a>
+<a name="ln304">	}</a>
+<a name="ln305">      else</a>
+<a name="ln306">	{</a>
+<a name="ln307">	  prefix2str (connected-&gt;address, (char *)buf, BUFSIZ);</a>
+<a name="ln308">	  zlog_warn (&quot;Nonexitant ip address %s removal attempt from \</a>
+<a name="ln309">                      circuit %d&quot;, buf, circuit-&gt;circuit_id);</a>
+<a name="ln310">	  zlog_warn (&quot;Current ip addresses on %s:&quot;, circuit-&gt;interface-&gt;name);</a>
+<a name="ln311">	  for (ALL_LIST_ELEMENTS_RO(circuit-&gt;ip_addrs, node, ip))</a>
+<a name="ln312">	    {</a>
+<a name="ln313">	      prefix2str((struct prefix*)ip, (char *)buf, BUFSIZ);</a>
+<a name="ln314">	      zlog_warn(&quot;  %s&quot;, buf);</a>
+<a name="ln315">	    }</a>
+<a name="ln316">	  zlog_warn(&quot;End of addresses&quot;);</a>
+<a name="ln317">	}</a>
+<a name="ln318"> </a>
+<a name="ln319">      prefix_ipv4_free (ipv4);</a>
+<a name="ln320">    }</a>
+<a name="ln321">#ifdef HAVE_IPV6</a>
+<a name="ln322">  if (connected-&gt;address-&gt;family == AF_INET6)</a>
+<a name="ln323">    {</a>
+<a name="ln324">      ipv6 = prefix_ipv6_new ();</a>
+<a name="ln325">      ipv6-&gt;prefixlen = connected-&gt;address-&gt;prefixlen;</a>
+<a name="ln326">      ipv6-&gt;prefix = connected-&gt;address-&gt;u.prefix6;</a>
+<a name="ln327"> </a>
+<a name="ln328">      if (IN6_IS_ADDR_LINKLOCAL (&amp;ipv6-&gt;prefix))</a>
+<a name="ln329">	{</a>
+<a name="ln330">	  for (ALL_LIST_ELEMENTS_RO (circuit-&gt;ipv6_link, node, ip6))</a>
+<a name="ln331">	    {</a>
+<a name="ln332">	      if (prefix_same ((struct prefix *) ip6, (struct prefix *) ipv6))</a>
+<a name="ln333">		break;</a>
+<a name="ln334">	    }</a>
+<a name="ln335">	  if (ip6)</a>
+<a name="ln336">	    {</a>
+<a name="ln337">	      listnode_delete (circuit-&gt;ipv6_link, ip6);</a>
+<a name="ln338">	      found = 1;</a>
+<a name="ln339">	    }</a>
+<a name="ln340">	}</a>
+<a name="ln341">      else</a>
+<a name="ln342">	{</a>
+<a name="ln343">	  for (ALL_LIST_ELEMENTS_RO (circuit-&gt;ipv6_non_link, node, ip6))</a>
+<a name="ln344">	    {</a>
+<a name="ln345">	      if (prefix_same ((struct prefix *) ip6, (struct prefix *) ipv6))</a>
+<a name="ln346">		break;</a>
+<a name="ln347">	    }</a>
+<a name="ln348">	  if (ip6)</a>
+<a name="ln349">	    {</a>
+<a name="ln350">	      listnode_delete (circuit-&gt;ipv6_non_link, ip6);</a>
+<a name="ln351">	      found = 1;</a>
+<a name="ln352">	    }</a>
+<a name="ln353">	}</a>
+<a name="ln354"> </a>
+<a name="ln355">      if (!found)</a>
+<a name="ln356">	{</a>
+<a name="ln357">	  prefix2str (connected-&gt;address, (char *)buf, BUFSIZ);</a>
+<a name="ln358">	  zlog_warn (&quot;Nonexitant ip address %s removal attempt from \</a>
+<a name="ln359">		      circuit %d&quot;, buf, circuit-&gt;circuit_id);</a>
+<a name="ln360">	  zlog_warn (&quot;Current ip addresses on %s:&quot;, circuit-&gt;interface-&gt;name);</a>
+<a name="ln361">	  for (ALL_LIST_ELEMENTS_RO(circuit-&gt;ipv6_link, node, ip6))</a>
+<a name="ln362">	    {</a>
+<a name="ln363">	      prefix2str((struct prefix*)ip6, (char *)buf, BUFSIZ);</a>
+<a name="ln364">	      zlog_warn(&quot;  %s&quot;, buf);</a>
+<a name="ln365">	    }</a>
+<a name="ln366">	  zlog_warn(&quot; -----&quot;);</a>
+<a name="ln367">	  for (ALL_LIST_ELEMENTS_RO(circuit-&gt;ipv6_non_link, node, ip6))</a>
+<a name="ln368">	    {</a>
+<a name="ln369">	      prefix2str((struct prefix*)ip6, (char *)buf, BUFSIZ);</a>
+<a name="ln370">	      zlog_warn(&quot;  %s&quot;, buf);</a>
+<a name="ln371">	    }</a>
+<a name="ln372">	  zlog_warn(&quot;End of addresses&quot;);</a>
+<a name="ln373">	}</a>
+<a name="ln374">      else if (circuit-&gt;area)</a>
+<a name="ln375">	  lsp_regenerate_schedule (circuit-&gt;area, circuit-&gt;is_type, 0);</a>
+<a name="ln376"> </a>
+<a name="ln377">      prefix_ipv6_free (ipv6);</a>
+<a name="ln378">    }</a>
+<a name="ln379">#endif /* HAVE_IPV6 */</a>
+<a name="ln380">  return;</a>
+<a name="ln381">}</a>
+<a name="ln382"> </a>
+<a name="ln383">static u_char</a>
+<a name="ln384">isis_circuit_id_gen (struct interface *ifp)</a>
+<a name="ln385">{</a>
+<a name="ln386">  u_char id = 0;</a>
+<a name="ln387">  char ifname[16];</a>
+<a name="ln388">  unsigned int i;</a>
+<a name="ln389">  int start = -1, end = -1;</a>
+<a name="ln390"> </a>
+<a name="ln391">  /*</a>
+<a name="ln392">   * Get a stable circuit id from ifname. This makes</a>
+<a name="ln393">   * the ifindex from flapping when netdevs are created</a>
+<a name="ln394">   * and deleted on the fly. Note that this circuit id</a>
+<a name="ln395">   * is used in pseudo lsps so it is better to be stable.</a>
+<a name="ln396">   * The following code works on any reasonanle ifname</a>
+<a name="ln397">   * like: eth1 or trk-1.1 etc.</a>
+<a name="ln398">   */</a>
+<a name="ln399">  for (i = 0; i &lt; strlen (ifp-&gt;name); i++)</a>
+<a name="ln400">    {</a>
+<a name="ln401">      if (isdigit((unsigned char)ifp-&gt;name[i]))</a>
+<a name="ln402">        {</a>
+<a name="ln403">          if (start &lt; 0)</a>
+<a name="ln404">            {</a>
+<a name="ln405">              start = i;</a>
+<a name="ln406">              end = i + 1;</a>
+<a name="ln407">            }</a>
+<a name="ln408">          else</a>
+<a name="ln409">            {</a>
+<a name="ln410">              end = i + 1;</a>
+<a name="ln411">            }</a>
+<a name="ln412">        }</a>
+<a name="ln413">      else if (start &gt;= 0)</a>
+<a name="ln414">        break;</a>
+<a name="ln415">    }</a>
+<a name="ln416"> </a>
+<a name="ln417">  if ((start &gt;= 0) &amp;&amp; (end &gt;= start) &amp;&amp; (end - start) &lt; 16)</a>
+<a name="ln418">    {</a>
+<a name="ln419">      memset (ifname, 0, 16);</a>
+<a name="ln420">      strncpy (ifname, &amp;ifp-&gt;name[start], end - start);</a>
+<a name="ln421">      id = (u_char)atoi(ifname);</a>
+<a name="ln422">    }</a>
+<a name="ln423"> </a>
+<a name="ln424">  /* Try to be unique. */</a>
+<a name="ln425">  if (!id)</a>
+<a name="ln426">    id = (u_char)((ifp-&gt;ifindex &amp; 0xff) | 0x80);</a>
+<a name="ln427"> </a>
+<a name="ln428">  return id;</a>
+<a name="ln429">}</a>
+<a name="ln430"> </a>
+<a name="ln431">void</a>
+<a name="ln432">isis_circuit_if_add (struct isis_circuit *circuit, struct interface *ifp)</a>
+<a name="ln433">{</a>
+<a name="ln434">  struct listnode *node, *nnode;</a>
+<a name="ln435">  struct connected *conn;</a>
+<a name="ln436"> </a>
+<a name="ln437">  circuit-&gt;circuit_id = isis_circuit_id_gen (ifp);</a>
+<a name="ln438"> </a>
+<a name="ln439">  isis_circuit_if_bind (circuit, ifp);</a>
+<a name="ln440">  /*  isis_circuit_update_addrs (circuit, ifp); */</a>
+<a name="ln441"> </a>
+<a name="ln442">  if (if_is_broadcast (ifp))</a>
+<a name="ln443">    {</a>
+<a name="ln444">      if (circuit-&gt;circ_type_config == CIRCUIT_T_P2P)</a>
+<a name="ln445">        circuit-&gt;circ_type = CIRCUIT_T_P2P;</a>
+<a name="ln446">      else</a>
+<a name="ln447">        circuit-&gt;circ_type = CIRCUIT_T_BROADCAST;</a>
+<a name="ln448">    }</a>
+<a name="ln449">  else if (if_is_pointopoint (ifp))</a>
+<a name="ln450">    {</a>
+<a name="ln451">      circuit-&gt;circ_type = CIRCUIT_T_P2P;</a>
+<a name="ln452">    }</a>
+<a name="ln453">  else if (if_is_loopback (ifp))</a>
+<a name="ln454">    {</a>
+<a name="ln455">      circuit-&gt;circ_type = CIRCUIT_T_LOOPBACK;</a>
+<a name="ln456">      circuit-&gt;is_passive = 1;</a>
+<a name="ln457">    }</a>
+<a name="ln458">  else</a>
+<a name="ln459">    {</a>
+<a name="ln460">      /* It's normal in case of loopback etc. */</a>
+<a name="ln461">      if (isis-&gt;debugs &amp; DEBUG_EVENTS)</a>
+<a name="ln462">        zlog_debug (&quot;isis_circuit_if_add: unsupported media&quot;);</a>
+<a name="ln463">      circuit-&gt;circ_type = CIRCUIT_T_UNKNOWN;</a>
+<a name="ln464">    }</a>
+<a name="ln465"> </a>
+<a name="ln466">  circuit-&gt;ip_addrs = list_new ();</a>
+<a name="ln467">#ifdef HAVE_IPV6</a>
+<a name="ln468">  circuit-&gt;ipv6_link = list_new ();</a>
+<a name="ln469">  circuit-&gt;ipv6_non_link = list_new ();</a>
+<a name="ln470">#endif /* HAVE_IPV6 */</a>
+<a name="ln471"> </a>
+<a name="ln472">  for (ALL_LIST_ELEMENTS (ifp-&gt;connected, node, nnode, conn))</a>
+<a name="ln473">    isis_circuit_add_addr (circuit, conn);</a>
+<a name="ln474"> </a>
+<a name="ln475">  return;</a>
+<a name="ln476">}</a>
+<a name="ln477"> </a>
+<a name="ln478">void</a>
+<a name="ln479">isis_circuit_if_del (struct isis_circuit *circuit, struct interface *ifp)</a>
+<a name="ln480">{</a>
+<a name="ln481">  struct listnode *node, *nnode;</a>
+<a name="ln482">  struct connected *conn;</a>
+<a name="ln483"> </a>
+<a name="ln484">  assert (circuit-&gt;interface == ifp);</a>
+<a name="ln485"> </a>
+<a name="ln486">  /* destroy addresses */</a>
+<a name="ln487">  for (ALL_LIST_ELEMENTS (ifp-&gt;connected, node, nnode, conn))</a>
+<a name="ln488">    isis_circuit_del_addr (circuit, conn);</a>
+<a name="ln489"> </a>
+<a name="ln490">  if (circuit-&gt;ip_addrs)</a>
+<a name="ln491">    {</a>
+<a name="ln492">      assert (listcount(circuit-&gt;ip_addrs) == 0);</a>
+<a name="ln493">      list_delete (circuit-&gt;ip_addrs);</a>
+<a name="ln494">      circuit-&gt;ip_addrs = NULL;</a>
+<a name="ln495">    }</a>
+<a name="ln496"> </a>
+<a name="ln497">#ifdef HAVE_IPV6</a>
+<a name="ln498">  if (circuit-&gt;ipv6_link)</a>
+<a name="ln499">    {</a>
+<a name="ln500">      assert (listcount(circuit-&gt;ipv6_link) == 0);</a>
+<a name="ln501">      list_delete (circuit-&gt;ipv6_link);</a>
+<a name="ln502">      circuit-&gt;ipv6_link = NULL;</a>
+<a name="ln503">    }</a>
+<a name="ln504"> </a>
+<a name="ln505">  if (circuit-&gt;ipv6_non_link)</a>
+<a name="ln506">    {</a>
+<a name="ln507">      assert (listcount(circuit-&gt;ipv6_non_link) == 0);</a>
+<a name="ln508">      list_delete (circuit-&gt;ipv6_non_link);</a>
+<a name="ln509">      circuit-&gt;ipv6_non_link = NULL;</a>
+<a name="ln510">    }</a>
+<a name="ln511">#endif /* HAVE_IPV6 */</a>
+<a name="ln512"> </a>
+<a name="ln513">  circuit-&gt;circ_type = CIRCUIT_T_UNKNOWN;</a>
+<a name="ln514">  circuit-&gt;circuit_id = 0;</a>
+<a name="ln515"> </a>
+<a name="ln516">  return;</a>
+<a name="ln517">}</a>
+<a name="ln518"> </a>
+<a name="ln519">void</a>
+<a name="ln520">isis_circuit_if_bind (struct isis_circuit *circuit, struct interface *ifp)</a>
+<a name="ln521">{</a>
+<a name="ln522">  assert (circuit != NULL);</a>
+<a name="ln523">  assert (ifp != NULL);</a>
+<a name="ln524">  if (circuit-&gt;interface)</a>
+<a name="ln525">    assert (circuit-&gt;interface == ifp);</a>
+<a name="ln526">  else</a>
+<a name="ln527">    circuit-&gt;interface = ifp;</a>
+<a name="ln528">  if (ifp-&gt;info)</a>
+<a name="ln529">    assert (ifp-&gt;info == circuit);</a>
+<a name="ln530">  else</a>
+<a name="ln531">    ifp-&gt;info = circuit;</a>
+<a name="ln532">  isis_link_params_update (circuit, ifp);</a>
+<a name="ln533">}</a>
+<a name="ln534"> </a>
+<a name="ln535">void</a>
+<a name="ln536">isis_circuit_if_unbind (struct isis_circuit *circuit, struct interface *ifp)</a>
+<a name="ln537">{</a>
+<a name="ln538">  assert (circuit != NULL);</a>
+<a name="ln539">  assert (ifp != NULL);</a>
+<a name="ln540">  assert (circuit-&gt;interface == ifp);</a>
+<a name="ln541">  assert (ifp-&gt;info == circuit);</a>
+<a name="ln542">  circuit-&gt;interface = NULL;</a>
+<a name="ln543">  ifp-&gt;info = NULL;</a>
+<a name="ln544">}</a>
+<a name="ln545"> </a>
+<a name="ln546">static void</a>
+<a name="ln547">isis_circuit_update_all_srmflags (struct isis_circuit *circuit, int is_set)</a>
+<a name="ln548">{</a>
+<a name="ln549">  struct isis_area *area;</a>
+<a name="ln550">  struct isis_lsp *lsp;</a>
+<a name="ln551">  dnode_t *dnode, *dnode_next;</a>
+<a name="ln552">  int level;</a>
+<a name="ln553"> </a>
+<a name="ln554">  assert (circuit);</a>
+<a name="ln555">  area = circuit-&gt;area;</a>
+<a name="ln556">  assert (area);</a>
+<a name="ln557">  for (level = ISIS_LEVEL1; level &lt;= ISIS_LEVEL2; level++)</a>
+<a name="ln558">    {</a>
+<a name="ln559">      if (level &amp; circuit-&gt;is_type)</a>
+<a name="ln560">        {</a>
+<a name="ln561">          if (area-&gt;lspdb[level - 1] &amp;&amp;</a>
+<a name="ln562">              dict_count (area-&gt;lspdb[level - 1]) &gt; 0)</a>
+<a name="ln563">            {</a>
+<a name="ln564">              for (dnode = dict_first (area-&gt;lspdb[level - 1]);</a>
+<a name="ln565">                   dnode != NULL; dnode = dnode_next)</a>
+<a name="ln566">                {</a>
+<a name="ln567">                  dnode_next = dict_next (area-&gt;lspdb[level - 1], dnode);</a>
+<a name="ln568">                  lsp = dnode_get (dnode);</a>
+<a name="ln569">                  if (is_set)</a>
+<a name="ln570">                    {</a>
+<a name="ln571">                      ISIS_SET_FLAG (lsp-&gt;SRMflags, circuit);</a>
+<a name="ln572">                    }</a>
+<a name="ln573">                  else</a>
+<a name="ln574">                    {</a>
+<a name="ln575">                      ISIS_CLEAR_FLAG (lsp-&gt;SRMflags, circuit);</a>
+<a name="ln576">                    }</a>
+<a name="ln577">                }</a>
+<a name="ln578">            }</a>
+<a name="ln579">        }</a>
+<a name="ln580">    }</a>
+<a name="ln581">}</a>
+<a name="ln582"> </a>
+<a name="ln583">size_t</a>
+<a name="ln584">isis_circuit_pdu_size(struct isis_circuit *circuit)</a>
+<a name="ln585">{</a>
+<a name="ln586">  return ISO_MTU(circuit);</a>
+<a name="ln587">}</a>
+<a name="ln588"> </a>
+<a name="ln589">void</a>
+<a name="ln590">isis_circuit_stream(struct isis_circuit *circuit, struct stream **stream)</a>
+<a name="ln591">{</a>
+<a name="ln592">  size_t stream_size = isis_circuit_pdu_size(circuit);</a>
+<a name="ln593"> </a>
+<a name="ln594">  if (!*stream)</a>
+<a name="ln595">    {</a>
+<a name="ln596">      *stream = stream_new(stream_size);</a>
+<a name="ln597">    }</a>
+<a name="ln598">  else</a>
+<a name="ln599">    {</a>
+<a name="ln600">      if (STREAM_SIZE(*stream) != stream_size)</a>
+<a name="ln601">        stream_resize(*stream, stream_size);</a>
+<a name="ln602">      stream_reset(*stream);</a>
+<a name="ln603">    }</a>
+<a name="ln604">}</a>
+<a name="ln605"> </a>
+<a name="ln606">int</a>
+<a name="ln607">isis_circuit_up (struct isis_circuit *circuit)</a>
+<a name="ln608">{</a>
+<a name="ln609">  int retv;</a>
+<a name="ln610"> </a>
+<a name="ln611">  /* Set the flags for all the lsps of the circuit. */</a>
+<a name="ln612">  isis_circuit_update_all_srmflags (circuit, 1);</a>
+<a name="ln613"> </a>
+<a name="ln614">  if (circuit-&gt;state == C_STATE_UP)</a>
+<a name="ln615">    return ISIS_OK;</a>
+<a name="ln616"> </a>
+<a name="ln617">  if (circuit-&gt;is_passive)</a>
+<a name="ln618">    return ISIS_OK;</a>
+<a name="ln619"> </a>
+<a name="ln620">  if (circuit-&gt;area-&gt;lsp_mtu &gt; isis_circuit_pdu_size(circuit))</a>
+<a name="ln621">    {</a>
+<a name="ln622">      zlog_err(&quot;Interface MTU %zu on %s is too low to support area lsp mtu %u!&quot;,</a>
+<a name="ln623">               isis_circuit_pdu_size(circuit), circuit-&gt;interface-&gt;name,</a>
+<a name="ln624">               circuit-&gt;area-&gt;lsp_mtu);</a>
+<a name="ln625">      isis_circuit_update_all_srmflags(circuit, 0);</a>
+<a name="ln626">      return ISIS_ERROR;</a>
+<a name="ln627">    }</a>
+<a name="ln628"> </a>
+<a name="ln629">  if (circuit-&gt;circ_type == CIRCUIT_T_BROADCAST)</a>
+<a name="ln630">    {</a>
+<a name="ln631">      /*</a>
+<a name="ln632">       * Get the Hardware Address</a>
+<a name="ln633">       */</a>
+<a name="ln634">      if (circuit-&gt;interface-&gt;hw_addr_len != ETH_ALEN)</a>
+<a name="ln635">        {</a>
+<a name="ln636">          zlog_warn (&quot;unsupported link layer&quot;);</a>
+<a name="ln637">        }</a>
+<a name="ln638">      else</a>
+<a name="ln639">        {</a>
+<a name="ln640">          memcpy (circuit-&gt;u.bc.snpa, circuit-&gt;interface-&gt;hw_addr, ETH_ALEN);</a>
+<a name="ln641">        }</a>
+<a name="ln642">#ifdef EXTREME_DEGUG</a>
+<a name="ln643">      zlog_debug (&quot;isis_circuit_if_add: if_id %d, isomtu %d snpa %s&quot;,</a>
+<a name="ln644">                  circuit-&gt;interface-&gt;ifindex, ISO_MTU (circuit),</a>
+<a name="ln645">                  snpa_print (circuit-&gt;u.bc.snpa));</a>
+<a name="ln646">#endif /* EXTREME_DEBUG */</a>
+<a name="ln647"> </a>
+<a name="ln648">      circuit-&gt;u.bc.adjdb[0] = list_new ();</a>
+<a name="ln649">      circuit-&gt;u.bc.adjdb[1] = list_new ();</a>
+<a name="ln650"> </a>
+<a name="ln651">      /*</a>
+<a name="ln652">       * ISO 10589 - 8.4.1 Enabling of broadcast circuits</a>
+<a name="ln653">       */</a>
+<a name="ln654"> </a>
+<a name="ln655">      /* initilizing the hello sending threads</a>
+<a name="ln656">       * for a broadcast IF</a>
+<a name="ln657">       */</a>
+<a name="ln658"> </a>
+<a name="ln659">      /* 8.4.1 a) commence sending of IIH PDUs */</a>
+<a name="ln660"> </a>
+<a name="ln661">      if (circuit-&gt;is_type &amp; IS_LEVEL_1)</a>
+<a name="ln662">        {</a>
+<a name="ln663">          thread_add_event (master, send_lan_l1_hello, circuit, 0);</a>
+<a name="ln664">          circuit-&gt;u.bc.lan_neighs[0] = list_new ();</a>
+<a name="ln665">        }</a>
+<a name="ln666"> </a>
+<a name="ln667">      if (circuit-&gt;is_type &amp; IS_LEVEL_2)</a>
+<a name="ln668">        {</a>
+<a name="ln669">          thread_add_event (master, send_lan_l2_hello, circuit, 0);</a>
+<a name="ln670">          circuit-&gt;u.bc.lan_neighs[1] = list_new ();</a>
+<a name="ln671">        }</a>
+<a name="ln672"> </a>
+<a name="ln673">      /* 8.4.1 b) FIXME: solicit ES - 8.4.6 */</a>
+<a name="ln674">      /* 8.4.1 c) FIXME: listen for ESH PDUs */</a>
+<a name="ln675"> </a>
+<a name="ln676">      /* 8.4.1 d) */</a>
+<a name="ln677">      /* dr election will commence in... */</a>
+<a name="ln678">      if (circuit-&gt;is_type &amp; IS_LEVEL_1)</a>
+<a name="ln679">        THREAD_TIMER_ON (master, circuit-&gt;u.bc.t_run_dr[0], isis_run_dr_l1,</a>
+<a name="ln680">            circuit, 2 * circuit-&gt;hello_interval[0]);</a>
+<a name="ln681">      if (circuit-&gt;is_type &amp; IS_LEVEL_2)</a>
+<a name="ln682">        THREAD_TIMER_ON (master, circuit-&gt;u.bc.t_run_dr[1], isis_run_dr_l2,</a>
+<a name="ln683">            circuit, 2 * circuit-&gt;hello_interval[1]);</a>
+<a name="ln684">    }</a>
+<a name="ln685">  else</a>
+<a name="ln686">    {</a>
+<a name="ln687">      /* initializing the hello send threads</a>
+<a name="ln688">       * for a ptp IF</a>
+<a name="ln689">       */</a>
+<a name="ln690">      circuit-&gt;u.p2p.neighbor = NULL;</a>
+<a name="ln691">      thread_add_event (master, send_p2p_hello, circuit, 0);</a>
+<a name="ln692">    }</a>
+<a name="ln693"> </a>
+<a name="ln694">  /* initializing PSNP timers */</a>
+<a name="ln695">  if (circuit-&gt;is_type &amp; IS_LEVEL_1)</a>
+<a name="ln696">    THREAD_TIMER_ON (master, circuit-&gt;t_send_psnp[0], send_l1_psnp, circuit,</a>
+<a name="ln697">                     isis_jitter (circuit-&gt;psnp_interval[0], PSNP_JITTER));</a>
+<a name="ln698"> </a>
+<a name="ln699">  if (circuit-&gt;is_type &amp; IS_LEVEL_2)</a>
+<a name="ln700">    THREAD_TIMER_ON (master, circuit-&gt;t_send_psnp[1], send_l2_psnp, circuit,</a>
+<a name="ln701">                     isis_jitter (circuit-&gt;psnp_interval[1], PSNP_JITTER));</a>
+<a name="ln702"> </a>
+<a name="ln703">  /* unified init for circuits; ignore warnings below this level */</a>
+<a name="ln704">  retv = isis_sock_init (circuit);</a>
+<a name="ln705">  if (retv != ISIS_OK)</a>
+<a name="ln706">    {</a>
+<a name="ln707">      isis_circuit_down (circuit);</a>
+<a name="ln708">      return retv;</a>
+<a name="ln709">    }</a>
+<a name="ln710"> </a>
+<a name="ln711">  /* initialize the circuit streams after opening connection */</a>
+<a name="ln712">  isis_circuit_stream(circuit, &amp;circuit-&gt;rcv_stream);</a>
+<a name="ln713">  isis_circuit_stream(circuit, &amp;circuit-&gt;snd_stream);</a>
+<a name="ln714"> </a>
+<a name="ln715">#ifdef GNU_LINUX</a>
+<a name="ln716">  THREAD_READ_ON (master, circuit-&gt;t_read, isis_receive, circuit,</a>
+<a name="ln717">                  circuit-&gt;fd);</a>
+<a name="ln718">#else</a>
+<a name="ln719">  THREAD_TIMER_ON (master, circuit-&gt;t_read, isis_receive, circuit,</a>
+<a name="ln720">                   circuit-&gt;fd);</a>
+<a name="ln721">#endif</a>
+<a name="ln722"> </a>
+<a name="ln723">  circuit-&gt;lsp_queue = list_new ();</a>
+<a name="ln724">  circuit-&gt;lsp_queue_last_cleared = time (NULL);</a>
+<a name="ln725"> </a>
+<a name="ln726">  return ISIS_OK;</a>
+<a name="ln727">}</a>
+<a name="ln728"> </a>
+<a name="ln729">void</a>
+<a name="ln730">isis_circuit_down (struct isis_circuit *circuit)</a>
+<a name="ln731">{</a>
+<a name="ln732">  if (circuit-&gt;state != C_STATE_UP)</a>
+<a name="ln733">    return;</a>
+<a name="ln734"> </a>
+<a name="ln735">  /* Clear the flags for all the lsps of the circuit. */</a>
+<a name="ln736">  isis_circuit_update_all_srmflags (circuit, 0);</a>
+<a name="ln737"> </a>
+<a name="ln738">  if (circuit-&gt;circ_type == CIRCUIT_T_BROADCAST)</a>
+<a name="ln739">    {</a>
+<a name="ln740">      /* destroy neighbour lists */</a>
+<a name="ln741">      if (circuit-&gt;u.bc.lan_neighs[0])</a>
+<a name="ln742">        {</a>
+<a name="ln743">          list_delete (circuit-&gt;u.bc.lan_neighs[0]);</a>
+<a name="ln744">          circuit-&gt;u.bc.lan_neighs[0] = NULL;</a>
+<a name="ln745">        }</a>
+<a name="ln746">      if (circuit-&gt;u.bc.lan_neighs[1])</a>
+<a name="ln747">        {</a>
+<a name="ln748">          list_delete (circuit-&gt;u.bc.lan_neighs[1]);</a>
+<a name="ln749">          circuit-&gt;u.bc.lan_neighs[1] = NULL;</a>
+<a name="ln750">        }</a>
+<a name="ln751">      /* destroy adjacency databases */</a>
+<a name="ln752">      if (circuit-&gt;u.bc.adjdb[0])</a>
+<a name="ln753">        {</a>
+<a name="ln754">          circuit-&gt;u.bc.adjdb[0]-&gt;del = isis_delete_adj;</a>
+<a name="ln755">          list_delete (circuit-&gt;u.bc.adjdb[0]);</a>
+<a name="ln756">          circuit-&gt;u.bc.adjdb[0] = NULL;</a>
+<a name="ln757">        }</a>
+<a name="ln758">      if (circuit-&gt;u.bc.adjdb[1])</a>
+<a name="ln759">        {</a>
+<a name="ln760">          circuit-&gt;u.bc.adjdb[1]-&gt;del = isis_delete_adj;</a>
+<a name="ln761">          list_delete (circuit-&gt;u.bc.adjdb[1]);</a>
+<a name="ln762">          circuit-&gt;u.bc.adjdb[1] = NULL;</a>
+<a name="ln763">        }</a>
+<a name="ln764">      if (circuit-&gt;u.bc.is_dr[0])</a>
+<a name="ln765">        {</a>
+<a name="ln766">          isis_dr_resign (circuit, 1);</a>
+<a name="ln767">          circuit-&gt;u.bc.is_dr[0] = 0;</a>
+<a name="ln768">        }</a>
+<a name="ln769">      memset (circuit-&gt;u.bc.l1_desig_is, 0, ISIS_SYS_ID_LEN + 1);</a>
+<a name="ln770">      if (circuit-&gt;u.bc.is_dr[1])</a>
+<a name="ln771">        {</a>
+<a name="ln772">          isis_dr_resign (circuit, 2);</a>
+<a name="ln773">          circuit-&gt;u.bc.is_dr[1] = 0;</a>
+<a name="ln774">        }</a>
+<a name="ln775">      memset (circuit-&gt;u.bc.l2_desig_is, 0, ISIS_SYS_ID_LEN + 1);</a>
+<a name="ln776">      memset (circuit-&gt;u.bc.snpa, 0, ETH_ALEN);</a>
+<a name="ln777"> </a>
+<a name="ln778">      THREAD_TIMER_OFF (circuit-&gt;u.bc.t_send_lan_hello[0]);</a>
+<a name="ln779">      THREAD_TIMER_OFF (circuit-&gt;u.bc.t_send_lan_hello[1]);</a>
+<a name="ln780">      THREAD_TIMER_OFF (circuit-&gt;u.bc.t_run_dr[0]);</a>
+<a name="ln781">      THREAD_TIMER_OFF (circuit-&gt;u.bc.t_run_dr[1]);</a>
+<a name="ln782">      THREAD_TIMER_OFF (circuit-&gt;u.bc.t_refresh_pseudo_lsp[0]);</a>
+<a name="ln783">      THREAD_TIMER_OFF (circuit-&gt;u.bc.t_refresh_pseudo_lsp[1]);</a>
+<a name="ln784">      circuit-&gt;lsp_regenerate_pending[0] = 0;</a>
+<a name="ln785">      circuit-&gt;lsp_regenerate_pending[1] = 0;</a>
+<a name="ln786">    }</a>
+<a name="ln787">  else if (circuit-&gt;circ_type == CIRCUIT_T_P2P)</a>
+<a name="ln788">    {</a>
+<a name="ln789">      isis_delete_adj (circuit-&gt;u.p2p.neighbor);</a>
+<a name="ln790">      circuit-&gt;u.p2p.neighbor = NULL;</a>
+<a name="ln791">      THREAD_TIMER_OFF (circuit-&gt;u.p2p.t_send_p2p_hello);</a>
+<a name="ln792">    }</a>
+<a name="ln793"> </a>
+<a name="ln794">  /* Cancel all active threads */</a>
+<a name="ln795">  THREAD_TIMER_OFF (circuit-&gt;t_send_csnp[0]);</a>
+<a name="ln796">  THREAD_TIMER_OFF (circuit-&gt;t_send_csnp[1]);</a>
+<a name="ln797">  THREAD_TIMER_OFF (circuit-&gt;t_send_psnp[0]);</a>
+<a name="ln798">  THREAD_TIMER_OFF (circuit-&gt;t_send_psnp[1]);</a>
+<a name="ln799">  THREAD_OFF (circuit-&gt;t_read);</a>
+<a name="ln800"> </a>
+<a name="ln801">  if (circuit-&gt;lsp_queue)</a>
+<a name="ln802">    {</a>
+<a name="ln803">      circuit-&gt;lsp_queue-&gt;del = NULL;</a>
+<a name="ln804">      list_delete (circuit-&gt;lsp_queue);</a>
+<a name="ln805">      circuit-&gt;lsp_queue = NULL;</a>
+<a name="ln806">    }</a>
+<a name="ln807"> </a>
+<a name="ln808">  /* send one gratuitous hello to spead up convergence */</a>
+<a name="ln809">  if (circuit-&gt;is_type &amp; IS_LEVEL_1)</a>
+<a name="ln810">    send_hello (circuit, IS_LEVEL_1);</a>
+<a name="ln811">  if (circuit-&gt;is_type &amp; IS_LEVEL_2)</a>
+<a name="ln812">    send_hello (circuit, IS_LEVEL_2);</a>
+<a name="ln813"> </a>
+<a name="ln814">  circuit-&gt;upadjcount[0] = 0;</a>
+<a name="ln815">  circuit-&gt;upadjcount[1] = 0;</a>
+<a name="ln816"> </a>
+<a name="ln817">  /* close the socket */</a>
+<a name="ln818">  if (circuit-&gt;fd)</a>
+<a name="ln819">    {</a>
+<a name="ln820">      close (circuit-&gt;fd);</a>
+<a name="ln821">      circuit-&gt;fd = 0;</a>
+<a name="ln822">    }</a>
+<a name="ln823"> </a>
+<a name="ln824">  if (circuit-&gt;rcv_stream != NULL)</a>
+<a name="ln825">    {</a>
+<a name="ln826">      stream_free (circuit-&gt;rcv_stream);</a>
+<a name="ln827">      circuit-&gt;rcv_stream = NULL;</a>
+<a name="ln828">    }</a>
+<a name="ln829"> </a>
+<a name="ln830">  if (circuit-&gt;snd_stream != NULL)</a>
+<a name="ln831">    {</a>
+<a name="ln832">      stream_free (circuit-&gt;snd_stream);</a>
+<a name="ln833">      circuit-&gt;snd_stream = NULL;</a>
+<a name="ln834">    }</a>
+<a name="ln835"> </a>
+<a name="ln836">  thread_cancel_event (master, circuit);</a>
+<a name="ln837"> </a>
+<a name="ln838">  return;</a>
+<a name="ln839">}</a>
+<a name="ln840"> </a>
+<a name="ln841">void</a>
+<a name="ln842">circuit_update_nlpids (struct isis_circuit *circuit)</a>
+<a name="ln843">{</a>
+<a name="ln844">  circuit-&gt;nlpids.count = 0;</a>
+<a name="ln845"> </a>
+<a name="ln846">  if (circuit-&gt;ip_router)</a>
+<a name="ln847">    {</a>
+<a name="ln848">      circuit-&gt;nlpids.nlpids[0] = NLPID_IP;</a>
+<a name="ln849">      circuit-&gt;nlpids.count++;</a>
+<a name="ln850">    }</a>
+<a name="ln851">#ifdef HAVE_IPV6</a>
+<a name="ln852">  if (circuit-&gt;ipv6_router)</a>
+<a name="ln853">    {</a>
+<a name="ln854">      circuit-&gt;nlpids.nlpids[circuit-&gt;nlpids.count] = NLPID_IPV6;</a>
+<a name="ln855">      circuit-&gt;nlpids.count++;</a>
+<a name="ln856">    }</a>
+<a name="ln857">#endif /* HAVE_IPV6 */</a>
+<a name="ln858">  return;</a>
+<a name="ln859">}</a>
+<a name="ln860"> </a>
+<a name="ln861">void</a>
+<a name="ln862">isis_circuit_print_vty (struct isis_circuit *circuit, struct vty *vty,</a>
+<a name="ln863">                        char detail)</a>
+<a name="ln864">{</a>
+<a name="ln865">  if (detail == ISIS_UI_LEVEL_BRIEF)</a>
+<a name="ln866">    {</a>
+<a name="ln867">      vty_out (vty, &quot;  %-12s&quot;, circuit-&gt;interface-&gt;name);</a>
+<a name="ln868">      vty_out (vty, &quot;0x%-7x&quot;, circuit-&gt;circuit_id);</a>
+<a name="ln869">      vty_out (vty, &quot;%-9s&quot;, circuit_state2string (circuit-&gt;state));</a>
+<a name="ln870">      vty_out (vty, &quot;%-9s&quot;, circuit_type2string (circuit-&gt;circ_type));</a>
+<a name="ln871">      vty_out (vty, &quot;%-9s&quot;, circuit_t2string (circuit-&gt;is_type));</a>
+<a name="ln872">      vty_out (vty, &quot;%s&quot;, VTY_NEWLINE);</a>
+<a name="ln873">    }</a>
+<a name="ln874"> </a>
+<a name="ln875">  if (detail == ISIS_UI_LEVEL_DETAIL)</a>
+<a name="ln876">    {</a>
+<a name="ln877">      struct listnode *node;</a>
+<a name="ln878">      struct prefix *ip_addr;</a>
+<a name="ln879">      u_char buf[BUFSIZ];</a>
+<a name="ln880"> </a>
+<a name="ln881">      vty_out (vty, &quot;  Interface: %s&quot;, circuit-&gt;interface-&gt;name);</a>
+<a name="ln882">      vty_out (vty, &quot;, State: %s&quot;, circuit_state2string (circuit-&gt;state));</a>
+<a name="ln883">      if (circuit-&gt;is_passive)</a>
+<a name="ln884">        vty_out (vty, &quot;, Passive&quot;);</a>
+<a name="ln885">      else</a>
+<a name="ln886">        vty_out (vty, &quot;, Active&quot;);</a>
+<a name="ln887">      vty_out (vty, &quot;, Circuit Id: 0x%x&quot;, circuit-&gt;circuit_id);</a>
+<a name="ln888">      vty_out (vty, &quot;%s&quot;, VTY_NEWLINE);</a>
+<a name="ln889">      vty_out (vty, &quot;    Type: %s&quot;, circuit_type2string (circuit-&gt;circ_type));</a>
+<a name="ln890">      vty_out (vty, &quot;, Level: %s&quot;, circuit_t2string (circuit-&gt;is_type));</a>
+<a name="ln891">      if (circuit-&gt;circ_type == CIRCUIT_T_BROADCAST)</a>
+<a name="ln892">        vty_out (vty, &quot;, SNPA: %-10s&quot;, snpa_print (circuit-&gt;u.bc.snpa));</a>
+<a name="ln893">      vty_out (vty, &quot;%s&quot;, VTY_NEWLINE);</a>
+<a name="ln894">      if (circuit-&gt;is_type &amp; IS_LEVEL_1)</a>
+<a name="ln895">        {</a>
+<a name="ln896">          vty_out (vty, &quot;    Level-1 Information:%s&quot;, VTY_NEWLINE);</a>
+<a name="ln897">          if (circuit-&gt;area-&gt;newmetric)</a>
+<a name="ln898">            vty_out (vty, &quot;      Metric: %d&quot;, circuit-&gt;te_metric[0]);</a>
+<a name="ln899">          else</a>
+<a name="ln900">            vty_out (vty, &quot;      Metric: %d&quot;,</a>
+<a name="ln901">                     circuit-&gt;metric[0]);</a>
+<a name="ln902">          if (!circuit-&gt;is_passive)</a>
+<a name="ln903">            {</a>
+<a name="ln904">              vty_out (vty, &quot;, Active neighbors: %u%s&quot;,</a>
+<a name="ln905">                       circuit-&gt;upadjcount[0], VTY_NEWLINE);</a>
+<a name="ln906">              vty_out (vty, &quot;      Hello interval: %u, &quot;</a>
+<a name="ln907">                            &quot;Holddown count: %u %s%s&quot;,</a>
+<a name="ln908">                       circuit-&gt;hello_interval[0],</a>
+<a name="ln909">                       circuit-&gt;hello_multiplier[0],</a>
+<a name="ln910">                       (circuit-&gt;pad_hellos ? &quot;(pad)&quot; : &quot;(no-pad)&quot;),</a>
+<a name="ln911">                       VTY_NEWLINE);</a>
+<a name="ln912">              vty_out (vty, &quot;      CNSP interval: %u, &quot;</a>
+<a name="ln913">                            &quot;PSNP interval: %u%s&quot;,</a>
+<a name="ln914">                       circuit-&gt;csnp_interval[0],</a>
+<a name="ln915">                       circuit-&gt;psnp_interval[0], VTY_NEWLINE);</a>
+<a name="ln916">              if (circuit-&gt;circ_type == CIRCUIT_T_BROADCAST)</a>
+<a name="ln917">                vty_out (vty, &quot;      LAN Priority: %u, %s%s&quot;,</a>
+<a name="ln918">                         circuit-&gt;priority[0],</a>
+<a name="ln919">                         (circuit-&gt;u.bc.is_dr[0] ? \</a>
+<a name="ln920">                          &quot;is DIS&quot; : &quot;is not DIS&quot;), VTY_NEWLINE);</a>
+<a name="ln921">            }</a>
+<a name="ln922">          else</a>
+<a name="ln923">            {</a>
+<a name="ln924">              vty_out (vty, &quot;%s&quot;, VTY_NEWLINE);</a>
+<a name="ln925">            }</a>
+<a name="ln926">        }</a>
+<a name="ln927">      if (circuit-&gt;is_type &amp; IS_LEVEL_2)</a>
+<a name="ln928">        {</a>
+<a name="ln929">          vty_out (vty, &quot;    Level-2 Information:%s&quot;, VTY_NEWLINE);</a>
+<a name="ln930">          if (circuit-&gt;area-&gt;newmetric)</a>
+<a name="ln931">            vty_out (vty, &quot;      Metric: %d&quot;, circuit-&gt;te_metric[1]);</a>
+<a name="ln932">          else</a>
+<a name="ln933">            vty_out (vty, &quot;      Metric: %d&quot;,</a>
+<a name="ln934">                     circuit-&gt;metric[1]);</a>
+<a name="ln935">          if (!circuit-&gt;is_passive)</a>
+<a name="ln936">            {</a>
+<a name="ln937">              vty_out (vty, &quot;, Active neighbors: %u%s&quot;,</a>
+<a name="ln938">                       circuit-&gt;upadjcount[1], VTY_NEWLINE);</a>
+<a name="ln939">              vty_out (vty, &quot;      Hello interval: %u, &quot;</a>
+<a name="ln940">                            &quot;Holddown count: %u %s%s&quot;,</a>
+<a name="ln941">                       circuit-&gt;hello_interval[1],</a>
+<a name="ln942">                       circuit-&gt;hello_multiplier[1],</a>
+<a name="ln943">                       (circuit-&gt;pad_hellos ? &quot;(pad)&quot; : &quot;(no-pad)&quot;),</a>
+<a name="ln944">                       VTY_NEWLINE);</a>
+<a name="ln945">              vty_out (vty, &quot;      CNSP interval: %u, &quot;</a>
+<a name="ln946">                            &quot;PSNP interval: %u%s&quot;,</a>
+<a name="ln947">                       circuit-&gt;csnp_interval[1],</a>
+<a name="ln948">                       circuit-&gt;psnp_interval[1], VTY_NEWLINE);</a>
+<a name="ln949">              if (circuit-&gt;circ_type == CIRCUIT_T_BROADCAST)</a>
+<a name="ln950">                vty_out (vty, &quot;      LAN Priority: %u, %s%s&quot;,</a>
+<a name="ln951">                         circuit-&gt;priority[1],</a>
+<a name="ln952">                         (circuit-&gt;u.bc.is_dr[1] ? \</a>
+<a name="ln953">                          &quot;is DIS&quot; : &quot;is not DIS&quot;), VTY_NEWLINE);</a>
+<a name="ln954">            }</a>
+<a name="ln955">          else</a>
+<a name="ln956">            {</a>
+<a name="ln957">              vty_out (vty, &quot;%s&quot;, VTY_NEWLINE);</a>
+<a name="ln958">            }</a>
+<a name="ln959">        }</a>
+<a name="ln960">      if (circuit-&gt;ip_addrs &amp;&amp; listcount (circuit-&gt;ip_addrs) &gt; 0)</a>
+<a name="ln961">        {</a>
+<a name="ln962">          vty_out (vty, &quot;    IP Prefix(es):%s&quot;, VTY_NEWLINE);</a>
+<a name="ln963">          for (ALL_LIST_ELEMENTS_RO (circuit-&gt;ip_addrs, node, ip_addr))</a>
+<a name="ln964">            {</a>
+<a name="ln965">              prefix2str (ip_addr, (char*)buf, BUFSIZ),</a>
+<a name="ln966">              vty_out (vty, &quot;      %s%s&quot;, buf, VTY_NEWLINE);</a>
+<a name="ln967">            }</a>
+<a name="ln968">        }</a>
+<a name="ln969">      if (circuit-&gt;ipv6_link &amp;&amp; listcount(circuit-&gt;ipv6_link) &gt; 0)</a>
+<a name="ln970">        {</a>
+<a name="ln971">          vty_out(vty, &quot;    IPv6 Link-Locals:%s&quot;, VTY_NEWLINE);</a>
+<a name="ln972">          for (ALL_LIST_ELEMENTS_RO(circuit-&gt;ipv6_link, node, ip_addr))</a>
+<a name="ln973">            {</a>
+<a name="ln974">              prefix2str(ip_addr, (char*)buf, BUFSIZ),</a>
+<a name="ln975">              vty_out(vty, &quot;      %s%s&quot;, buf, VTY_NEWLINE);</a>
+<a name="ln976">            }</a>
+<a name="ln977">        }</a>
+<a name="ln978">      if (circuit-&gt;ipv6_non_link &amp;&amp; listcount(circuit-&gt;ipv6_non_link) &gt; 0)</a>
+<a name="ln979">        {</a>
+<a name="ln980">          vty_out(vty, &quot;    IPv6 Prefixes:%s&quot;, VTY_NEWLINE);</a>
+<a name="ln981">          for (ALL_LIST_ELEMENTS_RO(circuit-&gt;ipv6_non_link, node, ip_addr))</a>
+<a name="ln982">            {</a>
+<a name="ln983">              prefix2str(ip_addr, (char*)buf, BUFSIZ),</a>
+<a name="ln984">              vty_out(vty, &quot;      %s%s&quot;, buf, VTY_NEWLINE);</a>
+<a name="ln985">            }</a>
+<a name="ln986">        }</a>
+<a name="ln987"> </a>
+<a name="ln988">      vty_out (vty, &quot;%s&quot;, VTY_NEWLINE);</a>
+<a name="ln989">    }</a>
+<a name="ln990">  return;</a>
+<a name="ln991">}</a>
+<a name="ln992"> </a>
+<a name="ln993">int</a>
+<a name="ln994">isis_interface_config_write (struct vty *vty)</a>
+<a name="ln995">{</a>
+<a name="ln996">  int write = 0;</a>
+<a name="ln997">  struct listnode *node, *node2;</a>
+<a name="ln998">  struct interface *ifp;</a>
+<a name="ln999">  struct isis_area *area;</a>
+<a name="ln1000">  struct isis_circuit *circuit;</a>
+<a name="ln1001">  int i;</a>
+<a name="ln1002"> </a>
+<a name="ln1003">  for (ALL_LIST_ELEMENTS_RO (iflist, node, ifp))</a>
+<a name="ln1004">    {</a>
+<a name="ln1005">      /* IF name */</a>
+<a name="ln1006">      vty_out (vty, &quot;interface %s%s&quot;, ifp-&gt;name, VTY_NEWLINE);</a>
+<a name="ln1007">      write++;</a>
+<a name="ln1008">      /* IF desc */</a>
+<a name="ln1009">      if (ifp-&gt;desc)</a>
+<a name="ln1010">        {</a>
+<a name="ln1011">          vty_out (vty, &quot; description %s%s&quot;, ifp-&gt;desc, VTY_NEWLINE);</a>
+<a name="ln1012">          write++;</a>
+<a name="ln1013">        }</a>
+<a name="ln1014">      /* ISIS Circuit */</a>
+<a name="ln1015">      for (ALL_LIST_ELEMENTS_RO (isis-&gt;area_list, node2, area))</a>
+<a name="ln1016">        {</a>
+<a name="ln1017">          circuit = circuit_lookup_by_ifp (ifp, area-&gt;circuit_list);</a>
+<a name="ln1018">          if (circuit == NULL)</a>
+<a name="ln1019">            continue;</a>
+<a name="ln1020">          if (circuit-&gt;ip_router)</a>
+<a name="ln1021">            {</a>
+<a name="ln1022">              vty_out (vty, &quot; ip router isis %s%s&quot;, area-&gt;area_tag,</a>
+<a name="ln1023">                       VTY_NEWLINE);</a>
+<a name="ln1024">              write++;</a>
+<a name="ln1025">            }</a>
+<a name="ln1026">          if (circuit-&gt;is_passive)</a>
+<a name="ln1027">            {</a>
+<a name="ln1028">              vty_out (vty, &quot; isis passive%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1029">              write++;</a>
+<a name="ln1030">            }</a>
+<a name="ln1031">          if (circuit-&gt;circ_type_config == CIRCUIT_T_P2P)</a>
+<a name="ln1032">            {</a>
+<a name="ln1033">              vty_out (vty, &quot; isis network point-to-point%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1034">              write++;</a>
+<a name="ln1035">            }</a>
+<a name="ln1036">#ifdef HAVE_IPV6</a>
+<a name="ln1037">          if (circuit-&gt;ipv6_router)</a>
+<a name="ln1038">            {</a>
+<a name="ln1039">              vty_out (vty, &quot; ipv6 router isis %s%s&quot;, area-&gt;area_tag,</a>
+<a name="ln1040">                  VTY_NEWLINE);</a>
+<a name="ln1041">              write++;</a>
+<a name="ln1042">            }</a>
+<a name="ln1043">#endif /* HAVE_IPV6 */</a>
+<a name="ln1044"> </a>
+<a name="ln1045">          /* ISIS - circuit type */</a>
+<a name="ln1046">          if (circuit-&gt;is_type == IS_LEVEL_1)</a>
+<a name="ln1047">            {</a>
+<a name="ln1048">              vty_out (vty, &quot; isis circuit-type level-1%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1049">              write++;</a>
+<a name="ln1050">            }</a>
+<a name="ln1051">          else</a>
+<a name="ln1052">            {</a>
+<a name="ln1053">              if (circuit-&gt;is_type == IS_LEVEL_2)</a>
+<a name="ln1054">                {</a>
+<a name="ln1055">                  vty_out (vty, &quot; isis circuit-type level-2-only%s&quot;,</a>
+<a name="ln1056">                           VTY_NEWLINE);</a>
+<a name="ln1057">                  write++;</a>
+<a name="ln1058">                }</a>
+<a name="ln1059">            }</a>
+<a name="ln1060"> </a>
+<a name="ln1061">          /* ISIS - CSNP interval */</a>
+<a name="ln1062">          if (circuit-&gt;csnp_interval[0] == circuit-&gt;csnp_interval[1])</a>
+<a name="ln1063">            {</a>
+<a name="ln1064">              if (circuit-&gt;csnp_interval[0] != DEFAULT_CSNP_INTERVAL)</a>
+<a name="ln1065">                {</a>
+<a name="ln1066">                  vty_out (vty, &quot; isis csnp-interval %d%s&quot;,</a>
+<a name="ln1067">                           circuit-&gt;csnp_interval[0], VTY_NEWLINE);</a>
+<a name="ln1068">                  write++;</a>
+<a name="ln1069">                }</a>
+<a name="ln1070">            }</a>
+<a name="ln1071">          else</a>
+<a name="ln1072">          {</a>
+<a name="ln1073">            for (i = 0; i &lt; 2; i++)</a>
+<a name="ln1074">              {</a>
+<a name="ln1075">                if (circuit-&gt;csnp_interval[i] != DEFAULT_CSNP_INTERVAL)</a>
+<a name="ln1076">                  {</a>
+<a name="ln1077">                    vty_out (vty, &quot; isis csnp-interval %d level-%d%s&quot;,</a>
+<a name="ln1078">                             circuit-&gt;csnp_interval[i], i + 1, VTY_NEWLINE);</a>
+<a name="ln1079">                    write++;</a>
+<a name="ln1080">                  }</a>
+<a name="ln1081">              }</a>
+<a name="ln1082">          }</a>
+<a name="ln1083"> </a>
+<a name="ln1084">          /* ISIS - PSNP interval */</a>
+<a name="ln1085">          if (circuit-&gt;psnp_interval[0] == circuit-&gt;psnp_interval[1])</a>
+<a name="ln1086">            {</a>
+<a name="ln1087">              if (circuit-&gt;psnp_interval[0] != DEFAULT_PSNP_INTERVAL)</a>
+<a name="ln1088">                {</a>
+<a name="ln1089">                  vty_out (vty, &quot; isis psnp-interval %d%s&quot;,</a>
+<a name="ln1090">                           circuit-&gt;psnp_interval[0], VTY_NEWLINE);</a>
+<a name="ln1091">                  write++;</a>
+<a name="ln1092">                }</a>
+<a name="ln1093">            }</a>
+<a name="ln1094">          else</a>
+<a name="ln1095">            {</a>
+<a name="ln1096">              for (i = 0; i &lt; 2; i++)</a>
+<a name="ln1097">                {</a>
+<a name="ln1098">                  if (circuit-&gt;psnp_interval[i] != DEFAULT_PSNP_INTERVAL)</a>
+<a name="ln1099">                  {</a>
+<a name="ln1100">                    vty_out (vty, &quot; isis psnp-interval %d level-%d%s&quot;,</a>
+<a name="ln1101">                             circuit-&gt;psnp_interval[i], i + 1, VTY_NEWLINE);</a>
+<a name="ln1102">                    write++;</a>
+<a name="ln1103">                  }</a>
+<a name="ln1104">                }</a>
+<a name="ln1105">            }</a>
+<a name="ln1106"> </a>
+<a name="ln1107">          /* ISIS - Hello padding - Defaults to true so only display if false */</a>
+<a name="ln1108">          if (circuit-&gt;pad_hellos == 0)</a>
+<a name="ln1109">            {</a>
+<a name="ln1110">              vty_out (vty, &quot; no isis hello padding%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1111">              write++;</a>
+<a name="ln1112">            }</a>
+<a name="ln1113"> </a>
+<a name="ln1114">          /* ISIS - Hello interval */</a>
+<a name="ln1115">          if (circuit-&gt;hello_interval[0] == circuit-&gt;hello_interval[1])</a>
+<a name="ln1116">            {</a>
+<a name="ln1117">              if (circuit-&gt;hello_interval[0] != DEFAULT_HELLO_INTERVAL)</a>
+<a name="ln1118">                {</a>
+<a name="ln1119">                  vty_out (vty, &quot; isis hello-interval %d%s&quot;,</a>
+<a name="ln1120">                           circuit-&gt;hello_interval[0], VTY_NEWLINE);</a>
+<a name="ln1121">                  write++;</a>
+<a name="ln1122">                }</a>
+<a name="ln1123">            }</a>
+<a name="ln1124">          else</a>
+<a name="ln1125">            {</a>
+<a name="ln1126">              for (i = 0; i &lt; 2; i++)</a>
+<a name="ln1127">                {</a>
+<a name="ln1128">                  if (circuit-&gt;hello_interval[i] != DEFAULT_HELLO_INTERVAL)</a>
+<a name="ln1129">                    {</a>
+<a name="ln1130">                      vty_out (vty, &quot; isis hello-interval %d level-%d%s&quot;,</a>
+<a name="ln1131">                               circuit-&gt;hello_interval[i], i + 1, VTY_NEWLINE);</a>
+<a name="ln1132">                      write++;</a>
+<a name="ln1133">                    }</a>
+<a name="ln1134">                }</a>
+<a name="ln1135">            }</a>
+<a name="ln1136"> </a>
+<a name="ln1137">          /* ISIS - Hello Multiplier */</a>
+<a name="ln1138">          if (circuit-&gt;hello_multiplier[0] == circuit-&gt;hello_multiplier[1])</a>
+<a name="ln1139">            {</a>
+<a name="ln1140">              if (circuit-&gt;hello_multiplier[0] != DEFAULT_HELLO_MULTIPLIER)</a>
+<a name="ln1141">                {</a>
+<a name="ln1142">                  vty_out (vty, &quot; isis hello-multiplier %d%s&quot;,</a>
+<a name="ln1143">                           circuit-&gt;hello_multiplier[0], VTY_NEWLINE);</a>
+<a name="ln1144">                  write++;</a>
+<a name="ln1145">                }</a>
+<a name="ln1146">            }</a>
+<a name="ln1147">          else</a>
+<a name="ln1148">            {</a>
+<a name="ln1149">              for (i = 0; i &lt; 2; i++)</a>
+<a name="ln1150">                {</a>
+<a name="ln1151">                  if (circuit-&gt;hello_multiplier[i] != DEFAULT_HELLO_MULTIPLIER)</a>
+<a name="ln1152">                    {</a>
+<a name="ln1153">                      vty_out (vty, &quot; isis hello-multiplier %d level-%d%s&quot;,</a>
+<a name="ln1154">                               circuit-&gt;hello_multiplier[i], i + 1,</a>
+<a name="ln1155">                               VTY_NEWLINE);</a>
+<a name="ln1156">                      write++;</a>
+<a name="ln1157">                    }</a>
+<a name="ln1158">                }</a>
+<a name="ln1159">            }</a>
+<a name="ln1160"> </a>
+<a name="ln1161">          /* ISIS - Priority */</a>
+<a name="ln1162">          if (circuit-&gt;priority[0] == circuit-&gt;priority[1])</a>
+<a name="ln1163">            {</a>
+<a name="ln1164">              if (circuit-&gt;priority[0] != DEFAULT_PRIORITY)</a>
+<a name="ln1165">                {</a>
+<a name="ln1166">                  vty_out (vty, &quot; isis priority %d%s&quot;,</a>
+<a name="ln1167">                           circuit-&gt;priority[0], VTY_NEWLINE);</a>
+<a name="ln1168">                  write++;</a>
+<a name="ln1169">                }</a>
+<a name="ln1170">            }</a>
+<a name="ln1171">          else</a>
+<a name="ln1172">            {</a>
+<a name="ln1173">              for (i = 0; i &lt; 2; i++)</a>
+<a name="ln1174">                {</a>
+<a name="ln1175">                  if (circuit-&gt;priority[i] != DEFAULT_PRIORITY)</a>
+<a name="ln1176">                    {</a>
+<a name="ln1177">                      vty_out (vty, &quot; isis priority %d level-%d%s&quot;,</a>
+<a name="ln1178">                               circuit-&gt;priority[i], i + 1, VTY_NEWLINE);</a>
+<a name="ln1179">                      write++;</a>
+<a name="ln1180">                    }</a>
+<a name="ln1181">                }</a>
+<a name="ln1182">            }</a>
+<a name="ln1183"> </a>
+<a name="ln1184">          /* ISIS - Metric */</a>
+<a name="ln1185">          if (circuit-&gt;te_metric[0] == circuit-&gt;te_metric[1])</a>
+<a name="ln1186">            {</a>
+<a name="ln1187">              if (circuit-&gt;te_metric[0] != DEFAULT_CIRCUIT_METRIC)</a>
+<a name="ln1188">                {</a>
+<a name="ln1189">                  vty_out (vty, &quot; isis metric %d%s&quot;, circuit-&gt;te_metric[0],</a>
+<a name="ln1190">                           VTY_NEWLINE);</a>
+<a name="ln1191">                  write++;</a>
+<a name="ln1192">                }</a>
+<a name="ln1193">            }</a>
+<a name="ln1194">          else</a>
+<a name="ln1195">            {</a>
+<a name="ln1196">              for (i = 0; i &lt; 2; i++)</a>
+<a name="ln1197">                {</a>
+<a name="ln1198">                  if (circuit-&gt;te_metric[i] != DEFAULT_CIRCUIT_METRIC)</a>
+<a name="ln1199">                    {</a>
+<a name="ln1200">                      vty_out (vty, &quot; isis metric %d level-%d%s&quot;,</a>
+<a name="ln1201">                               circuit-&gt;te_metric[i], i + 1, VTY_NEWLINE);</a>
+<a name="ln1202">                      write++;</a>
+<a name="ln1203">                    }</a>
+<a name="ln1204">                }</a>
+<a name="ln1205">            }</a>
+<a name="ln1206">          if (circuit-&gt;passwd.type == ISIS_PASSWD_TYPE_HMAC_MD5)</a>
+<a name="ln1207">            {</a>
+<a name="ln1208">              vty_out (vty, &quot; isis password md5 %s%s&quot;, circuit-&gt;passwd.passwd,</a>
+<a name="ln1209">                       VTY_NEWLINE);</a>
+<a name="ln1210">              write++;</a>
+<a name="ln1211">            }</a>
+<a name="ln1212">          else if (circuit-&gt;passwd.type == ISIS_PASSWD_TYPE_CLEARTXT)</a>
+<a name="ln1213">            {</a>
+<a name="ln1214">              vty_out (vty, &quot; isis password clear %s%s&quot;, circuit-&gt;passwd.passwd,</a>
+<a name="ln1215">                       VTY_NEWLINE);</a>
+<a name="ln1216">              write++;</a>
+<a name="ln1217">            }</a>
+<a name="ln1218">        }</a>
+<a name="ln1219">      vty_out (vty, &quot;!%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1220">    }</a>
+<a name="ln1221"> </a>
+<a name="ln1222">  return write;</a>
+<a name="ln1223">}</a>
+<a name="ln1224"> </a>
+<a name="ln1225">struct isis_circuit *</a>
+<a name="ln1226">isis_circuit_create (struct isis_area *area, struct interface *ifp)</a>
+<a name="ln1227">{</a>
+<a name="ln1228">  struct isis_circuit *circuit = circuit_scan_by_ifp (ifp);</a>
+<a name="ln1229">  if (circuit &amp;&amp; circuit-&gt;area)</a>
+<a name="ln1230">    return NULL;</a>
+<a name="ln1231">  circuit = isis_csm_state_change (ISIS_ENABLE, circuit, area);</a>
+<a name="ln1232">  if (circuit-&gt;state != C_STATE_CONF &amp;&amp; circuit-&gt;state != C_STATE_UP)</a>
+<a name="ln1233">    return circuit;</a>
+<a name="ln1234">  isis_circuit_if_bind (circuit, ifp);</a>
+<a name="ln1235">  return circuit;</a>
+<a name="ln1236">}</a>
+<a name="ln1237"> </a>
+<a name="ln1238">void</a>
+<a name="ln1239">isis_circuit_af_set (struct isis_circuit *circuit, bool ip_router, bool ipv6_router)</a>
+<a name="ln1240">{</a>
+<a name="ln1241">  struct isis_area *area = circuit-&gt;area;</a>
+<a name="ln1242">  bool change = circuit-&gt;ip_router != ip_router || circuit-&gt;ipv6_router != ipv6_router;</a>
+<a name="ln1243">  bool was_enabled = !!circuit-&gt;area;</a>
+<a name="ln1244"> </a>
+<a name="ln1245">  area-&gt;ip_circuits   += ip_router   - circuit-&gt;ip_router;</a>
+<a name="ln1246">  area-&gt;ipv6_circuits += ipv6_router - circuit-&gt;ipv6_router;</a>
+<a name="ln1247">  circuit-&gt;ip_router   = ip_router;</a>
+<a name="ln1248">  circuit-&gt;ipv6_router = ipv6_router;</a>
+<a name="ln1249"> </a>
+<a name="ln1250">  if (!change)</a>
+<a name="ln1251">    return;</a>
+<a name="ln1252"> </a>
+<a name="ln1253">  circuit_update_nlpids (circuit);</a>
+<a name="ln1254"> </a>
+<a name="ln1255">  if (!ip_router &amp;&amp; !ipv6_router)</a>
+<a name="ln1256">    isis_csm_state_change (ISIS_DISABLE, circuit, area);</a>
+<a name="ln1257">  else if (!was_enabled)</a>
+<a name="ln1258">    isis_csm_state_change (ISIS_ENABLE, circuit, area);</a>
+<a name="ln1259">  else</a>
+<a name="ln1260">    lsp_regenerate_schedule(circuit-&gt;area, circuit-&gt;is_type, 0);</a>
+<a name="ln1261">}</a>
+<a name="ln1262"> </a>
+<a name="ln1263">int</a>
+<a name="ln1264">isis_circuit_passive_set (struct isis_circuit *circuit, bool passive)</a>
+<a name="ln1265">{</a>
+<a name="ln1266">  if (circuit-&gt;is_passive == passive)</a>
+<a name="ln1267">    return 0;</a>
+<a name="ln1268"> </a>
+<a name="ln1269">  if (if_is_loopback (circuit-&gt;interface) &amp;&amp; !passive)</a>
+<a name="ln1270">    return -1;</a>
+<a name="ln1271"> </a>
+<a name="ln1272">  if (circuit-&gt;state != C_STATE_UP)</a>
+<a name="ln1273">    {</a>
+<a name="ln1274">      circuit-&gt;is_passive = passive;</a>
+<a name="ln1275">    }</a>
+<a name="ln1276">  else</a>
+<a name="ln1277">    {</a>
+<a name="ln1278">      struct isis_area *area = circuit-&gt;area;</a>
+<a name="ln1279">      isis_csm_state_change (ISIS_DISABLE, circuit, area);</a>
+<a name="ln1280">      circuit-&gt;is_passive = passive;</a>
+<a name="ln1281">      isis_csm_state_change (ISIS_ENABLE, circuit, area);</a>
+<a name="ln1282">    }</a>
+<a name="ln1283"> </a>
+<a name="ln1284">  return 0;</a>
+<a name="ln1285">}</a>
+<a name="ln1286"> </a>
+<a name="ln1287">int</a>
+<a name="ln1288">isis_circuit_metric_set (struct isis_circuit *circuit, int level, int metric)</a>
+<a name="ln1289">{</a>
+<a name="ln1290">  assert (level == IS_LEVEL_1 || level == IS_LEVEL_2);</a>
+<a name="ln1291">  if (metric &gt; MAX_WIDE_LINK_METRIC)</a>
+<a name="ln1292">    return -1;</a>
+<a name="ln1293">  if (circuit-&gt;area &amp;&amp; circuit-&gt;area-&gt;oldmetric</a>
+<a name="ln1294">      &amp;&amp; metric &gt; MAX_NARROW_LINK_METRIC)</a>
+<a name="ln1295">    return -1;</a>
+<a name="ln1296"> </a>
+<a name="ln1297">  circuit-&gt;te_metric[level - 1] = metric;</a>
+<a name="ln1298">  circuit-&gt;metric[level - 1] = metric;</a>
+<a name="ln1299"> </a>
+<a name="ln1300">  if (circuit-&gt;area)</a>
+<a name="ln1301">    lsp_regenerate_schedule (circuit-&gt;area, level, 0);</a>
+<a name="ln1302">  return 0;</a>
+<a name="ln1303">}</a>
+<a name="ln1304"> </a>
+<a name="ln1305">int</a>
+<a name="ln1306">isis_circuit_passwd_unset (struct isis_circuit *circuit)</a>
+<a name="ln1307">{</a>
+<a name="ln1308">  memset(&amp;circuit-&gt;passwd, 0, sizeof(circuit-&gt;passwd));</a>
+<a name="ln1309">  return 0;</a>
+<a name="ln1310">}</a>
+<a name="ln1311"> </a>
+<a name="ln1312">static int</a>
+<a name="ln1313">isis_circuit_passwd_set (struct isis_circuit *circuit, u_char passwd_type, const char *passwd)</a>
+<a name="ln1314">{</a>
+<a name="ln1315">  int len;</a>
+<a name="ln1316"> </a>
+<a name="ln1317">  if (!passwd)</a>
+<a name="ln1318">    return -1;</a>
+<a name="ln1319"> </a>
+<a name="ln1320">  len = strlen(passwd);</a>
+<a name="ln1321">  if (len &gt; 254)</a>
+<a name="ln1322">    return -1;</a>
+<a name="ln1323"> </a>
+<a name="ln1324">  circuit-&gt;passwd.len = len;</a>
+<a name="ln1325">  strncpy((char *)circuit-&gt;passwd.passwd, passwd, 255);</a>
+<a name="ln1326">  circuit-&gt;passwd.type = passwd_type;</a>
+<a name="ln1327">  return 0;</a>
+<a name="ln1328">}</a>
+<a name="ln1329"> </a>
+<a name="ln1330">int</a>
+<a name="ln1331">isis_circuit_passwd_cleartext_set (struct isis_circuit *circuit, const char *passwd)</a>
+<a name="ln1332">{</a>
+<a name="ln1333">  return isis_circuit_passwd_set (circuit, ISIS_PASSWD_TYPE_CLEARTXT, passwd);</a>
+<a name="ln1334">}</a>
+<a name="ln1335"> </a>
+<a name="ln1336">int</a>
+<a name="ln1337">isis_circuit_passwd_hmac_md5_set (struct isis_circuit *circuit, const char *passwd)</a>
+<a name="ln1338">{</a>
+<a name="ln1339">  return isis_circuit_passwd_set (circuit, ISIS_PASSWD_TYPE_HMAC_MD5, passwd);</a>
+<a name="ln1340">}</a>
+<a name="ln1341">struct cmd_node interface_node = {</a>
+<a name="ln1342">  INTERFACE_NODE,</a>
+<a name="ln1343">  &quot;%s(config-if)# &quot;,</a>
+<a name="ln1344">  1,</a>
+<a name="ln1345">};</a>
+<a name="ln1346"> </a>
+<a name="ln1347">int</a>
+<a name="ln1348">isis_circuit_circ_type_set(struct isis_circuit *circuit, int circ_type)</a>
+<a name="ln1349">{</a>
+<a name="ln1350">  /* Changing the network type to/of loopback or unknown interfaces</a>
+<a name="ln1351">   * is not supported. */</a>
+<a name="ln1352">  if (circ_type == CIRCUIT_T_UNKNOWN</a>
+<a name="ln1353">      || circ_type == CIRCUIT_T_LOOPBACK</a>
+<a name="ln1354">      || circuit-&gt;circ_type == CIRCUIT_T_LOOPBACK)</a>
+<a name="ln1355">    {</a>
+<a name="ln1356">      if (circuit-&gt;circ_type != circ_type)</a>
+<a name="ln1357">        return -1;</a>
+<a name="ln1358">      else</a>
+<a name="ln1359">        return 0;</a>
+<a name="ln1360">    }</a>
+<a name="ln1361"> </a>
+<a name="ln1362">  if (circuit-&gt;circ_type == circ_type)</a>
+<a name="ln1363">    return 0;</a>
+<a name="ln1364"> </a>
+<a name="ln1365">  if (circuit-&gt;state != C_STATE_UP)</a>
+<a name="ln1366">    {</a>
+<a name="ln1367">      circuit-&gt;circ_type = circ_type;</a>
+<a name="ln1368">      circuit-&gt;circ_type_config = circ_type;</a>
+<a name="ln1369">    }</a>
+<a name="ln1370">  else</a>
+<a name="ln1371">    {</a>
+<a name="ln1372">      struct isis_area *area = circuit-&gt;area;</a>
+<a name="ln1373">      if (circ_type == CIRCUIT_T_BROADCAST</a>
+<a name="ln1374">          &amp;&amp; !if_is_broadcast(circuit-&gt;interface))</a>
+<a name="ln1375">        return -1;</a>
+<a name="ln1376"> </a>
+<a name="ln1377">      isis_csm_state_change(ISIS_DISABLE, circuit, area);</a>
+<a name="ln1378">      circuit-&gt;circ_type = circ_type;</a>
+<a name="ln1379">      circuit-&gt;circ_type_config = circ_type;</a>
+<a name="ln1380">      isis_csm_state_change(ISIS_ENABLE, circuit, area);</a>
+<a name="ln1381">    }</a>
+<a name="ln1382">  return 0;</a>
+<a name="ln1383">}</a>
+<a name="ln1384"> </a>
+<a name="ln1385">int</a>
+<a name="ln1386">isis_if_new_hook (struct interface *ifp)</a>
+<a name="ln1387">{</a>
+<a name="ln1388">  return 0;</a>
+<a name="ln1389">}</a>
+<a name="ln1390"> </a>
+<a name="ln1391">int</a>
+<a name="ln1392">isis_if_delete_hook (struct interface *ifp)</a>
+<a name="ln1393">{</a>
+<a name="ln1394">  struct isis_circuit *circuit;</a>
+<a name="ln1395">  /* Clean up the circuit data */</a>
+<a name="ln1396">  if (ifp &amp;&amp; ifp-&gt;info)</a>
+<a name="ln1397">    {</a>
+<a name="ln1398">      circuit = ifp-&gt;info;</a>
+<a name="ln1399">      isis_csm_state_change (IF_DOWN_FROM_Z, circuit, circuit-&gt;area);</a>
+<a name="ln1400">      isis_csm_state_change (ISIS_DISABLE, circuit, circuit-&gt;area);</a>
+<a name="ln1401">    }</a>
+<a name="ln1402"> </a>
+<a name="ln1403">  return 0;</a>
+<a name="ln1404">}</a>
+<a name="ln1405"> </a>
+<a name="ln1406">void</a>
+<a name="ln1407">isis_circuit_init ()</a>
+<a name="ln1408">{</a>
+<a name="ln1409">  /* Initialize Zebra interface data structure */</a>
+<a name="ln1410">  if_add_hook (IF_NEW_HOOK, isis_if_new_hook);</a>
+<a name="ln1411">  if_add_hook (IF_DELETE_HOOK, isis_if_delete_hook);</a>
+<a name="ln1412"> </a>
+<a name="ln1413">  /* Install interface node */</a>
+<a name="ln1414">  install_node (&amp;interface_node, isis_interface_config_write);</a>
+<a name="ln1415">  install_element (CONFIG_NODE, &amp;interface_cmd);</a>
+<a name="ln1416">  install_element (CONFIG_NODE, &amp;no_interface_cmd);</a>
+<a name="ln1417"> </a>
+<a name="ln1418">  install_default (INTERFACE_NODE);</a>
+<a name="ln1419">  install_element (INTERFACE_NODE, &amp;interface_desc_cmd);</a>
+<a name="ln1420">  install_element (INTERFACE_NODE, &amp;no_interface_desc_cmd);</a>
+<a name="ln1421"> </a>
+<a name="ln1422">  isis_vty_init ();</a>
+<a name="ln1423">}</a>
+
+</code></pre>
+<div class="balloon" rel="15"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1042/" target="_blank">V1042</a> This file is marked with copyleft license, which requires you to open the derived source code.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

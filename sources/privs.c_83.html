@@ -1,0 +1,897 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>privs.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.5.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/* </a>
+<a name="ln2"> * Zebra privileges.</a>
+<a name="ln3"> *</a>
+<a name="ln4"> * Copyright (C) 2003 Paul Jakma.</a>
+<a name="ln5"> * Copyright (c) 2005, 2011, Oracle and/or its affiliates. All rights reserved.</a>
+<a name="ln6"> *</a>
+<a name="ln7"> * This file is part of GNU Zebra.</a>
+<a name="ln8"> *</a>
+<a name="ln9"> * GNU Zebra is free software; you can redistribute it and/or modify it</a>
+<a name="ln10"> * under the terms of the GNU General Public License as published by the</a>
+<a name="ln11"> * Free Software Foundation; either version 2, or (at your option) any</a>
+<a name="ln12"> * later version.</a>
+<a name="ln13"> *</a>
+<a name="ln14"> * GNU Zebra is distributed in the hope that it will be useful, but</a>
+<a name="ln15"> * WITHOUT ANY WARRANTY; without even the implied warranty of</a>
+<a name="ln16"> * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU</a>
+<a name="ln17"> * General Public License for more details.</a>
+<a name="ln18"> *</a>
+<a name="ln19"> * You should have received a copy of the GNU General Public License</a>
+<a name="ln20"> * along with GNU Zebra; see the file COPYING.  If not, write to the Free</a>
+<a name="ln21"> * Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA</a>
+<a name="ln22"> * 02111-1307, USA.  </a>
+<a name="ln23"> */</a>
+<a name="ln24">#include &lt;zebra.h&gt;</a>
+<a name="ln25">#include &quot;log.h&quot;</a>
+<a name="ln26">#include &quot;privs.h&quot;</a>
+<a name="ln27">#include &quot;memory.h&quot;</a>
+<a name="ln28"> </a>
+<a name="ln29">#ifdef HAVE_CAPABILITIES</a>
+<a name="ln30">/* sort out some generic internal types for:</a>
+<a name="ln31"> *</a>
+<a name="ln32"> * privilege values (cap_value_t, priv_t) 	-&gt; pvalue_t</a>
+<a name="ln33"> * privilege set (..., priv_set_t) 		-&gt; pset_t</a>
+<a name="ln34"> * privilege working storage (cap_t, ...) 	-&gt; pstorage_t</a>
+<a name="ln35"> *</a>
+<a name="ln36"> * values we think of as numeric (they're ints really, but we dont know)</a>
+<a name="ln37"> * sets are mostly opaque, to hold a set of privileges, related in some way.</a>
+<a name="ln38"> * storage binds together a set of sets we're interested in.</a>
+<a name="ln39"> * (in reality: cap_value_t and priv_t are ints)</a>
+<a name="ln40"> */ </a>
+<a name="ln41">#ifdef HAVE_LCAPS</a>
+<a name="ln42">/* Linux doesn't have a 'set' type: a set of related privileges */</a>
+<a name="ln43">struct _pset {</a>
+<a name="ln44">  int num;</a>
+<a name="ln45">  cap_value_t *caps;</a>
+<a name="ln46">};</a>
+<a name="ln47">typedef cap_value_t pvalue_t;</a>
+<a name="ln48">typedef struct _pset pset_t;</a>
+<a name="ln49">typedef cap_t pstorage_t;</a>
+<a name="ln50"> </a>
+<a name="ln51">#elif defined (HAVE_SOLARIS_CAPABILITIES)</a>
+<a name="ln52">typedef priv_t pvalue_t;</a>
+<a name="ln53">typedef priv_set_t pset_t;</a>
+<a name="ln54">typedef priv_set_t *pstorage_t;</a>
+<a name="ln55">#else /* neither LCAPS nor SOLARIS_CAPABILITIES */</a>
+<a name="ln56">#error &quot;HAVE_CAPABILITIES defined, but neither LCAPS nor Solaris Capabilties!&quot;</a>
+<a name="ln57">#endif /* HAVE_LCAPS */</a>
+<a name="ln58">#endif /* HAVE_CAPABILITIES */</a>
+<a name="ln59"> </a>
+<a name="ln60">/* the default NULL state we report is RAISED, but could be LOWERED if</a>
+<a name="ln61"> * zprivs_terminate is called and the NULL handler is installed.</a>
+<a name="ln62"> */</a>
+<a name="ln63">static zebra_privs_current_t zprivs_null_state = ZPRIVS_RAISED;</a>
+<a name="ln64"> </a>
+<a name="ln65">/* internal privileges state */</a>
+<a name="ln66">static struct _zprivs_t</a>
+<a name="ln67">{</a>
+<a name="ln68">#ifdef HAVE_CAPABILITIES</a>
+<a name="ln69">  pstorage_t caps;		/* working storage        */</a>
+<a name="ln70">  pset_t *syscaps_p;		/* system-type requested permitted caps    */</a>
+<a name="ln71">  pset_t *syscaps_i;     	/* system-type requested inheritable caps  */</a>
+<a name="ln72">#endif /* HAVE_CAPABILITIES */</a>
+<a name="ln73">  uid_t zuid,                 /* uid to run as            */</a>
+<a name="ln74">        zsuid;                /* saved uid                */</a>
+<a name="ln75">  gid_t zgid;                 /* gid to run as            */</a>
+<a name="ln76">  gid_t vtygrp;               /* gid for vty sockets      */</a>
+<a name="ln77">} zprivs_state;</a>
+<a name="ln78"> </a>
+<a name="ln79">/* externally exported but not directly accessed functions */</a>
+<a name="ln80">#ifdef HAVE_CAPABILITIES</a>
+<a name="ln81">int zprivs_change_caps (zebra_privs_ops_t);</a>
+<a name="ln82">zebra_privs_current_t zprivs_state_caps (void);</a>
+<a name="ln83">#endif /* HAVE_CAPABILITIES */</a>
+<a name="ln84">int zprivs_change_uid (zebra_privs_ops_t);</a>
+<a name="ln85">zebra_privs_current_t zprivs_state_uid (void);</a>
+<a name="ln86">int zprivs_change_null (zebra_privs_ops_t);</a>
+<a name="ln87">zebra_privs_current_t zprivs_state_null (void);</a>
+<a name="ln88"> </a>
+<a name="ln89">#ifdef HAVE_CAPABILITIES</a>
+<a name="ln90">/* internal capability API */</a>
+<a name="ln91">static pset_t *zcaps2sys (zebra_capabilities_t *, int);</a>
+<a name="ln92">static void zprivs_caps_init (struct zebra_privs_t *);</a>
+<a name="ln93">static void zprivs_caps_terminate (void);</a>
+<a name="ln94"> </a>
+<a name="ln95">/* Map of Quagga abstract capabilities to system capabilities */</a>
+<a name="ln96">static struct</a>
+<a name="ln97">{</a>
+<a name="ln98">  int num;</a>
+<a name="ln99">  pvalue_t *system_caps;</a>
+<a name="ln100">} cap_map [ZCAP_MAX] =</a>
+<a name="ln101">{</a>
+<a name="ln102">#ifdef HAVE_LCAPS /* Quagga -&gt; Linux capabilities mappings */</a>
+<a name="ln103">  [ZCAP_SETID] = 	{ 2, (pvalue_t []) { CAP_SETGID,</a>
+<a name="ln104">                                             CAP_SETUID 		}, },</a>
+<a name="ln105">  [ZCAP_BIND] =		{ 1, (pvalue_t []) { CAP_NET_BIND_SERVICE	}, },</a>
+<a name="ln106">  [ZCAP_NET_ADMIN] =	{ 1, (pvalue_t []) { CAP_NET_ADMIN		}, },</a>
+<a name="ln107">  [ZCAP_NET_RAW] = 	{ 1, (pvalue_t []) { CAP_NET_RAW		}, },</a>
+<a name="ln108">  [ZCAP_CHROOT] = 	{ 1, (pvalue_t []) { CAP_SYS_CHROOT,		}, },</a>
+<a name="ln109">  [ZCAP_NICE] = 	{ 1, (pvalue_t []) { CAP_SYS_NICE 		}, },</a>
+<a name="ln110">  [ZCAP_PTRACE] =  	{ 1, (pvalue_t []) { CAP_SYS_PTRACE 		}, },</a>
+<a name="ln111">  [ZCAP_DAC_OVERRIDE] = { 1, (pvalue_t []) { CAP_DAC_OVERRIDE 		}, },</a>
+<a name="ln112">  [ZCAP_READ_SEARCH] =  { 1, (pvalue_t []) { CAP_DAC_READ_SEARCH 	}, },</a>
+<a name="ln113">  [ZCAP_SYS_ADMIN] =	{ 1, (pvalue_t []) { CAP_SYS_ADMIN 		}, },</a>
+<a name="ln114">  [ZCAP_FOWNER] = 	{ 1, (pvalue_t []) { CAP_FOWNER			}, },</a>
+<a name="ln115">#elif defined(HAVE_SOLARIS_CAPABILITIES) /* HAVE_LCAPS */</a>
+<a name="ln116">  /* Quagga -&gt; Solaris privilege mappings */</a>
+<a name="ln117">  [ZCAP_SETID] =	{ 1, (pvalue_t []) { PRIV_PROC_SETID		}, },</a>
+<a name="ln118">  [ZCAP_BIND] = 	{ 1, (pvalue_t []) { PRIV_NET_PRIVADDR		}, },</a>
+<a name="ln119">  /* IP_CONFIG is a subset of NET_CONFIG and is allowed in zones */</a>
+<a name="ln120">#ifdef PRIV_SYS_IP_CONFIG</a>
+<a name="ln121">  [ZCAP_NET_ADMIN] =	{ 1, (pvalue_t []) { PRIV_SYS_IP_CONFIG	}, },</a>
+<a name="ln122">#else</a>
+<a name="ln123">  [ZCAP_NET_ADMIN] =	{ 1, (pvalue_t []) { PRIV_SYS_NET_CONFIG	}, },</a>
+<a name="ln124">#endif</a>
+<a name="ln125">  [ZCAP_NET_RAW] = 	{ 2, (pvalue_t []) { PRIV_NET_RAWACCESS,</a>
+<a name="ln126">                                             PRIV_NET_ICMPACCESS 	}, },</a>
+<a name="ln127">  [ZCAP_CHROOT] = 	{ 1, (pvalue_t []) { PRIV_PROC_CHROOT		}, },</a>
+<a name="ln128">  [ZCAP_NICE] = 	{ 1, (pvalue_t []) { PRIV_PROC_PRIOCNTL		}, },</a>
+<a name="ln129">  [ZCAP_PTRACE] =	{ 1, (pvalue_t []) { PRIV_PROC_SESSION		}, },</a>
+<a name="ln130">  [ZCAP_DAC_OVERRIDE] = { 4, (pvalue_t []) { PRIV_FILE_DAC_EXECUTE, </a>
+<a name="ln131">                                             PRIV_FILE_DAC_READ,</a>
+<a name="ln132">                                             PRIV_FILE_DAC_WRITE,</a>
+<a name="ln133">                                             PRIV_FILE_DAC_SEARCH	}, },</a>
+<a name="ln134">  [ZCAP_READ_SEARCH] =	{ 2, (pvalue_t []) { PRIV_FILE_DAC_SEARCH,</a>
+<a name="ln135">                                             PRIV_FILE_DAC_READ		}, },</a>
+<a name="ln136">  [ZCAP_SYS_ADMIN] =	{ 1, (pvalue_t []) { PRIV_SYS_ADMIN		}, },</a>
+<a name="ln137">  [ZCAP_FOWNER] =	{ 1, (pvalue_t []) { PRIV_FILE_OWNER		}, },</a>
+<a name="ln138">#endif /* HAVE_SOLARIS_CAPABILITIES */</a>
+<a name="ln139">};</a>
+<a name="ln140"> </a>
+<a name="ln141">#ifdef HAVE_LCAPS</a>
+<a name="ln142">/* Linux forms of capabilities methods */</a>
+<a name="ln143">/* convert zebras privileges to system capabilities */</a>
+<a name="ln144">static pset_t *</a>
+<a name="ln145">zcaps2sys (zebra_capabilities_t *zcaps, int num)</a>
+<a name="ln146">{</a>
+<a name="ln147">  pset_t *syscaps;</a>
+<a name="ln148">  int i, j = 0, count = 0;</a>
+<a name="ln149">  </a>
+<a name="ln150">  if (!num)</a>
+<a name="ln151">    return NULL;</a>
+<a name="ln152">  </a>
+<a name="ln153">  /* first count up how many system caps we have */</a>
+<a name="ln154">  for (i= 0; i &lt; num; i++)</a>
+<a name="ln155">    count += cap_map[zcaps[i]].num;</a>
+<a name="ln156">  </a>
+<a name="ln157">  if ( (syscaps = XCALLOC (MTYPE_PRIVS, (sizeof(pset_t) * num))) == NULL)</a>
+<a name="ln158">    {</a>
+<a name="ln159">      fprintf (stderr, &quot;%s: could not allocate syscaps!&quot;, __func__);</a>
+<a name="ln160">      return NULL;</a>
+<a name="ln161">    }</a>
+<a name="ln162">  </a>
+<a name="ln163">  syscaps-&gt;caps = XCALLOC (MTYPE_PRIVS, (sizeof (pvalue_t) * count));</a>
+<a name="ln164">  </a>
+<a name="ln165">  if (!syscaps-&gt;caps)</a>
+<a name="ln166">    {</a>
+<a name="ln167">      fprintf (stderr, &quot;%s: could not XCALLOC caps!&quot;, __func__);</a>
+<a name="ln168">      return NULL;</a>
+<a name="ln169">    }</a>
+<a name="ln170">  </a>
+<a name="ln171">  /* copy the capabilities over */</a>
+<a name="ln172">  count = 0;</a>
+<a name="ln173">  for (i=0; i &lt; num; i++)</a>
+<a name="ln174">    for (j = 0; j &lt; cap_map[zcaps[i]].num; j++)</a>
+<a name="ln175">      syscaps-&gt;caps[count++] = cap_map[zcaps[i]].system_caps[j];</a>
+<a name="ln176">  </a>
+<a name="ln177">  /* iterations above should be exact same as previous count, obviously.. */</a>
+<a name="ln178">  syscaps-&gt;num = count;</a>
+<a name="ln179">  </a>
+<a name="ln180">  return syscaps;</a>
+<a name="ln181">}</a>
+<a name="ln182"> </a>
+<a name="ln183">/* set or clear the effective capabilities to/from permitted */</a>
+<a name="ln184">int </a>
+<a name="ln185">zprivs_change_caps (zebra_privs_ops_t op)</a>
+<a name="ln186">{</a>
+<a name="ln187">  cap_flag_value_t cflag;</a>
+<a name="ln188">  </a>
+<a name="ln189">  /* should be no possibility of being called without valid caps */</a>
+<a name="ln190">  assert (zprivs_state.syscaps_p &amp;&amp; zprivs_state.caps);</a>
+<a name="ln191">  if (! (zprivs_state.syscaps_p &amp;&amp; zprivs_state.caps))</a>
+<a name="ln192">    exit (1);</a>
+<a name="ln193">    </a>
+<a name="ln194">  if (op == ZPRIVS_RAISE)</a>
+<a name="ln195">    cflag = CAP_SET;</a>
+<a name="ln196">  else if (op == ZPRIVS_LOWER)</a>
+<a name="ln197">    cflag = CAP_CLEAR;</a>
+<a name="ln198">  else</a>
+<a name="ln199">    return -1;</a>
+<a name="ln200"> </a>
+<a name="ln201">  if ( !cap_set_flag (zprivs_state.caps, CAP_EFFECTIVE,</a>
+<a name="ln202">                       zprivs_state.syscaps_p-&gt;num, </a>
+<a name="ln203">                       zprivs_state.syscaps_p-&gt;caps, </a>
+<a name="ln204">                       cflag))</a>
+<a name="ln205">    return cap_set_proc (zprivs_state.caps);</a>
+<a name="ln206">  return -1;</a>
+<a name="ln207">}</a>
+<a name="ln208"> </a>
+<a name="ln209">zebra_privs_current_t</a>
+<a name="ln210">zprivs_state_caps (void)</a>
+<a name="ln211">{</a>
+<a name="ln212">  int i;</a>
+<a name="ln213">  cap_flag_value_t val;</a>
+<a name="ln214"> </a>
+<a name="ln215">  /* should be no possibility of being called without valid caps */</a>
+<a name="ln216">  assert (zprivs_state.syscaps_p &amp;&amp; zprivs_state.caps);</a>
+<a name="ln217">  if (! (zprivs_state.syscaps_p &amp;&amp; zprivs_state.caps))</a>
+<a name="ln218">    exit (1);</a>
+<a name="ln219">  </a>
+<a name="ln220">  for (i=0; i &lt; zprivs_state.syscaps_p-&gt;num; i++)</a>
+<a name="ln221">    {</a>
+<a name="ln222">      if ( cap_get_flag (zprivs_state.caps, zprivs_state.syscaps_p-&gt;caps[i], </a>
+<a name="ln223">                         CAP_EFFECTIVE, &amp;val) )</a>
+<a name="ln224">        {</a>
+<a name="ln225">          zlog_warn (&quot;zprivs_state_caps: could not cap_get_flag, %s&quot;,</a>
+<a name="ln226">                     safe_strerror (errno) );</a>
+<a name="ln227">          return ZPRIVS_UNKNOWN;</a>
+<a name="ln228">        }</a>
+<a name="ln229">      if (val == CAP_SET)</a>
+<a name="ln230">        return ZPRIVS_RAISED;</a>
+<a name="ln231">    }</a>
+<a name="ln232">  return ZPRIVS_LOWERED;</a>
+<a name="ln233">}</a>
+<a name="ln234"> </a>
+<a name="ln235">static void</a>
+<a name="ln236">zprivs_caps_init (struct zebra_privs_t *zprivs)</a>
+<a name="ln237">{</a>
+<a name="ln238">  zprivs_state.syscaps_p = zcaps2sys (zprivs-&gt;caps_p, zprivs-&gt;cap_num_p);</a>
+<a name="ln239">  zprivs_state.syscaps_i = zcaps2sys (zprivs-&gt;caps_i, zprivs-&gt;cap_num_i);</a>
+<a name="ln240"> </a>
+<a name="ln241">  /* Tell kernel we want caps maintained across uid changes */</a>
+<a name="ln242">  if ( prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0) == -1 )</a>
+<a name="ln243">    {</a>
+<a name="ln244">      fprintf (stderr, &quot;privs_init: could not set PR_SET_KEEPCAPS, %s\n&quot;,</a>
+<a name="ln245">                safe_strerror (errno) );</a>
+<a name="ln246">      exit(1);</a>
+<a name="ln247">    }</a>
+<a name="ln248"> </a>
+<a name="ln249">  if ( !zprivs_state.syscaps_p )</a>
+<a name="ln250">    {</a>
+<a name="ln251">      fprintf (stderr, &quot;privs_init: capabilities enabled, &quot;</a>
+<a name="ln252">                       &quot;but no capabilities supplied\n&quot;);</a>
+<a name="ln253">    }</a>
+<a name="ln254"> </a>
+<a name="ln255">  /* we have caps, we have no need to ever change back the original user */</a>
+<a name="ln256">  if (zprivs_state.zuid)</a>
+<a name="ln257">    {</a>
+<a name="ln258">      if ( setreuid (zprivs_state.zuid, zprivs_state.zuid) )</a>
+<a name="ln259">        {</a>
+<a name="ln260">          fprintf (stderr, &quot;zprivs_init (cap): could not setreuid, %s\n&quot;, </a>
+<a name="ln261">                     safe_strerror (errno));</a>
+<a name="ln262">          exit (1);</a>
+<a name="ln263">        }</a>
+<a name="ln264">    }</a>
+<a name="ln265">  </a>
+<a name="ln266">  if ( !(zprivs_state.caps = cap_init()) )</a>
+<a name="ln267">    {</a>
+<a name="ln268">      fprintf (stderr, &quot;privs_init: failed to cap_init, %s\n&quot;, </a>
+<a name="ln269">               safe_strerror (errno));</a>
+<a name="ln270">      exit (1);</a>
+<a name="ln271">    }</a>
+<a name="ln272"> </a>
+<a name="ln273">  if ( cap_clear (zprivs_state.caps) )</a>
+<a name="ln274">    {</a>
+<a name="ln275">      fprintf (stderr, &quot;privs_init: failed to cap_clear, %s\n&quot;, </a>
+<a name="ln276">               safe_strerror (errno));</a>
+<a name="ln277">      exit (1);</a>
+<a name="ln278">    }</a>
+<a name="ln279">  </a>
+<a name="ln280">  /* set permitted caps */</a>
+<a name="ln281">  cap_set_flag(zprivs_state.caps, CAP_PERMITTED, </a>
+<a name="ln282">               zprivs_state.syscaps_p-&gt;num,</a>
+<a name="ln283">               zprivs_state.syscaps_p-&gt;caps,</a>
+<a name="ln284">               CAP_SET);</a>
+<a name="ln285">    </a>
+<a name="ln286">  /* set inheritable caps, if any */</a>
+<a name="ln287">  if (zprivs_state.syscaps_i &amp;&amp; zprivs_state.syscaps_i-&gt;num)</a>
+<a name="ln288">    {</a>
+<a name="ln289">      cap_set_flag(zprivs_state.caps, CAP_INHERITABLE, </a>
+<a name="ln290">                   zprivs_state.syscaps_i-&gt;num, </a>
+<a name="ln291">                   zprivs_state.syscaps_i-&gt;caps, </a>
+<a name="ln292">                   CAP_SET);</a>
+<a name="ln293">    }</a>
+<a name="ln294">  </a>
+<a name="ln295">  /* apply caps. CAP_EFFECTIVE is cleared. we'll raise the caps as </a>
+<a name="ln296">   * and when, and only when, they are needed.</a>
+<a name="ln297">   */</a>
+<a name="ln298">  if ( cap_set_proc (zprivs_state.caps) ) </a>
+<a name="ln299">    {</a>
+<a name="ln300">      cap_t current_caps;</a>
+<a name="ln301">      char *current_caps_text = NULL;</a>
+<a name="ln302">      char *wanted_caps_text = NULL;</a>
+<a name="ln303"> </a>
+<a name="ln304">      fprintf(stderr, &quot;privs_init: initial cap_set_proc failed: %s\n&quot;,</a>
+<a name="ln305">              safe_strerror(errno));</a>
+<a name="ln306"> </a>
+<a name="ln307">      current_caps = cap_get_proc();</a>
+<a name="ln308">      if (current_caps)</a>
+<a name="ln309">        {</a>
+<a name="ln310">          current_caps_text = cap_to_text(current_caps, NULL);</a>
+<a name="ln311">          cap_free(current_caps);</a>
+<a name="ln312">        }</a>
+<a name="ln313"> </a>
+<a name="ln314">      wanted_caps_text = cap_to_text(zprivs_state.caps, NULL);</a>
+<a name="ln315">      fprintf(stderr, &quot;Wanted caps: %s\n&quot;, wanted_caps_text ? wanted_caps_text : &quot;???&quot;);</a>
+<a name="ln316">      fprintf(stderr, &quot;Have   caps: %s\n&quot;, current_caps_text ? current_caps_text : &quot;???&quot;);</a>
+<a name="ln317">      if (current_caps_text)</a>
+<a name="ln318">          cap_free(current_caps_text);</a>
+<a name="ln319">      if (wanted_caps_text)</a>
+<a name="ln320">          cap_free(wanted_caps_text);</a>
+<a name="ln321"> </a>
+<a name="ln322">      exit (1);</a>
+<a name="ln323">    }</a>
+<a name="ln324">  </a>
+<a name="ln325">  /* set methods for the caller to use */</a>
+<a name="ln326">  zprivs-&gt;change = zprivs_change_caps;</a>
+<a name="ln327">  zprivs-&gt;current_state = zprivs_state_caps;</a>
+<a name="ln328">}</a>
+<a name="ln329"> </a>
+<a name="ln330">static void</a>
+<a name="ln331">zprivs_caps_terminate (void)</a>
+<a name="ln332">{</a>
+<a name="ln333">  /* clear all capabilities */</a>
+<a name="ln334">  if (zprivs_state.caps)</a>
+<a name="ln335">      cap_clear (zprivs_state.caps);</a>
+<a name="ln336"> </a>
+<a name="ln337">  /* and boom, capabilities are gone forever */</a>
+<a name="ln338">  if ( cap_set_proc (zprivs_state.caps) ) </a>
+<a name="ln339">    {</a>
+<a name="ln340">      fprintf (stderr, &quot;privs_terminate: cap_set_proc failed, %s&quot;,</a>
+<a name="ln341">                safe_strerror (errno) );</a>
+<a name="ln342">      exit (1);</a>
+<a name="ln343">    }  </a>
+<a name="ln344"> </a>
+<a name="ln345">  /* free up private state */</a>
+<a name="ln346">  if (zprivs_state.syscaps_p-&gt;num)</a>
+<a name="ln347">    {</a>
+<a name="ln348">      XFREE (MTYPE_PRIVS, zprivs_state.syscaps_p-&gt;caps);</a>
+<a name="ln349">      XFREE (MTYPE_PRIVS, zprivs_state.syscaps_p);</a>
+<a name="ln350">    }</a>
+<a name="ln351">  </a>
+<a name="ln352">  if (zprivs_state.syscaps_i &amp;&amp; zprivs_state.syscaps_i-&gt;num)</a>
+<a name="ln353">    {</a>
+<a name="ln354">      XFREE (MTYPE_PRIVS, zprivs_state.syscaps_i-&gt;caps);</a>
+<a name="ln355">      XFREE (MTYPE_PRIVS, zprivs_state.syscaps_i);</a>
+<a name="ln356">    }</a>
+<a name="ln357">  </a>
+<a name="ln358">  cap_free (zprivs_state.caps);</a>
+<a name="ln359">}</a>
+<a name="ln360">#elif defined (HAVE_SOLARIS_CAPABILITIES) /* !HAVE_LCAPS */</a>
+<a name="ln361"> </a>
+<a name="ln362">/* Solaris specific capability/privilege methods </a>
+<a name="ln363"> *</a>
+<a name="ln364"> * Resources:</a>
+<a name="ln365"> * - the 'privileges' man page</a>
+<a name="ln366"> * - http://cvs.opensolaris.org</a>
+<a name="ln367"> * - http://blogs.sun.com/roller/page/gbrunett?entry=privilege_enabling_set_id_programs1</a>
+<a name="ln368"> */</a>
+<a name="ln369"> </a>
+<a name="ln370">static pset_t *</a>
+<a name="ln371">zprivs_caps_minimal ()</a>
+<a name="ln372">{</a>
+<a name="ln373">  pset_t *minimal;</a>
+<a name="ln374"> </a>
+<a name="ln375">  if ((minimal = priv_str_to_set(&quot;basic&quot;, &quot;,&quot;, NULL)) == NULL)</a>
+<a name="ln376">    {</a>
+<a name="ln377">      fprintf (stderr, &quot;%s: couldn't get basic set!\n&quot;, __func__);</a>
+<a name="ln378">      exit (1);</a>
+<a name="ln379">    }</a>
+<a name="ln380"> </a>
+<a name="ln381">   /* create a minimal privilege set from the basic set */</a>
+<a name="ln382">  (void) priv_delset(minimal, PRIV_PROC_EXEC);</a>
+<a name="ln383">  (void) priv_delset(minimal, PRIV_PROC_INFO);</a>
+<a name="ln384">  (void) priv_delset(minimal, PRIV_PROC_SESSION);</a>
+<a name="ln385">  (void) priv_delset(minimal, PRIV_FILE_LINK_ANY);</a>
+<a name="ln386"> </a>
+<a name="ln387">  return  minimal;</a>
+<a name="ln388">}</a>
+<a name="ln389"> </a>
+<a name="ln390">/* convert zebras privileges to system capabilities */</a>
+<a name="ln391">static pset_t *</a>
+<a name="ln392">zcaps2sys (zebra_capabilities_t *zcaps, int num)</a>
+<a name="ln393">{</a>
+<a name="ln394">  pset_t *syscaps;</a>
+<a name="ln395">  int i, j = 0;</a>
+<a name="ln396">  </a>
+<a name="ln397">  if ((syscaps = priv_allocset()) == NULL)</a>
+<a name="ln398">    {</a>
+<a name="ln399">      fprintf (stderr, &quot;%s: could not allocate syscaps!\n&quot;, __func__);</a>
+<a name="ln400">      exit (1);</a>
+<a name="ln401">    }</a>
+<a name="ln402">    </a>
+<a name="ln403">  priv_emptyset (syscaps);</a>
+<a name="ln404">  </a>
+<a name="ln405">  for (i=0; i &lt; num; i++)</a>
+<a name="ln406">    for (j = 0; j &lt; cap_map[zcaps[i]].num; j++)</a>
+<a name="ln407">      priv_addset (syscaps, cap_map[zcaps[i]].system_caps[j]);</a>
+<a name="ln408">  </a>
+<a name="ln409">  return syscaps;</a>
+<a name="ln410">}</a>
+<a name="ln411"> </a>
+<a name="ln412">/* callback exported to users to RAISE and LOWER effective privileges</a>
+<a name="ln413"> * from nothing to the given permitted set and back down</a>
+<a name="ln414"> */</a>
+<a name="ln415">int </a>
+<a name="ln416">zprivs_change_caps (zebra_privs_ops_t op)</a>
+<a name="ln417">{</a>
+<a name="ln418">  pset_t *privset;</a>
+<a name="ln419">  </a>
+<a name="ln420">  /* should be no possibility of being called without valid caps */</a>
+<a name="ln421">  assert (zprivs_state.syscaps_p);</a>
+<a name="ln422">  if (!zprivs_state.syscaps_p)</a>
+<a name="ln423">    {</a>
+<a name="ln424">      fprintf (stderr, &quot;%s: Eek, missing privileged caps!&quot;, __func__);</a>
+<a name="ln425">      exit (1);</a>
+<a name="ln426">    }</a>
+<a name="ln427"> </a>
+<a name="ln428">  assert (zprivs_state.caps);</a>
+<a name="ln429">  if (!zprivs_state.caps)</a>
+<a name="ln430">    {</a>
+<a name="ln431">      fprintf (stderr, &quot;%s: Eek, missing caps!&quot;, __func__);</a>
+<a name="ln432">      exit (1);</a>
+<a name="ln433">    }</a>
+<a name="ln434"> </a>
+<a name="ln435">  /* to raise: copy original permitted as our working effective set</a>
+<a name="ln436">   * to lower: copy regular effective set stored in zprivs_state.caps</a>
+<a name="ln437">   */</a>
+<a name="ln438">  if (op == ZPRIVS_RAISE)</a>
+<a name="ln439">    privset = zprivs_state.syscaps_p;</a>
+<a name="ln440">  else if (op == ZPRIVS_LOWER)</a>
+<a name="ln441">    privset = zprivs_state.caps;</a>
+<a name="ln442">  else</a>
+<a name="ln443">    return -1;</a>
+<a name="ln444">  </a>
+<a name="ln445">  if (setppriv (PRIV_SET, PRIV_EFFECTIVE, privset) != 0)</a>
+<a name="ln446">    return -1;</a>
+<a name="ln447">  </a>
+<a name="ln448">  return 0;</a>
+<a name="ln449">}</a>
+<a name="ln450"> </a>
+<a name="ln451">/* Retrieve current privilege state, is it RAISED or LOWERED? */</a>
+<a name="ln452">zebra_privs_current_t </a>
+<a name="ln453">zprivs_state_caps (void)</a>
+<a name="ln454">{</a>
+<a name="ln455">  zebra_privs_current_t result;</a>
+<a name="ln456">  pset_t *effective;</a>
+<a name="ln457">  </a>
+<a name="ln458">  if ( (effective = priv_allocset()) == NULL)</a>
+<a name="ln459">    {</a>
+<a name="ln460">      fprintf (stderr, &quot;%s: failed to get priv_allocset! %s\n&quot;, __func__,</a>
+<a name="ln461">               safe_strerror (errno));</a>
+<a name="ln462">      return ZPRIVS_UNKNOWN;</a>
+<a name="ln463">    }</a>
+<a name="ln464">  </a>
+<a name="ln465">  if (getppriv (PRIV_EFFECTIVE, effective))</a>
+<a name="ln466">    {</a>
+<a name="ln467">      fprintf (stderr, &quot;%s: failed to get state! %s\n&quot;, __func__,</a>
+<a name="ln468">               safe_strerror (errno));</a>
+<a name="ln469">      result = ZPRIVS_UNKNOWN;</a>
+<a name="ln470">    }</a>
+<a name="ln471">  else</a>
+<a name="ln472">    {</a>
+<a name="ln473">      if (priv_isequalset (effective, zprivs_state.syscaps_p))</a>
+<a name="ln474">        result = ZPRIVS_RAISED;</a>
+<a name="ln475">      else if (priv_isequalset (effective, zprivs_state.caps))</a>
+<a name="ln476">        result = ZPRIVS_LOWERED;</a>
+<a name="ln477">      else</a>
+<a name="ln478">        result = ZPRIVS_UNKNOWN;</a>
+<a name="ln479">    }</a>
+<a name="ln480">  </a>
+<a name="ln481">  priv_freeset (effective);</a>
+<a name="ln482">  return result;</a>
+<a name="ln483">}</a>
+<a name="ln484"> </a>
+<a name="ln485">static void</a>
+<a name="ln486">zprivs_caps_init (struct zebra_privs_t *zprivs)</a>
+<a name="ln487">{</a>
+<a name="ln488">  pset_t *basic;</a>
+<a name="ln489">  pset_t *minimal;</a>
+<a name="ln490">  </a>
+<a name="ln491">  /* the specified sets */</a>
+<a name="ln492">  zprivs_state.syscaps_p = zcaps2sys (zprivs-&gt;caps_p, zprivs-&gt;cap_num_p);</a>
+<a name="ln493">  zprivs_state.syscaps_i = zcaps2sys (zprivs-&gt;caps_i, zprivs-&gt;cap_num_i);</a>
+<a name="ln494">  </a>
+<a name="ln495">  /* nonsensical to have gotten here but not have capabilities */</a>
+<a name="ln496">  if (!zprivs_state.syscaps_p)</a>
+<a name="ln497">    {</a>
+<a name="ln498">      fprintf (stderr, &quot;%s: capabilities enabled, &quot;</a>
+<a name="ln499">                       &quot;but no valid capabilities supplied\n&quot;,</a>
+<a name="ln500">                       __func__);</a>
+<a name="ln501">    }</a>
+<a name="ln502">  </a>
+<a name="ln503">  /* We retain the basic set in our permitted set, as Linux has no</a>
+<a name="ln504">   * equivalent. The basic set on Linux hence is implicit, always</a>
+<a name="ln505">   * there.</a>
+<a name="ln506">   */</a>
+<a name="ln507">  if ((basic = priv_str_to_set(&quot;basic&quot;, &quot;,&quot;, NULL)) == NULL)</a>
+<a name="ln508">    {</a>
+<a name="ln509">      fprintf (stderr, &quot;%s: couldn't get basic set!\n&quot;, __func__);</a>
+<a name="ln510">      exit (1);</a>
+<a name="ln511">    }</a>
+<a name="ln512"> </a>
+<a name="ln513">  /* Add the basic set to the permitted set */</a>
+<a name="ln514">  priv_union (basic, zprivs_state.syscaps_p);</a>
+<a name="ln515">  priv_freeset (basic);</a>
+<a name="ln516">  </a>
+<a name="ln517">  /* Hey kernel, we know about privileges! </a>
+<a name="ln518">   * this isn't strictly required, use of setppriv should have same effect</a>
+<a name="ln519">   */</a>
+<a name="ln520">  if (setpflags (PRIV_AWARE, 1))</a>
+<a name="ln521">    {</a>
+<a name="ln522">      fprintf (stderr, &quot;%s: error setting PRIV_AWARE!, %s\n&quot;, __func__,</a>
+<a name="ln523">               safe_strerror (errno) );</a>
+<a name="ln524">      exit (1);</a>
+<a name="ln525">    }</a>
+<a name="ln526">  </a>
+<a name="ln527">  /* need either valid or empty sets for both p and i.. */</a>
+<a name="ln528">  assert (zprivs_state.syscaps_i &amp;&amp; zprivs_state.syscaps_p);</a>
+<a name="ln529">  </a>
+<a name="ln530">  /* we have caps, we have no need to ever change back the original user</a>
+<a name="ln531">   * change real, effective and saved to the specified user.</a>
+<a name="ln532">   */</a>
+<a name="ln533">  if (zprivs_state.zuid)</a>
+<a name="ln534">    {</a>
+<a name="ln535">      if ( setreuid (zprivs_state.zuid, zprivs_state.zuid) )</a>
+<a name="ln536">        {</a>
+<a name="ln537">          fprintf (stderr, &quot;%s: could not setreuid, %s\n&quot;, </a>
+<a name="ln538">                   __func__, safe_strerror (errno));</a>
+<a name="ln539">          exit (1);</a>
+<a name="ln540">        }</a>
+<a name="ln541">    }</a>
+<a name="ln542">  </a>
+<a name="ln543">  /* set the permitted set */</a>
+<a name="ln544">  if (setppriv (PRIV_SET, PRIV_PERMITTED, zprivs_state.syscaps_p))</a>
+<a name="ln545">    {</a>
+<a name="ln546">      fprintf (stderr, &quot;%s: error setting permitted set!, %s\n&quot;, __func__,</a>
+<a name="ln547">               safe_strerror (errno) );</a>
+<a name="ln548">      exit (1);</a>
+<a name="ln549">    }</a>
+<a name="ln550">  </a>
+<a name="ln551">  /* set the inheritable set */</a>
+<a name="ln552">  if (setppriv (PRIV_SET, PRIV_INHERITABLE, zprivs_state.syscaps_i))</a>
+<a name="ln553">    {</a>
+<a name="ln554">      fprintf (stderr, &quot;%s: error setting inheritable set!, %s\n&quot;, __func__,</a>
+<a name="ln555">               safe_strerror (errno) );</a>
+<a name="ln556">      exit (1);</a>
+<a name="ln557">    }</a>
+<a name="ln558"> </a>
+<a name="ln559">  /* we need a minimal basic set for 'effective', potentially for inheritable too */</a>
+<a name="ln560">  minimal = zprivs_caps_minimal();</a>
+<a name="ln561"> </a>
+<a name="ln562">  /* now set the effective set with a subset of basic privileges */</a>
+<a name="ln563">  if (setppriv (PRIV_SET, PRIV_EFFECTIVE, minimal))</a>
+<a name="ln564">    {</a>
+<a name="ln565">      fprintf (stderr, &quot;%s: error setting effective set!, %s\n&quot;, __func__,</a>
+<a name="ln566">               safe_strerror (errno) );</a>
+<a name="ln567">      exit (1);</a>
+<a name="ln568">    }</a>
+<a name="ln569">  </a>
+<a name="ln570">  /* we'll use the minimal set as our working-storage privset */</a>
+<a name="ln571">  zprivs_state.caps = minimal;</a>
+<a name="ln572">  </a>
+<a name="ln573">  /* set methods for the caller to use */</a>
+<a name="ln574">  zprivs-&gt;change = zprivs_change_caps;</a>
+<a name="ln575">  zprivs-&gt;current_state = zprivs_state_caps;</a>
+<a name="ln576">}</a>
+<a name="ln577"> </a>
+<a name="ln578">static void</a>
+<a name="ln579">zprivs_caps_terminate (void)</a>
+<a name="ln580">{</a>
+<a name="ln581">  assert (zprivs_state.caps);</a>
+<a name="ln582">  </a>
+<a name="ln583">  /* clear all capabilities by using working-storage privset */</a>
+<a name="ln584">  setppriv (PRIV_SET, PRIV_EFFECTIVE, zprivs_state.caps);</a>
+<a name="ln585">  setppriv (PRIV_SET, PRIV_PERMITTED, zprivs_state.caps);</a>
+<a name="ln586">  setppriv (PRIV_SET, PRIV_INHERITABLE, zprivs_state.caps);</a>
+<a name="ln587">  </a>
+<a name="ln588">  /* free up private state */</a>
+<a name="ln589">  if (zprivs_state.syscaps_p)</a>
+<a name="ln590">    priv_freeset (zprivs_state.syscaps_p);</a>
+<a name="ln591">  if (zprivs_state.syscaps_i)</a>
+<a name="ln592">    priv_freeset (zprivs_state.syscaps_i);</a>
+<a name="ln593">  </a>
+<a name="ln594">  priv_freeset (zprivs_state.caps);</a>
+<a name="ln595">}</a>
+<a name="ln596">#else /* !HAVE_LCAPS &amp;&amp; ! HAVE_SOLARIS_CAPABILITIES */</a>
+<a name="ln597">#error &quot;Neither Solaris nor Linux capabilities, dazed and confused...&quot;</a>
+<a name="ln598">#endif /* HAVE_LCAPS */</a>
+<a name="ln599">#endif /* HAVE_CAPABILITIES */</a>
+<a name="ln600"> </a>
+<a name="ln601">int</a>
+<a name="ln602">zprivs_change_uid (zebra_privs_ops_t op)</a>
+<a name="ln603">{</a>
+<a name="ln604"> </a>
+<a name="ln605">  if (op == ZPRIVS_RAISE)</a>
+<a name="ln606">    return seteuid (zprivs_state.zsuid);</a>
+<a name="ln607">  else if (op == ZPRIVS_LOWER)</a>
+<a name="ln608">    return seteuid (zprivs_state.zuid);</a>
+<a name="ln609">  else</a>
+<a name="ln610">    return -1;</a>
+<a name="ln611">}</a>
+<a name="ln612"> </a>
+<a name="ln613">zebra_privs_current_t</a>
+<a name="ln614">zprivs_state_uid (void)</a>
+<a name="ln615">{</a>
+<a name="ln616">  return ( (zprivs_state.zuid == geteuid()) ? ZPRIVS_LOWERED : ZPRIVS_RAISED);</a>
+<a name="ln617">}</a>
+<a name="ln618"> </a>
+<a name="ln619">int</a>
+<a name="ln620">zprivs_change_null (zebra_privs_ops_t op)</a>
+<a name="ln621">{</a>
+<a name="ln622">  return 0;</a>
+<a name="ln623">}</a>
+<a name="ln624"> </a>
+<a name="ln625">zebra_privs_current_t</a>
+<a name="ln626">zprivs_state_null (void)</a>
+<a name="ln627">{</a>
+<a name="ln628">  return zprivs_null_state;</a>
+<a name="ln629">}</a>
+<a name="ln630"> </a>
+<a name="ln631">#ifndef HAVE_GETGROUPLIST</a>
+<a name="ln632">/* Solaris 11 has no getgrouplist() */</a>
+<a name="ln633">static int</a>
+<a name="ln634">getgrouplist(const char *user, gid_t group, gid_t *groups, int *ngroups)</a>
+<a name="ln635">{</a>
+<a name="ln636">  struct group *grp;</a>
+<a name="ln637">  size_t usridx;</a>
+<a name="ln638">  int pos = 0, ret;</a>
+<a name="ln639"> </a>
+<a name="ln640">  if (pos &lt; *ngroups)</a>
+<a name="ln641">    groups[pos] = group;</a>
+<a name="ln642">  pos++;</a>
+<a name="ln643"> </a>
+<a name="ln644">  setgrent();</a>
+<a name="ln645">  while ((grp = getgrent()))</a>
+<a name="ln646">    {</a>
+<a name="ln647">      if (grp-&gt;gr_gid == group)</a>
+<a name="ln648">        continue;</a>
+<a name="ln649">      for (usridx = 0; grp-&gt;gr_mem[usridx] != NULL; usridx++)</a>
+<a name="ln650">        if (!strcmp (grp-&gt;gr_mem[usridx], user))</a>
+<a name="ln651">          {</a>
+<a name="ln652">            if (pos &lt; *ngroups)</a>
+<a name="ln653">              groups[pos] = grp-&gt;gr_gid;</a>
+<a name="ln654">            pos++;</a>
+<a name="ln655">            break;</a>
+<a name="ln656">          }</a>
+<a name="ln657">    }</a>
+<a name="ln658">  endgrent();</a>
+<a name="ln659"> </a>
+<a name="ln660">  ret = (pos &lt;= *ngroups) ? pos : -1;</a>
+<a name="ln661">  *ngroups = pos;</a>
+<a name="ln662">  return ret;</a>
+<a name="ln663">}</a>
+<a name="ln664">#endif /* HAVE_GETGROUPLIST */</a>
+<a name="ln665"> </a>
+<a name="ln666">void</a>
+<a name="ln667">zprivs_init(struct zebra_privs_t *zprivs)</a>
+<a name="ln668">{</a>
+<a name="ln669">  struct passwd *pwentry = NULL;</a>
+<a name="ln670">  struct group *grentry = NULL;</a>
+<a name="ln671">  gid_t groups[NGROUPS_MAX];</a>
+<a name="ln672">  int i, ngroups = 0;</a>
+<a name="ln673">  int found = 0;</a>
+<a name="ln674"> </a>
+<a name="ln675">  if (!zprivs)</a>
+<a name="ln676">    {</a>
+<a name="ln677">      fprintf (stderr, &quot;zprivs_init: called with NULL arg!\n&quot;);</a>
+<a name="ln678">      exit (1);</a>
+<a name="ln679">    }</a>
+<a name="ln680"> </a>
+<a name="ln681">  /* NULL privs */</a>
+<a name="ln682">  if (! (zprivs-&gt;user || zprivs-&gt;group </a>
+<a name="ln683">         || zprivs-&gt;cap_num_p || zprivs-&gt;cap_num_i) )</a>
+<a name="ln684">    {</a>
+<a name="ln685">      zprivs-&gt;change = zprivs_change_null;</a>
+<a name="ln686">      zprivs-&gt;current_state = zprivs_state_null;</a>
+<a name="ln687">      return;</a>
+<a name="ln688">    }</a>
+<a name="ln689"> </a>
+<a name="ln690">  if (zprivs-&gt;user)</a>
+<a name="ln691">    {</a>
+<a name="ln692">      if ( (pwentry = getpwnam (zprivs-&gt;user)) == NULL )</a>
+<a name="ln693">        {</a>
+<a name="ln694">          /* cant use log.h here as it depends on vty */</a>
+<a name="ln695">          fprintf (stderr, &quot;privs_init: could not lookup user %s\n&quot;,</a>
+<a name="ln696">                   zprivs-&gt;user);</a>
+<a name="ln697">          exit (1);</a>
+<a name="ln698">        }</a>
+<a name="ln699"> </a>
+<a name="ln700">      zprivs_state.zuid = pwentry-&gt;pw_uid;</a>
+<a name="ln701">      zprivs_state.zgid = pwentry-&gt;pw_gid;</a>
+<a name="ln702">    }</a>
+<a name="ln703"> </a>
+<a name="ln704">  grentry = NULL;</a>
+<a name="ln705"> </a>
+<a name="ln706">  if (zprivs-&gt;group)</a>
+<a name="ln707">    {</a>
+<a name="ln708">      if ( (grentry = getgrnam (zprivs-&gt;group)) == NULL )</a>
+<a name="ln709">        {</a>
+<a name="ln710">          fprintf (stderr, &quot;privs_init: could not lookup group %s\n&quot;,</a>
+<a name="ln711">                   zprivs-&gt;group);</a>
+<a name="ln712">          exit (1);</a>
+<a name="ln713">        }</a>
+<a name="ln714"> </a>
+<a name="ln715">      zprivs_state.zgid = grentry-&gt;gr_gid;</a>
+<a name="ln716">    }</a>
+<a name="ln717"> </a>
+<a name="ln718">  if (zprivs-&gt;user)</a>
+<a name="ln719">    {</a>
+<a name="ln720">      ngroups = sizeof(groups);</a>
+<a name="ln721">      if ( (ngroups = getgrouplist (zprivs-&gt;user, zprivs_state.zgid, groups, &amp;ngroups )) &lt; 0 )</a>
+<a name="ln722">        {</a>
+<a name="ln723">          /* cant use log.h here as it depends on vty */</a>
+<a name="ln724">          fprintf (stderr, &quot;privs_init: could not getgrouplist for user %s\n&quot;,</a>
+<a name="ln725">                   zprivs-&gt;user);</a>
+<a name="ln726">          exit (1);</a>
+<a name="ln727">        }</a>
+<a name="ln728">    }</a>
+<a name="ln729"> </a>
+<a name="ln730">  if (zprivs-&gt;vty_group)</a>
+<a name="ln731">    /* Add the vty_group to the supplementary groups so it can be chowned to */</a>
+<a name="ln732">    {</a>
+<a name="ln733">      if ( (grentry = getgrnam (zprivs-&gt;vty_group)) )</a>
+<a name="ln734">        {</a>
+<a name="ln735">          zprivs_state.vtygrp = grentry-&gt;gr_gid;</a>
+<a name="ln736"> </a>
+<a name="ln737">          for ( i = 0; i &lt; ngroups; i++ )</a>
+<a name="ln738">            if ( groups[i] == zprivs_state.vtygrp )</a>
+<a name="ln739">              {</a>
+<a name="ln740">                found++;</a>
+<a name="ln741">                break;</a>
+<a name="ln742">              }</a>
+<a name="ln743"> </a>
+<a name="ln744">          if (!found)</a>
+<a name="ln745">            {</a>
+<a name="ln746">	      fprintf (stderr, &quot;privs_init: user(%s) is not part of vty group specified(%s)\n&quot;,</a>
+<a name="ln747">		       zprivs-&gt;user, zprivs-&gt;vty_group);</a>
+<a name="ln748">              exit (1);</a>
+<a name="ln749">            }</a>
+<a name="ln750">          if ( i &gt;= ngroups &amp;&amp; ngroups &lt; (int) ZEBRA_NUM_OF(groups) )</a>
+<a name="ln751">            {</a>
+<a name="ln752">              groups[i] = zprivs_state.vtygrp;</a>
+<a name="ln753">            }</a>
+<a name="ln754">        }</a>
+<a name="ln755">      else</a>
+<a name="ln756">        {</a>
+<a name="ln757">          fprintf (stderr, &quot;privs_init: could not lookup vty group %s\n&quot;,</a>
+<a name="ln758">                   zprivs-&gt;vty_group);</a>
+<a name="ln759">          exit (1);</a>
+<a name="ln760">        }</a>
+<a name="ln761">    }</a>
+<a name="ln762"> </a>
+<a name="ln763">  if (ngroups)</a>
+<a name="ln764">    {</a>
+<a name="ln765">      if ( setgroups (ngroups, groups) )</a>
+<a name="ln766">        {</a>
+<a name="ln767">          fprintf (stderr, &quot;privs_init: could not setgroups, %s\n&quot;,</a>
+<a name="ln768">                   safe_strerror (errno) );</a>
+<a name="ln769">          exit (1);</a>
+<a name="ln770">        }</a>
+<a name="ln771">    }</a>
+<a name="ln772"> </a>
+<a name="ln773">  if (zprivs_state.zgid)</a>
+<a name="ln774">    {</a>
+<a name="ln775">      /* change group now, forever. uid we do later */</a>
+<a name="ln776">      if ( setregid (zprivs_state.zgid, zprivs_state.zgid) )</a>
+<a name="ln777">        {</a>
+<a name="ln778">          fprintf (stderr, &quot;zprivs_init: could not setregid, %s\n&quot;,</a>
+<a name="ln779">                    safe_strerror (errno) );</a>
+<a name="ln780">          exit (1);</a>
+<a name="ln781">        }</a>
+<a name="ln782">    }</a>
+<a name="ln783">  </a>
+<a name="ln784">#ifdef HAVE_CAPABILITIES</a>
+<a name="ln785">  zprivs_caps_init (zprivs);</a>
+<a name="ln786">#else /* !HAVE_CAPABILITIES */</a>
+<a name="ln787">  /* we dont have caps. we'll need to maintain rid and saved uid</a>
+<a name="ln788">   * and change euid back to saved uid (who we presume has all neccessary</a>
+<a name="ln789">   * privileges) whenever we are asked to raise our privileges.</a>
+<a name="ln790">   *</a>
+<a name="ln791">   * This is not worth that much security wise, but all we can do.</a>
+<a name="ln792">   */</a>
+<a name="ln793">  zprivs_state.zsuid = geteuid();  </a>
+<a name="ln794">  if ( zprivs_state.zuid )</a>
+<a name="ln795">    {</a>
+<a name="ln796">      if ( setreuid (-1, zprivs_state.zuid) )</a>
+<a name="ln797">        {</a>
+<a name="ln798">          fprintf (stderr, &quot;privs_init (uid): could not setreuid, %s\n&quot;, </a>
+<a name="ln799">                   safe_strerror (errno));</a>
+<a name="ln800">          exit (1);</a>
+<a name="ln801">        }</a>
+<a name="ln802">    }</a>
+<a name="ln803">  </a>
+<a name="ln804">  zprivs-&gt;change = zprivs_change_uid;</a>
+<a name="ln805">  zprivs-&gt;current_state = zprivs_state_uid;</a>
+<a name="ln806">#endif /* HAVE_CAPABILITIES */</a>
+<a name="ln807">}</a>
+<a name="ln808"> </a>
+<a name="ln809">void </a>
+<a name="ln810">zprivs_terminate (struct zebra_privs_t *zprivs)</a>
+<a name="ln811">{</a>
+<a name="ln812">  if (!zprivs)</a>
+<a name="ln813">    {</a>
+<a name="ln814">      fprintf (stderr, &quot;%s: no privs struct given, terminating&quot;, __func__);</a>
+<a name="ln815">      exit (0);</a>
+<a name="ln816">    }</a>
+<a name="ln817">  </a>
+<a name="ln818">#ifdef HAVE_CAPABILITIES</a>
+<a name="ln819">  zprivs_caps_terminate();</a>
+<a name="ln820">#else /* !HAVE_CAPABILITIES */</a>
+<a name="ln821">  if (zprivs_state.zuid)</a>
+<a name="ln822">    {</a>
+<a name="ln823">      if ( setreuid (zprivs_state.zuid, zprivs_state.zuid) )</a>
+<a name="ln824">        {</a>
+<a name="ln825">          fprintf (stderr, &quot;privs_terminate: could not setreuid, %s&quot;, </a>
+<a name="ln826">                     safe_strerror (errno) );</a>
+<a name="ln827">          exit (1);</a>
+<a name="ln828">        }</a>
+<a name="ln829">     }</a>
+<a name="ln830">#endif /* HAVE_LCAPS */</a>
+<a name="ln831"> </a>
+<a name="ln832">  zprivs-&gt;change = zprivs_change_null;</a>
+<a name="ln833">  zprivs-&gt;current_state = zprivs_state_null;</a>
+<a name="ln834">  zprivs_null_state = ZPRIVS_LOWERED;</a>
+<a name="ln835">  return;</a>
+<a name="ln836">}</a>
+<a name="ln837"> </a>
+<a name="ln838">void</a>
+<a name="ln839">zprivs_get_ids(struct zprivs_ids_t *ids)</a>
+<a name="ln840">{</a>
+<a name="ln841"> </a>
+<a name="ln842">   ids-&gt;uid_priv = getuid();</a>
+<a name="ln843">   (zprivs_state.zuid) ? (ids-&gt;uid_normal = zprivs_state.zuid)</a>
+<a name="ln844">                     : (ids-&gt;uid_normal = -1);</a>
+<a name="ln845">   (zprivs_state.zgid) ? (ids-&gt;gid_normal = zprivs_state.zgid)</a>
+<a name="ln846">                     : (ids-&gt;gid_normal = -1);</a>
+<a name="ln847">   (zprivs_state.vtygrp) ? (ids-&gt;gid_vty = zprivs_state.vtygrp)</a>
+<a name="ln848">                       : (ids-&gt;gid_vty = -1);</a>
+<a name="ln849">   </a>
+<a name="ln850">   return;</a>
+<a name="ln851">}</a>
+
+</code></pre>
+<div class="balloon" rel="10"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1042/" target="_blank">V1042</a> This file is marked with copyleft license, which requires you to open the derived source code.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

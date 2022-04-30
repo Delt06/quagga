@@ -1,0 +1,3311 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>isis_pdu.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.5.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * IS-IS Rout(e)ing protocol - isis_pdu.c   </a>
+<a name="ln3"> *                             PDU processing</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * Copyright (C) 2001,2002   Sampo Saaristo</a>
+<a name="ln6"> *                           Tampere University of Technology      </a>
+<a name="ln7"> *                           Institute of Communications Engineering</a>
+<a name="ln8"> *</a>
+<a name="ln9"> * This program is free software; you can redistribute it and/or modify it </a>
+<a name="ln10"> * under the terms of the GNU General Public Licenseas published by the Free </a>
+<a name="ln11"> * Software Foundation; either version 2 of the License, or (at your option) </a>
+<a name="ln12"> * any later version.</a>
+<a name="ln13"> *</a>
+<a name="ln14"> * This program is distributed in the hope that it will be useful,but WITHOUT </a>
+<a name="ln15"> * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or </a>
+<a name="ln16"> * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for </a>
+<a name="ln17"> * more details.</a>
+<a name="ln18"> </a>
+<a name="ln19"> * You should have received a copy of the GNU General Public License along </a>
+<a name="ln20"> * with this program; if not, write to the Free Software Foundation, Inc., </a>
+<a name="ln21"> * 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.</a>
+<a name="ln22"> */</a>
+<a name="ln23"> </a>
+<a name="ln24">#include &lt;zebra.h&gt;</a>
+<a name="ln25"> </a>
+<a name="ln26">#include &quot;memory.h&quot;</a>
+<a name="ln27">#include &quot;thread.h&quot;</a>
+<a name="ln28">#include &quot;linklist.h&quot;</a>
+<a name="ln29">#include &quot;log.h&quot;</a>
+<a name="ln30">#include &quot;stream.h&quot;</a>
+<a name="ln31">#include &quot;vty.h&quot;</a>
+<a name="ln32">#include &quot;hash.h&quot;</a>
+<a name="ln33">#include &quot;prefix.h&quot;</a>
+<a name="ln34">#include &quot;if.h&quot;</a>
+<a name="ln35">#include &quot;checksum.h&quot;</a>
+<a name="ln36">#include &quot;md5.h&quot;</a>
+<a name="ln37"> </a>
+<a name="ln38">#include &quot;isisd/dict.h&quot;</a>
+<a name="ln39">#include &quot;isisd/include-netbsd/iso.h&quot;</a>
+<a name="ln40">#include &quot;isisd/isis_constants.h&quot;</a>
+<a name="ln41">#include &quot;isisd/isis_common.h&quot;</a>
+<a name="ln42">#include &quot;isisd/isis_flags.h&quot;</a>
+<a name="ln43">#include &quot;isisd/isis_adjacency.h&quot;</a>
+<a name="ln44">#include &quot;isisd/isis_circuit.h&quot;</a>
+<a name="ln45">#include &quot;isisd/isis_network.h&quot;</a>
+<a name="ln46">#include &quot;isisd/isis_misc.h&quot;</a>
+<a name="ln47">#include &quot;isisd/isis_dr.h&quot;</a>
+<a name="ln48">#include &quot;isisd/isis_tlv.h&quot;</a>
+<a name="ln49">#include &quot;isisd/isisd.h&quot;</a>
+<a name="ln50">#include &quot;isisd/isis_dynhn.h&quot;</a>
+<a name="ln51">#include &quot;isisd/isis_lsp.h&quot;</a>
+<a name="ln52">#include &quot;isisd/isis_pdu.h&quot;</a>
+<a name="ln53">#include &quot;isisd/iso_checksum.h&quot;</a>
+<a name="ln54">#include &quot;isisd/isis_csm.h&quot;</a>
+<a name="ln55">#include &quot;isisd/isis_events.h&quot;</a>
+<a name="ln56">#include &quot;isisd/isis_te.h&quot;</a>
+<a name="ln57"> </a>
+<a name="ln58">#define ISIS_MINIMUM_FIXED_HDR_LEN 15</a>
+<a name="ln59">#define ISIS_MIN_PDU_LEN           13	/* partial seqnum pdu with id_len=2 */</a>
+<a name="ln60"> </a>
+<a name="ln61">#ifndef PNBBY</a>
+<a name="ln62">#define PNBBY 8</a>
+<a name="ln63">#endif /* PNBBY */</a>
+<a name="ln64"> </a>
+<a name="ln65">/* Utility mask array. */</a>
+<a name="ln66">static const u_char maskbit[] = {</a>
+<a name="ln67">  0x00, 0x80, 0xc0, 0xe0, 0xf0, 0xf8, 0xfc, 0xfe, 0xff</a>
+<a name="ln68">};</a>
+<a name="ln69"> </a>
+<a name="ln70">/*</a>
+<a name="ln71"> * HELPER FUNCS</a>
+<a name="ln72"> */</a>
+<a name="ln73"> </a>
+<a name="ln74">/*</a>
+<a name="ln75"> * Compares two sets of area addresses</a>
+<a name="ln76"> */</a>
+<a name="ln77">static int</a>
+<a name="ln78">area_match (struct list *left, struct list *right)</a>
+<a name="ln79">{</a>
+<a name="ln80">  struct area_addr *addr1, *addr2;</a>
+<a name="ln81">  struct listnode *node1, *node2;</a>
+<a name="ln82"> </a>
+<a name="ln83">  for (ALL_LIST_ELEMENTS_RO (left, node1, addr1))</a>
+<a name="ln84">  {</a>
+<a name="ln85">    for (ALL_LIST_ELEMENTS_RO (right, node2, addr2))</a>
+<a name="ln86">    {</a>
+<a name="ln87">      if (addr1-&gt;addr_len == addr2-&gt;addr_len &amp;&amp;</a>
+<a name="ln88">	  !memcmp (addr1-&gt;area_addr, addr2-&gt;area_addr, (int) addr1-&gt;addr_len))</a>
+<a name="ln89">	return 1;		/* match */</a>
+<a name="ln90">    }</a>
+<a name="ln91">  }</a>
+<a name="ln92"> </a>
+<a name="ln93">  return 0;			/* mismatch */</a>
+<a name="ln94">}</a>
+<a name="ln95"> </a>
+<a name="ln96">/*</a>
+<a name="ln97"> * Check if ip2 is in the ip1's network (function like Prefix.h:prefix_match() )</a>
+<a name="ln98"> * param ip1            the IS interface ip address structure</a>
+<a name="ln99"> * param ip2            the IIH's ip address</a>
+<a name="ln100"> * return  0            the IIH's IP is not in the IS's subnetwork</a>
+<a name="ln101"> *         1            the IIH's IP is in the IS's subnetwork</a>
+<a name="ln102"> */</a>
+<a name="ln103">static int</a>
+<a name="ln104">ip_same_subnet (struct prefix_ipv4 *ip1, struct in_addr *ip2)</a>
+<a name="ln105">{</a>
+<a name="ln106">  u_char *addr1, *addr2;</a>
+<a name="ln107">  int shift, offset, offsetloop;</a>
+<a name="ln108">  int len;</a>
+<a name="ln109"> </a>
+<a name="ln110">  addr1 = (u_char *) &amp; ip1-&gt;prefix.s_addr;</a>
+<a name="ln111">  addr2 = (u_char *) &amp; ip2-&gt;s_addr;</a>
+<a name="ln112">  len = ip1-&gt;prefixlen;</a>
+<a name="ln113"> </a>
+<a name="ln114">  shift = len % PNBBY;</a>
+<a name="ln115">  offsetloop = offset = len / PNBBY;</a>
+<a name="ln116"> </a>
+<a name="ln117">  while (offsetloop--)</a>
+<a name="ln118">    if (addr1[offsetloop] != addr2[offsetloop])</a>
+<a name="ln119">      return 0;</a>
+<a name="ln120"> </a>
+<a name="ln121">  if (shift)</a>
+<a name="ln122">    if (maskbit[shift] &amp; (addr1[offset] ^ addr2[offset]))</a>
+<a name="ln123">      return 0;</a>
+<a name="ln124"> </a>
+<a name="ln125">  return 1;			/* match  */</a>
+<a name="ln126">}</a>
+<a name="ln127"> </a>
+<a name="ln128">/*</a>
+<a name="ln129"> * Compares two set of ip addresses</a>
+<a name="ln130"> * param left     the local interface's ip addresses</a>
+<a name="ln131"> * param right    the iih interface's ip address</a>
+<a name="ln132"> * return         0   no match;</a>
+<a name="ln133"> *                1   match;</a>
+<a name="ln134"> */</a>
+<a name="ln135">static int</a>
+<a name="ln136">ip_match (struct list *left, struct list *right)</a>
+<a name="ln137">{</a>
+<a name="ln138">  struct prefix_ipv4 *ip1;</a>
+<a name="ln139">  struct in_addr *ip2;</a>
+<a name="ln140">  struct listnode *node1, *node2;</a>
+<a name="ln141"> </a>
+<a name="ln142">  if ((left == NULL) || (right == NULL))</a>
+<a name="ln143">    return 0;</a>
+<a name="ln144">  </a>
+<a name="ln145">  for (ALL_LIST_ELEMENTS_RO (left, node1, ip1))</a>
+<a name="ln146">  {</a>
+<a name="ln147">    for (ALL_LIST_ELEMENTS_RO (right, node2, ip2))</a>
+<a name="ln148">    {</a>
+<a name="ln149">      if (ip_same_subnet (ip1, ip2))</a>
+<a name="ln150">	{</a>
+<a name="ln151">	  return 1;		/* match */</a>
+<a name="ln152">	}</a>
+<a name="ln153">    }</a>
+<a name="ln154"> </a>
+<a name="ln155">  }</a>
+<a name="ln156">  return 0;</a>
+<a name="ln157">}</a>
+<a name="ln158"> </a>
+<a name="ln159">/*</a>
+<a name="ln160"> * Checks whether we should accept a PDU of given level </a>
+<a name="ln161"> */</a>
+<a name="ln162">static int</a>
+<a name="ln163">accept_level (int level, int circuit_t)</a>
+<a name="ln164">{</a>
+<a name="ln165">  int retval = ((circuit_t &amp; level) == level);	/* simple approach */</a>
+<a name="ln166"> </a>
+<a name="ln167">  return retval;</a>
+<a name="ln168">}</a>
+<a name="ln169"> </a>
+<a name="ln170">/*</a>
+<a name="ln171"> * Verify authentication information</a>
+<a name="ln172"> * Support cleartext and HMAC MD5 authentication</a>
+<a name="ln173"> */</a>
+<a name="ln174">static int</a>
+<a name="ln175">authentication_check (struct isis_passwd *remote, struct isis_passwd *local,</a>
+<a name="ln176">                      struct stream *stream, uint32_t auth_tlv_offset)</a>
+<a name="ln177">{</a>
+<a name="ln178">  unsigned char digest[ISIS_AUTH_MD5_SIZE];</a>
+<a name="ln179"> </a>
+<a name="ln180">  /* Auth fail () - passwd type mismatch */</a>
+<a name="ln181">  if (local-&gt;type != remote-&gt;type)</a>
+<a name="ln182">    return ISIS_ERROR;</a>
+<a name="ln183"> </a>
+<a name="ln184">  switch (local-&gt;type)</a>
+<a name="ln185">  {</a>
+<a name="ln186">    /* No authentication required */</a>
+<a name="ln187">    case ISIS_PASSWD_TYPE_UNUSED:</a>
+<a name="ln188">      break;</a>
+<a name="ln189"> </a>
+<a name="ln190">    /* Cleartext (ISO 10589) */</a>
+<a name="ln191">    case ISIS_PASSWD_TYPE_CLEARTXT:</a>
+<a name="ln192">      /* Auth fail () - passwd len mismatch */</a>
+<a name="ln193">      if (remote-&gt;len != local-&gt;len)</a>
+<a name="ln194">        return ISIS_ERROR;</a>
+<a name="ln195">      return memcmp (local-&gt;passwd, remote-&gt;passwd, local-&gt;len);</a>
+<a name="ln196"> </a>
+<a name="ln197">    /* HMAC MD5 (RFC 3567) */</a>
+<a name="ln198">    case ISIS_PASSWD_TYPE_HMAC_MD5:</a>
+<a name="ln199">      /* Auth fail () - passwd len mismatch */</a>
+<a name="ln200">      if (remote-&gt;len != ISIS_AUTH_MD5_SIZE)</a>
+<a name="ln201">        return ISIS_ERROR;</a>
+<a name="ln202">      /* Set the authentication value to 0 before the check */</a>
+<a name="ln203">      memset (STREAM_DATA (stream) + auth_tlv_offset + 3, 0,</a>
+<a name="ln204">              ISIS_AUTH_MD5_SIZE);</a>
+<a name="ln205">      /* Compute the digest */</a>
+<a name="ln206">      hmac_md5 (STREAM_DATA (stream), stream_get_endp (stream),</a>
+<a name="ln207">                (unsigned char *) &amp;(local-&gt;passwd), local-&gt;len,</a>
+<a name="ln208">                (unsigned char *) &amp;digest);</a>
+<a name="ln209">      /* Copy back the authentication value after the check */</a>
+<a name="ln210">      memcpy (STREAM_DATA (stream) + auth_tlv_offset + 3,</a>
+<a name="ln211">              remote-&gt;passwd, ISIS_AUTH_MD5_SIZE);</a>
+<a name="ln212">      return memcmp (digest, remote-&gt;passwd, ISIS_AUTH_MD5_SIZE);</a>
+<a name="ln213"> </a>
+<a name="ln214">    default:</a>
+<a name="ln215">      zlog_err (&quot;Unsupported authentication type&quot;);</a>
+<a name="ln216">      return ISIS_ERROR;</a>
+<a name="ln217">  }</a>
+<a name="ln218"> </a>
+<a name="ln219">  /* Authentication pass when no authentication is configured */</a>
+<a name="ln220">  return ISIS_OK;</a>
+<a name="ln221">}</a>
+<a name="ln222"> </a>
+<a name="ln223">static int</a>
+<a name="ln224">lsp_authentication_check (struct stream *stream, struct isis_area *area,</a>
+<a name="ln225">                          int level, struct isis_passwd *passwd)</a>
+<a name="ln226">{</a>
+<a name="ln227">  struct isis_link_state_hdr *hdr;</a>
+<a name="ln228">  uint32_t expected = 0, found = 0, auth_tlv_offset = 0;</a>
+<a name="ln229">  uint16_t checksum, rem_lifetime, pdu_len;</a>
+<a name="ln230">  struct tlvs tlvs;</a>
+<a name="ln231">  int retval = ISIS_OK;</a>
+<a name="ln232"> </a>
+<a name="ln233">  hdr = (struct isis_link_state_hdr *) (STREAM_PNT (stream));</a>
+<a name="ln234">  pdu_len = ntohs (hdr-&gt;pdu_len);</a>
+<a name="ln235">  expected |= TLVFLAG_AUTH_INFO;</a>
+<a name="ln236">  auth_tlv_offset = stream_get_getp (stream) + ISIS_LSP_HDR_LEN;</a>
+<a name="ln237">  retval = parse_tlvs (area-&gt;area_tag, STREAM_PNT (stream) + ISIS_LSP_HDR_LEN,</a>
+<a name="ln238">                       pdu_len - ISIS_FIXED_HDR_LEN - ISIS_LSP_HDR_LEN,</a>
+<a name="ln239">                       &amp;expected, &amp;found, &amp;tlvs, &amp;auth_tlv_offset);</a>
+<a name="ln240"> </a>
+<a name="ln241">  if (retval != ISIS_OK)</a>
+<a name="ln242">    {</a>
+<a name="ln243">      zlog_err (&quot;ISIS-Upd (%s): Parse failed L%d LSP %s, seq 0x%08x, &quot;</a>
+<a name="ln244">                &quot;cksum 0x%04x, lifetime %us, len %u&quot;,</a>
+<a name="ln245">                area-&gt;area_tag, level, rawlspid_print (hdr-&gt;lsp_id),</a>
+<a name="ln246">                ntohl (hdr-&gt;seq_num), ntohs (hdr-&gt;checksum),</a>
+<a name="ln247">                ntohs (hdr-&gt;rem_lifetime), pdu_len);</a>
+<a name="ln248">      if ((isis-&gt;debugs &amp; DEBUG_UPDATE_PACKETS) &amp;&amp;</a>
+<a name="ln249">          (isis-&gt;debugs &amp; DEBUG_PACKET_DUMP))</a>
+<a name="ln250">        zlog_dump_data (STREAM_DATA (stream), stream_get_endp (stream));</a>
+<a name="ln251">      return retval;</a>
+<a name="ln252">    }</a>
+<a name="ln253"> </a>
+<a name="ln254">  if (!(found &amp; TLVFLAG_AUTH_INFO))</a>
+<a name="ln255">    {</a>
+<a name="ln256">      zlog_err (&quot;No authentication tlv in LSP&quot;);</a>
+<a name="ln257">      return ISIS_ERROR;</a>
+<a name="ln258">    }</a>
+<a name="ln259"> </a>
+<a name="ln260">  if (tlvs.auth_info.type != ISIS_PASSWD_TYPE_CLEARTXT &amp;&amp;</a>
+<a name="ln261">      tlvs.auth_info.type != ISIS_PASSWD_TYPE_HMAC_MD5)</a>
+<a name="ln262">    {</a>
+<a name="ln263">      zlog_err (&quot;Unknown authentication type in LSP&quot;);</a>
+<a name="ln264">      return ISIS_ERROR;</a>
+<a name="ln265">    }</a>
+<a name="ln266"> </a>
+<a name="ln267">  /*</a>
+<a name="ln268">   * RFC 5304 set checksum and remaining lifetime to zero before</a>
+<a name="ln269">   * verification and reset to old values after verification.</a>
+<a name="ln270">   */</a>
+<a name="ln271">  checksum = hdr-&gt;checksum;</a>
+<a name="ln272">  rem_lifetime = hdr-&gt;rem_lifetime;</a>
+<a name="ln273">  hdr-&gt;checksum = 0;</a>
+<a name="ln274">  hdr-&gt;rem_lifetime = 0;</a>
+<a name="ln275">  retval = authentication_check (&amp;tlvs.auth_info, passwd, stream,</a>
+<a name="ln276">                                 auth_tlv_offset);</a>
+<a name="ln277">  hdr-&gt;checksum = checksum;</a>
+<a name="ln278">  hdr-&gt;rem_lifetime = rem_lifetime;</a>
+<a name="ln279"> </a>
+<a name="ln280">  return retval;</a>
+<a name="ln281">}</a>
+<a name="ln282"> </a>
+<a name="ln283">/*</a>
+<a name="ln284"> * Processing helper functions</a>
+<a name="ln285"> */</a>
+<a name="ln286">static void</a>
+<a name="ln287">del_addr (void *val)</a>
+<a name="ln288">{</a>
+<a name="ln289">  XFREE (MTYPE_ISIS_TMP, val);</a>
+<a name="ln290">}</a>
+<a name="ln291"> </a>
+<a name="ln292">static void</a>
+<a name="ln293">tlvs_to_adj_area_addrs (struct tlvs *tlvs, struct isis_adjacency *adj)</a>
+<a name="ln294">{</a>
+<a name="ln295">  struct listnode *node;</a>
+<a name="ln296">  struct area_addr *area_addr, *malloced;</a>
+<a name="ln297"> </a>
+<a name="ln298">  if (adj-&gt;area_addrs)</a>
+<a name="ln299">    {</a>
+<a name="ln300">      adj-&gt;area_addrs-&gt;del = del_addr;</a>
+<a name="ln301">      list_delete (adj-&gt;area_addrs);</a>
+<a name="ln302">    }</a>
+<a name="ln303">  adj-&gt;area_addrs = list_new ();</a>
+<a name="ln304">  if (tlvs-&gt;area_addrs)</a>
+<a name="ln305">    {</a>
+<a name="ln306">      for (ALL_LIST_ELEMENTS_RO (tlvs-&gt;area_addrs, node, area_addr))</a>
+<a name="ln307">      {</a>
+<a name="ln308">	malloced = XMALLOC (MTYPE_ISIS_TMP, sizeof (struct area_addr));</a>
+<a name="ln309">	memcpy (malloced, area_addr, sizeof (struct area_addr));</a>
+<a name="ln310">	listnode_add (adj-&gt;area_addrs, malloced);</a>
+<a name="ln311">      }</a>
+<a name="ln312">    }</a>
+<a name="ln313">}</a>
+<a name="ln314"> </a>
+<a name="ln315">static int</a>
+<a name="ln316">tlvs_to_adj_nlpids (struct tlvs *tlvs, struct isis_adjacency *adj)</a>
+<a name="ln317">{</a>
+<a name="ln318">  int i;</a>
+<a name="ln319">  struct nlpids *tlv_nlpids;</a>
+<a name="ln320"> </a>
+<a name="ln321">  if (tlvs-&gt;nlpids)</a>
+<a name="ln322">    {</a>
+<a name="ln323"> </a>
+<a name="ln324">      tlv_nlpids = tlvs-&gt;nlpids;</a>
+<a name="ln325">      if (tlv_nlpids-&gt;count &gt; array_size (adj-&gt;nlpids.nlpids))</a>
+<a name="ln326">        return 1;</a>
+<a name="ln327"> </a>
+<a name="ln328">      adj-&gt;nlpids.count = tlv_nlpids-&gt;count;</a>
+<a name="ln329"> </a>
+<a name="ln330">      for (i = 0; i &lt; tlv_nlpids-&gt;count; i++)</a>
+<a name="ln331">	{</a>
+<a name="ln332">	  adj-&gt;nlpids.nlpids[i] = tlv_nlpids-&gt;nlpids[i];</a>
+<a name="ln333">	}</a>
+<a name="ln334">    }</a>
+<a name="ln335">  return 0;</a>
+<a name="ln336">}</a>
+<a name="ln337"> </a>
+<a name="ln338">static void</a>
+<a name="ln339">tlvs_to_adj_ipv4_addrs (struct tlvs *tlvs, struct isis_adjacency *adj)</a>
+<a name="ln340">{</a>
+<a name="ln341">  struct listnode *node;</a>
+<a name="ln342">  struct in_addr *ipv4_addr, *malloced;</a>
+<a name="ln343"> </a>
+<a name="ln344">  if (adj-&gt;ipv4_addrs)</a>
+<a name="ln345">    {</a>
+<a name="ln346">      adj-&gt;ipv4_addrs-&gt;del = del_addr;</a>
+<a name="ln347">      list_delete (adj-&gt;ipv4_addrs);</a>
+<a name="ln348">    }</a>
+<a name="ln349">  adj-&gt;ipv4_addrs = list_new ();</a>
+<a name="ln350">  if (tlvs-&gt;ipv4_addrs)</a>
+<a name="ln351">    {</a>
+<a name="ln352">      for (ALL_LIST_ELEMENTS_RO (tlvs-&gt;ipv4_addrs, node, ipv4_addr))</a>
+<a name="ln353">      {</a>
+<a name="ln354">	malloced = XMALLOC (MTYPE_ISIS_TMP, sizeof (struct in_addr));</a>
+<a name="ln355">	memcpy (malloced, ipv4_addr, sizeof (struct in_addr));</a>
+<a name="ln356">	listnode_add (adj-&gt;ipv4_addrs, malloced);</a>
+<a name="ln357">      }</a>
+<a name="ln358">    }</a>
+<a name="ln359">}</a>
+<a name="ln360"> </a>
+<a name="ln361">#ifdef HAVE_IPV6</a>
+<a name="ln362">static void</a>
+<a name="ln363">tlvs_to_adj_ipv6_addrs (struct tlvs *tlvs, struct isis_adjacency *adj)</a>
+<a name="ln364">{</a>
+<a name="ln365">  struct listnode *node;</a>
+<a name="ln366">  struct in6_addr *ipv6_addr, *malloced;</a>
+<a name="ln367"> </a>
+<a name="ln368">  if (adj-&gt;ipv6_addrs)</a>
+<a name="ln369">    {</a>
+<a name="ln370">      adj-&gt;ipv6_addrs-&gt;del = del_addr;</a>
+<a name="ln371">      list_delete (adj-&gt;ipv6_addrs);</a>
+<a name="ln372">    }</a>
+<a name="ln373">  adj-&gt;ipv6_addrs = list_new ();</a>
+<a name="ln374">  if (tlvs-&gt;ipv6_addrs)</a>
+<a name="ln375">    {</a>
+<a name="ln376">      for (ALL_LIST_ELEMENTS_RO (tlvs-&gt;ipv6_addrs, node, ipv6_addr))</a>
+<a name="ln377">      {</a>
+<a name="ln378">	malloced = XMALLOC (MTYPE_ISIS_TMP, sizeof (struct in6_addr));</a>
+<a name="ln379">	memcpy (malloced, ipv6_addr, sizeof (struct in6_addr));</a>
+<a name="ln380">	listnode_add (adj-&gt;ipv6_addrs, malloced);</a>
+<a name="ln381">      }</a>
+<a name="ln382">    }</a>
+<a name="ln383"> </a>
+<a name="ln384">}</a>
+<a name="ln385">#endif /* HAVE_IPV6 */</a>
+<a name="ln386"> </a>
+<a name="ln387">/*</a>
+<a name="ln388"> *  RECEIVE SIDE                           </a>
+<a name="ln389"> */</a>
+<a name="ln390"> </a>
+<a name="ln391">/*</a>
+<a name="ln392"> * Process P2P IIH</a>
+<a name="ln393"> * ISO - 10589</a>
+<a name="ln394"> * Section 8.2.5 - Receiving point-to-point IIH PDUs</a>
+<a name="ln395"> *</a>
+<a name="ln396"> */</a>
+<a name="ln397">static int</a>
+<a name="ln398">process_p2p_hello (struct isis_circuit *circuit)</a>
+<a name="ln399">{</a>
+<a name="ln400">  int retval = ISIS_OK;</a>
+<a name="ln401">  struct isis_p2p_hello_hdr *hdr;</a>
+<a name="ln402">  struct isis_adjacency *adj;</a>
+<a name="ln403">  u_int32_t expected = 0, found = 0, auth_tlv_offset = 0;</a>
+<a name="ln404">  uint16_t pdu_len;</a>
+<a name="ln405">  struct tlvs tlvs;</a>
+<a name="ln406">  int v4_usable = 0, v6_usable = 0;</a>
+<a name="ln407"> </a>
+<a name="ln408">  if (isis-&gt;debugs &amp; DEBUG_ADJ_PACKETS)</a>
+<a name="ln409">    {</a>
+<a name="ln410">      zlog_debug (&quot;ISIS-Adj (%s): Rcvd P2P IIH on %s, cirType %s, cirID %u&quot;,</a>
+<a name="ln411">                  circuit-&gt;area-&gt;area_tag, circuit-&gt;interface-&gt;name,</a>
+<a name="ln412">                  circuit_t2string (circuit-&gt;is_type), circuit-&gt;circuit_id);</a>
+<a name="ln413">      if (isis-&gt;debugs &amp; DEBUG_PACKET_DUMP)</a>
+<a name="ln414">        zlog_dump_data (STREAM_DATA (circuit-&gt;rcv_stream),</a>
+<a name="ln415">                        stream_get_endp (circuit-&gt;rcv_stream));</a>
+<a name="ln416">    }</a>
+<a name="ln417"> </a>
+<a name="ln418">  if (circuit-&gt;circ_type != CIRCUIT_T_P2P)</a>
+<a name="ln419">    {</a>
+<a name="ln420">      zlog_warn (&quot;p2p hello on non p2p circuit&quot;);</a>
+<a name="ln421">      return ISIS_WARNING;</a>
+<a name="ln422">    }</a>
+<a name="ln423"> </a>
+<a name="ln424">  if ((stream_get_endp (circuit-&gt;rcv_stream) -</a>
+<a name="ln425">       stream_get_getp (circuit-&gt;rcv_stream)) &lt; ISIS_P2PHELLO_HDRLEN)</a>
+<a name="ln426">    {</a>
+<a name="ln427">      zlog_warn (&quot;Packet too short&quot;);</a>
+<a name="ln428">      return ISIS_WARNING;</a>
+<a name="ln429">    }</a>
+<a name="ln430"> </a>
+<a name="ln431">  /* 8.2.5.1 PDU acceptance tests */</a>
+<a name="ln432"> </a>
+<a name="ln433">  /* 8.2.5.1 a) external domain untrue */</a>
+<a name="ln434">  /* FIXME: not useful at all?         */</a>
+<a name="ln435"> </a>
+<a name="ln436">  /* 8.2.5.1 b) ID Length mismatch */</a>
+<a name="ln437">  /* checked at the handle_pdu     */</a>
+<a name="ln438"> </a>
+<a name="ln439">  /* 8.2.5.2 IIH PDU Processing */</a>
+<a name="ln440"> </a>
+<a name="ln441">  /* 8.2.5.2 a) 1) Maximum Area Addresses */</a>
+<a name="ln442">  /* Already checked, and can also be ommited */</a>
+<a name="ln443"> </a>
+<a name="ln444">  /*</a>
+<a name="ln445">   * Get the header</a>
+<a name="ln446">   */</a>
+<a name="ln447">  hdr = (struct isis_p2p_hello_hdr *) STREAM_PNT (circuit-&gt;rcv_stream);</a>
+<a name="ln448">  pdu_len = ntohs (hdr-&gt;pdu_len);</a>
+<a name="ln449"> </a>
+<a name="ln450">  if (pdu_len &lt; (ISIS_FIXED_HDR_LEN + ISIS_P2PHELLO_HDRLEN) ||</a>
+<a name="ln451">      pdu_len &gt; ISO_MTU(circuit) ||</a>
+<a name="ln452">      pdu_len &gt; stream_get_endp (circuit-&gt;rcv_stream))</a>
+<a name="ln453">    {</a>
+<a name="ln454">      zlog_warn (&quot;ISIS-Adj (%s): Rcvd P2P IIH from (%s) with &quot;</a>
+<a name="ln455">                 &quot;invalid pdu length %d&quot;,</a>
+<a name="ln456">                 circuit-&gt;area-&gt;area_tag, circuit-&gt;interface-&gt;name, pdu_len);</a>
+<a name="ln457">      return ISIS_WARNING;</a>
+<a name="ln458">    }</a>
+<a name="ln459"> </a>
+<a name="ln460">  /*</a>
+<a name="ln461">   * Set the stream endp to PDU length, ignoring additional padding</a>
+<a name="ln462">   * introduced by transport chips.</a>
+<a name="ln463">   */</a>
+<a name="ln464">  if (pdu_len &lt; stream_get_endp (circuit-&gt;rcv_stream))</a>
+<a name="ln465">    stream_set_endp (circuit-&gt;rcv_stream, pdu_len);</a>
+<a name="ln466"> </a>
+<a name="ln467">  stream_forward_getp (circuit-&gt;rcv_stream, ISIS_P2PHELLO_HDRLEN);</a>
+<a name="ln468"> </a>
+<a name="ln469">  /*</a>
+<a name="ln470">   * Lets get the TLVS now</a>
+<a name="ln471">   */</a>
+<a name="ln472">  expected |= TLVFLAG_AREA_ADDRS;</a>
+<a name="ln473">  expected |= TLVFLAG_AUTH_INFO;</a>
+<a name="ln474">  expected |= TLVFLAG_NLPID;</a>
+<a name="ln475">  expected |= TLVFLAG_IPV4_ADDR;</a>
+<a name="ln476">  expected |= TLVFLAG_IPV6_ADDR;</a>
+<a name="ln477"> </a>
+<a name="ln478">  auth_tlv_offset = stream_get_getp (circuit-&gt;rcv_stream);</a>
+<a name="ln479">  retval = parse_tlvs (circuit-&gt;area-&gt;area_tag,</a>
+<a name="ln480">		       STREAM_PNT (circuit-&gt;rcv_stream),</a>
+<a name="ln481">		       pdu_len - ISIS_P2PHELLO_HDRLEN - ISIS_FIXED_HDR_LEN,</a>
+<a name="ln482">                       &amp;expected, &amp;found, &amp;tlvs, &amp;auth_tlv_offset);</a>
+<a name="ln483"> </a>
+<a name="ln484">  if (retval &gt; ISIS_WARNING)</a>
+<a name="ln485">    {</a>
+<a name="ln486">      zlog_warn (&quot;parse_tlvs() failed&quot;);</a>
+<a name="ln487">      free_tlvs (&amp;tlvs);</a>
+<a name="ln488">      return retval;</a>
+<a name="ln489">    };</a>
+<a name="ln490"> </a>
+<a name="ln491">  if (!(found &amp; TLVFLAG_AREA_ADDRS))</a>
+<a name="ln492">    {</a>
+<a name="ln493">      zlog_warn (&quot;No Area addresses TLV in P2P IS to IS hello&quot;);</a>
+<a name="ln494">      free_tlvs (&amp;tlvs);</a>
+<a name="ln495">      return ISIS_WARNING;</a>
+<a name="ln496">    }</a>
+<a name="ln497"> </a>
+<a name="ln498">  if (!(found &amp; TLVFLAG_NLPID))</a>
+<a name="ln499">    {</a>
+<a name="ln500">      zlog_warn (&quot;No supported protocols TLV in P2P IS to IS hello&quot;);</a>
+<a name="ln501">      free_tlvs (&amp;tlvs);</a>
+<a name="ln502">      return ISIS_WARNING;</a>
+<a name="ln503">    }</a>
+<a name="ln504"> </a>
+<a name="ln505">  /* 8.2.5.1 c) Authentication */</a>
+<a name="ln506">  if (circuit-&gt;passwd.type)</a>
+<a name="ln507">    {</a>
+<a name="ln508">      if (!(found &amp; TLVFLAG_AUTH_INFO) ||</a>
+<a name="ln509">          authentication_check (&amp;tlvs.auth_info, &amp;circuit-&gt;passwd,</a>
+<a name="ln510">                                circuit-&gt;rcv_stream, auth_tlv_offset))</a>
+<a name="ln511">        {</a>
+<a name="ln512">          isis_event_auth_failure (circuit-&gt;area-&gt;area_tag,</a>
+<a name="ln513">                                   &quot;P2P hello authentication failure&quot;,</a>
+<a name="ln514">                                   hdr-&gt;source_id);</a>
+<a name="ln515">          free_tlvs (&amp;tlvs);</a>
+<a name="ln516">          return ISIS_OK;</a>
+<a name="ln517">        }</a>
+<a name="ln518">    }</a>
+<a name="ln519"> </a>
+<a name="ln520">  /*</a>
+<a name="ln521">   * check if it's own interface ip match iih ip addrs</a>
+<a name="ln522">   */</a>
+<a name="ln523">  if (found &amp; TLVFLAG_IPV4_ADDR)</a>
+<a name="ln524">    {</a>
+<a name="ln525">      if (ip_match (circuit-&gt;ip_addrs, tlvs.ipv4_addrs))</a>
+<a name="ln526">	v4_usable = 1;</a>
+<a name="ln527">      else</a>
+<a name="ln528">	zlog_warn (&quot;ISIS-Adj: IPv4 addresses present but no overlap &quot;</a>
+<a name="ln529">		   &quot;in P2P IIH from %s\n&quot;, circuit-&gt;interface-&gt;name);</a>
+<a name="ln530">    }</a>
+<a name="ln531">#ifndef HAVE_IPV6</a>
+<a name="ln532">  else /* !(found &amp; TLVFLAG_IPV4_ADDR) */</a>
+<a name="ln533">    zlog_warn (&quot;ISIS-Adj: no IPv4 in P2P IIH from %s &quot;</a>
+<a name="ln534">	       &quot;(this isisd has no IPv6)\n&quot;, circuit-&gt;interface-&gt;name);</a>
+<a name="ln535"> </a>
+<a name="ln536">#else</a>
+<a name="ln537">  if (found &amp; TLVFLAG_IPV6_ADDR)</a>
+<a name="ln538">    {</a>
+<a name="ln539">      /* TBA: check that we have a linklocal ourselves? */</a>
+<a name="ln540">      struct listnode *node;</a>
+<a name="ln541">      struct in6_addr *ip;</a>
+<a name="ln542">      for (ALL_LIST_ELEMENTS_RO (tlvs.ipv6_addrs, node, ip))</a>
+<a name="ln543">	if (IN6_IS_ADDR_LINKLOCAL (ip))</a>
+<a name="ln544">	  {</a>
+<a name="ln545">	    v6_usable = 1;</a>
+<a name="ln546">	    break;</a>
+<a name="ln547">	  }</a>
+<a name="ln548"> </a>
+<a name="ln549">      if (!v6_usable)</a>
+<a name="ln550">	zlog_warn (&quot;ISIS-Adj: IPv6 addresses present but no link-local &quot;</a>
+<a name="ln551">		   &quot;in P2P IIH from %s\n&quot;, circuit-&gt;interface-&gt;name);</a>
+<a name="ln552">    }</a>
+<a name="ln553"> </a>
+<a name="ln554">  if (!(found &amp; (TLVFLAG_IPV4_ADDR | TLVFLAG_IPV6_ADDR)))</a>
+<a name="ln555">    zlog_warn (&quot;ISIS-Adj: neither IPv4 nor IPv6 addr in P2P IIH from %s\n&quot;,</a>
+<a name="ln556">	       circuit-&gt;interface-&gt;name);</a>
+<a name="ln557">#endif</a>
+<a name="ln558"> </a>
+<a name="ln559">  if (!v6_usable &amp;&amp; !v4_usable)</a>
+<a name="ln560">    {</a>
+<a name="ln561">      free_tlvs (&amp;tlvs);</a>
+<a name="ln562">      return ISIS_WARNING;</a>
+<a name="ln563">    }</a>
+<a name="ln564"> </a>
+<a name="ln565">  /*</a>
+<a name="ln566">   * it's own p2p IIH PDU - discard</a>
+<a name="ln567">   */</a>
+<a name="ln568">  if (!memcmp (hdr-&gt;source_id, isis-&gt;sysid, ISIS_SYS_ID_LEN))</a>
+<a name="ln569">    {</a>
+<a name="ln570">      zlog_warn (&quot;ISIS-Adj (%s): it's own IIH PDU - discarded&quot;,</a>
+<a name="ln571">                  circuit-&gt;area-&gt;area_tag);</a>
+<a name="ln572">      free_tlvs (&amp;tlvs);</a>
+<a name="ln573">      return ISIS_WARNING;</a>
+<a name="ln574">    }</a>
+<a name="ln575"> </a>
+<a name="ln576">  /*</a>
+<a name="ln577">   * My interpertation of the ISO, if no adj exists we will create one for</a>
+<a name="ln578">   * the circuit</a>
+<a name="ln579">   */</a>
+<a name="ln580">  adj = circuit-&gt;u.p2p.neighbor;</a>
+<a name="ln581">  /* If an adjacency exists, check it is with the source of the hello</a>
+<a name="ln582">   * packets */</a>
+<a name="ln583">  if (adj)</a>
+<a name="ln584">    {</a>
+<a name="ln585">      if (memcmp(hdr-&gt;source_id, adj-&gt;sysid, ISIS_SYS_ID_LEN))</a>
+<a name="ln586">	{</a>
+<a name="ln587">          zlog_debug(&quot;hello source and adjacency do not match, set adj down\n&quot;);</a>
+<a name="ln588">          isis_adj_state_change (adj, ISIS_ADJ_DOWN, &quot;adj do not exist&quot;);</a>
+<a name="ln589">          return 0;</a>
+<a name="ln590">        }</a>
+<a name="ln591">    }</a>
+<a name="ln592">  if (!adj || adj-&gt;level != hdr-&gt;circuit_t)</a>
+<a name="ln593">    {</a>
+<a name="ln594">      if (!adj)</a>
+<a name="ln595">        {</a>
+<a name="ln596">          adj = isis_new_adj (hdr-&gt;source_id, NULL, hdr-&gt;circuit_t, circuit);</a>
+<a name="ln597">          if (adj == NULL)</a>
+<a name="ln598">            return ISIS_ERROR;</a>
+<a name="ln599">        }</a>
+<a name="ln600">      else</a>
+<a name="ln601">        {</a>
+<a name="ln602">          adj-&gt;level = hdr-&gt;circuit_t;</a>
+<a name="ln603">        }</a>
+<a name="ln604">      circuit-&gt;u.p2p.neighbor = adj;</a>
+<a name="ln605">      /* Build lsp with the new neighbor entry when a new</a>
+<a name="ln606">       * adjacency is formed. Set adjacency circuit type to</a>
+<a name="ln607">       * IIH PDU header circuit type before lsp is regenerated</a>
+<a name="ln608">       * when an adjacency is up. This will result in the new</a>
+<a name="ln609">       * adjacency entry getting added to the lsp tlv neighbor list.</a>
+<a name="ln610">       */</a>
+<a name="ln611">      adj-&gt;circuit_t = hdr-&gt;circuit_t;</a>
+<a name="ln612">      isis_adj_state_change (adj, ISIS_ADJ_INITIALIZING, NULL);</a>
+<a name="ln613">      adj-&gt;sys_type = ISIS_SYSTYPE_UNKNOWN;</a>
+<a name="ln614">    }</a>
+<a name="ln615"> </a>
+<a name="ln616">  /* 8.2.6 Monitoring point-to-point adjacencies */</a>
+<a name="ln617">  adj-&gt;hold_time = ntohs (hdr-&gt;hold_time);</a>
+<a name="ln618">  adj-&gt;last_upd = time (NULL);</a>
+<a name="ln619"> </a>
+<a name="ln620">  /* we do this now because the adj may not survive till the end... */</a>
+<a name="ln621">  tlvs_to_adj_area_addrs (&amp;tlvs, adj);</a>
+<a name="ln622"> </a>
+<a name="ln623">  /* which protocol are spoken ??? */</a>
+<a name="ln624">  if (tlvs_to_adj_nlpids (&amp;tlvs, adj))</a>
+<a name="ln625">    {</a>
+<a name="ln626">      free_tlvs (&amp;tlvs);</a>
+<a name="ln627">      return ISIS_WARNING;</a>
+<a name="ln628">    }</a>
+<a name="ln629"> </a>
+<a name="ln630">  /* we need to copy addresses to the adj */</a>
+<a name="ln631">  if (found &amp; TLVFLAG_IPV4_ADDR)</a>
+<a name="ln632">    tlvs_to_adj_ipv4_addrs (&amp;tlvs, adj);</a>
+<a name="ln633"> </a>
+<a name="ln634">  /* Update MPLS TE Remote IP address parameter if possible */</a>
+<a name="ln635">  if (IS_MPLS_TE(isisMplsTE) &amp;&amp; circuit-&gt;mtc &amp;&amp; IS_CIRCUIT_TE(circuit-&gt;mtc))</a>
+<a name="ln636">    if (adj-&gt;ipv4_addrs != NULL &amp;&amp; listcount(adj-&gt;ipv4_addrs) != 0)</a>
+<a name="ln637">      {</a>
+<a name="ln638">        struct in_addr *ip_addr;</a>
+<a name="ln639">        ip_addr = (struct in_addr *)listgetdata ((struct listnode *)listhead (adj-&gt;ipv4_addrs));</a>
+<a name="ln640">        set_circuitparams_rmt_ipaddr (circuit-&gt;mtc, *ip_addr);</a>
+<a name="ln641">      }</a>
+<a name="ln642"> </a>
+<a name="ln643">#ifdef HAVE_IPV6</a>
+<a name="ln644">  if (found &amp; TLVFLAG_IPV6_ADDR)</a>
+<a name="ln645">    tlvs_to_adj_ipv6_addrs (&amp;tlvs, adj);</a>
+<a name="ln646">#endif /* HAVE_IPV6 */</a>
+<a name="ln647"> </a>
+<a name="ln648">  /* lets take care of the expiry */</a>
+<a name="ln649">  THREAD_TIMER_OFF (adj-&gt;t_expire);</a>
+<a name="ln650">  THREAD_TIMER_ON (master, adj-&gt;t_expire, isis_adj_expire, adj,</a>
+<a name="ln651">		   (long) adj-&gt;hold_time);</a>
+<a name="ln652"> </a>
+<a name="ln653">  /* 8.2.5.2 a) a match was detected */</a>
+<a name="ln654">  if (area_match (circuit-&gt;area-&gt;area_addrs, tlvs.area_addrs))</a>
+<a name="ln655">    {</a>
+<a name="ln656">      /* 8.2.5.2 a) 2) If the system is L1 - table 5 */</a>
+<a name="ln657">      if (circuit-&gt;area-&gt;is_type == IS_LEVEL_1)</a>
+<a name="ln658">	{</a>
+<a name="ln659">	  switch (hdr-&gt;circuit_t)</a>
+<a name="ln660">	    {</a>
+<a name="ln661">	    case IS_LEVEL_1:</a>
+<a name="ln662">	    case IS_LEVEL_1_AND_2:</a>
+<a name="ln663">	      if (adj-&gt;adj_state != ISIS_ADJ_UP)</a>
+<a name="ln664">		{</a>
+<a name="ln665">		  /* (4) adj state up */</a>
+<a name="ln666">		  isis_adj_state_change (adj, ISIS_ADJ_UP, NULL);</a>
+<a name="ln667">		  /* (5) adj usage level 1 */</a>
+<a name="ln668">		  adj-&gt;adj_usage = ISIS_ADJ_LEVEL1;</a>
+<a name="ln669">		}</a>
+<a name="ln670">	      else if (adj-&gt;adj_usage == ISIS_ADJ_LEVEL1)</a>
+<a name="ln671">		{</a>
+<a name="ln672">		  ;		/* accept */</a>
+<a name="ln673">		}</a>
+<a name="ln674">	      break;</a>
+<a name="ln675">	    case IS_LEVEL_2:</a>
+<a name="ln676">	      if (adj-&gt;adj_state != ISIS_ADJ_UP)</a>
+<a name="ln677">		{</a>
+<a name="ln678">		  /* (7) reject - wrong system type event */</a>
+<a name="ln679">		  zlog_warn (&quot;wrongSystemType&quot;);</a>
+<a name="ln680">                  free_tlvs (&amp;tlvs);</a>
+<a name="ln681">		  return ISIS_WARNING;	/* Reject */</a>
+<a name="ln682">		}</a>
+<a name="ln683">	      else if (adj-&gt;adj_usage == ISIS_ADJ_LEVEL1)</a>
+<a name="ln684">		{</a>
+<a name="ln685">		  /* (6) down - wrong system */</a>
+<a name="ln686">		  isis_adj_state_change (adj, ISIS_ADJ_DOWN, &quot;Wrong System&quot;);</a>
+<a name="ln687">		}</a>
+<a name="ln688">	      break;</a>
+<a name="ln689">	    }</a>
+<a name="ln690">	}</a>
+<a name="ln691"> </a>
+<a name="ln692">      /* 8.2.5.2 a) 3) If the system is L1L2 - table 6 */</a>
+<a name="ln693">      if (circuit-&gt;area-&gt;is_type == IS_LEVEL_1_AND_2)</a>
+<a name="ln694">	{</a>
+<a name="ln695">	  switch (hdr-&gt;circuit_t)</a>
+<a name="ln696">	    {</a>
+<a name="ln697">	    case IS_LEVEL_1:</a>
+<a name="ln698">	      if (adj-&gt;adj_state != ISIS_ADJ_UP)</a>
+<a name="ln699">		{</a>
+<a name="ln700">		  /* (6) adj state up */</a>
+<a name="ln701">		  isis_adj_state_change (adj, ISIS_ADJ_UP, NULL);</a>
+<a name="ln702">		  /* (7) adj usage level 1 */</a>
+<a name="ln703">		  adj-&gt;adj_usage = ISIS_ADJ_LEVEL1;</a>
+<a name="ln704">		}</a>
+<a name="ln705">	      else if (adj-&gt;adj_usage == ISIS_ADJ_LEVEL1)</a>
+<a name="ln706">		{</a>
+<a name="ln707">		  ;		/* accept */</a>
+<a name="ln708">		}</a>
+<a name="ln709">	      else if ((adj-&gt;adj_usage == ISIS_ADJ_LEVEL1AND2) ||</a>
+<a name="ln710">		       (adj-&gt;adj_usage == ISIS_ADJ_LEVEL2))</a>
+<a name="ln711">		{</a>
+<a name="ln712">		  /* (8) down - wrong system */</a>
+<a name="ln713">		  isis_adj_state_change (adj, ISIS_ADJ_DOWN, &quot;Wrong System&quot;);</a>
+<a name="ln714">		}</a>
+<a name="ln715">	      break;</a>
+<a name="ln716">	    case IS_LEVEL_2:</a>
+<a name="ln717">	      if (adj-&gt;adj_state != ISIS_ADJ_UP)</a>
+<a name="ln718">		{</a>
+<a name="ln719">		  /* (6) adj state up */</a>
+<a name="ln720">		  isis_adj_state_change (adj, ISIS_ADJ_UP, NULL);</a>
+<a name="ln721">		  /* (9) adj usage level 2 */</a>
+<a name="ln722">		  adj-&gt;adj_usage = ISIS_ADJ_LEVEL2;</a>
+<a name="ln723">		}</a>
+<a name="ln724">	      else if ((adj-&gt;adj_usage == ISIS_ADJ_LEVEL1) ||</a>
+<a name="ln725">		       (adj-&gt;adj_usage == ISIS_ADJ_LEVEL1AND2))</a>
+<a name="ln726">		{</a>
+<a name="ln727">		  /* (8) down - wrong system */</a>
+<a name="ln728">		  isis_adj_state_change (adj, ISIS_ADJ_DOWN, &quot;Wrong System&quot;);</a>
+<a name="ln729">		}</a>
+<a name="ln730">	      else if (adj-&gt;adj_usage == ISIS_ADJ_LEVEL2)</a>
+<a name="ln731">		{</a>
+<a name="ln732">		  ;		/* Accept */</a>
+<a name="ln733">		}</a>
+<a name="ln734">	      break;</a>
+<a name="ln735">	    case IS_LEVEL_1_AND_2:</a>
+<a name="ln736">	      if (adj-&gt;adj_state != ISIS_ADJ_UP)</a>
+<a name="ln737">		{</a>
+<a name="ln738">		  /* (6) adj state up */</a>
+<a name="ln739">		  isis_adj_state_change (adj, ISIS_ADJ_UP, NULL);</a>
+<a name="ln740">		  /* (10) adj usage level 1 */</a>
+<a name="ln741">		  adj-&gt;adj_usage = ISIS_ADJ_LEVEL1AND2;</a>
+<a name="ln742">		}</a>
+<a name="ln743">	      else if ((adj-&gt;adj_usage == ISIS_ADJ_LEVEL1) ||</a>
+<a name="ln744">		       (adj-&gt;adj_usage == ISIS_ADJ_LEVEL2))</a>
+<a name="ln745">		{</a>
+<a name="ln746">		  /* (8) down - wrong system */</a>
+<a name="ln747">		  isis_adj_state_change (adj, ISIS_ADJ_DOWN, &quot;Wrong System&quot;);</a>
+<a name="ln748">		}</a>
+<a name="ln749">	      else if (adj-&gt;adj_usage == ISIS_ADJ_LEVEL1AND2)</a>
+<a name="ln750">		{</a>
+<a name="ln751">		  ;		/* Accept */</a>
+<a name="ln752">		}</a>
+<a name="ln753">	      break;</a>
+<a name="ln754">	    }</a>
+<a name="ln755">	}</a>
+<a name="ln756"> </a>
+<a name="ln757">      /* 8.2.5.2 a) 4) If the system is L2 - table 7 */</a>
+<a name="ln758">      if (circuit-&gt;area-&gt;is_type == IS_LEVEL_2)</a>
+<a name="ln759">	{</a>
+<a name="ln760">	  switch (hdr-&gt;circuit_t)</a>
+<a name="ln761">	    {</a>
+<a name="ln762">	    case IS_LEVEL_1:</a>
+<a name="ln763">	      if (adj-&gt;adj_state != ISIS_ADJ_UP)</a>
+<a name="ln764">		{</a>
+<a name="ln765">		  /* (5) reject - wrong system type event */</a>
+<a name="ln766">		  zlog_warn (&quot;wrongSystemType&quot;);</a>
+<a name="ln767">                  free_tlvs (&amp;tlvs);</a>
+<a name="ln768">		  return ISIS_WARNING;	/* Reject */</a>
+<a name="ln769">		}</a>
+<a name="ln770">	      else if ((adj-&gt;adj_usage == ISIS_ADJ_LEVEL1AND2) ||</a>
+<a name="ln771">		       (adj-&gt;adj_usage == ISIS_ADJ_LEVEL2))</a>
+<a name="ln772">		{</a>
+<a name="ln773">		  /* (6) down - wrong system */</a>
+<a name="ln774">		  isis_adj_state_change (adj, ISIS_ADJ_DOWN, &quot;Wrong System&quot;);</a>
+<a name="ln775">		}</a>
+<a name="ln776">	      break;</a>
+<a name="ln777">	    case IS_LEVEL_1_AND_2:</a>
+<a name="ln778">	    case IS_LEVEL_2:</a>
+<a name="ln779">	      if (adj-&gt;adj_state != ISIS_ADJ_UP)</a>
+<a name="ln780">		{</a>
+<a name="ln781">		  /* (7) adj state up */</a>
+<a name="ln782">		  isis_adj_state_change (adj, ISIS_ADJ_UP, NULL);</a>
+<a name="ln783">		  /* (8) adj usage level 2 */</a>
+<a name="ln784">		  adj-&gt;adj_usage = ISIS_ADJ_LEVEL2;</a>
+<a name="ln785">		}</a>
+<a name="ln786">	      else if (adj-&gt;adj_usage == ISIS_ADJ_LEVEL1AND2)</a>
+<a name="ln787">		{</a>
+<a name="ln788">		  /* (6) down - wrong system */</a>
+<a name="ln789">		  isis_adj_state_change (adj, ISIS_ADJ_DOWN, &quot;Wrong System&quot;);</a>
+<a name="ln790">		}</a>
+<a name="ln791">	      else if (adj-&gt;adj_usage == ISIS_ADJ_LEVEL2)</a>
+<a name="ln792">		{</a>
+<a name="ln793">		  ;		/* Accept */</a>
+<a name="ln794">		}</a>
+<a name="ln795">	      break;</a>
+<a name="ln796">	    }</a>
+<a name="ln797">	}</a>
+<a name="ln798">    }</a>
+<a name="ln799">  /* 8.2.5.2 b) if no match was detected */</a>
+<a name="ln800">  else if (listcount (circuit-&gt;area-&gt;area_addrs) &gt; 0)</a>
+<a name="ln801">    {</a>
+<a name="ln802">      if (circuit-&gt;area-&gt;is_type == IS_LEVEL_1)</a>
+<a name="ln803">	{</a>
+<a name="ln804">	  /* 8.2.5.2 b) 1) is_type L1 and adj is not up */</a>
+<a name="ln805">	  if (adj-&gt;adj_state != ISIS_ADJ_UP)</a>
+<a name="ln806">	    {</a>
+<a name="ln807">	      isis_adj_state_change (adj, ISIS_ADJ_DOWN, &quot;Area Mismatch&quot;);</a>
+<a name="ln808">	      /* 8.2.5.2 b) 2)is_type L1 and adj is up */</a>
+<a name="ln809">	    }</a>
+<a name="ln810">	  else</a>
+<a name="ln811">	    {</a>
+<a name="ln812">	      isis_adj_state_change (adj, ISIS_ADJ_DOWN,</a>
+<a name="ln813">				     &quot;Down - Area Mismatch&quot;);</a>
+<a name="ln814">	    }</a>
+<a name="ln815">	}</a>
+<a name="ln816">      /* 8.2.5.2 b 3 If the system is L2 or L1L2 - table 8 */</a>
+<a name="ln817">      else</a>
+<a name="ln818">	{</a>
+<a name="ln819">	  switch (hdr-&gt;circuit_t)</a>
+<a name="ln820">	    {</a>
+<a name="ln821">	    case IS_LEVEL_1:</a>
+<a name="ln822">	      if (adj-&gt;adj_state != ISIS_ADJ_UP)</a>
+<a name="ln823">		{</a>
+<a name="ln824">		  /* (6) reject - Area Mismatch event */</a>
+<a name="ln825">		  zlog_warn (&quot;AreaMismatch&quot;);</a>
+<a name="ln826">                  free_tlvs (&amp;tlvs);</a>
+<a name="ln827">		  return ISIS_WARNING;	/* Reject */</a>
+<a name="ln828">		}</a>
+<a name="ln829">	      else if (adj-&gt;adj_usage == ISIS_ADJ_LEVEL1)</a>
+<a name="ln830">		{</a>
+<a name="ln831">		  /* (7) down - area mismatch */</a>
+<a name="ln832">		  isis_adj_state_change (adj, ISIS_ADJ_DOWN, &quot;Area Mismatch&quot;);</a>
+<a name="ln833"> </a>
+<a name="ln834">		}</a>
+<a name="ln835">	      else if ((adj-&gt;adj_usage == ISIS_ADJ_LEVEL1AND2) ||</a>
+<a name="ln836">		       (adj-&gt;adj_usage == ISIS_ADJ_LEVEL2))</a>
+<a name="ln837">		{</a>
+<a name="ln838">		  /* (7) down - wrong system */</a>
+<a name="ln839">		  isis_adj_state_change (adj, ISIS_ADJ_DOWN, &quot;Wrong System&quot;);</a>
+<a name="ln840">		}</a>
+<a name="ln841">	      break;</a>
+<a name="ln842">	    case IS_LEVEL_1_AND_2:</a>
+<a name="ln843">	    case IS_LEVEL_2:</a>
+<a name="ln844">	      if (adj-&gt;adj_state != ISIS_ADJ_UP)</a>
+<a name="ln845">		{</a>
+<a name="ln846">		  /* (8) adj state up */</a>
+<a name="ln847">		  isis_adj_state_change (adj, ISIS_ADJ_UP, NULL);</a>
+<a name="ln848">		  /* (9) adj usage level 2 */</a>
+<a name="ln849">		  adj-&gt;adj_usage = ISIS_ADJ_LEVEL2;</a>
+<a name="ln850">		}</a>
+<a name="ln851">	      else if (adj-&gt;adj_usage == ISIS_ADJ_LEVEL1)</a>
+<a name="ln852">		{</a>
+<a name="ln853">		  /* (7) down - wrong system */</a>
+<a name="ln854">		  isis_adj_state_change (adj, ISIS_ADJ_DOWN, &quot;Wrong System&quot;);</a>
+<a name="ln855">		}</a>
+<a name="ln856">	      else if (adj-&gt;adj_usage == ISIS_ADJ_LEVEL1AND2)</a>
+<a name="ln857">		{</a>
+<a name="ln858">		  if (hdr-&gt;circuit_t == IS_LEVEL_2)</a>
+<a name="ln859">		    {</a>
+<a name="ln860">		      /* (7) down - wrong system */</a>
+<a name="ln861">		      isis_adj_state_change (adj, ISIS_ADJ_DOWN,</a>
+<a name="ln862">					     &quot;Wrong System&quot;);</a>
+<a name="ln863">		    }</a>
+<a name="ln864">		  else</a>
+<a name="ln865">		    {</a>
+<a name="ln866">		      /* (7) down - area mismatch */</a>
+<a name="ln867">		      isis_adj_state_change (adj, ISIS_ADJ_DOWN,</a>
+<a name="ln868">					     &quot;Area Mismatch&quot;);</a>
+<a name="ln869">		    }</a>
+<a name="ln870">		}</a>
+<a name="ln871">	      else if (adj-&gt;adj_usage == ISIS_ADJ_LEVEL2)</a>
+<a name="ln872">		{</a>
+<a name="ln873">		  ;		/* Accept */</a>
+<a name="ln874">		}</a>
+<a name="ln875">	      break;</a>
+<a name="ln876">	    }</a>
+<a name="ln877">	}</a>
+<a name="ln878">    }</a>
+<a name="ln879">  else</a>
+<a name="ln880">    {</a>
+<a name="ln881">      /* down - area mismatch */</a>
+<a name="ln882">      isis_adj_state_change (adj, ISIS_ADJ_DOWN, &quot;Area Mismatch&quot;);</a>
+<a name="ln883">    }</a>
+<a name="ln884">  /* 8.2.5.2 c) if the action was up - comparing circuit IDs */</a>
+<a name="ln885">  /* FIXME - Missing parts */</a>
+<a name="ln886"> </a>
+<a name="ln887">  /* some of my own understanding of the ISO, why the heck does</a>
+<a name="ln888">   * it not say what should I change the system_type to...</a>
+<a name="ln889">   */</a>
+<a name="ln890">  switch (adj-&gt;adj_usage)</a>
+<a name="ln891">    {</a>
+<a name="ln892">    case ISIS_ADJ_LEVEL1:</a>
+<a name="ln893">      adj-&gt;sys_type = ISIS_SYSTYPE_L1_IS;</a>
+<a name="ln894">      break;</a>
+<a name="ln895">    case ISIS_ADJ_LEVEL2:</a>
+<a name="ln896">      adj-&gt;sys_type = ISIS_SYSTYPE_L2_IS;</a>
+<a name="ln897">      break;</a>
+<a name="ln898">    case ISIS_ADJ_LEVEL1AND2:</a>
+<a name="ln899">      adj-&gt;sys_type = ISIS_SYSTYPE_L2_IS;</a>
+<a name="ln900">      break;</a>
+<a name="ln901">    case ISIS_ADJ_NONE:</a>
+<a name="ln902">      adj-&gt;sys_type = ISIS_SYSTYPE_UNKNOWN;</a>
+<a name="ln903">      break;</a>
+<a name="ln904">    }</a>
+<a name="ln905"> </a>
+<a name="ln906"> </a>
+<a name="ln907">  if (isis-&gt;debugs &amp; DEBUG_ADJ_PACKETS)</a>
+<a name="ln908">    {</a>
+<a name="ln909">      zlog_debug (&quot;ISIS-Adj (%s): Rcvd P2P IIH from (%s), cir type %s,&quot;</a>
+<a name="ln910">		  &quot; cir id %02d, length %d&quot;,</a>
+<a name="ln911">		  circuit-&gt;area-&gt;area_tag, circuit-&gt;interface-&gt;name,</a>
+<a name="ln912">		  circuit_t2string (circuit-&gt;is_type),</a>
+<a name="ln913">		  circuit-&gt;circuit_id, pdu_len);</a>
+<a name="ln914">    }</a>
+<a name="ln915"> </a>
+<a name="ln916">  free_tlvs (&amp;tlvs);</a>
+<a name="ln917"> </a>
+<a name="ln918">  return retval;</a>
+<a name="ln919">}</a>
+<a name="ln920"> </a>
+<a name="ln921">/*</a>
+<a name="ln922"> * Process IS-IS LAN Level 1/2 Hello PDU</a>
+<a name="ln923"> */</a>
+<a name="ln924">static int</a>
+<a name="ln925">process_lan_hello (int level, struct isis_circuit *circuit, const u_char *ssnpa)</a>
+<a name="ln926">{</a>
+<a name="ln927">  int retval = ISIS_OK;</a>
+<a name="ln928">  struct isis_lan_hello_hdr hdr;</a>
+<a name="ln929">  struct isis_adjacency *adj;</a>
+<a name="ln930">  u_int32_t expected = 0, found = 0, auth_tlv_offset = 0;</a>
+<a name="ln931">  struct tlvs tlvs;</a>
+<a name="ln932">  u_char *snpa;</a>
+<a name="ln933">  struct listnode *node;</a>
+<a name="ln934">  int v4_usable = 0, v6_usable = 0;</a>
+<a name="ln935"> </a>
+<a name="ln936">  if (isis-&gt;debugs &amp; DEBUG_ADJ_PACKETS)</a>
+<a name="ln937">    {</a>
+<a name="ln938">      zlog_debug (&quot;ISIS-Adj (%s): Rcvd L%d LAN IIH on %s, cirType %s, &quot;</a>
+<a name="ln939">                  &quot;cirID %u&quot;,</a>
+<a name="ln940">                  circuit-&gt;area-&gt;area_tag, level, circuit-&gt;interface-&gt;name,</a>
+<a name="ln941">                  circuit_t2string (circuit-&gt;is_type), circuit-&gt;circuit_id);</a>
+<a name="ln942">      if (isis-&gt;debugs &amp; DEBUG_PACKET_DUMP)</a>
+<a name="ln943">        zlog_dump_data (STREAM_DATA (circuit-&gt;rcv_stream),</a>
+<a name="ln944">                        stream_get_endp (circuit-&gt;rcv_stream));</a>
+<a name="ln945">    }</a>
+<a name="ln946"> </a>
+<a name="ln947">  if (circuit-&gt;circ_type != CIRCUIT_T_BROADCAST)</a>
+<a name="ln948">    {</a>
+<a name="ln949">      zlog_warn (&quot;lan hello on non broadcast circuit&quot;);</a>
+<a name="ln950">      return ISIS_WARNING;</a>
+<a name="ln951">    }</a>
+<a name="ln952"> </a>
+<a name="ln953">  if ((stream_get_endp (circuit-&gt;rcv_stream) -</a>
+<a name="ln954">       stream_get_getp (circuit-&gt;rcv_stream)) &lt; ISIS_LANHELLO_HDRLEN)</a>
+<a name="ln955">    {</a>
+<a name="ln956">      zlog_warn (&quot;Packet too short&quot;);</a>
+<a name="ln957">      return ISIS_WARNING;</a>
+<a name="ln958">    }</a>
+<a name="ln959"> </a>
+<a name="ln960">  if (circuit-&gt;ext_domain)</a>
+<a name="ln961">    {</a>
+<a name="ln962">      zlog_debug (&quot;level %d LAN Hello received over circuit with &quot;</a>
+<a name="ln963">		  &quot;externalDomain = true&quot;, level);</a>
+<a name="ln964">      return ISIS_WARNING;</a>
+<a name="ln965">    }</a>
+<a name="ln966"> </a>
+<a name="ln967">  if (!accept_level (level, circuit-&gt;is_type))</a>
+<a name="ln968">    {</a>
+<a name="ln969">      if (isis-&gt;debugs &amp; DEBUG_ADJ_PACKETS)</a>
+<a name="ln970">	{</a>
+<a name="ln971">	  zlog_debug (&quot;ISIS-Adj (%s): Interface level mismatch, %s&quot;,</a>
+<a name="ln972">		      circuit-&gt;area-&gt;area_tag, circuit-&gt;interface-&gt;name);</a>
+<a name="ln973">	}</a>
+<a name="ln974">      return ISIS_WARNING;</a>
+<a name="ln975">    }</a>
+<a name="ln976"> </a>
+<a name="ln977">#if 0</a>
+<a name="ln978">  /* Cisco's debug message compatability */</a>
+<a name="ln979">  if (!accept_level (level, circuit-&gt;area-&gt;is_type))</a>
+<a name="ln980">    {</a>
+<a name="ln981">      if (isis-&gt;debugs &amp; DEBUG_ADJ_PACKETS)</a>
+<a name="ln982">	{</a>
+<a name="ln983">	  zlog_debug (&quot;ISIS-Adj (%s): is type mismatch&quot;,</a>
+<a name="ln984">		      circuit-&gt;area-&gt;area_tag);</a>
+<a name="ln985">	}</a>
+<a name="ln986">      return ISIS_WARNING;</a>
+<a name="ln987">    }</a>
+<a name="ln988">#endif</a>
+<a name="ln989">  /*</a>
+<a name="ln990">   * Fill the header</a>
+<a name="ln991">   */</a>
+<a name="ln992">  hdr.circuit_t = stream_getc (circuit-&gt;rcv_stream);</a>
+<a name="ln993">  stream_get (hdr.source_id, circuit-&gt;rcv_stream, ISIS_SYS_ID_LEN);</a>
+<a name="ln994">  hdr.hold_time = stream_getw (circuit-&gt;rcv_stream);</a>
+<a name="ln995">  hdr.pdu_len = stream_getw (circuit-&gt;rcv_stream);</a>
+<a name="ln996">  hdr.prio = stream_getc (circuit-&gt;rcv_stream);</a>
+<a name="ln997">  stream_get (hdr.lan_id, circuit-&gt;rcv_stream, ISIS_SYS_ID_LEN + 1);</a>
+<a name="ln998"> </a>
+<a name="ln999">  if (hdr.pdu_len &lt; (ISIS_FIXED_HDR_LEN + ISIS_LANHELLO_HDRLEN) ||</a>
+<a name="ln1000">      hdr.pdu_len &gt; ISO_MTU(circuit) ||</a>
+<a name="ln1001">      hdr.pdu_len &gt; stream_get_endp (circuit-&gt;rcv_stream))</a>
+<a name="ln1002">    {</a>
+<a name="ln1003">      zlog_warn (&quot;ISIS-Adj (%s): Rcvd LAN IIH from (%s) with &quot;</a>
+<a name="ln1004">                 &quot;invalid pdu length %d&quot;,</a>
+<a name="ln1005">                 circuit-&gt;area-&gt;area_tag, circuit-&gt;interface-&gt;name,</a>
+<a name="ln1006">                 hdr.pdu_len);</a>
+<a name="ln1007">      return ISIS_WARNING;</a>
+<a name="ln1008">    }</a>
+<a name="ln1009"> </a>
+<a name="ln1010">  /*</a>
+<a name="ln1011">   * Set the stream endp to PDU length, ignoring additional padding</a>
+<a name="ln1012">   * introduced by transport chips.</a>
+<a name="ln1013">   */</a>
+<a name="ln1014">  if (hdr.pdu_len &lt; stream_get_endp (circuit-&gt;rcv_stream))</a>
+<a name="ln1015">    stream_set_endp (circuit-&gt;rcv_stream, hdr.pdu_len);</a>
+<a name="ln1016"> </a>
+<a name="ln1017">  if (hdr.circuit_t != IS_LEVEL_1 &amp;&amp;</a>
+<a name="ln1018">      hdr.circuit_t != IS_LEVEL_2 &amp;&amp;</a>
+<a name="ln1019">      hdr.circuit_t != IS_LEVEL_1_AND_2 &amp;&amp;</a>
+<a name="ln1020">      (level &amp; hdr.circuit_t) == 0)</a>
+<a name="ln1021">    {</a>
+<a name="ln1022">      zlog_err (&quot;Level %d LAN Hello with Circuit Type %d&quot;, level,</a>
+<a name="ln1023">                hdr.circuit_t);</a>
+<a name="ln1024">      return ISIS_ERROR;</a>
+<a name="ln1025">    }</a>
+<a name="ln1026"> </a>
+<a name="ln1027">  /*</a>
+<a name="ln1028">   * Then get the tlvs</a>
+<a name="ln1029">   */</a>
+<a name="ln1030">  expected |= TLVFLAG_AUTH_INFO;</a>
+<a name="ln1031">  expected |= TLVFLAG_AREA_ADDRS;</a>
+<a name="ln1032">  expected |= TLVFLAG_LAN_NEIGHS;</a>
+<a name="ln1033">  expected |= TLVFLAG_NLPID;</a>
+<a name="ln1034">  expected |= TLVFLAG_IPV4_ADDR;</a>
+<a name="ln1035">  expected |= TLVFLAG_IPV6_ADDR;</a>
+<a name="ln1036"> </a>
+<a name="ln1037">  auth_tlv_offset = stream_get_getp (circuit-&gt;rcv_stream);</a>
+<a name="ln1038">  retval = parse_tlvs (circuit-&gt;area-&gt;area_tag,</a>
+<a name="ln1039">                       STREAM_PNT (circuit-&gt;rcv_stream),</a>
+<a name="ln1040">                       hdr.pdu_len - ISIS_LANHELLO_HDRLEN - ISIS_FIXED_HDR_LEN,</a>
+<a name="ln1041">                       &amp;expected, &amp;found, &amp;tlvs,</a>
+<a name="ln1042">                       &amp;auth_tlv_offset);</a>
+<a name="ln1043"> </a>
+<a name="ln1044">  if (retval &gt; ISIS_WARNING)</a>
+<a name="ln1045">    {</a>
+<a name="ln1046">      zlog_warn (&quot;parse_tlvs() failed&quot;);</a>
+<a name="ln1047">      goto out;</a>
+<a name="ln1048">    }</a>
+<a name="ln1049"> </a>
+<a name="ln1050">  if (!(found &amp; TLVFLAG_AREA_ADDRS))</a>
+<a name="ln1051">    {</a>
+<a name="ln1052">      zlog_warn (&quot;No Area addresses TLV in Level %d LAN IS to IS hello&quot;,</a>
+<a name="ln1053">		 level);</a>
+<a name="ln1054">      retval = ISIS_WARNING;</a>
+<a name="ln1055">      goto out;</a>
+<a name="ln1056">    }</a>
+<a name="ln1057"> </a>
+<a name="ln1058">  if (!(found &amp; TLVFLAG_NLPID))</a>
+<a name="ln1059">    {</a>
+<a name="ln1060">      zlog_warn (&quot;No supported protocols TLV in Level %d LAN IS to IS hello&quot;,</a>
+<a name="ln1061">		 level);</a>
+<a name="ln1062">      retval = ISIS_WARNING;</a>
+<a name="ln1063">      goto out;</a>
+<a name="ln1064">    }</a>
+<a name="ln1065"> </a>
+<a name="ln1066">  /* Verify authentication, either cleartext of HMAC MD5 */</a>
+<a name="ln1067">  if (circuit-&gt;passwd.type)</a>
+<a name="ln1068">    {</a>
+<a name="ln1069">      if (!(found &amp; TLVFLAG_AUTH_INFO) ||</a>
+<a name="ln1070">          authentication_check (&amp;tlvs.auth_info, &amp;circuit-&gt;passwd,</a>
+<a name="ln1071">                                circuit-&gt;rcv_stream, auth_tlv_offset))</a>
+<a name="ln1072">        {</a>
+<a name="ln1073">          isis_event_auth_failure (circuit-&gt;area-&gt;area_tag,</a>
+<a name="ln1074">                                   &quot;LAN hello authentication failure&quot;,</a>
+<a name="ln1075">                                   hdr.source_id);</a>
+<a name="ln1076">          retval = ISIS_WARNING;</a>
+<a name="ln1077">          goto out;</a>
+<a name="ln1078">        }</a>
+<a name="ln1079">    }</a>
+<a name="ln1080"> </a>
+<a name="ln1081">  if (!memcmp (hdr.source_id, isis-&gt;sysid, ISIS_SYS_ID_LEN))</a>
+<a name="ln1082">    {</a>
+<a name="ln1083">      zlog_warn (&quot;ISIS-Adj (%s): duplicate system ID on interface %s&quot;,</a>
+<a name="ln1084">		 circuit-&gt;area-&gt;area_tag, circuit-&gt;interface-&gt;name);</a>
+<a name="ln1085">      return ISIS_WARNING;</a>
+<a name="ln1086">    }</a>
+<a name="ln1087"> </a>
+<a name="ln1088">  /*</a>
+<a name="ln1089">   * Accept the level 1 adjacency only if a match between local and</a>
+<a name="ln1090">   * remote area addresses is found</a>
+<a name="ln1091">   */</a>
+<a name="ln1092">  if (listcount (circuit-&gt;area-&gt;area_addrs) == 0 ||</a>
+<a name="ln1093">      (level == IS_LEVEL_1 &amp;&amp;</a>
+<a name="ln1094">       area_match (circuit-&gt;area-&gt;area_addrs, tlvs.area_addrs) == 0))</a>
+<a name="ln1095">    {</a>
+<a name="ln1096">      if (isis-&gt;debugs &amp; DEBUG_ADJ_PACKETS)</a>
+<a name="ln1097">	{</a>
+<a name="ln1098">	  zlog_debug (&quot;ISIS-Adj (%s): Area mismatch, level %d IIH on %s&quot;,</a>
+<a name="ln1099">		      circuit-&gt;area-&gt;area_tag, level,</a>
+<a name="ln1100">		      circuit-&gt;interface-&gt;name);</a>
+<a name="ln1101">	}</a>
+<a name="ln1102">      retval = ISIS_OK;</a>
+<a name="ln1103">      goto out;</a>
+<a name="ln1104">    }</a>
+<a name="ln1105"> </a>
+<a name="ln1106">  /* </a>
+<a name="ln1107">   * it's own IIH PDU - discard silently </a>
+<a name="ln1108">   */</a>
+<a name="ln1109">  if (!memcmp (circuit-&gt;u.bc.snpa, ssnpa, ETH_ALEN))</a>
+<a name="ln1110">    {</a>
+<a name="ln1111">      zlog_debug (&quot;ISIS-Adj (%s): it's own IIH PDU - discarded&quot;,</a>
+<a name="ln1112">		  circuit-&gt;area-&gt;area_tag);</a>
+<a name="ln1113"> </a>
+<a name="ln1114">      retval = ISIS_OK;</a>
+<a name="ln1115">      goto out;</a>
+<a name="ln1116">    }</a>
+<a name="ln1117"> </a>
+<a name="ln1118">  /*</a>
+<a name="ln1119">   * check if it's own interface ip match iih ip addrs</a>
+<a name="ln1120">   */</a>
+<a name="ln1121">  if (found &amp; TLVFLAG_IPV4_ADDR)</a>
+<a name="ln1122">    {</a>
+<a name="ln1123">      if (ip_match (circuit-&gt;ip_addrs, tlvs.ipv4_addrs))</a>
+<a name="ln1124">	v4_usable = 1;</a>
+<a name="ln1125">      else</a>
+<a name="ln1126">	zlog_warn (&quot;ISIS-Adj: IPv4 addresses present but no overlap &quot;</a>
+<a name="ln1127">		   &quot;in LAN IIH from %s\n&quot;, circuit-&gt;interface-&gt;name);</a>
+<a name="ln1128">    }</a>
+<a name="ln1129">#ifndef HAVE_IPV6</a>
+<a name="ln1130">  else /* !(found &amp; TLVFLAG_IPV4_ADDR) */</a>
+<a name="ln1131">    zlog_warn (&quot;ISIS-Adj: no IPv4 in LAN IIH from %s &quot;</a>
+<a name="ln1132">	       &quot;(this isisd has no IPv6)\n&quot;, circuit-&gt;interface-&gt;name);</a>
+<a name="ln1133"> </a>
+<a name="ln1134">#else</a>
+<a name="ln1135">  if (found &amp; TLVFLAG_IPV6_ADDR)</a>
+<a name="ln1136">    {</a>
+<a name="ln1137">      /* TBA: check that we have a linklocal ourselves? */</a>
+<a name="ln1138">      struct listnode *node;</a>
+<a name="ln1139">      struct in6_addr *ip;</a>
+<a name="ln1140">      for (ALL_LIST_ELEMENTS_RO (tlvs.ipv6_addrs, node, ip))</a>
+<a name="ln1141">	if (IN6_IS_ADDR_LINKLOCAL (ip))</a>
+<a name="ln1142">	  {</a>
+<a name="ln1143">	    v6_usable = 1;</a>
+<a name="ln1144">	    break;</a>
+<a name="ln1145">	  }</a>
+<a name="ln1146"> </a>
+<a name="ln1147">      if (!v6_usable)</a>
+<a name="ln1148">	zlog_warn (&quot;ISIS-Adj: IPv6 addresses present but no link-local &quot;</a>
+<a name="ln1149">		   &quot;in LAN IIH from %s\n&quot;, circuit-&gt;interface-&gt;name);</a>
+<a name="ln1150">    }</a>
+<a name="ln1151"> </a>
+<a name="ln1152">  if (!(found &amp; (TLVFLAG_IPV4_ADDR | TLVFLAG_IPV6_ADDR)))</a>
+<a name="ln1153">    zlog_warn (&quot;ISIS-Adj: neither IPv4 nor IPv6 addr in LAN IIH from %s\n&quot;,</a>
+<a name="ln1154">	       circuit-&gt;interface-&gt;name);</a>
+<a name="ln1155">#endif</a>
+<a name="ln1156"> </a>
+<a name="ln1157">  if (!v6_usable &amp;&amp; !v4_usable)</a>
+<a name="ln1158">    {</a>
+<a name="ln1159">      free_tlvs (&amp;tlvs);</a>
+<a name="ln1160">      return ISIS_WARNING;</a>
+<a name="ln1161">    }</a>
+<a name="ln1162"> </a>
+<a name="ln1163"> </a>
+<a name="ln1164">  adj = isis_adj_lookup (hdr.source_id, circuit-&gt;u.bc.adjdb[level - 1]);</a>
+<a name="ln1165">  if ((adj == NULL) || (memcmp(adj-&gt;snpa, ssnpa, ETH_ALEN)) ||</a>
+<a name="ln1166">      (adj-&gt;level != level))</a>
+<a name="ln1167">    {</a>
+<a name="ln1168">      if (!adj)</a>
+<a name="ln1169">        {</a>
+<a name="ln1170">          /*</a>
+<a name="ln1171">           * Do as in 8.4.2.5</a>
+<a name="ln1172">           */</a>
+<a name="ln1173">          adj = isis_new_adj (hdr.source_id, ssnpa, level, circuit);</a>
+<a name="ln1174">          if (adj == NULL)</a>
+<a name="ln1175">            {</a>
+<a name="ln1176">              retval = ISIS_ERROR;</a>
+<a name="ln1177">              goto out;</a>
+<a name="ln1178">            }</a>
+<a name="ln1179">        }</a>
+<a name="ln1180">      else</a>
+<a name="ln1181">        {</a>
+<a name="ln1182">          if (ssnpa) {</a>
+<a name="ln1183">            memcpy (adj-&gt;snpa, ssnpa, 6);</a>
+<a name="ln1184">          } else {</a>
+<a name="ln1185">            memset (adj-&gt;snpa, ' ', 6);</a>
+<a name="ln1186">          }</a>
+<a name="ln1187">          adj-&gt;level = level;</a>
+<a name="ln1188">        }</a>
+<a name="ln1189">      isis_adj_state_change (adj, ISIS_ADJ_INITIALIZING, NULL);</a>
+<a name="ln1190"> </a>
+<a name="ln1191">      if (level == IS_LEVEL_1)</a>
+<a name="ln1192">          adj-&gt;sys_type = ISIS_SYSTYPE_L1_IS;</a>
+<a name="ln1193">      else</a>
+<a name="ln1194">          adj-&gt;sys_type = ISIS_SYSTYPE_L2_IS;</a>
+<a name="ln1195">      list_delete_all_node (circuit-&gt;u.bc.lan_neighs[level - 1]);</a>
+<a name="ln1196">      isis_adj_build_neigh_list (circuit-&gt;u.bc.adjdb[level - 1],</a>
+<a name="ln1197">                                 circuit-&gt;u.bc.lan_neighs[level - 1]);</a>
+<a name="ln1198">    }</a>
+<a name="ln1199"> </a>
+<a name="ln1200">  if(adj-&gt;dis_record[level-1].dis==ISIS_IS_DIS)</a>
+<a name="ln1201">    switch (level)</a>
+<a name="ln1202">      {</a>
+<a name="ln1203">      case 1:</a>
+<a name="ln1204">	if (memcmp (circuit-&gt;u.bc.l1_desig_is, hdr.lan_id, ISIS_SYS_ID_LEN + 1))</a>
+<a name="ln1205">	  {</a>
+<a name="ln1206">            thread_add_event (master, isis_event_dis_status_change, circuit, 0);</a>
+<a name="ln1207">	    memcpy (&amp;circuit-&gt;u.bc.l1_desig_is, hdr.lan_id,</a>
+<a name="ln1208">		    ISIS_SYS_ID_LEN + 1);</a>
+<a name="ln1209">	  }</a>
+<a name="ln1210">	break;</a>
+<a name="ln1211">      case 2:</a>
+<a name="ln1212">	if (memcmp (circuit-&gt;u.bc.l2_desig_is, hdr.lan_id, ISIS_SYS_ID_LEN + 1))</a>
+<a name="ln1213">	  {</a>
+<a name="ln1214">            thread_add_event (master, isis_event_dis_status_change, circuit, 0);</a>
+<a name="ln1215">	    memcpy (&amp;circuit-&gt;u.bc.l2_desig_is, hdr.lan_id,</a>
+<a name="ln1216">		    ISIS_SYS_ID_LEN + 1);</a>
+<a name="ln1217">	  }</a>
+<a name="ln1218">	break;</a>
+<a name="ln1219">      }</a>
+<a name="ln1220"> </a>
+<a name="ln1221">  adj-&gt;hold_time = hdr.hold_time;</a>
+<a name="ln1222">  adj-&gt;last_upd = time (NULL);</a>
+<a name="ln1223">  adj-&gt;prio[level - 1] = hdr.prio;</a>
+<a name="ln1224"> </a>
+<a name="ln1225">  memcpy (adj-&gt;lanid, hdr.lan_id, ISIS_SYS_ID_LEN + 1);</a>
+<a name="ln1226"> </a>
+<a name="ln1227">  tlvs_to_adj_area_addrs (&amp;tlvs, adj);</a>
+<a name="ln1228"> </a>
+<a name="ln1229">  /* which protocol are spoken ??? */</a>
+<a name="ln1230">  if (tlvs_to_adj_nlpids (&amp;tlvs, adj))</a>
+<a name="ln1231">    {</a>
+<a name="ln1232">      retval = ISIS_WARNING;</a>
+<a name="ln1233">      goto out;</a>
+<a name="ln1234">    }</a>
+<a name="ln1235"> </a>
+<a name="ln1236">  /* we need to copy addresses to the adj */</a>
+<a name="ln1237">  if (found &amp; TLVFLAG_IPV4_ADDR)</a>
+<a name="ln1238">    tlvs_to_adj_ipv4_addrs (&amp;tlvs, adj);</a>
+<a name="ln1239"> </a>
+<a name="ln1240">#ifdef HAVE_IPV6</a>
+<a name="ln1241">  if (found &amp; TLVFLAG_IPV6_ADDR)</a>
+<a name="ln1242">    tlvs_to_adj_ipv6_addrs (&amp;tlvs, adj);</a>
+<a name="ln1243">#endif /* HAVE_IPV6 */</a>
+<a name="ln1244"> </a>
+<a name="ln1245">  adj-&gt;circuit_t = hdr.circuit_t;</a>
+<a name="ln1246"> </a>
+<a name="ln1247">  /* lets take care of the expiry */</a>
+<a name="ln1248">  THREAD_TIMER_OFF (adj-&gt;t_expire);</a>
+<a name="ln1249">  THREAD_TIMER_ON (master, adj-&gt;t_expire, isis_adj_expire, adj,</a>
+<a name="ln1250">                   (long) adj-&gt;hold_time);</a>
+<a name="ln1251"> </a>
+<a name="ln1252">  /*</a>
+<a name="ln1253">   * If the snpa for this circuit is found from LAN Neighbours TLV</a>
+<a name="ln1254">   * we have two-way communication -&gt; adjacency can be put to state &quot;up&quot;</a>
+<a name="ln1255">   */</a>
+<a name="ln1256"> </a>
+<a name="ln1257">  if (found &amp; TLVFLAG_LAN_NEIGHS)</a>
+<a name="ln1258">  {</a>
+<a name="ln1259">    if (adj-&gt;adj_state != ISIS_ADJ_UP)</a>
+<a name="ln1260">    {</a>
+<a name="ln1261">      for (ALL_LIST_ELEMENTS_RO (tlvs.lan_neighs, node, snpa))</a>
+<a name="ln1262">      {</a>
+<a name="ln1263">        if (!memcmp (snpa, circuit-&gt;u.bc.snpa, ETH_ALEN))</a>
+<a name="ln1264">        {</a>
+<a name="ln1265">          isis_adj_state_change (adj, ISIS_ADJ_UP,</a>
+<a name="ln1266">                                 &quot;own SNPA found in LAN Neighbours TLV&quot;);</a>
+<a name="ln1267">        }</a>
+<a name="ln1268">      }</a>
+<a name="ln1269">    }</a>
+<a name="ln1270">    else</a>
+<a name="ln1271">    {</a>
+<a name="ln1272">      int found = 0;</a>
+<a name="ln1273">      for (ALL_LIST_ELEMENTS_RO (tlvs.lan_neighs, node, snpa))</a>
+<a name="ln1274">        if (!memcmp (snpa, circuit-&gt;u.bc.snpa, ETH_ALEN))</a>
+<a name="ln1275">        {</a>
+<a name="ln1276">          found = 1;</a>
+<a name="ln1277">          break;</a>
+<a name="ln1278">        }</a>
+<a name="ln1279">      if (found == 0)</a>
+<a name="ln1280">        isis_adj_state_change (adj, ISIS_ADJ_INITIALIZING,</a>
+<a name="ln1281">                               &quot;own SNPA not found in LAN Neighbours TLV&quot;);</a>
+<a name="ln1282">    }</a>
+<a name="ln1283">  }</a>
+<a name="ln1284">  else if (adj-&gt;adj_state == ISIS_ADJ_UP)</a>
+<a name="ln1285">  {</a>
+<a name="ln1286">    isis_adj_state_change (adj, ISIS_ADJ_INITIALIZING,</a>
+<a name="ln1287">                           &quot;no LAN Neighbours TLV found&quot;);</a>
+<a name="ln1288">  }</a>
+<a name="ln1289"> </a>
+<a name="ln1290">out:</a>
+<a name="ln1291">  if (isis-&gt;debugs &amp; DEBUG_ADJ_PACKETS)</a>
+<a name="ln1292">    {</a>
+<a name="ln1293">      zlog_debug (&quot;ISIS-Adj (%s): Rcvd L%d LAN IIH from %s on %s, cirType %s, &quot;</a>
+<a name="ln1294">		  &quot;cirID %u, length %zd&quot;,</a>
+<a name="ln1295">		  circuit-&gt;area-&gt;area_tag,</a>
+<a name="ln1296">		  level, snpa_print (ssnpa), circuit-&gt;interface-&gt;name,</a>
+<a name="ln1297">		  circuit_t2string (circuit-&gt;is_type),</a>
+<a name="ln1298">		  circuit-&gt;circuit_id,</a>
+<a name="ln1299">		  stream_get_endp (circuit-&gt;rcv_stream));</a>
+<a name="ln1300">    }</a>
+<a name="ln1301"> </a>
+<a name="ln1302">  free_tlvs (&amp;tlvs);</a>
+<a name="ln1303"> </a>
+<a name="ln1304">  return retval;</a>
+<a name="ln1305">}</a>
+<a name="ln1306"> </a>
+<a name="ln1307">/*</a>
+<a name="ln1308"> * Process Level 1/2 Link State</a>
+<a name="ln1309"> * ISO - 10589</a>
+<a name="ln1310"> * Section 7.3.15.1 - Action on receipt of a link state PDU</a>
+<a name="ln1311"> */</a>
+<a name="ln1312">static int</a>
+<a name="ln1313">process_lsp (int level, struct isis_circuit *circuit, const u_char *ssnpa)</a>
+<a name="ln1314">{</a>
+<a name="ln1315">  struct isis_link_state_hdr *hdr;</a>
+<a name="ln1316">  struct isis_adjacency *adj = NULL;</a>
+<a name="ln1317">  struct isis_lsp *lsp, *lsp0 = NULL;</a>
+<a name="ln1318">  int retval = ISIS_OK, comp = 0;</a>
+<a name="ln1319">  u_char lspid[ISIS_SYS_ID_LEN + 2];</a>
+<a name="ln1320">  struct isis_passwd *passwd;</a>
+<a name="ln1321">  uint16_t pdu_len;</a>
+<a name="ln1322">  int lsp_confusion;</a>
+<a name="ln1323"> </a>
+<a name="ln1324">  if (isis-&gt;debugs &amp; DEBUG_UPDATE_PACKETS)</a>
+<a name="ln1325">    {</a>
+<a name="ln1326">      zlog_debug (&quot;ISIS-Upd (%s): Rcvd L%d LSP on %s, cirType %s, cirID %u&quot;,</a>
+<a name="ln1327">                  circuit-&gt;area-&gt;area_tag, level, circuit-&gt;interface-&gt;name,</a>
+<a name="ln1328">                  circuit_t2string (circuit-&gt;is_type), circuit-&gt;circuit_id);</a>
+<a name="ln1329">      if (isis-&gt;debugs &amp; DEBUG_PACKET_DUMP)</a>
+<a name="ln1330">        zlog_dump_data (STREAM_DATA (circuit-&gt;rcv_stream),</a>
+<a name="ln1331">                        stream_get_endp (circuit-&gt;rcv_stream));</a>
+<a name="ln1332">    }</a>
+<a name="ln1333"> </a>
+<a name="ln1334">  if ((stream_get_endp (circuit-&gt;rcv_stream) -</a>
+<a name="ln1335">       stream_get_getp (circuit-&gt;rcv_stream)) &lt; ISIS_LSP_HDR_LEN)</a>
+<a name="ln1336">    {</a>
+<a name="ln1337">      zlog_warn (&quot;Packet too short&quot;);</a>
+<a name="ln1338">      return ISIS_WARNING;</a>
+<a name="ln1339">    }</a>
+<a name="ln1340"> </a>
+<a name="ln1341">  /* Reference the header   */</a>
+<a name="ln1342">  hdr = (struct isis_link_state_hdr *) STREAM_PNT (circuit-&gt;rcv_stream);</a>
+<a name="ln1343">  pdu_len = ntohs (hdr-&gt;pdu_len);</a>
+<a name="ln1344"> </a>
+<a name="ln1345">  /* lsp length check */</a>
+<a name="ln1346">  if (pdu_len &lt; (ISIS_FIXED_HDR_LEN + ISIS_LSP_HDR_LEN) ||</a>
+<a name="ln1347">      pdu_len &gt; ISO_MTU(circuit) ||</a>
+<a name="ln1348">      pdu_len &gt; stream_get_endp (circuit-&gt;rcv_stream))</a>
+<a name="ln1349">    {</a>
+<a name="ln1350">      zlog_debug (&quot;ISIS-Upd (%s): LSP %s invalid LSP length %d&quot;,</a>
+<a name="ln1351">		  circuit-&gt;area-&gt;area_tag,</a>
+<a name="ln1352">		  rawlspid_print (hdr-&gt;lsp_id), pdu_len);</a>
+<a name="ln1353"> </a>
+<a name="ln1354">      return ISIS_WARNING;</a>
+<a name="ln1355">    }</a>
+<a name="ln1356"> </a>
+<a name="ln1357">  /*</a>
+<a name="ln1358">   * Set the stream endp to PDU length, ignoring additional padding</a>
+<a name="ln1359">   * introduced by transport chips.</a>
+<a name="ln1360">   */</a>
+<a name="ln1361">  if (pdu_len &lt; stream_get_endp (circuit-&gt;rcv_stream))</a>
+<a name="ln1362">    stream_set_endp (circuit-&gt;rcv_stream, pdu_len);</a>
+<a name="ln1363"> </a>
+<a name="ln1364">  if (isis-&gt;debugs &amp; DEBUG_UPDATE_PACKETS)</a>
+<a name="ln1365">    {</a>
+<a name="ln1366">      zlog_debug (&quot;ISIS-Upd (%s): Rcvd L%d LSP %s, seq 0x%08x, cksum 0x%04x, &quot;</a>
+<a name="ln1367">		  &quot;lifetime %us, len %u, on %s&quot;,</a>
+<a name="ln1368">		  circuit-&gt;area-&gt;area_tag,</a>
+<a name="ln1369">		  level,</a>
+<a name="ln1370">		  rawlspid_print (hdr-&gt;lsp_id),</a>
+<a name="ln1371">		  ntohl (hdr-&gt;seq_num),</a>
+<a name="ln1372">		  ntohs (hdr-&gt;checksum),</a>
+<a name="ln1373">		  ntohs (hdr-&gt;rem_lifetime),</a>
+<a name="ln1374">		  pdu_len,</a>
+<a name="ln1375">		  circuit-&gt;interface-&gt;name);</a>
+<a name="ln1376">    }</a>
+<a name="ln1377"> </a>
+<a name="ln1378">  /* lsp is_type check */</a>
+<a name="ln1379">  if ((hdr-&gt;lsp_bits &amp; IS_LEVEL_1_AND_2) != IS_LEVEL_1 &amp;&amp;</a>
+<a name="ln1380">      (hdr-&gt;lsp_bits &amp; IS_LEVEL_1_AND_2) != IS_LEVEL_1_AND_2)</a>
+<a name="ln1381">    {</a>
+<a name="ln1382">      zlog_debug (&quot;ISIS-Upd (%s): LSP %s invalid LSP is type %x&quot;,</a>
+<a name="ln1383">		  circuit-&gt;area-&gt;area_tag,</a>
+<a name="ln1384">		  rawlspid_print (hdr-&gt;lsp_id), hdr-&gt;lsp_bits);</a>
+<a name="ln1385">      /* continue as per RFC1122 Be liberal in what you accept, and</a>
+<a name="ln1386">       * conservative in what you send */</a>
+<a name="ln1387">    }</a>
+<a name="ln1388"> </a>
+<a name="ln1389">  /* Checksum sanity check - FIXME: move to correct place */</a>
+<a name="ln1390">  /* 12 = sysid+pdu+remtime */</a>
+<a name="ln1391">  if (iso_csum_verify (STREAM_PNT (circuit-&gt;rcv_stream) + 4,</a>
+<a name="ln1392">		       pdu_len - 12, &amp;hdr-&gt;checksum))</a>
+<a name="ln1393">    {</a>
+<a name="ln1394">      zlog_debug (&quot;ISIS-Upd (%s): LSP %s invalid LSP checksum 0x%04x&quot;,</a>
+<a name="ln1395">		  circuit-&gt;area-&gt;area_tag,</a>
+<a name="ln1396">		  rawlspid_print (hdr-&gt;lsp_id), ntohs (hdr-&gt;checksum));</a>
+<a name="ln1397"> </a>
+<a name="ln1398">      return ISIS_WARNING;</a>
+<a name="ln1399">    }</a>
+<a name="ln1400"> </a>
+<a name="ln1401">  /* 7.3.15.1 a) 1 - external domain circuit will discard lsps */</a>
+<a name="ln1402">  if (circuit-&gt;ext_domain)</a>
+<a name="ln1403">    {</a>
+<a name="ln1404">      zlog_debug</a>
+<a name="ln1405">	(&quot;ISIS-Upd (%s): LSP %s received at level %d over circuit with &quot;</a>
+<a name="ln1406">	 &quot;externalDomain = true&quot;, circuit-&gt;area-&gt;area_tag,</a>
+<a name="ln1407">	 rawlspid_print (hdr-&gt;lsp_id), level);</a>
+<a name="ln1408"> </a>
+<a name="ln1409">      return ISIS_WARNING;</a>
+<a name="ln1410">    }</a>
+<a name="ln1411"> </a>
+<a name="ln1412">  /* 7.3.15.1 a) 2,3 - manualL2OnlyMode not implemented */</a>
+<a name="ln1413">  if (!accept_level (level, circuit-&gt;is_type))</a>
+<a name="ln1414">    {</a>
+<a name="ln1415">      zlog_debug (&quot;ISIS-Upd (%s): LSP %s received at level %d over circuit of&quot;</a>
+<a name="ln1416">		  &quot; type %s&quot;,</a>
+<a name="ln1417">		  circuit-&gt;area-&gt;area_tag,</a>
+<a name="ln1418">		  rawlspid_print (hdr-&gt;lsp_id),</a>
+<a name="ln1419">		  level, circuit_t2string (circuit-&gt;is_type));</a>
+<a name="ln1420"> </a>
+<a name="ln1421">      return ISIS_WARNING;</a>
+<a name="ln1422">    }</a>
+<a name="ln1423"> </a>
+<a name="ln1424">  /* 7.3.15.1 a) 4 - need to make sure IDLength matches */</a>
+<a name="ln1425"> </a>
+<a name="ln1426">  /* 7.3.15.1 a) 5 - maximum area match, can be ommited since we only use 3 */</a>
+<a name="ln1427"> </a>
+<a name="ln1428">  /* 7.3.15.1 a) 7 - password check */</a>
+<a name="ln1429">  (level == IS_LEVEL_1) ? (passwd = &amp;circuit-&gt;area-&gt;area_passwd) :</a>
+<a name="ln1430">                          (passwd = &amp;circuit-&gt;area-&gt;domain_passwd);</a>
+<a name="ln1431">  if (passwd-&gt;type)</a>
+<a name="ln1432">    {</a>
+<a name="ln1433">      if (lsp_authentication_check (circuit-&gt;rcv_stream, circuit-&gt;area,</a>
+<a name="ln1434">                                    level, passwd))</a>
+<a name="ln1435">	{</a>
+<a name="ln1436">	  isis_event_auth_failure (circuit-&gt;area-&gt;area_tag,</a>
+<a name="ln1437">				   &quot;LSP authentication failure&quot;, hdr-&gt;lsp_id);</a>
+<a name="ln1438">	  return ISIS_WARNING;</a>
+<a name="ln1439">	}</a>
+<a name="ln1440">    }</a>
+<a name="ln1441">  /* Find the LSP in our database and compare it to this Link State header */</a>
+<a name="ln1442">  lsp = lsp_search (hdr-&gt;lsp_id, circuit-&gt;area-&gt;lspdb[level - 1]);</a>
+<a name="ln1443">  if (lsp)</a>
+<a name="ln1444">    comp = lsp_compare (circuit-&gt;area-&gt;area_tag, lsp, hdr-&gt;seq_num,</a>
+<a name="ln1445">			hdr-&gt;checksum, hdr-&gt;rem_lifetime);</a>
+<a name="ln1446">  if (lsp &amp;&amp; (lsp-&gt;own_lsp</a>
+<a name="ln1447">#ifdef TOPOLOGY_GENERATE</a>
+<a name="ln1448">	      || lsp-&gt;from_topology</a>
+<a name="ln1449">#endif /* TOPOLOGY_GENERATE */</a>
+<a name="ln1450">      ))</a>
+<a name="ln1451">    goto dontcheckadj;</a>
+<a name="ln1452"> </a>
+<a name="ln1453">  /* 7.3.15.1 a) 6 - Must check that we have an adjacency of the same level  */</a>
+<a name="ln1454">  /* for broadcast circuits, snpa should be compared */</a>
+<a name="ln1455"> </a>
+<a name="ln1456">  if (circuit-&gt;circ_type == CIRCUIT_T_BROADCAST)</a>
+<a name="ln1457">    {</a>
+<a name="ln1458">      adj = isis_adj_lookup_snpa (ssnpa, circuit-&gt;u.bc.adjdb[level - 1]);</a>
+<a name="ln1459">      if (!adj)</a>
+<a name="ln1460">	{</a>
+<a name="ln1461">	  zlog_debug (&quot;(%s): DS ======= LSP %s, seq 0x%08x, cksum 0x%04x, &quot;</a>
+<a name="ln1462">		      &quot;lifetime %us on %s&quot;,</a>
+<a name="ln1463">		      circuit-&gt;area-&gt;area_tag,</a>
+<a name="ln1464">		      rawlspid_print (hdr-&gt;lsp_id),</a>
+<a name="ln1465">		      ntohl (hdr-&gt;seq_num),</a>
+<a name="ln1466">		      ntohs (hdr-&gt;checksum),</a>
+<a name="ln1467">		      ntohs (hdr-&gt;rem_lifetime), circuit-&gt;interface-&gt;name);</a>
+<a name="ln1468">	  return ISIS_WARNING;	/* Silently discard */</a>
+<a name="ln1469">	}</a>
+<a name="ln1470">    }</a>
+<a name="ln1471">  /* for non broadcast, we just need to find same level adj */</a>
+<a name="ln1472">  else</a>
+<a name="ln1473">    {</a>
+<a name="ln1474">      /* If no adj, or no sharing of level */</a>
+<a name="ln1475">      if (!circuit-&gt;u.p2p.neighbor)</a>
+<a name="ln1476">	{</a>
+<a name="ln1477">	  return ISIS_OK;	/* Silently discard */</a>
+<a name="ln1478">	}</a>
+<a name="ln1479">      else</a>
+<a name="ln1480">	{</a>
+<a name="ln1481">	  if (((level == IS_LEVEL_1) &amp;&amp;</a>
+<a name="ln1482">	       (circuit-&gt;u.p2p.neighbor-&gt;adj_usage == ISIS_ADJ_LEVEL2)) ||</a>
+<a name="ln1483">	      ((level == IS_LEVEL_2) &amp;&amp;</a>
+<a name="ln1484">	       (circuit-&gt;u.p2p.neighbor-&gt;adj_usage == ISIS_ADJ_LEVEL1)))</a>
+<a name="ln1485">	    return ISIS_WARNING;	/* Silently discard */</a>
+<a name="ln1486">	  adj = circuit-&gt;u.p2p.neighbor;</a>
+<a name="ln1487">	}</a>
+<a name="ln1488">    }</a>
+<a name="ln1489"> </a>
+<a name="ln1490">dontcheckadj:</a>
+<a name="ln1491">  /* 7.3.15.1 a) 7 - Passwords for level 1 - not implemented  */</a>
+<a name="ln1492"> </a>
+<a name="ln1493">  /* 7.3.15.1 a) 8 - Passwords for level 2 - not implemented  */</a>
+<a name="ln1494"> </a>
+<a name="ln1495">  /* 7.3.15.1 a) 9 - OriginatingLSPBufferSize - not implemented  FIXME: do it */</a>
+<a name="ln1496"> </a>
+<a name="ln1497">  /* 7.3.16.2 - If this is an LSP from another IS with identical seq_num but</a>
+<a name="ln1498">   *            wrong checksum, initiate a purge. */</a>
+<a name="ln1499">  if (lsp</a>
+<a name="ln1500">      &amp;&amp; (lsp-&gt;lsp_header-&gt;seq_num == hdr-&gt;seq_num)</a>
+<a name="ln1501">      &amp;&amp; (lsp-&gt;lsp_header-&gt;checksum != hdr-&gt;checksum))</a>
+<a name="ln1502">    {</a>
+<a name="ln1503">      zlog_warn(&quot;ISIS-Upd (%s): LSP %s seq 0x%08x with confused checksum received.&quot;,</a>
+<a name="ln1504">                circuit-&gt;area-&gt;area_tag, rawlspid_print(hdr-&gt;lsp_id),</a>
+<a name="ln1505">                ntohl(hdr-&gt;seq_num));</a>
+<a name="ln1506">      hdr-&gt;rem_lifetime = 0;</a>
+<a name="ln1507">      lsp_confusion = 1;</a>
+<a name="ln1508">    }</a>
+<a name="ln1509">  else</a>
+<a name="ln1510">    lsp_confusion = 0;</a>
+<a name="ln1511"> </a>
+<a name="ln1512">  /* 7.3.15.1 b) - If the remaining life time is 0, we perform 7.3.16.4 */</a>
+<a name="ln1513">  if (hdr-&gt;rem_lifetime == 0)</a>
+<a name="ln1514">    {</a>
+<a name="ln1515">      if (!lsp)</a>
+<a name="ln1516">	{</a>
+<a name="ln1517">	  /* 7.3.16.4 a) 1) No LSP in db -&gt; send an ack, but don't save */</a>
+<a name="ln1518">	  /* only needed on explicit update, eg - p2p */</a>
+<a name="ln1519">	  if (circuit-&gt;circ_type == CIRCUIT_T_P2P)</a>
+<a name="ln1520">	    ack_lsp (hdr, circuit, level);</a>
+<a name="ln1521">	  return retval;	/* FIXME: do we need a purge? */</a>
+<a name="ln1522">	}</a>
+<a name="ln1523">      else</a>
+<a name="ln1524">	{</a>
+<a name="ln1525">	  if (memcmp (hdr-&gt;lsp_id, isis-&gt;sysid, ISIS_SYS_ID_LEN))</a>
+<a name="ln1526">	    {</a>
+<a name="ln1527">	      /* LSP by some other system -&gt; do 7.3.16.4 b) */</a>
+<a name="ln1528">	      /* 7.3.16.4 b) 1)  */</a>
+<a name="ln1529">	      if (comp == LSP_NEWER)</a>
+<a name="ln1530">		{</a>
+<a name="ln1531">                  lsp_update (lsp, circuit-&gt;rcv_stream, circuit-&gt;area, level);</a>
+<a name="ln1532">		  /* ii */</a>
+<a name="ln1533">                  lsp_set_all_srmflags (lsp);</a>
+<a name="ln1534">		  /* v */</a>
+<a name="ln1535">		  ISIS_FLAGS_CLEAR_ALL (lsp-&gt;SSNflags);	/* FIXME: OTHER than c */</a>
+<a name="ln1536"> </a>
+<a name="ln1537">		  /* For the case of lsp confusion, flood the purge back to its</a>
+<a name="ln1538">		   * originator so that it can react. Otherwise, don't reflood</a>
+<a name="ln1539">		   * through incoming circuit as usual */</a>
+<a name="ln1540">		  if (!lsp_confusion)</a>
+<a name="ln1541">		    {</a>
+<a name="ln1542">		      /* iii */</a>
+<a name="ln1543">		      ISIS_CLEAR_FLAG (lsp-&gt;SRMflags, circuit);</a>
+<a name="ln1544">		      /* iv */</a>
+<a name="ln1545">		      if (circuit-&gt;circ_type != CIRCUIT_T_BROADCAST)</a>
+<a name="ln1546">		        ISIS_SET_FLAG (lsp-&gt;SSNflags, circuit);</a>
+<a name="ln1547">		    }</a>
+<a name="ln1548">		}		/* 7.3.16.4 b) 2) */</a>
+<a name="ln1549">	      else if (comp == LSP_EQUAL)</a>
+<a name="ln1550">		{</a>
+<a name="ln1551">		  /* i */</a>
+<a name="ln1552">		  ISIS_CLEAR_FLAG (lsp-&gt;SRMflags, circuit);</a>
+<a name="ln1553">		  /* ii */</a>
+<a name="ln1554">		  if (circuit-&gt;circ_type != CIRCUIT_T_BROADCAST)</a>
+<a name="ln1555">		    ISIS_SET_FLAG (lsp-&gt;SSNflags, circuit);</a>
+<a name="ln1556">		}		/* 7.3.16.4 b) 3) */</a>
+<a name="ln1557">	      else</a>
+<a name="ln1558">		{</a>
+<a name="ln1559">		  ISIS_SET_FLAG (lsp-&gt;SRMflags, circuit);</a>
+<a name="ln1560">		  ISIS_CLEAR_FLAG (lsp-&gt;SSNflags, circuit);</a>
+<a name="ln1561">		}</a>
+<a name="ln1562">	    }</a>
+<a name="ln1563">          else if (lsp-&gt;lsp_header-&gt;rem_lifetime != 0)</a>
+<a name="ln1564">            {</a>
+<a name="ln1565">              /* our own LSP -&gt; 7.3.16.4 c) */</a>
+<a name="ln1566">              if (comp == LSP_NEWER)</a>
+<a name="ln1567">                {</a>
+<a name="ln1568">                  lsp_inc_seqnum (lsp, ntohl (hdr-&gt;seq_num));</a>
+<a name="ln1569">                  lsp_set_all_srmflags (lsp);</a>
+<a name="ln1570">                }</a>
+<a name="ln1571">              else</a>
+<a name="ln1572">                {</a>
+<a name="ln1573">                  ISIS_SET_FLAG (lsp-&gt;SRMflags, circuit);</a>
+<a name="ln1574">                  ISIS_CLEAR_FLAG (lsp-&gt;SSNflags, circuit);</a>
+<a name="ln1575">                }</a>
+<a name="ln1576">              if (isis-&gt;debugs &amp; DEBUG_UPDATE_PACKETS)</a>
+<a name="ln1577">                zlog_debug (&quot;ISIS-Upd (%s): (1) re-originating LSP %s new &quot;</a>
+<a name="ln1578">                            &quot;seq 0x%08x&quot;, circuit-&gt;area-&gt;area_tag,</a>
+<a name="ln1579">                            rawlspid_print (hdr-&gt;lsp_id),</a>
+<a name="ln1580">                            ntohl (lsp-&gt;lsp_header-&gt;seq_num));</a>
+<a name="ln1581">            }</a>
+<a name="ln1582">	}</a>
+<a name="ln1583">      return retval;</a>
+<a name="ln1584">    }</a>
+<a name="ln1585">  /* 7.3.15.1 c) - If this is our own lsp and we don't have it initiate a </a>
+<a name="ln1586">   * purge */</a>
+<a name="ln1587">  if (memcmp (hdr-&gt;lsp_id, isis-&gt;sysid, ISIS_SYS_ID_LEN) == 0)</a>
+<a name="ln1588">    {</a>
+<a name="ln1589">      if (!lsp)</a>
+<a name="ln1590">	{</a>
+<a name="ln1591">	  /* 7.3.16.4: initiate a purge */</a>
+<a name="ln1592">	  lsp_purge_non_exist(level, hdr, circuit-&gt;area);</a>
+<a name="ln1593">	  return ISIS_OK;</a>
+<a name="ln1594">	}</a>
+<a name="ln1595">      /* 7.3.15.1 d) - If this is our own lsp and we have it */</a>
+<a name="ln1596"> </a>
+<a name="ln1597">      /* In 7.3.16.1, If an Intermediate system R somewhere in the domain</a>
+<a name="ln1598">       * has information that the current sequence number for source S is</a>
+<a name="ln1599">       * &quot;greater&quot; than that held by S, ... */</a>
+<a name="ln1600"> </a>
+<a name="ln1601">      if (ntohl (hdr-&gt;seq_num) &gt; ntohl (lsp-&gt;lsp_header-&gt;seq_num))</a>
+<a name="ln1602">	{</a>
+<a name="ln1603">	  /* 7.3.16.1  */</a>
+<a name="ln1604">          lsp_inc_seqnum (lsp, ntohl (hdr-&gt;seq_num));</a>
+<a name="ln1605">	  if (isis-&gt;debugs &amp; DEBUG_UPDATE_PACKETS)</a>
+<a name="ln1606">	    zlog_debug (&quot;ISIS-Upd (%s): (2) re-originating LSP %s new seq &quot;</a>
+<a name="ln1607">			&quot;0x%08x&quot;, circuit-&gt;area-&gt;area_tag,</a>
+<a name="ln1608">			rawlspid_print (hdr-&gt;lsp_id),</a>
+<a name="ln1609">			ntohl (lsp-&gt;lsp_header-&gt;seq_num));</a>
+<a name="ln1610">	}</a>
+<a name="ln1611">      /* If the received LSP is older or equal,</a>
+<a name="ln1612">       * resend the LSP which will act as ACK */</a>
+<a name="ln1613">      lsp_set_all_srmflags (lsp);</a>
+<a name="ln1614">    }</a>
+<a name="ln1615">  else</a>
+<a name="ln1616">    {</a>
+<a name="ln1617">      /* 7.3.15.1 e) - This lsp originated on another system */</a>
+<a name="ln1618"> </a>
+<a name="ln1619">      /* 7.3.15.1 e) 1) LSP newer than the one in db or no LSP in db */</a>
+<a name="ln1620">      if ((!lsp || comp == LSP_NEWER))</a>
+<a name="ln1621">	{</a>
+<a name="ln1622">	  /*</a>
+<a name="ln1623">	   * If this lsp is a frag, need to see if we have zero lsp present</a>
+<a name="ln1624">	   */</a>
+<a name="ln1625">	  if (LSP_FRAGMENT (hdr-&gt;lsp_id) != 0)</a>
+<a name="ln1626">	    {</a>
+<a name="ln1627">	      memcpy (lspid, hdr-&gt;lsp_id, ISIS_SYS_ID_LEN + 1);</a>
+<a name="ln1628">	      LSP_FRAGMENT (lspid) = 0;</a>
+<a name="ln1629">	      lsp0 = lsp_search (lspid, circuit-&gt;area-&gt;lspdb[level - 1]);</a>
+<a name="ln1630">	      if (!lsp0)</a>
+<a name="ln1631">		{</a>
+<a name="ln1632">		  zlog_debug (&quot;Got lsp frag, while zero lsp not in database&quot;);</a>
+<a name="ln1633">		  return ISIS_OK;</a>
+<a name="ln1634">		}</a>
+<a name="ln1635">	    }</a>
+<a name="ln1636">	  /* i */</a>
+<a name="ln1637">	  if (!lsp)</a>
+<a name="ln1638">            {</a>
+<a name="ln1639">	      lsp = lsp_new_from_stream_ptr (circuit-&gt;rcv_stream,</a>
+<a name="ln1640">                                             pdu_len, lsp0,</a>
+<a name="ln1641">                                             circuit-&gt;area, level);</a>
+<a name="ln1642">              lsp_insert (lsp, circuit-&gt;area-&gt;lspdb[level - 1]);</a>
+<a name="ln1643">            }</a>
+<a name="ln1644">          else /* exists, so we overwrite */</a>
+<a name="ln1645">            {</a>
+<a name="ln1646">              lsp_update (lsp, circuit-&gt;rcv_stream, circuit-&gt;area, level);</a>
+<a name="ln1647">            }</a>
+<a name="ln1648">	  /* ii */</a>
+<a name="ln1649">          lsp_set_all_srmflags (lsp);</a>
+<a name="ln1650">	  /* iii */</a>
+<a name="ln1651">	  ISIS_CLEAR_FLAG (lsp-&gt;SRMflags, circuit);</a>
+<a name="ln1652"> </a>
+<a name="ln1653">	  /* iv */</a>
+<a name="ln1654">	  if (circuit-&gt;circ_type != CIRCUIT_T_BROADCAST)</a>
+<a name="ln1655">	    ISIS_SET_FLAG (lsp-&gt;SSNflags, circuit);</a>
+<a name="ln1656">	  /* FIXME: v) */</a>
+<a name="ln1657">	}</a>
+<a name="ln1658">      /* 7.3.15.1 e) 2) LSP equal to the one in db */</a>
+<a name="ln1659">      else if (comp == LSP_EQUAL)</a>
+<a name="ln1660">	{</a>
+<a name="ln1661">	  ISIS_CLEAR_FLAG (lsp-&gt;SRMflags, circuit);</a>
+<a name="ln1662">	  lsp_update (lsp, circuit-&gt;rcv_stream, circuit-&gt;area, level);</a>
+<a name="ln1663">	  if (circuit-&gt;circ_type != CIRCUIT_T_BROADCAST)</a>
+<a name="ln1664">	    ISIS_SET_FLAG (lsp-&gt;SSNflags, circuit);</a>
+<a name="ln1665">	}</a>
+<a name="ln1666">      /* 7.3.15.1 e) 3) LSP older than the one in db */</a>
+<a name="ln1667">      else</a>
+<a name="ln1668">	{</a>
+<a name="ln1669">	  ISIS_SET_FLAG (lsp-&gt;SRMflags, circuit);</a>
+<a name="ln1670">	  ISIS_CLEAR_FLAG (lsp-&gt;SSNflags, circuit);</a>
+<a name="ln1671">	}</a>
+<a name="ln1672">    }</a>
+<a name="ln1673">  return retval;</a>
+<a name="ln1674">}</a>
+<a name="ln1675"> </a>
+<a name="ln1676">/*</a>
+<a name="ln1677"> * Process Sequence Numbers</a>
+<a name="ln1678"> * ISO - 10589</a>
+<a name="ln1679"> * Section 7.3.15.2 - Action on receipt of a sequence numbers PDU</a>
+<a name="ln1680"> */</a>
+<a name="ln1681"> </a>
+<a name="ln1682">static int</a>
+<a name="ln1683">process_snp (int snp_type, int level, struct isis_circuit *circuit,</a>
+<a name="ln1684">	     const u_char *ssnpa)</a>
+<a name="ln1685">{</a>
+<a name="ln1686">  int retval = ISIS_OK;</a>
+<a name="ln1687">  int cmp, own_lsp;</a>
+<a name="ln1688">  char typechar = ' ';</a>
+<a name="ln1689">  uint16_t pdu_len;</a>
+<a name="ln1690">  struct isis_adjacency *adj;</a>
+<a name="ln1691">  struct isis_complete_seqnum_hdr *chdr = NULL;</a>
+<a name="ln1692">  struct isis_partial_seqnum_hdr *phdr = NULL;</a>
+<a name="ln1693">  uint32_t found = 0, expected = 0, auth_tlv_offset = 0;</a>
+<a name="ln1694">  struct isis_lsp *lsp;</a>
+<a name="ln1695">  struct lsp_entry *entry;</a>
+<a name="ln1696">  struct listnode *node, *nnode;</a>
+<a name="ln1697">  struct listnode *node2, *nnode2;</a>
+<a name="ln1698">  struct tlvs tlvs;</a>
+<a name="ln1699">  struct list *lsp_list = NULL;</a>
+<a name="ln1700">  struct isis_passwd *passwd;</a>
+<a name="ln1701"> </a>
+<a name="ln1702">  if (snp_type == ISIS_SNP_CSNP_FLAG)</a>
+<a name="ln1703">    {</a>
+<a name="ln1704">      /* getting the header info */</a>
+<a name="ln1705">      typechar = 'C';</a>
+<a name="ln1706">      chdr =</a>
+<a name="ln1707">	(struct isis_complete_seqnum_hdr *) STREAM_PNT (circuit-&gt;rcv_stream);</a>
+<a name="ln1708">      stream_forward_getp (circuit-&gt;rcv_stream, ISIS_CSNP_HDRLEN);</a>
+<a name="ln1709">      pdu_len = ntohs (chdr-&gt;pdu_len);</a>
+<a name="ln1710">      if (pdu_len &lt; (ISIS_FIXED_HDR_LEN + ISIS_CSNP_HDRLEN) ||</a>
+<a name="ln1711">          pdu_len &gt; ISO_MTU(circuit) ||</a>
+<a name="ln1712">          pdu_len &gt; stream_get_endp (circuit-&gt;rcv_stream))</a>
+<a name="ln1713">	{</a>
+<a name="ln1714">	  zlog_warn (&quot;Received a CSNP with bogus length %d&quot;, pdu_len);</a>
+<a name="ln1715">	  return ISIS_WARNING;</a>
+<a name="ln1716">	}</a>
+<a name="ln1717">    }</a>
+<a name="ln1718">  else</a>
+<a name="ln1719">    {</a>
+<a name="ln1720">      typechar = 'P';</a>
+<a name="ln1721">      phdr =</a>
+<a name="ln1722">	(struct isis_partial_seqnum_hdr *) STREAM_PNT (circuit-&gt;rcv_stream);</a>
+<a name="ln1723">      stream_forward_getp (circuit-&gt;rcv_stream, ISIS_PSNP_HDRLEN);</a>
+<a name="ln1724">      pdu_len = ntohs (phdr-&gt;pdu_len);</a>
+<a name="ln1725">      if (pdu_len &lt; (ISIS_FIXED_HDR_LEN + ISIS_PSNP_HDRLEN) ||</a>
+<a name="ln1726">          pdu_len &gt; ISO_MTU(circuit) ||</a>
+<a name="ln1727">          pdu_len &gt; stream_get_endp (circuit-&gt;rcv_stream))</a>
+<a name="ln1728">	{</a>
+<a name="ln1729">	  zlog_warn (&quot;Received a PSNP with bogus length %d&quot;, pdu_len);</a>
+<a name="ln1730">	  return ISIS_WARNING;</a>
+<a name="ln1731">	}</a>
+<a name="ln1732">    }</a>
+<a name="ln1733"> </a>
+<a name="ln1734">  /*</a>
+<a name="ln1735">   * Set the stream endp to PDU length, ignoring additional padding</a>
+<a name="ln1736">   * introduced by transport chips.</a>
+<a name="ln1737">   */</a>
+<a name="ln1738">  if (pdu_len &lt; stream_get_endp (circuit-&gt;rcv_stream))</a>
+<a name="ln1739">    stream_set_endp (circuit-&gt;rcv_stream, pdu_len);</a>
+<a name="ln1740"> </a>
+<a name="ln1741">  /* 7.3.15.2 a) 1 - external domain circuit will discard snp pdu */</a>
+<a name="ln1742">  if (circuit-&gt;ext_domain)</a>
+<a name="ln1743">    {</a>
+<a name="ln1744"> </a>
+<a name="ln1745">      zlog_debug (&quot;ISIS-Snp (%s): Rcvd L%d %cSNP on %s, &quot;</a>
+<a name="ln1746">		  &quot;skipping: circuit externalDomain = true&quot;,</a>
+<a name="ln1747">		  circuit-&gt;area-&gt;area_tag,</a>
+<a name="ln1748">		  level, typechar, circuit-&gt;interface-&gt;name);</a>
+<a name="ln1749"> </a>
+<a name="ln1750">      return ISIS_OK;</a>
+<a name="ln1751">    }</a>
+<a name="ln1752"> </a>
+<a name="ln1753">  /* 7.3.15.2 a) 2,3 - manualL2OnlyMode not implemented */</a>
+<a name="ln1754">  if (!accept_level (level, circuit-&gt;is_type))</a>
+<a name="ln1755">    {</a>
+<a name="ln1756"> </a>
+<a name="ln1757">      zlog_debug (&quot;ISIS-Snp (%s): Rcvd L%d %cSNP on %s, &quot;</a>
+<a name="ln1758">		  &quot;skipping: circuit type %s does not match level %d&quot;,</a>
+<a name="ln1759">		  circuit-&gt;area-&gt;area_tag,</a>
+<a name="ln1760">		  level,</a>
+<a name="ln1761">		  typechar,</a>
+<a name="ln1762">		  circuit-&gt;interface-&gt;name,</a>
+<a name="ln1763">		  circuit_t2string (circuit-&gt;is_type), level);</a>
+<a name="ln1764"> </a>
+<a name="ln1765">      return ISIS_OK;</a>
+<a name="ln1766">    }</a>
+<a name="ln1767"> </a>
+<a name="ln1768">  /* 7.3.15.2 a) 4 - not applicable for CSNP  only PSNPs on broadcast */</a>
+<a name="ln1769">  if ((snp_type == ISIS_SNP_PSNP_FLAG) &amp;&amp;</a>
+<a name="ln1770">      (circuit-&gt;circ_type == CIRCUIT_T_BROADCAST) &amp;&amp;</a>
+<a name="ln1771">      (!circuit-&gt;u.bc.is_dr[level - 1]))</a>
+<a name="ln1772">    {</a>
+<a name="ln1773">      zlog_debug (&quot;ISIS-Snp (%s): Rcvd L%d %cSNP from %s on %s, &quot;</a>
+<a name="ln1774">                  &quot;skipping: we are not the DIS&quot;,</a>
+<a name="ln1775">                  circuit-&gt;area-&gt;area_tag,</a>
+<a name="ln1776">                  level,</a>
+<a name="ln1777">                  typechar, snpa_print (ssnpa), circuit-&gt;interface-&gt;name);</a>
+<a name="ln1778"> </a>
+<a name="ln1779">      return ISIS_OK;</a>
+<a name="ln1780">    }</a>
+<a name="ln1781"> </a>
+<a name="ln1782">  /* 7.3.15.2 a) 5 - need to make sure IDLength matches - already checked */</a>
+<a name="ln1783"> </a>
+<a name="ln1784">  /* 7.3.15.2 a) 6 - maximum area match, can be ommited since we only use 3</a>
+<a name="ln1785">   * - already checked */</a>
+<a name="ln1786"> </a>
+<a name="ln1787">  /* 7.3.15.2 a) 7 - Must check that we have an adjacency of the same level  */</a>
+<a name="ln1788">  /* for broadcast circuits, snpa should be compared */</a>
+<a name="ln1789">  /* FIXME : Do we need to check SNPA? */</a>
+<a name="ln1790">  if (circuit-&gt;circ_type == CIRCUIT_T_BROADCAST)</a>
+<a name="ln1791">    {</a>
+<a name="ln1792">      if (snp_type == ISIS_SNP_CSNP_FLAG)</a>
+<a name="ln1793">	{</a>
+<a name="ln1794">	  adj =</a>
+<a name="ln1795">	    isis_adj_lookup (chdr-&gt;source_id, circuit-&gt;u.bc.adjdb[level - 1]);</a>
+<a name="ln1796">	}</a>
+<a name="ln1797">      else</a>
+<a name="ln1798">	{</a>
+<a name="ln1799">	  /* a psnp on a broadcast, how lovely of Juniper :) */</a>
+<a name="ln1800">	  adj =</a>
+<a name="ln1801">	    isis_adj_lookup (phdr-&gt;source_id, circuit-&gt;u.bc.adjdb[level - 1]);</a>
+<a name="ln1802">	}</a>
+<a name="ln1803">      if (!adj)</a>
+<a name="ln1804">	return ISIS_OK;		/* Silently discard */</a>
+<a name="ln1805">    }</a>
+<a name="ln1806">  else</a>
+<a name="ln1807">    {</a>
+<a name="ln1808">      if (!circuit-&gt;u.p2p.neighbor)</a>
+<a name="ln1809">      {</a>
+<a name="ln1810">        zlog_warn (&quot;no p2p neighbor on circuit %s&quot;, circuit-&gt;interface-&gt;name);</a>
+<a name="ln1811">        return ISIS_OK;		/* Silently discard */</a>
+<a name="ln1812">      }</a>
+<a name="ln1813">    }</a>
+<a name="ln1814"> </a>
+<a name="ln1815">  /* 7.3.15.2 a) 8 - Passwords for level 1 - not implemented  */</a>
+<a name="ln1816"> </a>
+<a name="ln1817">  /* 7.3.15.2 a) 9 - Passwords for level 2 - not implemented  */</a>
+<a name="ln1818"> </a>
+<a name="ln1819">  memset (&amp;tlvs, 0, sizeof (struct tlvs));</a>
+<a name="ln1820"> </a>
+<a name="ln1821">  /* parse the SNP */</a>
+<a name="ln1822">  expected |= TLVFLAG_LSP_ENTRIES;</a>
+<a name="ln1823">  expected |= TLVFLAG_AUTH_INFO;</a>
+<a name="ln1824"> </a>
+<a name="ln1825">  auth_tlv_offset = stream_get_getp (circuit-&gt;rcv_stream);</a>
+<a name="ln1826">  retval = parse_tlvs (circuit-&gt;area-&gt;area_tag,</a>
+<a name="ln1827">		       STREAM_PNT (circuit-&gt;rcv_stream),</a>
+<a name="ln1828">		       pdu_len - stream_get_getp (circuit-&gt;rcv_stream),</a>
+<a name="ln1829">		       &amp;expected, &amp;found, &amp;tlvs, &amp;auth_tlv_offset);</a>
+<a name="ln1830"> </a>
+<a name="ln1831">  if (retval &gt; ISIS_WARNING)</a>
+<a name="ln1832">    {</a>
+<a name="ln1833">      zlog_warn (&quot;something went very wrong processing SNP&quot;);</a>
+<a name="ln1834">      free_tlvs (&amp;tlvs);</a>
+<a name="ln1835">      return retval;</a>
+<a name="ln1836">    }</a>
+<a name="ln1837"> </a>
+<a name="ln1838">  if (level == IS_LEVEL_1)</a>
+<a name="ln1839">    passwd = &amp;circuit-&gt;area-&gt;area_passwd;</a>
+<a name="ln1840">  else</a>
+<a name="ln1841">    passwd = &amp;circuit-&gt;area-&gt;domain_passwd;</a>
+<a name="ln1842"> </a>
+<a name="ln1843">  if (CHECK_FLAG(passwd-&gt;snp_auth, SNP_AUTH_RECV))</a>
+<a name="ln1844">    {</a>
+<a name="ln1845">      if (passwd-&gt;type)</a>
+<a name="ln1846">        {</a>
+<a name="ln1847">          if (!(found &amp; TLVFLAG_AUTH_INFO) ||</a>
+<a name="ln1848">              authentication_check (&amp;tlvs.auth_info, passwd,</a>
+<a name="ln1849">                                    circuit-&gt;rcv_stream, auth_tlv_offset))</a>
+<a name="ln1850">            {</a>
+<a name="ln1851">              isis_event_auth_failure (circuit-&gt;area-&gt;area_tag,</a>
+<a name="ln1852">                                       &quot;SNP authentication&quot; &quot; failure&quot;,</a>
+<a name="ln1853">                                       phdr ? phdr-&gt;source_id :</a>
+<a name="ln1854">                                       chdr-&gt;source_id);</a>
+<a name="ln1855">              free_tlvs (&amp;tlvs);</a>
+<a name="ln1856">              return ISIS_OK;</a>
+<a name="ln1857">            }</a>
+<a name="ln1858">        }</a>
+<a name="ln1859">    }</a>
+<a name="ln1860"> </a>
+<a name="ln1861">  /* debug isis snp-packets */</a>
+<a name="ln1862">  if (isis-&gt;debugs &amp; DEBUG_SNP_PACKETS)</a>
+<a name="ln1863">    {</a>
+<a name="ln1864">      zlog_debug (&quot;ISIS-Snp (%s): Rcvd L%d %cSNP from %s on %s&quot;,</a>
+<a name="ln1865">		  circuit-&gt;area-&gt;area_tag,</a>
+<a name="ln1866">		  level,</a>
+<a name="ln1867">		  typechar, snpa_print (ssnpa), circuit-&gt;interface-&gt;name);</a>
+<a name="ln1868">      if (tlvs.lsp_entries)</a>
+<a name="ln1869">	{</a>
+<a name="ln1870">	  for (ALL_LIST_ELEMENTS_RO (tlvs.lsp_entries, node, entry))</a>
+<a name="ln1871">	  {</a>
+<a name="ln1872">	    zlog_debug (&quot;ISIS-Snp (%s):         %cSNP entry %s, seq 0x%08x,&quot;</a>
+<a name="ln1873">			&quot; cksum 0x%04x, lifetime %us&quot;,</a>
+<a name="ln1874">			circuit-&gt;area-&gt;area_tag,</a>
+<a name="ln1875">			typechar,</a>
+<a name="ln1876">			rawlspid_print (entry-&gt;lsp_id),</a>
+<a name="ln1877">			ntohl (entry-&gt;seq_num),</a>
+<a name="ln1878">			ntohs (entry-&gt;checksum), ntohs (entry-&gt;rem_lifetime));</a>
+<a name="ln1879">	  }</a>
+<a name="ln1880">	}</a>
+<a name="ln1881">    }</a>
+<a name="ln1882"> </a>
+<a name="ln1883">  /* 7.3.15.2 b) Actions on LSP_ENTRIES reported */</a>
+<a name="ln1884">  if (tlvs.lsp_entries)</a>
+<a name="ln1885">    {</a>
+<a name="ln1886">      for (ALL_LIST_ELEMENTS_RO (tlvs.lsp_entries, node, entry))</a>
+<a name="ln1887">      {</a>
+<a name="ln1888">	lsp = lsp_search (entry-&gt;lsp_id, circuit-&gt;area-&gt;lspdb[level - 1]);</a>
+<a name="ln1889">	own_lsp = !memcmp (entry-&gt;lsp_id, isis-&gt;sysid, ISIS_SYS_ID_LEN);</a>
+<a name="ln1890">	if (lsp)</a>
+<a name="ln1891">	  {</a>
+<a name="ln1892">	    /* 7.3.15.2 b) 1) is this LSP newer */</a>
+<a name="ln1893">	    cmp = lsp_compare (circuit-&gt;area-&gt;area_tag, lsp, entry-&gt;seq_num,</a>
+<a name="ln1894">			       entry-&gt;checksum, entry-&gt;rem_lifetime);</a>
+<a name="ln1895">	    /* 7.3.15.2 b) 2) if it equals, clear SRM on p2p */</a>
+<a name="ln1896">	    if (cmp == LSP_EQUAL)</a>
+<a name="ln1897">	      {</a>
+<a name="ln1898">		/* if (circuit-&gt;circ_type != CIRCUIT_T_BROADCAST) */</a>
+<a name="ln1899">	        ISIS_CLEAR_FLAG (lsp-&gt;SRMflags, circuit);</a>
+<a name="ln1900">	      }</a>
+<a name="ln1901">	    /* 7.3.15.2 b) 3) if it is older, clear SSN and set SRM */</a>
+<a name="ln1902">	    else if (cmp == LSP_OLDER)</a>
+<a name="ln1903">	      {</a>
+<a name="ln1904">		ISIS_CLEAR_FLAG (lsp-&gt;SSNflags, circuit);</a>
+<a name="ln1905">		ISIS_SET_FLAG (lsp-&gt;SRMflags, circuit);</a>
+<a name="ln1906">	      }</a>
+<a name="ln1907">	    /* 7.3.15.2 b) 4) if it is newer, set SSN and clear SRM on p2p */</a>
+<a name="ln1908">	    else</a>
+<a name="ln1909">	      {</a>
+<a name="ln1910">		if (own_lsp)</a>
+<a name="ln1911">		  {</a>
+<a name="ln1912">		    lsp_inc_seqnum (lsp, ntohl (entry-&gt;seq_num));</a>
+<a name="ln1913">		    ISIS_SET_FLAG (lsp-&gt;SRMflags, circuit);</a>
+<a name="ln1914">		  }</a>
+<a name="ln1915">		else</a>
+<a name="ln1916">		  {</a>
+<a name="ln1917">		    ISIS_SET_FLAG (lsp-&gt;SSNflags, circuit);</a>
+<a name="ln1918">		    /* if (circuit-&gt;circ_type != CIRCUIT_T_BROADCAST) */</a>
+<a name="ln1919">		    ISIS_CLEAR_FLAG (lsp-&gt;SRMflags, circuit);</a>
+<a name="ln1920">		  }</a>
+<a name="ln1921">	      }</a>
+<a name="ln1922">	  }</a>
+<a name="ln1923">	else</a>
+<a name="ln1924">	  {</a>
+<a name="ln1925">	    /* 7.3.15.2 b) 5) if it was not found, and all of those are not 0, </a>
+<a name="ln1926">	     * insert it and set SSN on it */</a>
+<a name="ln1927">	    if (entry-&gt;rem_lifetime &amp;&amp; entry-&gt;checksum &amp;&amp; entry-&gt;seq_num &amp;&amp;</a>
+<a name="ln1928">		memcmp (entry-&gt;lsp_id, isis-&gt;sysid, ISIS_SYS_ID_LEN))</a>
+<a name="ln1929">	      {</a>
+<a name="ln1930">		lsp = lsp_new(circuit-&gt;area, entry-&gt;lsp_id,</a>
+<a name="ln1931">			      ntohs(entry-&gt;rem_lifetime),</a>
+<a name="ln1932">			      0, 0, entry-&gt;checksum, level);</a>
+<a name="ln1933">		lsp_insert (lsp, circuit-&gt;area-&gt;lspdb[level - 1]);</a>
+<a name="ln1934">		ISIS_FLAGS_CLEAR_ALL (lsp-&gt;SRMflags);</a>
+<a name="ln1935">		ISIS_SET_FLAG (lsp-&gt;SSNflags, circuit);</a>
+<a name="ln1936">	      }</a>
+<a name="ln1937">	  }</a>
+<a name="ln1938">      }</a>
+<a name="ln1939">    }</a>
+<a name="ln1940"> </a>
+<a name="ln1941">  /* 7.3.15.2 c) on CSNP set SRM for all in range which were not reported */</a>
+<a name="ln1942">  if (snp_type == ISIS_SNP_CSNP_FLAG)</a>
+<a name="ln1943">    {</a>
+<a name="ln1944">      /*</a>
+<a name="ln1945">       * Build a list from our own LSP db bounded with</a>
+<a name="ln1946">       * start_lsp_id and stop_lsp_id</a>
+<a name="ln1947">       */</a>
+<a name="ln1948">      lsp_list = list_new ();</a>
+<a name="ln1949">      lsp_build_list_nonzero_ht (chdr-&gt;start_lsp_id, chdr-&gt;stop_lsp_id,</a>
+<a name="ln1950">				 lsp_list, circuit-&gt;area-&gt;lspdb[level - 1]);</a>
+<a name="ln1951"> </a>
+<a name="ln1952">      /* Fixme: Find a better solution */</a>
+<a name="ln1953">      if (tlvs.lsp_entries)</a>
+<a name="ln1954">	{</a>
+<a name="ln1955">	  for (ALL_LIST_ELEMENTS (tlvs.lsp_entries, node, nnode, entry))</a>
+<a name="ln1956">	  {</a>
+<a name="ln1957">	    for (ALL_LIST_ELEMENTS (lsp_list, node2, nnode2, lsp))</a>
+<a name="ln1958">	    {</a>
+<a name="ln1959">	      if (lsp_id_cmp (lsp-&gt;lsp_header-&gt;lsp_id, entry-&gt;lsp_id) == 0)</a>
+<a name="ln1960">		{</a>
+<a name="ln1961">		  list_delete_node (lsp_list, node2);</a>
+<a name="ln1962">		  break;</a>
+<a name="ln1963">		}</a>
+<a name="ln1964">	    }</a>
+<a name="ln1965">	  }</a>
+<a name="ln1966">	}</a>
+<a name="ln1967">      /* on remaining LSPs we set SRM (neighbor knew not of) */</a>
+<a name="ln1968">      for (ALL_LIST_ELEMENTS_RO (lsp_list, node, lsp))</a>
+<a name="ln1969">	ISIS_SET_FLAG (lsp-&gt;SRMflags, circuit);</a>
+<a name="ln1970">      /* lets free it */</a>
+<a name="ln1971">      list_delete (lsp_list);</a>
+<a name="ln1972"> </a>
+<a name="ln1973">    }</a>
+<a name="ln1974"> </a>
+<a name="ln1975">  free_tlvs (&amp;tlvs);</a>
+<a name="ln1976">  return retval;</a>
+<a name="ln1977">}</a>
+<a name="ln1978"> </a>
+<a name="ln1979">static int</a>
+<a name="ln1980">process_csnp (int level, struct isis_circuit *circuit, const u_char *ssnpa)</a>
+<a name="ln1981">{</a>
+<a name="ln1982">  if (isis-&gt;debugs &amp; DEBUG_SNP_PACKETS)</a>
+<a name="ln1983">    {</a>
+<a name="ln1984">      zlog_debug (&quot;ISIS-Snp (%s): Rcvd L%d CSNP on %s, cirType %s, cirID %u&quot;,</a>
+<a name="ln1985">                  circuit-&gt;area-&gt;area_tag, level, circuit-&gt;interface-&gt;name,</a>
+<a name="ln1986">                  circuit_t2string (circuit-&gt;is_type), circuit-&gt;circuit_id);</a>
+<a name="ln1987">      if (isis-&gt;debugs &amp; DEBUG_PACKET_DUMP)</a>
+<a name="ln1988">        zlog_dump_data (STREAM_DATA (circuit-&gt;rcv_stream),</a>
+<a name="ln1989">                        stream_get_endp (circuit-&gt;rcv_stream));</a>
+<a name="ln1990">    }</a>
+<a name="ln1991"> </a>
+<a name="ln1992">  /* Sanity check - FIXME: move to correct place */</a>
+<a name="ln1993">  if ((stream_get_endp (circuit-&gt;rcv_stream) -</a>
+<a name="ln1994">       stream_get_getp (circuit-&gt;rcv_stream)) &lt; ISIS_CSNP_HDRLEN)</a>
+<a name="ln1995">    {</a>
+<a name="ln1996">      zlog_warn (&quot;Packet too short ( &lt; %d)&quot;, ISIS_CSNP_HDRLEN);</a>
+<a name="ln1997">      return ISIS_WARNING;</a>
+<a name="ln1998">    }</a>
+<a name="ln1999"> </a>
+<a name="ln2000">  return process_snp (ISIS_SNP_CSNP_FLAG, level, circuit, ssnpa);</a>
+<a name="ln2001">}</a>
+<a name="ln2002"> </a>
+<a name="ln2003">static int</a>
+<a name="ln2004">process_psnp (int level, struct isis_circuit *circuit, const u_char *ssnpa)</a>
+<a name="ln2005">{</a>
+<a name="ln2006">  if (isis-&gt;debugs &amp; DEBUG_SNP_PACKETS)</a>
+<a name="ln2007">    {</a>
+<a name="ln2008">      zlog_debug (&quot;ISIS-Snp (%s): Rcvd L%d PSNP on %s, cirType %s, cirID %u&quot;,</a>
+<a name="ln2009">                  circuit-&gt;area-&gt;area_tag, level, circuit-&gt;interface-&gt;name,</a>
+<a name="ln2010">                  circuit_t2string (circuit-&gt;is_type), circuit-&gt;circuit_id);</a>
+<a name="ln2011">      if (isis-&gt;debugs &amp; DEBUG_PACKET_DUMP)</a>
+<a name="ln2012">        zlog_dump_data (STREAM_DATA (circuit-&gt;rcv_stream),</a>
+<a name="ln2013">                        stream_get_endp (circuit-&gt;rcv_stream));</a>
+<a name="ln2014">    }</a>
+<a name="ln2015"> </a>
+<a name="ln2016">  if ((stream_get_endp (circuit-&gt;rcv_stream) -</a>
+<a name="ln2017">       stream_get_getp (circuit-&gt;rcv_stream)) &lt; ISIS_PSNP_HDRLEN)</a>
+<a name="ln2018">    {</a>
+<a name="ln2019">      zlog_warn (&quot;Packet too short ( &lt; %d)&quot;, ISIS_PSNP_HDRLEN);</a>
+<a name="ln2020">      return ISIS_WARNING;</a>
+<a name="ln2021">    }</a>
+<a name="ln2022"> </a>
+<a name="ln2023">  return process_snp (ISIS_SNP_PSNP_FLAG, level, circuit, ssnpa);</a>
+<a name="ln2024">}</a>
+<a name="ln2025"> </a>
+<a name="ln2026">/*</a>
+<a name="ln2027"> * PDU Dispatcher</a>
+<a name="ln2028"> */</a>
+<a name="ln2029"> </a>
+<a name="ln2030">static int</a>
+<a name="ln2031">isis_handle_pdu (struct isis_circuit *circuit, u_char * ssnpa)</a>
+<a name="ln2032">{</a>
+<a name="ln2033">  struct isis_fixed_hdr *hdr;</a>
+<a name="ln2034"> </a>
+<a name="ln2035">  int retval = ISIS_OK;</a>
+<a name="ln2036"> </a>
+<a name="ln2037">  /*</a>
+<a name="ln2038">   * Let's first read data from stream to the header</a>
+<a name="ln2039">   */</a>
+<a name="ln2040">  hdr = (struct isis_fixed_hdr *) STREAM_DATA (circuit-&gt;rcv_stream);</a>
+<a name="ln2041"> </a>
+<a name="ln2042">  if ((hdr-&gt;idrp != ISO10589_ISIS) &amp;&amp; (hdr-&gt;idrp != ISO9542_ESIS))</a>
+<a name="ln2043">    {</a>
+<a name="ln2044">      zlog_err (&quot;Not an IS-IS or ES-IS packet IDRP=%02x&quot;, hdr-&gt;idrp);</a>
+<a name="ln2045">      return ISIS_ERROR;</a>
+<a name="ln2046">    }</a>
+<a name="ln2047"> </a>
+<a name="ln2048">  /* now we need to know if this is an ISO 9542 packet and</a>
+<a name="ln2049">   * take real good care of it, waaa!</a>
+<a name="ln2050">   */</a>
+<a name="ln2051">  if (hdr-&gt;idrp == ISO9542_ESIS)</a>
+<a name="ln2052">    {</a>
+<a name="ln2053">      zlog_err (&quot;No support for ES-IS packet IDRP=%02x&quot;, hdr-&gt;idrp);</a>
+<a name="ln2054">      return ISIS_ERROR;</a>
+<a name="ln2055">    }</a>
+<a name="ln2056">  stream_set_getp (circuit-&gt;rcv_stream, ISIS_FIXED_HDR_LEN);</a>
+<a name="ln2057"> </a>
+<a name="ln2058">  /*</a>
+<a name="ln2059">   * and then process it</a>
+<a name="ln2060">   */</a>
+<a name="ln2061"> </a>
+<a name="ln2062">  if (hdr-&gt;length &lt; ISIS_MINIMUM_FIXED_HDR_LEN)</a>
+<a name="ln2063">    {</a>
+<a name="ln2064">      zlog_err (&quot;Fixed header length = %d&quot;, hdr-&gt;length);</a>
+<a name="ln2065">      return ISIS_ERROR;</a>
+<a name="ln2066">    }</a>
+<a name="ln2067"> </a>
+<a name="ln2068">  if (hdr-&gt;version1 != 1)</a>
+<a name="ln2069">    {</a>
+<a name="ln2070">      zlog_warn (&quot;Unsupported ISIS version %u&quot;, hdr-&gt;version1);</a>
+<a name="ln2071">      return ISIS_WARNING;</a>
+<a name="ln2072">    }</a>
+<a name="ln2073">  /* either 6 or 0 */</a>
+<a name="ln2074">  if ((hdr-&gt;id_len != 0) &amp;&amp; (hdr-&gt;id_len != ISIS_SYS_ID_LEN))</a>
+<a name="ln2075">    {</a>
+<a name="ln2076">      zlog_err</a>
+<a name="ln2077">	(&quot;IDFieldLengthMismatch: ID Length field in a received PDU  %u, &quot;</a>
+<a name="ln2078">	 &quot;while the parameter for this IS is %u&quot;, hdr-&gt;id_len,</a>
+<a name="ln2079">	 ISIS_SYS_ID_LEN);</a>
+<a name="ln2080">      return ISIS_ERROR;</a>
+<a name="ln2081">    }</a>
+<a name="ln2082"> </a>
+<a name="ln2083">  if (hdr-&gt;version2 != 1)</a>
+<a name="ln2084">    {</a>
+<a name="ln2085">      zlog_warn (&quot;Unsupported ISIS version %u&quot;, hdr-&gt;version2);</a>
+<a name="ln2086">      return ISIS_WARNING;</a>
+<a name="ln2087">    }</a>
+<a name="ln2088"> </a>
+<a name="ln2089">  if (circuit-&gt;is_passive)</a>
+<a name="ln2090">    {</a>
+<a name="ln2091">      zlog_warn (&quot;Received ISIS PDU on passive circuit %s&quot;,</a>
+<a name="ln2092">		 circuit-&gt;interface-&gt;name);</a>
+<a name="ln2093">      return ISIS_WARNING;</a>
+<a name="ln2094">    }</a>
+<a name="ln2095"> </a>
+<a name="ln2096">  /* either 3 or 0 */</a>
+<a name="ln2097">  if ((hdr-&gt;max_area_addrs != 0)</a>
+<a name="ln2098">      &amp;&amp; (hdr-&gt;max_area_addrs != isis-&gt;max_area_addrs))</a>
+<a name="ln2099">    {</a>
+<a name="ln2100">      zlog_err (&quot;maximumAreaAddressesMismatch: maximumAreaAdresses in a &quot;</a>
+<a name="ln2101">		&quot;received PDU %u while the parameter for this IS is %u&quot;,</a>
+<a name="ln2102">		hdr-&gt;max_area_addrs, isis-&gt;max_area_addrs);</a>
+<a name="ln2103">      return ISIS_ERROR;</a>
+<a name="ln2104">    }</a>
+<a name="ln2105"> </a>
+<a name="ln2106">  switch (hdr-&gt;pdu_type)</a>
+<a name="ln2107">    {</a>
+<a name="ln2108">    case L1_LAN_HELLO:</a>
+<a name="ln2109">      retval = process_lan_hello (ISIS_LEVEL1, circuit, ssnpa);</a>
+<a name="ln2110">      break;</a>
+<a name="ln2111">    case L2_LAN_HELLO:</a>
+<a name="ln2112">      retval = process_lan_hello (ISIS_LEVEL2, circuit, ssnpa);</a>
+<a name="ln2113">      break;</a>
+<a name="ln2114">    case P2P_HELLO:</a>
+<a name="ln2115">      retval = process_p2p_hello (circuit);</a>
+<a name="ln2116">      break;</a>
+<a name="ln2117">    case L1_LINK_STATE:</a>
+<a name="ln2118">      retval = process_lsp (ISIS_LEVEL1, circuit, ssnpa);</a>
+<a name="ln2119">      break;</a>
+<a name="ln2120">    case L2_LINK_STATE:</a>
+<a name="ln2121">      retval = process_lsp (ISIS_LEVEL2, circuit, ssnpa);</a>
+<a name="ln2122">      break;</a>
+<a name="ln2123">    case L1_COMPLETE_SEQ_NUM:</a>
+<a name="ln2124">      retval = process_csnp (ISIS_LEVEL1, circuit, ssnpa);</a>
+<a name="ln2125">      break;</a>
+<a name="ln2126">    case L2_COMPLETE_SEQ_NUM:</a>
+<a name="ln2127">      retval = process_csnp (ISIS_LEVEL2, circuit, ssnpa);</a>
+<a name="ln2128">      break;</a>
+<a name="ln2129">    case L1_PARTIAL_SEQ_NUM:</a>
+<a name="ln2130">      retval = process_psnp (ISIS_LEVEL1, circuit, ssnpa);</a>
+<a name="ln2131">      break;</a>
+<a name="ln2132">    case L2_PARTIAL_SEQ_NUM:</a>
+<a name="ln2133">      retval = process_psnp (ISIS_LEVEL2, circuit, ssnpa);</a>
+<a name="ln2134">      break;</a>
+<a name="ln2135">    default:</a>
+<a name="ln2136">      return ISIS_ERROR;</a>
+<a name="ln2137">    }</a>
+<a name="ln2138"> </a>
+<a name="ln2139">  return retval;</a>
+<a name="ln2140">}</a>
+<a name="ln2141"> </a>
+<a name="ln2142">#ifdef GNU_LINUX</a>
+<a name="ln2143">int</a>
+<a name="ln2144">isis_receive (struct thread *thread)</a>
+<a name="ln2145">{</a>
+<a name="ln2146">  struct isis_circuit *circuit;</a>
+<a name="ln2147">  u_char ssnpa[ETH_ALEN];</a>
+<a name="ln2148">  int retval;</a>
+<a name="ln2149"> </a>
+<a name="ln2150">  /*</a>
+<a name="ln2151">   * Get the circuit </a>
+<a name="ln2152">   */</a>
+<a name="ln2153">  circuit = THREAD_ARG (thread);</a>
+<a name="ln2154">  assert (circuit);</a>
+<a name="ln2155"> </a>
+<a name="ln2156">  isis_circuit_stream(circuit, &amp;circuit-&gt;rcv_stream);</a>
+<a name="ln2157"> </a>
+<a name="ln2158">  retval = circuit-&gt;rx (circuit, ssnpa);</a>
+<a name="ln2159">  circuit-&gt;t_read = NULL;</a>
+<a name="ln2160"> </a>
+<a name="ln2161">  if (retval == ISIS_OK)</a>
+<a name="ln2162">    retval = isis_handle_pdu (circuit, ssnpa);</a>
+<a name="ln2163"> </a>
+<a name="ln2164">  /* </a>
+<a name="ln2165">   * prepare for next packet. </a>
+<a name="ln2166">   */</a>
+<a name="ln2167">  if (!circuit-&gt;is_passive)</a>
+<a name="ln2168">  {</a>
+<a name="ln2169">    THREAD_READ_ON (master, circuit-&gt;t_read, isis_receive, circuit,</a>
+<a name="ln2170">                    circuit-&gt;fd);</a>
+<a name="ln2171">  }</a>
+<a name="ln2172"> </a>
+<a name="ln2173">  return retval;</a>
+<a name="ln2174">}</a>
+<a name="ln2175"> </a>
+<a name="ln2176">#else</a>
+<a name="ln2177">int</a>
+<a name="ln2178">isis_receive (struct thread *thread)</a>
+<a name="ln2179">{</a>
+<a name="ln2180">  struct isis_circuit *circuit;</a>
+<a name="ln2181">  u_char ssnpa[ETH_ALEN];</a>
+<a name="ln2182">  int retval;</a>
+<a name="ln2183"> </a>
+<a name="ln2184">  /*</a>
+<a name="ln2185">   * Get the circuit </a>
+<a name="ln2186">   */</a>
+<a name="ln2187">  circuit = THREAD_ARG (thread);</a>
+<a name="ln2188">  assert (circuit);</a>
+<a name="ln2189"> </a>
+<a name="ln2190">  circuit-&gt;t_read = NULL;</a>
+<a name="ln2191"> </a>
+<a name="ln2192">  isis_circuit_stream(circuit, &amp;circuit-&gt;rcv_stream);</a>
+<a name="ln2193"> </a>
+<a name="ln2194">  retval = circuit-&gt;rx (circuit, ssnpa);</a>
+<a name="ln2195"> </a>
+<a name="ln2196">  if (retval == ISIS_OK)</a>
+<a name="ln2197">    retval = isis_handle_pdu (circuit, ssnpa);</a>
+<a name="ln2198"> </a>
+<a name="ln2199">  /* </a>
+<a name="ln2200">   * prepare for next packet. </a>
+<a name="ln2201">   */</a>
+<a name="ln2202">  if (!circuit-&gt;is_passive)</a>
+<a name="ln2203">  {</a>
+<a name="ln2204">    circuit-&gt;t_read = thread_add_timer_msec (master, isis_receive, circuit,</a>
+<a name="ln2205">  					     listcount</a>
+<a name="ln2206">					     (circuit-&gt;area-&gt;circuit_list) *</a>
+<a name="ln2207">					     100);</a>
+<a name="ln2208">  }</a>
+<a name="ln2209"> </a>
+<a name="ln2210">  return retval;</a>
+<a name="ln2211">}</a>
+<a name="ln2212"> </a>
+<a name="ln2213">#endif</a>
+<a name="ln2214"> </a>
+<a name="ln2215"> /* filling of the fixed isis header */</a>
+<a name="ln2216">void</a>
+<a name="ln2217">fill_fixed_hdr (struct isis_fixed_hdr *hdr, u_char pdu_type)</a>
+<a name="ln2218">{</a>
+<a name="ln2219">  memset (hdr, 0, sizeof (struct isis_fixed_hdr));</a>
+<a name="ln2220"> </a>
+<a name="ln2221">  hdr-&gt;idrp = ISO10589_ISIS;</a>
+<a name="ln2222"> </a>
+<a name="ln2223">  switch (pdu_type)</a>
+<a name="ln2224">    {</a>
+<a name="ln2225">    case L1_LAN_HELLO:</a>
+<a name="ln2226">    case L2_LAN_HELLO:</a>
+<a name="ln2227">      hdr-&gt;length = ISIS_LANHELLO_HDRLEN;</a>
+<a name="ln2228">      break;</a>
+<a name="ln2229">    case P2P_HELLO:</a>
+<a name="ln2230">      hdr-&gt;length = ISIS_P2PHELLO_HDRLEN;</a>
+<a name="ln2231">      break;</a>
+<a name="ln2232">    case L1_LINK_STATE:</a>
+<a name="ln2233">    case L2_LINK_STATE:</a>
+<a name="ln2234">      hdr-&gt;length = ISIS_LSP_HDR_LEN;</a>
+<a name="ln2235">      break;</a>
+<a name="ln2236">    case L1_COMPLETE_SEQ_NUM:</a>
+<a name="ln2237">    case L2_COMPLETE_SEQ_NUM:</a>
+<a name="ln2238">      hdr-&gt;length = ISIS_CSNP_HDRLEN;</a>
+<a name="ln2239">      break;</a>
+<a name="ln2240">    case L1_PARTIAL_SEQ_NUM:</a>
+<a name="ln2241">    case L2_PARTIAL_SEQ_NUM:</a>
+<a name="ln2242">      hdr-&gt;length = ISIS_PSNP_HDRLEN;</a>
+<a name="ln2243">      break;</a>
+<a name="ln2244">    default:</a>
+<a name="ln2245">      zlog_warn (&quot;fill_fixed_hdr(): unknown pdu type %d&quot;, pdu_type);</a>
+<a name="ln2246">      return;</a>
+<a name="ln2247">    }</a>
+<a name="ln2248">  hdr-&gt;length += ISIS_FIXED_HDR_LEN;</a>
+<a name="ln2249">  hdr-&gt;pdu_type = pdu_type;</a>
+<a name="ln2250">  hdr-&gt;version1 = 1;</a>
+<a name="ln2251">  hdr-&gt;id_len = 0;		/* ISIS_SYS_ID_LEN -  0==6 */</a>
+<a name="ln2252">  hdr-&gt;version2 = 1;</a>
+<a name="ln2253">  hdr-&gt;max_area_addrs = 0;	/* isis-&gt;max_area_addrs -  0==3 */</a>
+<a name="ln2254">}</a>
+<a name="ln2255"> </a>
+<a name="ln2256">/*</a>
+<a name="ln2257"> * SEND SIDE                             </a>
+<a name="ln2258"> */</a>
+<a name="ln2259">static void</a>
+<a name="ln2260">fill_fixed_hdr_andstream (struct isis_fixed_hdr *hdr, u_char pdu_type,</a>
+<a name="ln2261">			  struct stream *stream)</a>
+<a name="ln2262">{</a>
+<a name="ln2263">  fill_fixed_hdr (hdr, pdu_type);</a>
+<a name="ln2264"> </a>
+<a name="ln2265">  stream_putc (stream, hdr-&gt;idrp);</a>
+<a name="ln2266">  stream_putc (stream, hdr-&gt;length);</a>
+<a name="ln2267">  stream_putc (stream, hdr-&gt;version1);</a>
+<a name="ln2268">  stream_putc (stream, hdr-&gt;id_len);</a>
+<a name="ln2269">  stream_putc (stream, hdr-&gt;pdu_type);</a>
+<a name="ln2270">  stream_putc (stream, hdr-&gt;version2);</a>
+<a name="ln2271">  stream_putc (stream, hdr-&gt;reserved);</a>
+<a name="ln2272">  stream_putc (stream, hdr-&gt;max_area_addrs);</a>
+<a name="ln2273"> </a>
+<a name="ln2274">  return;</a>
+<a name="ln2275">}</a>
+<a name="ln2276"> </a>
+<a name="ln2277">int</a>
+<a name="ln2278">send_hello (struct isis_circuit *circuit, int level)</a>
+<a name="ln2279">{</a>
+<a name="ln2280">  struct isis_fixed_hdr fixed_hdr;</a>
+<a name="ln2281">  struct isis_lan_hello_hdr hello_hdr;</a>
+<a name="ln2282">  struct isis_p2p_hello_hdr p2p_hello_hdr;</a>
+<a name="ln2283">  unsigned char hmac_md5_hash[ISIS_AUTH_MD5_SIZE];</a>
+<a name="ln2284">  size_t len_pointer, length, auth_tlv_offset = 0;</a>
+<a name="ln2285">  u_int32_t interval;</a>
+<a name="ln2286">  int retval;</a>
+<a name="ln2287"> </a>
+<a name="ln2288">  if (circuit-&gt;is_passive)</a>
+<a name="ln2289">    return ISIS_OK;</a>
+<a name="ln2290"> </a>
+<a name="ln2291">  if (circuit-&gt;interface-&gt;mtu == 0)</a>
+<a name="ln2292">    {</a>
+<a name="ln2293">      zlog_warn (&quot;circuit has zero MTU&quot;);</a>
+<a name="ln2294">      return ISIS_WARNING;</a>
+<a name="ln2295">    }</a>
+<a name="ln2296"> </a>
+<a name="ln2297">  isis_circuit_stream(circuit, &amp;circuit-&gt;snd_stream);</a>
+<a name="ln2298"> </a>
+<a name="ln2299">  if (circuit-&gt;circ_type == CIRCUIT_T_BROADCAST)</a>
+<a name="ln2300">    if (level == IS_LEVEL_1)</a>
+<a name="ln2301">      fill_fixed_hdr_andstream (&amp;fixed_hdr, L1_LAN_HELLO,</a>
+<a name="ln2302">				circuit-&gt;snd_stream);</a>
+<a name="ln2303">    else</a>
+<a name="ln2304">      fill_fixed_hdr_andstream (&amp;fixed_hdr, L2_LAN_HELLO,</a>
+<a name="ln2305">				circuit-&gt;snd_stream);</a>
+<a name="ln2306">  else</a>
+<a name="ln2307">    fill_fixed_hdr_andstream (&amp;fixed_hdr, P2P_HELLO, circuit-&gt;snd_stream);</a>
+<a name="ln2308"> </a>
+<a name="ln2309">  /*</a>
+<a name="ln2310">   * Fill LAN Level 1 or 2 Hello PDU header</a>
+<a name="ln2311">   */</a>
+<a name="ln2312">  memset (&amp;hello_hdr, 0, sizeof (struct isis_lan_hello_hdr));</a>
+<a name="ln2313">  interval = circuit-&gt;hello_multiplier[level - 1] *</a>
+<a name="ln2314">    circuit-&gt;hello_interval[level - 1];</a>
+<a name="ln2315">  if (interval &gt; USHRT_MAX)</a>
+<a name="ln2316">    interval = USHRT_MAX;</a>
+<a name="ln2317">  hello_hdr.circuit_t = circuit-&gt;is_type;</a>
+<a name="ln2318">  memcpy (hello_hdr.source_id, isis-&gt;sysid, ISIS_SYS_ID_LEN);</a>
+<a name="ln2319">  hello_hdr.hold_time = htons ((u_int16_t) interval);</a>
+<a name="ln2320"> </a>
+<a name="ln2321">  hello_hdr.pdu_len = 0;	/* Update the PDU Length later */</a>
+<a name="ln2322">  len_pointer = stream_get_endp (circuit-&gt;snd_stream) + 3 + ISIS_SYS_ID_LEN;</a>
+<a name="ln2323"> </a>
+<a name="ln2324">  /* copy the shared part of the hello to the p2p hello if needed */</a>
+<a name="ln2325">  if (circuit-&gt;circ_type == CIRCUIT_T_P2P)</a>
+<a name="ln2326">    {</a>
+<a name="ln2327">      memcpy (&amp;p2p_hello_hdr, &amp;hello_hdr, 5 + ISIS_SYS_ID_LEN);</a>
+<a name="ln2328">      p2p_hello_hdr.local_id = circuit-&gt;circuit_id;</a>
+<a name="ln2329">      /* FIXME: need better understanding */</a>
+<a name="ln2330">      stream_put (circuit-&gt;snd_stream, &amp;p2p_hello_hdr, ISIS_P2PHELLO_HDRLEN);</a>
+<a name="ln2331">    }</a>
+<a name="ln2332">  else</a>
+<a name="ln2333">    {</a>
+<a name="ln2334">      hello_hdr.prio = circuit-&gt;priority[level - 1];</a>
+<a name="ln2335">      if (level == IS_LEVEL_1)</a>
+<a name="ln2336">	{</a>
+<a name="ln2337">	  memcpy (hello_hdr.lan_id, circuit-&gt;u.bc.l1_desig_is,</a>
+<a name="ln2338">		  ISIS_SYS_ID_LEN + 1);</a>
+<a name="ln2339">	}</a>
+<a name="ln2340">      else if (level == IS_LEVEL_2)</a>
+<a name="ln2341">	{</a>
+<a name="ln2342">	  memcpy (hello_hdr.lan_id, circuit-&gt;u.bc.l2_desig_is,</a>
+<a name="ln2343">		  ISIS_SYS_ID_LEN + 1);</a>
+<a name="ln2344">	}</a>
+<a name="ln2345">      stream_put (circuit-&gt;snd_stream, &amp;hello_hdr, ISIS_LANHELLO_HDRLEN);</a>
+<a name="ln2346">    }</a>
+<a name="ln2347"> </a>
+<a name="ln2348">  /*</a>
+<a name="ln2349">   * Then the variable length part.</a>
+<a name="ln2350">   */</a>
+<a name="ln2351"> </a>
+<a name="ln2352">  /* add circuit password */</a>
+<a name="ln2353">  switch (circuit-&gt;passwd.type)</a>
+<a name="ln2354">  {</a>
+<a name="ln2355">    /* Cleartext */</a>
+<a name="ln2356">    case ISIS_PASSWD_TYPE_CLEARTXT:</a>
+<a name="ln2357">      if (tlv_add_authinfo (circuit-&gt;passwd.type, circuit-&gt;passwd.len,</a>
+<a name="ln2358">                            circuit-&gt;passwd.passwd, circuit-&gt;snd_stream))</a>
+<a name="ln2359">        return ISIS_WARNING;</a>
+<a name="ln2360">      break;</a>
+<a name="ln2361"> </a>
+<a name="ln2362">    /* HMAC MD5 */</a>
+<a name="ln2363">    case ISIS_PASSWD_TYPE_HMAC_MD5:</a>
+<a name="ln2364">      /* Remember where TLV is written so we can later overwrite the MD5 hash */</a>
+<a name="ln2365">      auth_tlv_offset = stream_get_endp (circuit-&gt;snd_stream);</a>
+<a name="ln2366">      memset(&amp;hmac_md5_hash, 0, ISIS_AUTH_MD5_SIZE);</a>
+<a name="ln2367">      if (tlv_add_authinfo (circuit-&gt;passwd.type, ISIS_AUTH_MD5_SIZE,</a>
+<a name="ln2368">                            hmac_md5_hash, circuit-&gt;snd_stream))</a>
+<a name="ln2369">        return ISIS_WARNING;</a>
+<a name="ln2370">      break;</a>
+<a name="ln2371"> </a>
+<a name="ln2372">    default:</a>
+<a name="ln2373">      break;</a>
+<a name="ln2374">  }</a>
+<a name="ln2375"> </a>
+<a name="ln2376">  /*  Area Addresses TLV */</a>
+<a name="ln2377">  if (listcount (circuit-&gt;area-&gt;area_addrs) == 0)</a>
+<a name="ln2378">    return ISIS_WARNING;</a>
+<a name="ln2379">  if (tlv_add_area_addrs (circuit-&gt;area-&gt;area_addrs, circuit-&gt;snd_stream))</a>
+<a name="ln2380">    return ISIS_WARNING;</a>
+<a name="ln2381"> </a>
+<a name="ln2382">  /*  LAN Neighbors TLV */</a>
+<a name="ln2383">  if (circuit-&gt;circ_type == CIRCUIT_T_BROADCAST)</a>
+<a name="ln2384">    {</a>
+<a name="ln2385">      if (level == IS_LEVEL_1 &amp;&amp; circuit-&gt;u.bc.lan_neighs[0] &amp;&amp;</a>
+<a name="ln2386">          listcount (circuit-&gt;u.bc.lan_neighs[0]) &gt; 0)</a>
+<a name="ln2387">	if (tlv_add_lan_neighs (circuit-&gt;u.bc.lan_neighs[0],</a>
+<a name="ln2388">				circuit-&gt;snd_stream))</a>
+<a name="ln2389">	  return ISIS_WARNING;</a>
+<a name="ln2390">      if (level == IS_LEVEL_2 &amp;&amp; circuit-&gt;u.bc.lan_neighs[1] &amp;&amp;</a>
+<a name="ln2391">          listcount (circuit-&gt;u.bc.lan_neighs[1]) &gt; 0)</a>
+<a name="ln2392">	if (tlv_add_lan_neighs (circuit-&gt;u.bc.lan_neighs[1],</a>
+<a name="ln2393">				circuit-&gt;snd_stream))</a>
+<a name="ln2394">	  return ISIS_WARNING;</a>
+<a name="ln2395">    }</a>
+<a name="ln2396"> </a>
+<a name="ln2397">  /* Protocols Supported TLV */</a>
+<a name="ln2398">  if (circuit-&gt;nlpids.count &gt; 0)</a>
+<a name="ln2399">    if (tlv_add_nlpid (&amp;circuit-&gt;nlpids, circuit-&gt;snd_stream))</a>
+<a name="ln2400">      return ISIS_WARNING;</a>
+<a name="ln2401">  /* IP interface Address TLV */</a>
+<a name="ln2402">  if (circuit-&gt;ip_router &amp;&amp; circuit-&gt;ip_addrs &amp;&amp;</a>
+<a name="ln2403">      listcount (circuit-&gt;ip_addrs) &gt; 0)</a>
+<a name="ln2404">    if (tlv_add_ip_addrs (circuit-&gt;ip_addrs, circuit-&gt;snd_stream))</a>
+<a name="ln2405">      return ISIS_WARNING;</a>
+<a name="ln2406"> </a>
+<a name="ln2407">#ifdef HAVE_IPV6</a>
+<a name="ln2408">  /* IPv6 Interface Address TLV */</a>
+<a name="ln2409">  if (circuit-&gt;ipv6_router &amp;&amp; circuit-&gt;ipv6_link &amp;&amp;</a>
+<a name="ln2410">      listcount (circuit-&gt;ipv6_link) &gt; 0)</a>
+<a name="ln2411">    if (tlv_add_ipv6_addrs (circuit-&gt;ipv6_link, circuit-&gt;snd_stream))</a>
+<a name="ln2412">      return ISIS_WARNING;</a>
+<a name="ln2413">#endif /* HAVE_IPV6 */</a>
+<a name="ln2414"> </a>
+<a name="ln2415">  if (circuit-&gt;pad_hellos)</a>
+<a name="ln2416">    if (tlv_add_padding (circuit-&gt;snd_stream))</a>
+<a name="ln2417">      return ISIS_WARNING;</a>
+<a name="ln2418"> </a>
+<a name="ln2419">  length = stream_get_endp (circuit-&gt;snd_stream);</a>
+<a name="ln2420">  /* Update PDU length */</a>
+<a name="ln2421">  stream_putw_at (circuit-&gt;snd_stream, len_pointer, (u_int16_t) length);</a>
+<a name="ln2422"> </a>
+<a name="ln2423">  /* For HMAC MD5 we need to compute the md5 hash and store it */</a>
+<a name="ln2424">  if (circuit-&gt;passwd.type == ISIS_PASSWD_TYPE_HMAC_MD5)</a>
+<a name="ln2425">    {</a>
+<a name="ln2426">      hmac_md5 (STREAM_DATA (circuit-&gt;snd_stream),</a>
+<a name="ln2427">                stream_get_endp (circuit-&gt;snd_stream),</a>
+<a name="ln2428">                (unsigned char *) &amp;circuit-&gt;passwd.passwd, circuit-&gt;passwd.len,</a>
+<a name="ln2429">                (unsigned char *) &amp;hmac_md5_hash);</a>
+<a name="ln2430">      /* Copy the hash into the stream */</a>
+<a name="ln2431">      memcpy (STREAM_DATA (circuit-&gt;snd_stream) + auth_tlv_offset + 3,</a>
+<a name="ln2432">              hmac_md5_hash, ISIS_AUTH_MD5_SIZE);</a>
+<a name="ln2433">    }</a>
+<a name="ln2434"> </a>
+<a name="ln2435">  if (isis-&gt;debugs &amp; DEBUG_ADJ_PACKETS)</a>
+<a name="ln2436">    {</a>
+<a name="ln2437">      if (circuit-&gt;circ_type == CIRCUIT_T_BROADCAST)</a>
+<a name="ln2438">	{</a>
+<a name="ln2439">	  zlog_debug (&quot;ISIS-Adj (%s): Sending L%d LAN IIH on %s, length %zd&quot;,</a>
+<a name="ln2440">		      circuit-&gt;area-&gt;area_tag, level, circuit-&gt;interface-&gt;name,</a>
+<a name="ln2441">		      length);</a>
+<a name="ln2442">	}</a>
+<a name="ln2443">      else</a>
+<a name="ln2444">	{</a>
+<a name="ln2445">	  zlog_debug (&quot;ISIS-Adj (%s): Sending P2P IIH on %s, length %zd&quot;,</a>
+<a name="ln2446">		      circuit-&gt;area-&gt;area_tag, circuit-&gt;interface-&gt;name,</a>
+<a name="ln2447">		      length);</a>
+<a name="ln2448">	}</a>
+<a name="ln2449">      if (isis-&gt;debugs &amp; DEBUG_PACKET_DUMP)</a>
+<a name="ln2450">        zlog_dump_data (STREAM_DATA (circuit-&gt;snd_stream),</a>
+<a name="ln2451">                        stream_get_endp (circuit-&gt;snd_stream));</a>
+<a name="ln2452">    }</a>
+<a name="ln2453"> </a>
+<a name="ln2454">  retval = circuit-&gt;tx (circuit, level);</a>
+<a name="ln2455">  if (retval != ISIS_OK)</a>
+<a name="ln2456">    zlog_err (&quot;ISIS-Adj (%s): Send L%d IIH on %s failed&quot;,</a>
+<a name="ln2457">              circuit-&gt;area-&gt;area_tag, level, circuit-&gt;interface-&gt;name);</a>
+<a name="ln2458"> </a>
+<a name="ln2459">  return retval;</a>
+<a name="ln2460">}</a>
+<a name="ln2461"> </a>
+<a name="ln2462">int</a>
+<a name="ln2463">send_lan_l1_hello (struct thread *thread)</a>
+<a name="ln2464">{</a>
+<a name="ln2465">  struct isis_circuit *circuit;</a>
+<a name="ln2466">  int retval;</a>
+<a name="ln2467"> </a>
+<a name="ln2468">  circuit = THREAD_ARG (thread);</a>
+<a name="ln2469">  assert (circuit);</a>
+<a name="ln2470">  circuit-&gt;u.bc.t_send_lan_hello[0] = NULL;</a>
+<a name="ln2471"> </a>
+<a name="ln2472">  if (!(circuit-&gt;area-&gt;is_type &amp; IS_LEVEL_1))</a>
+<a name="ln2473">    {</a>
+<a name="ln2474">      zlog_warn (&quot;ISIS-Hello (%s): Trying to send L1 IIH in L2-only area&quot;,</a>
+<a name="ln2475">		 circuit-&gt;area-&gt;area_tag);</a>
+<a name="ln2476">      return 1;</a>
+<a name="ln2477">    }</a>
+<a name="ln2478"> </a>
+<a name="ln2479">  if (circuit-&gt;u.bc.run_dr_elect[0])</a>
+<a name="ln2480">    retval = isis_dr_elect (circuit, 1);</a>
+<a name="ln2481"> </a>
+<a name="ln2482">  retval = send_hello (circuit, 1);</a>
+<a name="ln2483"> </a>
+<a name="ln2484">  /* set next timer thread */</a>
+<a name="ln2485">  THREAD_TIMER_ON (master, circuit-&gt;u.bc.t_send_lan_hello[0],</a>
+<a name="ln2486">		   send_lan_l1_hello, circuit,</a>
+<a name="ln2487">		   isis_jitter (circuit-&gt;hello_interval[0], IIH_JITTER));</a>
+<a name="ln2488"> </a>
+<a name="ln2489">  return retval;</a>
+<a name="ln2490">}</a>
+<a name="ln2491"> </a>
+<a name="ln2492">int</a>
+<a name="ln2493">send_lan_l2_hello (struct thread *thread)</a>
+<a name="ln2494">{</a>
+<a name="ln2495">  struct isis_circuit *circuit;</a>
+<a name="ln2496">  int retval;</a>
+<a name="ln2497"> </a>
+<a name="ln2498">  circuit = THREAD_ARG (thread);</a>
+<a name="ln2499">  assert (circuit);</a>
+<a name="ln2500">  circuit-&gt;u.bc.t_send_lan_hello[1] = NULL;</a>
+<a name="ln2501"> </a>
+<a name="ln2502">  if (!(circuit-&gt;area-&gt;is_type &amp; IS_LEVEL_2))</a>
+<a name="ln2503">    {</a>
+<a name="ln2504">      zlog_warn (&quot;ISIS-Hello (%s): Trying to send L2 IIH in L1 area&quot;,</a>
+<a name="ln2505">		 circuit-&gt;area-&gt;area_tag);</a>
+<a name="ln2506">      return 1;</a>
+<a name="ln2507">    }</a>
+<a name="ln2508"> </a>
+<a name="ln2509">  if (circuit-&gt;u.bc.run_dr_elect[1])</a>
+<a name="ln2510">    retval = isis_dr_elect (circuit, 2);</a>
+<a name="ln2511"> </a>
+<a name="ln2512">  retval = send_hello (circuit, 2);</a>
+<a name="ln2513"> </a>
+<a name="ln2514">  /* set next timer thread */</a>
+<a name="ln2515">  THREAD_TIMER_ON (master, circuit-&gt;u.bc.t_send_lan_hello[1],</a>
+<a name="ln2516">		   send_lan_l2_hello, circuit,</a>
+<a name="ln2517">		   isis_jitter (circuit-&gt;hello_interval[1], IIH_JITTER));</a>
+<a name="ln2518"> </a>
+<a name="ln2519">  return retval;</a>
+<a name="ln2520">}</a>
+<a name="ln2521"> </a>
+<a name="ln2522">int</a>
+<a name="ln2523">send_p2p_hello (struct thread *thread)</a>
+<a name="ln2524">{</a>
+<a name="ln2525">  struct isis_circuit *circuit;</a>
+<a name="ln2526"> </a>
+<a name="ln2527">  circuit = THREAD_ARG (thread);</a>
+<a name="ln2528">  assert (circuit);</a>
+<a name="ln2529">  circuit-&gt;u.p2p.t_send_p2p_hello = NULL;</a>
+<a name="ln2530"> </a>
+<a name="ln2531">  send_hello (circuit, 1);</a>
+<a name="ln2532"> </a>
+<a name="ln2533">  /* set next timer thread */</a>
+<a name="ln2534">  THREAD_TIMER_ON (master, circuit-&gt;u.p2p.t_send_p2p_hello, send_p2p_hello,</a>
+<a name="ln2535">		   circuit, isis_jitter (circuit-&gt;hello_interval[1],</a>
+<a name="ln2536">					 IIH_JITTER));</a>
+<a name="ln2537"> </a>
+<a name="ln2538">  return ISIS_OK;</a>
+<a name="ln2539">}</a>
+<a name="ln2540"> </a>
+<a name="ln2541">static int</a>
+<a name="ln2542">build_csnp (int level, u_char * start, u_char * stop, struct list *lsps,</a>
+<a name="ln2543">	    struct isis_circuit *circuit)</a>
+<a name="ln2544">{</a>
+<a name="ln2545">  struct isis_fixed_hdr fixed_hdr;</a>
+<a name="ln2546">  struct isis_passwd *passwd;</a>
+<a name="ln2547">  unsigned long lenp;</a>
+<a name="ln2548">  u_int16_t length;</a>
+<a name="ln2549">  unsigned char hmac_md5_hash[ISIS_AUTH_MD5_SIZE];</a>
+<a name="ln2550">  unsigned long auth_tlv_offset = 0;</a>
+<a name="ln2551">  int retval = ISIS_OK;</a>
+<a name="ln2552"> </a>
+<a name="ln2553">  isis_circuit_stream(circuit, &amp;circuit-&gt;snd_stream);</a>
+<a name="ln2554"> </a>
+<a name="ln2555">  if (level == IS_LEVEL_1)</a>
+<a name="ln2556">    fill_fixed_hdr_andstream (&amp;fixed_hdr, L1_COMPLETE_SEQ_NUM,</a>
+<a name="ln2557">			      circuit-&gt;snd_stream);</a>
+<a name="ln2558">  else</a>
+<a name="ln2559">    fill_fixed_hdr_andstream (&amp;fixed_hdr, L2_COMPLETE_SEQ_NUM,</a>
+<a name="ln2560">			      circuit-&gt;snd_stream);</a>
+<a name="ln2561"> </a>
+<a name="ln2562">  /*</a>
+<a name="ln2563">   * Fill Level 1 or 2 Complete Sequence Numbers header</a>
+<a name="ln2564">   */</a>
+<a name="ln2565"> </a>
+<a name="ln2566">  lenp = stream_get_endp (circuit-&gt;snd_stream);</a>
+<a name="ln2567">  stream_putw (circuit-&gt;snd_stream, 0);	/* PDU length - when we know it */</a>
+<a name="ln2568">  /* no need to send the source here, it is always us if we csnp */</a>
+<a name="ln2569">  stream_put (circuit-&gt;snd_stream, isis-&gt;sysid, ISIS_SYS_ID_LEN);</a>
+<a name="ln2570">  /* with zero circuit id - ref 9.10, 9.11 */</a>
+<a name="ln2571">  stream_putc (circuit-&gt;snd_stream, 0x00);</a>
+<a name="ln2572"> </a>
+<a name="ln2573">  stream_put (circuit-&gt;snd_stream, start, ISIS_SYS_ID_LEN + 2);</a>
+<a name="ln2574">  stream_put (circuit-&gt;snd_stream, stop, ISIS_SYS_ID_LEN + 2);</a>
+<a name="ln2575"> </a>
+<a name="ln2576">  /*</a>
+<a name="ln2577">   * And TLVs</a>
+<a name="ln2578">   */</a>
+<a name="ln2579">  if (level == IS_LEVEL_1)</a>
+<a name="ln2580">    passwd = &amp;circuit-&gt;area-&gt;area_passwd;</a>
+<a name="ln2581">  else</a>
+<a name="ln2582">    passwd = &amp;circuit-&gt;area-&gt;domain_passwd;</a>
+<a name="ln2583"> </a>
+<a name="ln2584">  if (CHECK_FLAG(passwd-&gt;snp_auth, SNP_AUTH_SEND))</a>
+<a name="ln2585">  {</a>
+<a name="ln2586">    switch (passwd-&gt;type)</a>
+<a name="ln2587">    {</a>
+<a name="ln2588">      /* Cleartext */</a>
+<a name="ln2589">      case ISIS_PASSWD_TYPE_CLEARTXT:</a>
+<a name="ln2590">        if (tlv_add_authinfo (ISIS_PASSWD_TYPE_CLEARTXT, passwd-&gt;len,</a>
+<a name="ln2591">                              passwd-&gt;passwd, circuit-&gt;snd_stream))</a>
+<a name="ln2592">          return ISIS_WARNING;</a>
+<a name="ln2593">        break;</a>
+<a name="ln2594"> </a>
+<a name="ln2595">        /* HMAC MD5 */</a>
+<a name="ln2596">      case ISIS_PASSWD_TYPE_HMAC_MD5:</a>
+<a name="ln2597">        /* Remember where TLV is written so we can later overwrite the MD5 hash */</a>
+<a name="ln2598">        auth_tlv_offset = stream_get_endp (circuit-&gt;snd_stream);</a>
+<a name="ln2599">        memset(&amp;hmac_md5_hash, 0, ISIS_AUTH_MD5_SIZE);</a>
+<a name="ln2600">        if (tlv_add_authinfo (ISIS_PASSWD_TYPE_HMAC_MD5, ISIS_AUTH_MD5_SIZE,</a>
+<a name="ln2601">                              hmac_md5_hash, circuit-&gt;snd_stream))</a>
+<a name="ln2602">          return ISIS_WARNING;</a>
+<a name="ln2603">        break;</a>
+<a name="ln2604"> </a>
+<a name="ln2605">      default:</a>
+<a name="ln2606">        break;</a>
+<a name="ln2607">    }</a>
+<a name="ln2608">  }</a>
+<a name="ln2609"> </a>
+<a name="ln2610">  retval = tlv_add_lsp_entries (lsps, circuit-&gt;snd_stream);</a>
+<a name="ln2611">  if (retval != ISIS_OK)</a>
+<a name="ln2612">    return retval;</a>
+<a name="ln2613"> </a>
+<a name="ln2614">  length = (u_int16_t) stream_get_endp (circuit-&gt;snd_stream);</a>
+<a name="ln2615">  /* Update PU length */</a>
+<a name="ln2616">  stream_putw_at (circuit-&gt;snd_stream, lenp, length);</a>
+<a name="ln2617"> </a>
+<a name="ln2618">  /* For HMAC MD5 we need to compute the md5 hash and store it */</a>
+<a name="ln2619">  if (CHECK_FLAG(passwd-&gt;snp_auth, SNP_AUTH_SEND) &amp;&amp;</a>
+<a name="ln2620">      passwd-&gt;type == ISIS_PASSWD_TYPE_HMAC_MD5)</a>
+<a name="ln2621">    {</a>
+<a name="ln2622">      hmac_md5 (STREAM_DATA (circuit-&gt;snd_stream),</a>
+<a name="ln2623">                stream_get_endp(circuit-&gt;snd_stream),</a>
+<a name="ln2624">                (unsigned char *) &amp;passwd-&gt;passwd, passwd-&gt;len,</a>
+<a name="ln2625">                (unsigned char *) &amp;hmac_md5_hash);</a>
+<a name="ln2626">      /* Copy the hash into the stream */</a>
+<a name="ln2627">      memcpy (STREAM_DATA (circuit-&gt;snd_stream) + auth_tlv_offset + 3,</a>
+<a name="ln2628">              hmac_md5_hash, ISIS_AUTH_MD5_SIZE);</a>
+<a name="ln2629">    }</a>
+<a name="ln2630"> </a>
+<a name="ln2631">  return retval;</a>
+<a name="ln2632">}</a>
+<a name="ln2633"> </a>
+<a name="ln2634">/*</a>
+<a name="ln2635"> * Count the maximum number of lsps that can be accomodated by a given size.</a>
+<a name="ln2636"> */</a>
+<a name="ln2637">static uint16_t</a>
+<a name="ln2638">get_max_lsp_count (uint16_t size)</a>
+<a name="ln2639">{</a>
+<a name="ln2640">  uint16_t tlv_count;</a>
+<a name="ln2641">  uint16_t lsp_count;</a>
+<a name="ln2642">  uint16_t remaining_size;</a>
+<a name="ln2643"> </a>
+<a name="ln2644">  /* First count the full size TLVs */</a>
+<a name="ln2645">  tlv_count = size / MAX_LSP_ENTRIES_TLV_SIZE;</a>
+<a name="ln2646">  lsp_count = tlv_count * (MAX_LSP_ENTRIES_TLV_SIZE / LSP_ENTRIES_LEN);</a>
+<a name="ln2647"> </a>
+<a name="ln2648">  /* The last TLV, if any */</a>
+<a name="ln2649">  remaining_size = size % MAX_LSP_ENTRIES_TLV_SIZE;</a>
+<a name="ln2650">  if (remaining_size - 2 &gt;= LSP_ENTRIES_LEN)</a>
+<a name="ln2651">    lsp_count += (remaining_size - 2) / LSP_ENTRIES_LEN;</a>
+<a name="ln2652"> </a>
+<a name="ln2653">  return lsp_count;</a>
+<a name="ln2654">}</a>
+<a name="ln2655"> </a>
+<a name="ln2656">/*</a>
+<a name="ln2657"> * Calculate the length of Authentication Info. TLV.</a>
+<a name="ln2658"> */</a>
+<a name="ln2659">static uint16_t</a>
+<a name="ln2660">auth_tlv_length (int level, struct isis_circuit *circuit)</a>
+<a name="ln2661">{</a>
+<a name="ln2662">  struct isis_passwd *passwd;</a>
+<a name="ln2663">  uint16_t length;</a>
+<a name="ln2664"> </a>
+<a name="ln2665">  if (level == IS_LEVEL_1)</a>
+<a name="ln2666">    passwd = &amp;circuit-&gt;area-&gt;area_passwd;</a>
+<a name="ln2667">  else</a>
+<a name="ln2668">    passwd = &amp;circuit-&gt;area-&gt;domain_passwd;</a>
+<a name="ln2669"> </a>
+<a name="ln2670">  /* Also include the length of TLV header */</a>
+<a name="ln2671">  length = AUTH_INFO_HDRLEN;</a>
+<a name="ln2672">  if (CHECK_FLAG(passwd-&gt;snp_auth, SNP_AUTH_SEND))</a>
+<a name="ln2673">  {</a>
+<a name="ln2674">    switch (passwd-&gt;type)</a>
+<a name="ln2675">    {</a>
+<a name="ln2676">      /* Cleartext */</a>
+<a name="ln2677">      case ISIS_PASSWD_TYPE_CLEARTXT:</a>
+<a name="ln2678">        length += passwd-&gt;len;</a>
+<a name="ln2679">        break;</a>
+<a name="ln2680"> </a>
+<a name="ln2681">        /* HMAC MD5 */</a>
+<a name="ln2682">      case ISIS_PASSWD_TYPE_HMAC_MD5:</a>
+<a name="ln2683">        length += ISIS_AUTH_MD5_SIZE;</a>
+<a name="ln2684">        break;</a>
+<a name="ln2685"> </a>
+<a name="ln2686">      default:</a>
+<a name="ln2687">        break;</a>
+<a name="ln2688">    }</a>
+<a name="ln2689">  }</a>
+<a name="ln2690"> </a>
+<a name="ln2691">  return length;</a>
+<a name="ln2692">}</a>
+<a name="ln2693"> </a>
+<a name="ln2694">/*</a>
+<a name="ln2695"> * Calculate the maximum number of lsps that can be accomodated in a CSNP/PSNP.</a>
+<a name="ln2696"> */</a>
+<a name="ln2697">static uint16_t</a>
+<a name="ln2698">max_lsps_per_snp (int snp_type, int level, struct isis_circuit *circuit)</a>
+<a name="ln2699">{</a>
+<a name="ln2700">  int snp_hdr_len;</a>
+<a name="ln2701">  int auth_tlv_len;</a>
+<a name="ln2702">  uint16_t lsp_count;</a>
+<a name="ln2703"> </a>
+<a name="ln2704">  snp_hdr_len = ISIS_FIXED_HDR_LEN;</a>
+<a name="ln2705">  if (snp_type == ISIS_SNP_CSNP_FLAG)</a>
+<a name="ln2706">    snp_hdr_len += ISIS_CSNP_HDRLEN;</a>
+<a name="ln2707">  else</a>
+<a name="ln2708">    snp_hdr_len += ISIS_PSNP_HDRLEN;</a>
+<a name="ln2709"> </a>
+<a name="ln2710">  auth_tlv_len = auth_tlv_length (level, circuit);</a>
+<a name="ln2711">  lsp_count = get_max_lsp_count (</a>
+<a name="ln2712">      stream_get_size (circuit-&gt;snd_stream) - snp_hdr_len - auth_tlv_len);</a>
+<a name="ln2713">  return lsp_count;</a>
+<a name="ln2714">}</a>
+<a name="ln2715"> </a>
+<a name="ln2716">/*</a>
+<a name="ln2717"> * FIXME: support multiple CSNPs</a>
+<a name="ln2718"> */</a>
+<a name="ln2719"> </a>
+<a name="ln2720">int</a>
+<a name="ln2721">send_csnp (struct isis_circuit *circuit, int level)</a>
+<a name="ln2722">{</a>
+<a name="ln2723">  u_char start[ISIS_SYS_ID_LEN + 2];</a>
+<a name="ln2724">  u_char stop[ISIS_SYS_ID_LEN + 2];</a>
+<a name="ln2725">  struct list *list = NULL;</a>
+<a name="ln2726">  struct listnode *node;</a>
+<a name="ln2727">  struct isis_lsp *lsp;</a>
+<a name="ln2728">  u_char num_lsps, loop = 1;</a>
+<a name="ln2729">  int i, retval = ISIS_OK;</a>
+<a name="ln2730"> </a>
+<a name="ln2731">  if (circuit-&gt;area-&gt;lspdb[level - 1] == NULL ||</a>
+<a name="ln2732">      dict_count (circuit-&gt;area-&gt;lspdb[level - 1]) == 0)</a>
+<a name="ln2733">    return retval;</a>
+<a name="ln2734"> </a>
+<a name="ln2735">  memset (start, 0x00, ISIS_SYS_ID_LEN + 2);</a>
+<a name="ln2736">  memset (stop, 0xff, ISIS_SYS_ID_LEN + 2);</a>
+<a name="ln2737"> </a>
+<a name="ln2738">  num_lsps = max_lsps_per_snp (ISIS_SNP_CSNP_FLAG, level, circuit);</a>
+<a name="ln2739"> </a>
+<a name="ln2740">  while (loop)</a>
+<a name="ln2741">    {</a>
+<a name="ln2742">      list = list_new ();</a>
+<a name="ln2743">      lsp_build_list (start, stop, num_lsps, list,</a>
+<a name="ln2744">                      circuit-&gt;area-&gt;lspdb[level - 1]);</a>
+<a name="ln2745">      /*</a>
+<a name="ln2746">       * Update the stop lsp_id before encoding this CSNP.</a>
+<a name="ln2747">       */</a>
+<a name="ln2748">      if (listcount (list) &lt; num_lsps)</a>
+<a name="ln2749">        {</a>
+<a name="ln2750">          memset (stop, 0xff, ISIS_SYS_ID_LEN + 2);</a>
+<a name="ln2751">        }</a>
+<a name="ln2752">      else</a>
+<a name="ln2753">        {</a>
+<a name="ln2754">          node = listtail (list);</a>
+<a name="ln2755">          lsp = listgetdata (node);</a>
+<a name="ln2756">          memcpy (stop, lsp-&gt;lsp_header-&gt;lsp_id, ISIS_SYS_ID_LEN + 2);</a>
+<a name="ln2757">        }</a>
+<a name="ln2758"> </a>
+<a name="ln2759">      retval = build_csnp (level, start, stop, list, circuit);</a>
+<a name="ln2760">      if (retval != ISIS_OK)</a>
+<a name="ln2761">        {</a>
+<a name="ln2762">          zlog_err (&quot;ISIS-Snp (%s): Build L%d CSNP on %s failed&quot;,</a>
+<a name="ln2763">                    circuit-&gt;area-&gt;area_tag, level, circuit-&gt;interface-&gt;name);</a>
+<a name="ln2764">          list_delete (list);</a>
+<a name="ln2765">          return retval;</a>
+<a name="ln2766">        }</a>
+<a name="ln2767"> </a>
+<a name="ln2768">      if (isis-&gt;debugs &amp; DEBUG_SNP_PACKETS)</a>
+<a name="ln2769">        {</a>
+<a name="ln2770">          zlog_debug (&quot;ISIS-Snp (%s): Sending L%d CSNP on %s, length %zd&quot;,</a>
+<a name="ln2771">                      circuit-&gt;area-&gt;area_tag, level, circuit-&gt;interface-&gt;name,</a>
+<a name="ln2772">                      stream_get_endp (circuit-&gt;snd_stream));</a>
+<a name="ln2773">          for (ALL_LIST_ELEMENTS_RO (list, node, lsp))</a>
+<a name="ln2774">            {</a>
+<a name="ln2775">              zlog_debug (&quot;ISIS-Snp (%s):         CSNP entry %s, seq 0x%08x,&quot;</a>
+<a name="ln2776">                          &quot; cksum 0x%04x, lifetime %us&quot;,</a>
+<a name="ln2777">                          circuit-&gt;area-&gt;area_tag,</a>
+<a name="ln2778">                          rawlspid_print (lsp-&gt;lsp_header-&gt;lsp_id),</a>
+<a name="ln2779">                          ntohl (lsp-&gt;lsp_header-&gt;seq_num),</a>
+<a name="ln2780">                          ntohs (lsp-&gt;lsp_header-&gt;checksum),</a>
+<a name="ln2781">                          ntohs (lsp-&gt;lsp_header-&gt;rem_lifetime));</a>
+<a name="ln2782">            }</a>
+<a name="ln2783">          if (isis-&gt;debugs &amp; DEBUG_PACKET_DUMP)</a>
+<a name="ln2784">            zlog_dump_data (STREAM_DATA (circuit-&gt;snd_stream),</a>
+<a name="ln2785">                            stream_get_endp (circuit-&gt;snd_stream));</a>
+<a name="ln2786">        }</a>
+<a name="ln2787"> </a>
+<a name="ln2788">      retval = circuit-&gt;tx (circuit, level);</a>
+<a name="ln2789">      if (retval != ISIS_OK)</a>
+<a name="ln2790">        {</a>
+<a name="ln2791">          zlog_err (&quot;ISIS-Snp (%s): Send L%d CSNP on %s failed&quot;,</a>
+<a name="ln2792">                    circuit-&gt;area-&gt;area_tag, level,</a>
+<a name="ln2793">                    circuit-&gt;interface-&gt;name);</a>
+<a name="ln2794">          list_delete (list);</a>
+<a name="ln2795">          return retval;</a>
+<a name="ln2796">        }</a>
+<a name="ln2797"> </a>
+<a name="ln2798">      /*</a>
+<a name="ln2799">       * Start lsp_id of the next CSNP should be one plus the</a>
+<a name="ln2800">       * stop lsp_id in this current CSNP.</a>
+<a name="ln2801">       */</a>
+<a name="ln2802">      memcpy (start, stop, ISIS_SYS_ID_LEN + 2);</a>
+<a name="ln2803">      loop = 0;</a>
+<a name="ln2804">      for (i = ISIS_SYS_ID_LEN + 1; i &gt;= 0; --i)</a>
+<a name="ln2805">        {</a>
+<a name="ln2806">          if (start[i] &lt; (u_char)0xff)</a>
+<a name="ln2807">            {</a>
+<a name="ln2808">              start[i] += 1;</a>
+<a name="ln2809">              loop = 1;</a>
+<a name="ln2810">              break;</a>
+<a name="ln2811">            }</a>
+<a name="ln2812">        }</a>
+<a name="ln2813">      memset (stop, 0xff, ISIS_SYS_ID_LEN + 2);</a>
+<a name="ln2814">      list_delete (list);</a>
+<a name="ln2815">    }</a>
+<a name="ln2816"> </a>
+<a name="ln2817">  return retval;</a>
+<a name="ln2818">}</a>
+<a name="ln2819"> </a>
+<a name="ln2820">int</a>
+<a name="ln2821">send_l1_csnp (struct thread *thread)</a>
+<a name="ln2822">{</a>
+<a name="ln2823">  struct isis_circuit *circuit;</a>
+<a name="ln2824">  int retval = ISIS_OK;</a>
+<a name="ln2825"> </a>
+<a name="ln2826">  circuit = THREAD_ARG (thread);</a>
+<a name="ln2827">  assert (circuit);</a>
+<a name="ln2828"> </a>
+<a name="ln2829">  circuit-&gt;t_send_csnp[0] = NULL;</a>
+<a name="ln2830"> </a>
+<a name="ln2831">  if (circuit-&gt;circ_type == CIRCUIT_T_BROADCAST &amp;&amp; circuit-&gt;u.bc.is_dr[0])</a>
+<a name="ln2832">    {</a>
+<a name="ln2833">      send_csnp (circuit, 1);</a>
+<a name="ln2834">    }</a>
+<a name="ln2835">  /* set next timer thread */</a>
+<a name="ln2836">  THREAD_TIMER_ON (master, circuit-&gt;t_send_csnp[0], send_l1_csnp, circuit,</a>
+<a name="ln2837">		   isis_jitter (circuit-&gt;csnp_interval[0], CSNP_JITTER));</a>
+<a name="ln2838"> </a>
+<a name="ln2839">  return retval;</a>
+<a name="ln2840">}</a>
+<a name="ln2841"> </a>
+<a name="ln2842">int</a>
+<a name="ln2843">send_l2_csnp (struct thread *thread)</a>
+<a name="ln2844">{</a>
+<a name="ln2845">  struct isis_circuit *circuit;</a>
+<a name="ln2846">  int retval = ISIS_OK;</a>
+<a name="ln2847"> </a>
+<a name="ln2848">  circuit = THREAD_ARG (thread);</a>
+<a name="ln2849">  assert (circuit);</a>
+<a name="ln2850"> </a>
+<a name="ln2851">  circuit-&gt;t_send_csnp[1] = NULL;</a>
+<a name="ln2852"> </a>
+<a name="ln2853">  if (circuit-&gt;circ_type == CIRCUIT_T_BROADCAST &amp;&amp; circuit-&gt;u.bc.is_dr[1])</a>
+<a name="ln2854">    {</a>
+<a name="ln2855">      send_csnp (circuit, 2);</a>
+<a name="ln2856">    }</a>
+<a name="ln2857">  /* set next timer thread */</a>
+<a name="ln2858">  THREAD_TIMER_ON (master, circuit-&gt;t_send_csnp[1], send_l2_csnp, circuit,</a>
+<a name="ln2859">		   isis_jitter (circuit-&gt;csnp_interval[1], CSNP_JITTER));</a>
+<a name="ln2860"> </a>
+<a name="ln2861">  return retval;</a>
+<a name="ln2862">}</a>
+<a name="ln2863"> </a>
+<a name="ln2864">static int</a>
+<a name="ln2865">build_psnp (int level, struct isis_circuit *circuit, struct list *lsps)</a>
+<a name="ln2866">{</a>
+<a name="ln2867">  struct isis_fixed_hdr fixed_hdr;</a>
+<a name="ln2868">  unsigned long lenp;</a>
+<a name="ln2869">  u_int16_t length;</a>
+<a name="ln2870">  struct isis_lsp *lsp;</a>
+<a name="ln2871">  struct isis_passwd *passwd;</a>
+<a name="ln2872">  struct listnode *node;</a>
+<a name="ln2873">  unsigned char hmac_md5_hash[ISIS_AUTH_MD5_SIZE];</a>
+<a name="ln2874">  unsigned long auth_tlv_offset = 0;</a>
+<a name="ln2875">  int retval = ISIS_OK;</a>
+<a name="ln2876"> </a>
+<a name="ln2877">  isis_circuit_stream(circuit, &amp;circuit-&gt;snd_stream);</a>
+<a name="ln2878"> </a>
+<a name="ln2879">  if (level == IS_LEVEL_1)</a>
+<a name="ln2880">    fill_fixed_hdr_andstream (&amp;fixed_hdr, L1_PARTIAL_SEQ_NUM,</a>
+<a name="ln2881">			      circuit-&gt;snd_stream);</a>
+<a name="ln2882">  else</a>
+<a name="ln2883">    fill_fixed_hdr_andstream (&amp;fixed_hdr, L2_PARTIAL_SEQ_NUM,</a>
+<a name="ln2884">			      circuit-&gt;snd_stream);</a>
+<a name="ln2885"> </a>
+<a name="ln2886">  /*</a>
+<a name="ln2887">   * Fill Level 1 or 2 Partial Sequence Numbers header</a>
+<a name="ln2888">   */</a>
+<a name="ln2889">  lenp = stream_get_endp (circuit-&gt;snd_stream);</a>
+<a name="ln2890">  stream_putw (circuit-&gt;snd_stream, 0);	/* PDU length - when we know it */</a>
+<a name="ln2891">  stream_put (circuit-&gt;snd_stream, isis-&gt;sysid, ISIS_SYS_ID_LEN);</a>
+<a name="ln2892">  stream_putc (circuit-&gt;snd_stream, circuit-&gt;idx);</a>
+<a name="ln2893"> </a>
+<a name="ln2894">  /*</a>
+<a name="ln2895">   * And TLVs</a>
+<a name="ln2896">   */</a>
+<a name="ln2897"> </a>
+<a name="ln2898">  if (level == IS_LEVEL_1)</a>
+<a name="ln2899">    passwd = &amp;circuit-&gt;area-&gt;area_passwd;</a>
+<a name="ln2900">  else</a>
+<a name="ln2901">    passwd = &amp;circuit-&gt;area-&gt;domain_passwd;</a>
+<a name="ln2902"> </a>
+<a name="ln2903">  if (CHECK_FLAG(passwd-&gt;snp_auth, SNP_AUTH_SEND))</a>
+<a name="ln2904">  {</a>
+<a name="ln2905">    switch (passwd-&gt;type)</a>
+<a name="ln2906">    {</a>
+<a name="ln2907">      /* Cleartext */</a>
+<a name="ln2908">      case ISIS_PASSWD_TYPE_CLEARTXT:</a>
+<a name="ln2909">        if (tlv_add_authinfo (ISIS_PASSWD_TYPE_CLEARTXT, passwd-&gt;len,</a>
+<a name="ln2910">                              passwd-&gt;passwd, circuit-&gt;snd_stream))</a>
+<a name="ln2911">          return ISIS_WARNING;</a>
+<a name="ln2912">        break;</a>
+<a name="ln2913"> </a>
+<a name="ln2914">        /* HMAC MD5 */</a>
+<a name="ln2915">      case ISIS_PASSWD_TYPE_HMAC_MD5:</a>
+<a name="ln2916">        /* Remember where TLV is written so we can later overwrite the MD5 hash */</a>
+<a name="ln2917">        auth_tlv_offset = stream_get_endp (circuit-&gt;snd_stream);</a>
+<a name="ln2918">        memset(&amp;hmac_md5_hash, 0, ISIS_AUTH_MD5_SIZE);</a>
+<a name="ln2919">        if (tlv_add_authinfo (ISIS_PASSWD_TYPE_HMAC_MD5, ISIS_AUTH_MD5_SIZE,</a>
+<a name="ln2920">                              hmac_md5_hash, circuit-&gt;snd_stream))</a>
+<a name="ln2921">          return ISIS_WARNING;</a>
+<a name="ln2922">        break;</a>
+<a name="ln2923"> </a>
+<a name="ln2924">      default:</a>
+<a name="ln2925">        break;</a>
+<a name="ln2926">    }</a>
+<a name="ln2927">  }</a>
+<a name="ln2928"> </a>
+<a name="ln2929">  retval = tlv_add_lsp_entries (lsps, circuit-&gt;snd_stream);</a>
+<a name="ln2930">  if (retval != ISIS_OK)</a>
+<a name="ln2931">    return retval;</a>
+<a name="ln2932"> </a>
+<a name="ln2933">  if (isis-&gt;debugs &amp; DEBUG_SNP_PACKETS)</a>
+<a name="ln2934">    {</a>
+<a name="ln2935">      for (ALL_LIST_ELEMENTS_RO (lsps, node, lsp))</a>
+<a name="ln2936">      {</a>
+<a name="ln2937">	zlog_debug (&quot;ISIS-Snp (%s):         PSNP entry %s, seq 0x%08x,&quot;</a>
+<a name="ln2938">		    &quot; cksum 0x%04x, lifetime %us&quot;,</a>
+<a name="ln2939">		    circuit-&gt;area-&gt;area_tag,</a>
+<a name="ln2940">		    rawlspid_print (lsp-&gt;lsp_header-&gt;lsp_id),</a>
+<a name="ln2941">		    ntohl (lsp-&gt;lsp_header-&gt;seq_num),</a>
+<a name="ln2942">		    ntohs (lsp-&gt;lsp_header-&gt;checksum),</a>
+<a name="ln2943">		    ntohs (lsp-&gt;lsp_header-&gt;rem_lifetime));</a>
+<a name="ln2944">      }</a>
+<a name="ln2945">    }</a>
+<a name="ln2946"> </a>
+<a name="ln2947">  length = (u_int16_t) stream_get_endp (circuit-&gt;snd_stream);</a>
+<a name="ln2948">  /* Update PDU length */</a>
+<a name="ln2949">  stream_putw_at (circuit-&gt;snd_stream, lenp, length);</a>
+<a name="ln2950"> </a>
+<a name="ln2951">  /* For HMAC MD5 we need to compute the md5 hash and store it */</a>
+<a name="ln2952">  if (CHECK_FLAG(passwd-&gt;snp_auth, SNP_AUTH_SEND) &amp;&amp;</a>
+<a name="ln2953">      passwd-&gt;type == ISIS_PASSWD_TYPE_HMAC_MD5)</a>
+<a name="ln2954">    {</a>
+<a name="ln2955">      hmac_md5 (STREAM_DATA (circuit-&gt;snd_stream),</a>
+<a name="ln2956">                stream_get_endp(circuit-&gt;snd_stream),</a>
+<a name="ln2957">                (unsigned char *) &amp;passwd-&gt;passwd, passwd-&gt;len,</a>
+<a name="ln2958">                (unsigned char *) &amp;hmac_md5_hash);</a>
+<a name="ln2959">      /* Copy the hash into the stream */</a>
+<a name="ln2960">      memcpy (STREAM_DATA (circuit-&gt;snd_stream) + auth_tlv_offset + 3,</a>
+<a name="ln2961">              hmac_md5_hash, ISIS_AUTH_MD5_SIZE);</a>
+<a name="ln2962">    }</a>
+<a name="ln2963"> </a>
+<a name="ln2964">  return ISIS_OK;</a>
+<a name="ln2965">}</a>
+<a name="ln2966"> </a>
+<a name="ln2967">/*</a>
+<a name="ln2968"> *  7.3.15.4 action on expiration of partial SNP interval</a>
+<a name="ln2969"> *  level 1</a>
+<a name="ln2970"> */</a>
+<a name="ln2971">static int</a>
+<a name="ln2972">send_psnp (int level, struct isis_circuit *circuit)</a>
+<a name="ln2973">{</a>
+<a name="ln2974">  struct isis_lsp *lsp;</a>
+<a name="ln2975">  struct list *list = NULL;</a>
+<a name="ln2976">  struct listnode *node;</a>
+<a name="ln2977">  u_char num_lsps;</a>
+<a name="ln2978">  int retval = ISIS_OK;</a>
+<a name="ln2979"> </a>
+<a name="ln2980">  if (circuit-&gt;circ_type == CIRCUIT_T_BROADCAST &amp;&amp;</a>
+<a name="ln2981">      circuit-&gt;u.bc.is_dr[level - 1])</a>
+<a name="ln2982">    return ISIS_OK;</a>
+<a name="ln2983"> </a>
+<a name="ln2984">  if (circuit-&gt;area-&gt;lspdb[level - 1] == NULL ||</a>
+<a name="ln2985">      dict_count (circuit-&gt;area-&gt;lspdb[level - 1]) == 0)</a>
+<a name="ln2986">    return ISIS_OK;</a>
+<a name="ln2987"> </a>
+<a name="ln2988">  if (! circuit-&gt;snd_stream)</a>
+<a name="ln2989">    return ISIS_ERROR;</a>
+<a name="ln2990"> </a>
+<a name="ln2991">  num_lsps = max_lsps_per_snp (ISIS_SNP_PSNP_FLAG, level, circuit);</a>
+<a name="ln2992"> </a>
+<a name="ln2993">  while (1)</a>
+<a name="ln2994">    {</a>
+<a name="ln2995">      list = list_new ();</a>
+<a name="ln2996">      lsp_build_list_ssn (circuit, num_lsps, list,</a>
+<a name="ln2997">                          circuit-&gt;area-&gt;lspdb[level - 1]);</a>
+<a name="ln2998"> </a>
+<a name="ln2999">      if (listcount (list) == 0)</a>
+<a name="ln3000">        {</a>
+<a name="ln3001">          list_delete (list);</a>
+<a name="ln3002">          return ISIS_OK;</a>
+<a name="ln3003">        }</a>
+<a name="ln3004"> </a>
+<a name="ln3005">      retval = build_psnp (level, circuit, list);</a>
+<a name="ln3006">      if (retval != ISIS_OK)</a>
+<a name="ln3007">        {</a>
+<a name="ln3008">          zlog_err (&quot;ISIS-Snp (%s): Build L%d PSNP on %s failed&quot;,</a>
+<a name="ln3009">                    circuit-&gt;area-&gt;area_tag, level, circuit-&gt;interface-&gt;name);</a>
+<a name="ln3010">          list_delete (list);</a>
+<a name="ln3011">          return retval;</a>
+<a name="ln3012">        }</a>
+<a name="ln3013"> </a>
+<a name="ln3014">      if (isis-&gt;debugs &amp; DEBUG_SNP_PACKETS)</a>
+<a name="ln3015">        {</a>
+<a name="ln3016">          zlog_debug (&quot;ISIS-Snp (%s): Sending L%d PSNP on %s, length %zd&quot;,</a>
+<a name="ln3017">                      circuit-&gt;area-&gt;area_tag, level,</a>
+<a name="ln3018">                      circuit-&gt;interface-&gt;name,</a>
+<a name="ln3019">                      stream_get_endp (circuit-&gt;snd_stream));</a>
+<a name="ln3020">          if (isis-&gt;debugs &amp; DEBUG_PACKET_DUMP)</a>
+<a name="ln3021">            zlog_dump_data (STREAM_DATA (circuit-&gt;snd_stream),</a>
+<a name="ln3022">                            stream_get_endp (circuit-&gt;snd_stream));</a>
+<a name="ln3023">        }</a>
+<a name="ln3024"> </a>
+<a name="ln3025">      retval = circuit-&gt;tx (circuit, level);</a>
+<a name="ln3026">      if (retval != ISIS_OK)</a>
+<a name="ln3027">        {</a>
+<a name="ln3028">          zlog_err (&quot;ISIS-Snp (%s): Send L%d PSNP on %s failed&quot;,</a>
+<a name="ln3029">                    circuit-&gt;area-&gt;area_tag, level,</a>
+<a name="ln3030">                    circuit-&gt;interface-&gt;name);</a>
+<a name="ln3031">          list_delete (list);</a>
+<a name="ln3032">          return retval;</a>
+<a name="ln3033">        }</a>
+<a name="ln3034"> </a>
+<a name="ln3035">      /*</a>
+<a name="ln3036">       * sending succeeded, we can clear SSN flags of this circuit</a>
+<a name="ln3037">       * for the LSPs in list</a>
+<a name="ln3038">       */</a>
+<a name="ln3039">      for (ALL_LIST_ELEMENTS_RO (list, node, lsp))</a>
+<a name="ln3040">        ISIS_CLEAR_FLAG (lsp-&gt;SSNflags, circuit);</a>
+<a name="ln3041">      list_delete (list);</a>
+<a name="ln3042">    }</a>
+<a name="ln3043"> </a>
+<a name="ln3044">  return retval;</a>
+<a name="ln3045">}</a>
+<a name="ln3046"> </a>
+<a name="ln3047">int</a>
+<a name="ln3048">send_l1_psnp (struct thread *thread)</a>
+<a name="ln3049">{</a>
+<a name="ln3050"> </a>
+<a name="ln3051">  struct isis_circuit *circuit;</a>
+<a name="ln3052">  int retval = ISIS_OK;</a>
+<a name="ln3053"> </a>
+<a name="ln3054">  circuit = THREAD_ARG (thread);</a>
+<a name="ln3055">  assert (circuit);</a>
+<a name="ln3056"> </a>
+<a name="ln3057">  circuit-&gt;t_send_psnp[0] = NULL;</a>
+<a name="ln3058"> </a>
+<a name="ln3059">  send_psnp (1, circuit);</a>
+<a name="ln3060">  /* set next timer thread */</a>
+<a name="ln3061">  THREAD_TIMER_ON (master, circuit-&gt;t_send_psnp[0], send_l1_psnp, circuit,</a>
+<a name="ln3062">		   isis_jitter (circuit-&gt;psnp_interval[0], PSNP_JITTER));</a>
+<a name="ln3063"> </a>
+<a name="ln3064">  return retval;</a>
+<a name="ln3065">}</a>
+<a name="ln3066"> </a>
+<a name="ln3067">/*</a>
+<a name="ln3068"> *  7.3.15.4 action on expiration of partial SNP interval</a>
+<a name="ln3069"> *  level 2</a>
+<a name="ln3070"> */</a>
+<a name="ln3071">int</a>
+<a name="ln3072">send_l2_psnp (struct thread *thread)</a>
+<a name="ln3073">{</a>
+<a name="ln3074">  struct isis_circuit *circuit;</a>
+<a name="ln3075">  int retval = ISIS_OK;</a>
+<a name="ln3076"> </a>
+<a name="ln3077">  circuit = THREAD_ARG (thread);</a>
+<a name="ln3078">  assert (circuit);</a>
+<a name="ln3079"> </a>
+<a name="ln3080">  circuit-&gt;t_send_psnp[1] = NULL;</a>
+<a name="ln3081"> </a>
+<a name="ln3082">  send_psnp (2, circuit);</a>
+<a name="ln3083"> </a>
+<a name="ln3084">  /* set next timer thread */</a>
+<a name="ln3085">  THREAD_TIMER_ON (master, circuit-&gt;t_send_psnp[1], send_l2_psnp, circuit,</a>
+<a name="ln3086">		   isis_jitter (circuit-&gt;psnp_interval[1], PSNP_JITTER));</a>
+<a name="ln3087"> </a>
+<a name="ln3088">  return retval;</a>
+<a name="ln3089">}</a>
+<a name="ln3090"> </a>
+<a name="ln3091">/*</a>
+<a name="ln3092"> * ISO 10589 - 7.3.14.3</a>
+<a name="ln3093"> */</a>
+<a name="ln3094">int</a>
+<a name="ln3095">send_lsp (struct thread *thread)</a>
+<a name="ln3096">{</a>
+<a name="ln3097">  struct isis_circuit *circuit;</a>
+<a name="ln3098">  struct isis_lsp *lsp;</a>
+<a name="ln3099">  struct listnode *node;</a>
+<a name="ln3100">  int clear_srm = 1;</a>
+<a name="ln3101">  int retval = ISIS_OK;</a>
+<a name="ln3102"> </a>
+<a name="ln3103">  circuit = THREAD_ARG (thread);</a>
+<a name="ln3104">  assert (circuit);</a>
+<a name="ln3105"> </a>
+<a name="ln3106">  if (!circuit-&gt;lsp_queue)</a>
+<a name="ln3107">    return ISIS_OK;</a>
+<a name="ln3108"> </a>
+<a name="ln3109">  node = listhead (circuit-&gt;lsp_queue);</a>
+<a name="ln3110"> </a>
+<a name="ln3111">  /*</a>
+<a name="ln3112">   * Handle case where there are no LSPs on the queue. This can</a>
+<a name="ln3113">   * happen, for instance, if an adjacency goes down before this</a>
+<a name="ln3114">   * thread gets a chance to run.</a>
+<a name="ln3115">   */</a>
+<a name="ln3116">  if (!node)</a>
+<a name="ln3117">    return ISIS_OK;</a>
+<a name="ln3118"> </a>
+<a name="ln3119">  /*</a>
+<a name="ln3120">   * Delete LSP from lsp_queue. If it's still in queue, it is assumed</a>
+<a name="ln3121">   * as 'transmit pending', but send_lsp may never be called again.</a>
+<a name="ln3122">   * Retry will happen because SRM flag will not be cleared.</a>
+<a name="ln3123">   */</a>
+<a name="ln3124">  lsp = listgetdata(node);</a>
+<a name="ln3125">  list_delete_node (circuit-&gt;lsp_queue, node);</a>
+<a name="ln3126"> </a>
+<a name="ln3127">  /* Set the last-cleared time if the queue is empty. */</a>
+<a name="ln3128">  /* TODO: Is is possible that new lsps keep being added to the queue</a>
+<a name="ln3129">   * that the queue is never empty? */</a>
+<a name="ln3130">  if (list_isempty (circuit-&gt;lsp_queue))</a>
+<a name="ln3131">    circuit-&gt;lsp_queue_last_cleared = time (NULL);</a>
+<a name="ln3132"> </a>
+<a name="ln3133">  if (circuit-&gt;state != C_STATE_UP || circuit-&gt;is_passive == 1)</a>
+<a name="ln3134">    goto out;</a>
+<a name="ln3135"> </a>
+<a name="ln3136">  /*</a>
+<a name="ln3137">   * Do not send if levels do not match</a>
+<a name="ln3138">   */</a>
+<a name="ln3139">  if (!(lsp-&gt;level &amp; circuit-&gt;is_type))</a>
+<a name="ln3140">    goto out;</a>
+<a name="ln3141"> </a>
+<a name="ln3142">  /*</a>
+<a name="ln3143">   * Do not send if we do not have adjacencies in state up on the circuit</a>
+<a name="ln3144">   */</a>
+<a name="ln3145">  if (circuit-&gt;upadjcount[lsp-&gt;level - 1] == 0)</a>
+<a name="ln3146">    goto out;</a>
+<a name="ln3147"> </a>
+<a name="ln3148">  /* stream_copy will assert and stop program execution if LSP is larger than</a>
+<a name="ln3149">   * the circuit's MTU. So handle and log this case here. */</a>
+<a name="ln3150">  if (stream_get_endp(lsp-&gt;pdu) &gt; stream_get_size(circuit-&gt;snd_stream))</a>
+<a name="ln3151">    {</a>
+<a name="ln3152">      zlog_err(&quot;ISIS-Upd (%s): Can't send L%d LSP %s, seq 0x%08x,&quot;</a>
+<a name="ln3153">               &quot; cksum 0x%04x, lifetime %us on %s. LSP Size is %zu&quot;</a>
+<a name="ln3154">               &quot; while interface stream size is %zu.&quot;,</a>
+<a name="ln3155">               circuit-&gt;area-&gt;area_tag, lsp-&gt;level,</a>
+<a name="ln3156">               rawlspid_print(lsp-&gt;lsp_header-&gt;lsp_id),</a>
+<a name="ln3157">               ntohl(lsp-&gt;lsp_header-&gt;seq_num),</a>
+<a name="ln3158">               ntohs(lsp-&gt;lsp_header-&gt;checksum),</a>
+<a name="ln3159">               ntohs(lsp-&gt;lsp_header-&gt;rem_lifetime),</a>
+<a name="ln3160">               circuit-&gt;interface-&gt;name,</a>
+<a name="ln3161">               stream_get_endp(lsp-&gt;pdu),</a>
+<a name="ln3162">               stream_get_size(circuit-&gt;snd_stream));</a>
+<a name="ln3163">      if (isis-&gt;debugs &amp; DEBUG_PACKET_DUMP)</a>
+<a name="ln3164">        zlog_dump_data(STREAM_DATA(lsp-&gt;pdu), stream_get_endp(lsp-&gt;pdu));</a>
+<a name="ln3165">      retval = ISIS_ERROR;</a>
+<a name="ln3166">      goto out;</a>
+<a name="ln3167">    }</a>
+<a name="ln3168"> </a>
+<a name="ln3169">  /* copy our lsp to the send buffer */</a>
+<a name="ln3170">  stream_copy (circuit-&gt;snd_stream, lsp-&gt;pdu);</a>
+<a name="ln3171"> </a>
+<a name="ln3172">  if (isis-&gt;debugs &amp; DEBUG_UPDATE_PACKETS)</a>
+<a name="ln3173">    {</a>
+<a name="ln3174">      zlog_debug</a>
+<a name="ln3175">        (&quot;ISIS-Upd (%s): Sending L%d LSP %s, seq 0x%08x, cksum 0x%04x,&quot;</a>
+<a name="ln3176">         &quot; lifetime %us on %s&quot;, circuit-&gt;area-&gt;area_tag, lsp-&gt;level,</a>
+<a name="ln3177">         rawlspid_print (lsp-&gt;lsp_header-&gt;lsp_id),</a>
+<a name="ln3178">         ntohl (lsp-&gt;lsp_header-&gt;seq_num),</a>
+<a name="ln3179">         ntohs (lsp-&gt;lsp_header-&gt;checksum),</a>
+<a name="ln3180">         ntohs (lsp-&gt;lsp_header-&gt;rem_lifetime),</a>
+<a name="ln3181">         circuit-&gt;interface-&gt;name);</a>
+<a name="ln3182">      if (isis-&gt;debugs &amp; DEBUG_PACKET_DUMP)</a>
+<a name="ln3183">        zlog_dump_data (STREAM_DATA (circuit-&gt;snd_stream),</a>
+<a name="ln3184">                        stream_get_endp (circuit-&gt;snd_stream));</a>
+<a name="ln3185">    }</a>
+<a name="ln3186"> </a>
+<a name="ln3187">  clear_srm = 0;</a>
+<a name="ln3188">  retval = circuit-&gt;tx (circuit, lsp-&gt;level);</a>
+<a name="ln3189">  if (retval != ISIS_OK)</a>
+<a name="ln3190">    {</a>
+<a name="ln3191">      zlog_err (&quot;ISIS-Upd (%s): Send L%d LSP on %s failed %s&quot;,</a>
+<a name="ln3192">                circuit-&gt;area-&gt;area_tag, lsp-&gt;level,</a>
+<a name="ln3193">                circuit-&gt;interface-&gt;name,</a>
+<a name="ln3194">                (retval == ISIS_WARNING) ? &quot;temporarily&quot; : &quot;permanently&quot;);</a>
+<a name="ln3195">    }</a>
+<a name="ln3196"> </a>
+<a name="ln3197">out:</a>
+<a name="ln3198">  if (clear_srm</a>
+<a name="ln3199">      || (retval == ISIS_OK &amp;&amp; circuit-&gt;circ_type == CIRCUIT_T_BROADCAST)</a>
+<a name="ln3200">      || (retval != ISIS_OK &amp;&amp; retval != ISIS_WARNING))</a>
+<a name="ln3201">    {</a>
+<a name="ln3202">      /* SRM flag will trigger retransmission. We will not retransmit if we</a>
+<a name="ln3203">       * encountered a fatal error.</a>
+<a name="ln3204">       * On success, they should only be cleared if it's a broadcast circuit.</a>
+<a name="ln3205">       * On a P2P circuit, we will wait for the ack from the neighbor to clear</a>
+<a name="ln3206">       * the fag.</a>
+<a name="ln3207">       */</a>
+<a name="ln3208">      ISIS_CLEAR_FLAG (lsp-&gt;SRMflags, circuit);</a>
+<a name="ln3209">    }</a>
+<a name="ln3210"> </a>
+<a name="ln3211">  return retval;</a>
+<a name="ln3212">}</a>
+<a name="ln3213"> </a>
+<a name="ln3214">int</a>
+<a name="ln3215">ack_lsp (struct isis_link_state_hdr *hdr, struct isis_circuit *circuit,</a>
+<a name="ln3216">	 int level)</a>
+<a name="ln3217">{</a>
+<a name="ln3218">  unsigned long lenp;</a>
+<a name="ln3219">  int retval;</a>
+<a name="ln3220">  u_int16_t length;</a>
+<a name="ln3221">  struct isis_fixed_hdr fixed_hdr;</a>
+<a name="ln3222"> </a>
+<a name="ln3223">  isis_circuit_stream(circuit, &amp;circuit-&gt;snd_stream);</a>
+<a name="ln3224"> </a>
+<a name="ln3225">  //  fill_llc_hdr (stream);</a>
+<a name="ln3226">  if (level == IS_LEVEL_1)</a>
+<a name="ln3227">    fill_fixed_hdr_andstream (&amp;fixed_hdr, L1_PARTIAL_SEQ_NUM,</a>
+<a name="ln3228">			      circuit-&gt;snd_stream);</a>
+<a name="ln3229">  else</a>
+<a name="ln3230">    fill_fixed_hdr_andstream (&amp;fixed_hdr, L2_PARTIAL_SEQ_NUM,</a>
+<a name="ln3231">			      circuit-&gt;snd_stream);</a>
+<a name="ln3232"> </a>
+<a name="ln3233"> </a>
+<a name="ln3234">  lenp = stream_get_endp (circuit-&gt;snd_stream);</a>
+<a name="ln3235">  stream_putw (circuit-&gt;snd_stream, 0);	/* PDU length  */</a>
+<a name="ln3236">  stream_put (circuit-&gt;snd_stream, isis-&gt;sysid, ISIS_SYS_ID_LEN);</a>
+<a name="ln3237">  stream_putc (circuit-&gt;snd_stream, circuit-&gt;idx);</a>
+<a name="ln3238">  stream_putc (circuit-&gt;snd_stream, 9);	/* code */</a>
+<a name="ln3239">  stream_putc (circuit-&gt;snd_stream, 16);	/* len */</a>
+<a name="ln3240"> </a>
+<a name="ln3241">  stream_putw (circuit-&gt;snd_stream, ntohs (hdr-&gt;rem_lifetime));</a>
+<a name="ln3242">  stream_put (circuit-&gt;snd_stream, hdr-&gt;lsp_id, ISIS_SYS_ID_LEN + 2);</a>
+<a name="ln3243">  stream_putl (circuit-&gt;snd_stream, ntohl (hdr-&gt;seq_num));</a>
+<a name="ln3244">  stream_putw (circuit-&gt;snd_stream, ntohs (hdr-&gt;checksum));</a>
+<a name="ln3245"> </a>
+<a name="ln3246">  length = (u_int16_t) stream_get_endp (circuit-&gt;snd_stream);</a>
+<a name="ln3247">  /* Update PDU length */</a>
+<a name="ln3248">  stream_putw_at (circuit-&gt;snd_stream, lenp, length);</a>
+<a name="ln3249"> </a>
+<a name="ln3250">  retval = circuit-&gt;tx (circuit, level);</a>
+<a name="ln3251">  if (retval != ISIS_OK)</a>
+<a name="ln3252">    zlog_err (&quot;ISIS-Upd (%s): Send L%d LSP PSNP on %s failed&quot;,</a>
+<a name="ln3253">              circuit-&gt;area-&gt;area_tag, level,</a>
+<a name="ln3254">              circuit-&gt;interface-&gt;name);</a>
+<a name="ln3255"> </a>
+<a name="ln3256">  return retval;</a>
+<a name="ln3257">}</a>
+
+</code></pre>
+<div class="balloon" rel="16"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1042/" target="_blank">V1042</a> This file is marked with copyleft license, which requires you to open the derived source code.</p></div>
+<div class="balloon" rel="210"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v512/" target="_blank">V512</a> A call of the 'memcpy' function will lead to underflow of the buffer 'remote->passwd'.</p></div>
+<div class="balloon" rel="896"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1037/" target="_blank">V1037</a> Two or more case-branches perform the same actions. Check lines: 896, 899</p></div>
+<div class="balloon" rel="2227"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1037/" target="_blank">V1037</a> Two or more case-branches perform the same actions. Check lines: 2227, 2234</p></div>
+<div class="balloon" rel="2327"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v512/" target="_blank">V512</a> A call of the 'memcpy' function will lead to underflow of the buffer '& p2p_hello_hdr'.</p></div>
+<div class="balloon" rel="2327"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v512/" target="_blank">V512</a> A call of the 'memcpy' function will lead to underflow of the buffer '& hello_hdr'.</p></div>
+<div class="balloon" rel="2482"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v519/" target="_blank">V519</a> The 'retval' variable is assigned values twice successively. Perhaps this is a mistake. Check lines: 2480, 2482.</p></div>
+<div class="balloon" rel="2512"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v519/" target="_blank">V519</a> The 'retval' variable is assigned values twice successively. Perhaps this is a mistake. Check lines: 2510, 2512.</p></div>
+<div class="balloon" rel="2650"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v658/" target="_blank">V658</a> A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '>=' comparison operation can potentially behave unexpectedly. Consider inspecting the 'remaining_size - 2 >= (10 + 6)' expression.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

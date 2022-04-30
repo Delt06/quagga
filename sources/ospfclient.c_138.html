@@ -1,0 +1,392 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>ospfclient.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.5.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/* This file is part of Quagga.</a>
+<a name="ln2"> *</a>
+<a name="ln3"> * Quagga is free software; you can redistribute it and/or modify it</a>
+<a name="ln4"> * under the terms of the GNU General Public License as published by the</a>
+<a name="ln5"> * Free Software Foundation; either version 2, or (at your option) any</a>
+<a name="ln6"> * later version.</a>
+<a name="ln7"> *</a>
+<a name="ln8"> * Quagga is distributed in the hope that it will be useful, but</a>
+<a name="ln9"> * WITHOUT ANY WARRANTY; without even the implied warranty of</a>
+<a name="ln10"> * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU</a>
+<a name="ln11"> * General Public License for more details.</a>
+<a name="ln12"> *</a>
+<a name="ln13"> * You should have received a copy of the GNU General Public License</a>
+<a name="ln14"> * along with Quagga; see the file COPYING.  If not, write to the Free</a>
+<a name="ln15"> * Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA</a>
+<a name="ln16"> * 02111-1307, USA.  </a>
+<a name="ln17"> */</a>
+<a name="ln18"> </a>
+<a name="ln19">/* </a>
+<a name="ln20"> * Simple program to demonstrate how OSPF API can be used. This</a>
+<a name="ln21"> * application retrieves the LSDB from the OSPF daemon and then</a>
+<a name="ln22"> * originates, updates and finally deletes an application-specific</a>
+<a name="ln23"> * opaque LSA. You can use this application as a template when writing</a>
+<a name="ln24"> * your own application.</a>
+<a name="ln25"> */</a>
+<a name="ln26"> </a>
+<a name="ln27">/* The following includes are needed in all OSPF API client</a>
+<a name="ln28">   applications. */</a>
+<a name="ln29"> </a>
+<a name="ln30">#include &lt;zebra.h&gt;</a>
+<a name="ln31">#include &quot;prefix.h&quot; /* needed by ospf_asbr.h */</a>
+<a name="ln32">#include &quot;privs.h&quot;</a>
+<a name="ln33">#include &quot;log.h&quot;</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &quot;ospfd/ospfd.h&quot;</a>
+<a name="ln36">#include &quot;ospfd/ospf_asbr.h&quot;</a>
+<a name="ln37">#include &quot;ospfd/ospf_lsa.h&quot;</a>
+<a name="ln38">#include &quot;ospfd/ospf_opaque.h&quot;</a>
+<a name="ln39">#include &quot;ospfd/ospf_api.h&quot;</a>
+<a name="ln40">#include &quot;ospf_apiclient.h&quot;</a>
+<a name="ln41"> </a>
+<a name="ln42">/* privileges struct. </a>
+<a name="ln43"> * set cap_num_* and uid/gid to nothing to use NULL privs</a>
+<a name="ln44"> * as ospfapiclient links in libospf.a which uses privs.</a>
+<a name="ln45"> */</a>
+<a name="ln46">struct zebra_privs_t ospfd_privs =</a>
+<a name="ln47">{</a>
+<a name="ln48">  .user = NULL,</a>
+<a name="ln49">  .group = NULL,</a>
+<a name="ln50">  .cap_num_p = 0,</a>
+<a name="ln51">  .cap_num_i = 0</a>
+<a name="ln52">};</a>
+<a name="ln53"> </a>
+<a name="ln54">/* The following includes are specific to this application. For</a>
+<a name="ln55">   example it uses threads from libzebra, however your application is</a>
+<a name="ln56">   free to use any thread library (like pthreads). */</a>
+<a name="ln57"> </a>
+<a name="ln58">#include &quot;ospfd/ospf_dump.h&quot; /* for ospf_lsa_header_dump */</a>
+<a name="ln59">#include &quot;thread.h&quot;</a>
+<a name="ln60">#include &quot;log.h&quot;</a>
+<a name="ln61"> </a>
+<a name="ln62">/* Local portnumber for async channel. Note that OSPF API library will also</a>
+<a name="ln63">   allocate a sync channel at ASYNCPORT+1. */</a>
+<a name="ln64">#define ASYNCPORT 4000</a>
+<a name="ln65"> </a>
+<a name="ln66">/* Master thread */</a>
+<a name="ln67">struct thread_master *master;</a>
+<a name="ln68"> </a>
+<a name="ln69">/* Global variables */</a>
+<a name="ln70">struct ospf_apiclient *oclient;</a>
+<a name="ln71">char **args;</a>
+<a name="ln72"> </a>
+<a name="ln73">/* Our opaque LSAs have the following format. */</a>
+<a name="ln74">struct my_opaque_lsa</a>
+<a name="ln75">{</a>
+<a name="ln76">  struct lsa_header hdr; /* include common LSA header */</a>
+<a name="ln77">  u_char data[4]; /* our own data format then follows here */</a>
+<a name="ln78">};</a>
+<a name="ln79"> </a>
+<a name="ln80"> </a>
+<a name="ln81">/* ---------------------------------------------------------</a>
+<a name="ln82"> * Threads for asynchronous messages and LSA update/delete </a>
+<a name="ln83"> * ---------------------------------------------------------</a>
+<a name="ln84"> */</a>
+<a name="ln85"> </a>
+<a name="ln86">static int</a>
+<a name="ln87">lsa_delete (struct thread *t)</a>
+<a name="ln88">{</a>
+<a name="ln89">  struct ospf_apiclient *oclient;</a>
+<a name="ln90">  struct in_addr area_id;</a>
+<a name="ln91">  int rc;</a>
+<a name="ln92"> </a>
+<a name="ln93">  oclient = THREAD_ARG (t);</a>
+<a name="ln94"> </a>
+<a name="ln95">  inet_aton (args[6], &amp;area_id);</a>
+<a name="ln96"> </a>
+<a name="ln97">  printf (&quot;Deleting LSA... &quot;);</a>
+<a name="ln98">  rc = ospf_apiclient_lsa_delete (oclient, </a>
+<a name="ln99">				  area_id, </a>
+<a name="ln100">				  atoi (args[2]),       /* lsa type */</a>
+<a name="ln101">				  atoi (args[3]),	/* opaque type */</a>
+<a name="ln102">				  atoi (args[4]));	/* opaque ID */</a>
+<a name="ln103">  printf (&quot;done, return code is = %d\n&quot;, rc);</a>
+<a name="ln104">  return rc;</a>
+<a name="ln105">}</a>
+<a name="ln106"> </a>
+<a name="ln107">static int</a>
+<a name="ln108">lsa_inject (struct thread *t)</a>
+<a name="ln109">{</a>
+<a name="ln110">  struct ospf_apiclient *cl;</a>
+<a name="ln111">  struct in_addr ifaddr;</a>
+<a name="ln112">  struct in_addr area_id;</a>
+<a name="ln113">  u_char lsa_type;</a>
+<a name="ln114">  u_char opaque_type;</a>
+<a name="ln115">  u_int32_t opaque_id;</a>
+<a name="ln116">  void *opaquedata;</a>
+<a name="ln117">  int opaquelen;</a>
+<a name="ln118"> </a>
+<a name="ln119">  static u_int32_t counter = 1;	/* Incremented each time invoked */</a>
+<a name="ln120">  int rc;</a>
+<a name="ln121"> </a>
+<a name="ln122">  cl = THREAD_ARG (t);</a>
+<a name="ln123"> </a>
+<a name="ln124">  inet_aton (args[5], &amp;ifaddr);</a>
+<a name="ln125">  inet_aton (args[6], &amp;area_id);</a>
+<a name="ln126">  lsa_type = atoi (args[2]);</a>
+<a name="ln127">  opaque_type = atoi (args[3]);</a>
+<a name="ln128">  opaque_id = atoi (args[4]);</a>
+<a name="ln129">  opaquedata = &amp;counter;</a>
+<a name="ln130">  opaquelen = sizeof (u_int32_t);</a>
+<a name="ln131"> </a>
+<a name="ln132">  printf (&quot;Originating/updating LSA with counter=%d... &quot;, counter);</a>
+<a name="ln133">  rc = ospf_apiclient_lsa_originate(cl, ifaddr, area_id,</a>
+<a name="ln134">				    lsa_type,</a>
+<a name="ln135">				    opaque_type, opaque_id,</a>
+<a name="ln136">				    opaquedata, opaquelen);</a>
+<a name="ln137"> </a>
+<a name="ln138">  printf (&quot;done, return code is %d\n&quot;, rc);</a>
+<a name="ln139"> </a>
+<a name="ln140">  counter++;</a>
+<a name="ln141"> </a>
+<a name="ln142">  return 0;</a>
+<a name="ln143">}</a>
+<a name="ln144"> </a>
+<a name="ln145"> </a>
+<a name="ln146">/* This thread handles asynchronous messages coming in from the OSPF</a>
+<a name="ln147">   API server */</a>
+<a name="ln148">static int</a>
+<a name="ln149">lsa_read (struct thread *thread)</a>
+<a name="ln150">{</a>
+<a name="ln151">  struct ospf_apiclient *oclient;</a>
+<a name="ln152">  int fd;</a>
+<a name="ln153">  int ret;</a>
+<a name="ln154"> </a>
+<a name="ln155">  printf (&quot;lsa_read called\n&quot;);</a>
+<a name="ln156"> </a>
+<a name="ln157">  oclient = THREAD_ARG (thread);</a>
+<a name="ln158">  fd = THREAD_FD (thread);</a>
+<a name="ln159"> </a>
+<a name="ln160">  /* Handle asynchronous message */</a>
+<a name="ln161">  ret = ospf_apiclient_handle_async (oclient);</a>
+<a name="ln162">  if (ret &lt; 0) {</a>
+<a name="ln163">    printf (&quot;Connection closed, exiting...&quot;);</a>
+<a name="ln164">    exit(0);</a>
+<a name="ln165">  }</a>
+<a name="ln166"> </a>
+<a name="ln167">  /* Reschedule read thread */</a>
+<a name="ln168">  thread_add_read (master, lsa_read, oclient, fd);</a>
+<a name="ln169"> </a>
+<a name="ln170">  return 0;</a>
+<a name="ln171">}</a>
+<a name="ln172"> </a>
+<a name="ln173">/* ---------------------------------------------------------</a>
+<a name="ln174"> * Callback functions for asynchronous events </a>
+<a name="ln175"> * ---------------------------------------------------------</a>
+<a name="ln176"> */</a>
+<a name="ln177"> </a>
+<a name="ln178">static void</a>
+<a name="ln179">lsa_update_callback (struct in_addr ifaddr, struct in_addr area_id,</a>
+<a name="ln180">		     u_char is_self_originated,</a>
+<a name="ln181">		     struct lsa_header *lsa)</a>
+<a name="ln182">{</a>
+<a name="ln183">  printf (&quot;lsa_update_callback: &quot;);</a>
+<a name="ln184">  printf (&quot;ifaddr: %s &quot;, inet_ntoa (ifaddr));</a>
+<a name="ln185">  printf (&quot;area: %s\n&quot;, inet_ntoa (area_id));</a>
+<a name="ln186">  printf (&quot;is_self_origin: %u\n&quot;, is_self_originated);</a>
+<a name="ln187"> </a>
+<a name="ln188">  /* It is important to note that lsa_header does indeed include the</a>
+<a name="ln189">     header and the LSA payload. To access the payload, first check</a>
+<a name="ln190">     the LSA type and then typecast lsa into the corresponding type,</a>
+<a name="ln191">     e.g.:</a>
+<a name="ln192">     </a>
+<a name="ln193">     if (lsa-&gt;type == OSPF_ROUTER_LSA) {</a>
+<a name="ln194">       struct router_lsa *rl = (struct router_lsa) lsa;</a>
+<a name="ln195">       ...</a>
+<a name="ln196">       u_int16_t links = rl-&gt;links;</a>
+<a name="ln197">       ...</a>
+<a name="ln198">    }</a>
+<a name="ln199">  */</a>
+<a name="ln200">       </a>
+<a name="ln201">  ospf_lsa_header_dump (lsa);</a>
+<a name="ln202">}</a>
+<a name="ln203"> </a>
+<a name="ln204">static void</a>
+<a name="ln205">lsa_delete_callback (struct in_addr ifaddr, struct in_addr area_id,</a>
+<a name="ln206">		     u_char is_self_originated,</a>
+<a name="ln207">		     struct lsa_header *lsa)</a>
+<a name="ln208">{</a>
+<a name="ln209">  printf (&quot;lsa_delete_callback: &quot;);</a>
+<a name="ln210">  printf (&quot;ifaddr: %s &quot;, inet_ntoa (ifaddr));</a>
+<a name="ln211">  printf (&quot;area: %s\n&quot;, inet_ntoa (area_id));</a>
+<a name="ln212">  printf (&quot;is_self_origin: %u\n&quot;, is_self_originated);</a>
+<a name="ln213"> </a>
+<a name="ln214">  ospf_lsa_header_dump (lsa);</a>
+<a name="ln215">}</a>
+<a name="ln216"> </a>
+<a name="ln217">static void</a>
+<a name="ln218">ready_callback (u_char lsa_type, u_char opaque_type, struct in_addr addr)</a>
+<a name="ln219">{</a>
+<a name="ln220">  printf (&quot;ready_callback: lsa_type: %d opaque_type: %d addr=%s\n&quot;,</a>
+<a name="ln221">	  lsa_type, opaque_type, inet_ntoa (addr));</a>
+<a name="ln222"> </a>
+<a name="ln223">  /* Schedule opaque LSA originate in 5 secs */</a>
+<a name="ln224">  thread_add_timer (master, lsa_inject, oclient, 5);</a>
+<a name="ln225"> </a>
+<a name="ln226">  /* Schedule opaque LSA update with new value */</a>
+<a name="ln227">  thread_add_timer (master, lsa_inject, oclient, 10);</a>
+<a name="ln228"> </a>
+<a name="ln229">  /* Schedule delete */</a>
+<a name="ln230">  thread_add_timer (master, lsa_delete, oclient, 30);</a>
+<a name="ln231">}</a>
+<a name="ln232"> </a>
+<a name="ln233">static void</a>
+<a name="ln234">new_if_callback (struct in_addr ifaddr, struct in_addr area_id)</a>
+<a name="ln235">{</a>
+<a name="ln236">  printf (&quot;new_if_callback: ifaddr: %s &quot;, inet_ntoa (ifaddr));</a>
+<a name="ln237">  printf (&quot;area_id: %s\n&quot;, inet_ntoa (area_id));</a>
+<a name="ln238">}</a>
+<a name="ln239"> </a>
+<a name="ln240">static void</a>
+<a name="ln241">del_if_callback (struct in_addr ifaddr)</a>
+<a name="ln242">{</a>
+<a name="ln243">  printf (&quot;new_if_callback: ifaddr: %s\n &quot;, inet_ntoa (ifaddr));</a>
+<a name="ln244">}</a>
+<a name="ln245"> </a>
+<a name="ln246">static void</a>
+<a name="ln247">ism_change_callback (struct in_addr ifaddr, struct in_addr area_id,</a>
+<a name="ln248">		     u_char state)</a>
+<a name="ln249">{</a>
+<a name="ln250">  printf (&quot;ism_change: ifaddr: %s &quot;, inet_ntoa (ifaddr));</a>
+<a name="ln251">  printf (&quot;area_id: %s\n&quot;, inet_ntoa (area_id));</a>
+<a name="ln252">  printf (&quot;state: %d [%s]\n&quot;, state, LOOKUP (ospf_ism_state_msg, state));</a>
+<a name="ln253">}</a>
+<a name="ln254"> </a>
+<a name="ln255">static void</a>
+<a name="ln256">nsm_change_callback (struct in_addr ifaddr, struct in_addr nbraddr,</a>
+<a name="ln257">		     struct in_addr router_id, u_char state)</a>
+<a name="ln258">{</a>
+<a name="ln259">  printf (&quot;nsm_change: ifaddr: %s &quot;, inet_ntoa (ifaddr));</a>
+<a name="ln260">  printf (&quot;nbraddr: %s\n&quot;, inet_ntoa (nbraddr));</a>
+<a name="ln261">  printf (&quot;router_id: %s\n&quot;, inet_ntoa (router_id));</a>
+<a name="ln262">  printf (&quot;state: %d [%s]\n&quot;, state, LOOKUP (ospf_nsm_state_msg, state));</a>
+<a name="ln263">}</a>
+<a name="ln264"> </a>
+<a name="ln265"> </a>
+<a name="ln266">/* ---------------------------------------------------------</a>
+<a name="ln267"> * Main program </a>
+<a name="ln268"> * ---------------------------------------------------------</a>
+<a name="ln269"> */</a>
+<a name="ln270"> </a>
+<a name="ln271">static int usage()</a>
+<a name="ln272">{</a>
+<a name="ln273">  printf(&quot;Usage: ospfclient &lt;ospfd&gt; &lt;lsatype&gt; &lt;opaquetype&gt; &lt;opaqueid&gt; &lt;ifaddr&gt; &lt;areaid&gt;\n&quot;);</a>
+<a name="ln274">  printf(&quot;where ospfd     : router where API-enabled OSPF daemon is running\n&quot;);</a>
+<a name="ln275">  printf(&quot;      lsatype   : either 9, 10, or 11 depending on flooding scope\n&quot;);</a>
+<a name="ln276">  printf(&quot;      opaquetype: 0-255 (e.g., experimental applications use &gt; 128)\n&quot;);</a>
+<a name="ln277">  printf(&quot;      opaqueid  : arbitrary application instance (24 bits)\n&quot;);</a>
+<a name="ln278">  printf(&quot;      ifaddr    : interface IP address (for type 9) otherwise ignored\n&quot;);</a>
+<a name="ln279">  printf(&quot;      areaid    : area in IP address format (for type 10) otherwise ignored\n&quot;);</a>
+<a name="ln280">  </a>
+<a name="ln281">  exit(1);</a>
+<a name="ln282">}</a>
+<a name="ln283"> </a>
+<a name="ln284">int</a>
+<a name="ln285">main (int argc, char *argv[])</a>
+<a name="ln286">{</a>
+<a name="ln287">  args = argv;</a>
+<a name="ln288"> </a>
+<a name="ln289">  /* ospfclient should be started with the following arguments:</a>
+<a name="ln290">   * </a>
+<a name="ln291">   * (1) host (2) lsa_type (3) opaque_type (4) opaque_id (5) if_addr </a>
+<a name="ln292">   * (6) area_id</a>
+<a name="ln293">   * </a>
+<a name="ln294">   * host: name or IP of host where ospfd is running</a>
+<a name="ln295">   * lsa_type: 9, 10, or 11</a>
+<a name="ln296">   * opaque_type: 0-255 (e.g., experimental applications use &gt; 128) </a>
+<a name="ln297">   * opaque_id: arbitrary application instance (24 bits)</a>
+<a name="ln298">   * if_addr: interface IP address (for type 9) otherwise ignored</a>
+<a name="ln299">   * area_id: area in IP address format (for type 10) otherwise ignored</a>
+<a name="ln300">   */</a>
+<a name="ln301"> </a>
+<a name="ln302">  if (argc != 7)</a>
+<a name="ln303">    {</a>
+<a name="ln304">      usage();</a>
+<a name="ln305">    }</a>
+<a name="ln306"> </a>
+<a name="ln307">  /* Initialization */</a>
+<a name="ln308">  zprivs_init (&amp;ospfd_privs);</a>
+<a name="ln309">  master = thread_master_create ();</a>
+<a name="ln310"> </a>
+<a name="ln311">  /* Open connection to OSPF daemon */</a>
+<a name="ln312">  oclient = ospf_apiclient_connect (args[1], ASYNCPORT);</a>
+<a name="ln313">  if (!oclient)</a>
+<a name="ln314">    {</a>
+<a name="ln315">      printf (&quot;Connecting to OSPF daemon on %s failed!\n&quot;,</a>
+<a name="ln316">	      args[1]);</a>
+<a name="ln317">      exit (1);</a>
+<a name="ln318">    }</a>
+<a name="ln319"> </a>
+<a name="ln320">  /* Register callback functions. */</a>
+<a name="ln321">  ospf_apiclient_register_callback (oclient,</a>
+<a name="ln322">				    ready_callback,</a>
+<a name="ln323">				    new_if_callback,</a>
+<a name="ln324">				    del_if_callback,</a>
+<a name="ln325">				    ism_change_callback,</a>
+<a name="ln326">				    nsm_change_callback,</a>
+<a name="ln327">				    lsa_update_callback, </a>
+<a name="ln328">				    lsa_delete_callback);</a>
+<a name="ln329"> </a>
+<a name="ln330">  /* Register LSA type and opaque type. */</a>
+<a name="ln331">  ospf_apiclient_register_opaque_type (oclient, atoi (args[2]),</a>
+<a name="ln332">				       atoi (args[3]));</a>
+<a name="ln333"> </a>
+<a name="ln334">  /* Synchronize database with OSPF daemon. */</a>
+<a name="ln335">  ospf_apiclient_sync_lsdb (oclient);</a>
+<a name="ln336"> </a>
+<a name="ln337">  /* Schedule thread that handles asynchronous messages */</a>
+<a name="ln338">  thread_add_read (master, lsa_read, oclient, oclient-&gt;fd_async);</a>
+<a name="ln339"> </a>
+<a name="ln340">  /* Now connection is established, run loop */</a>
+<a name="ln341">  thread_main (master);</a>
+<a name="ln342"> </a>
+<a name="ln343">  /* Never reached */</a>
+<a name="ln344">  return 0;</a>
+<a name="ln345">}</a>
+<a name="ln346"> </a>
+
+</code></pre>
+<div class="balloon" rel="4"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1042/" target="_blank">V1042</a> This file is marked with copyleft license, which requires you to open the derived source code.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

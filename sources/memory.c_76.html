@@ -1,0 +1,533 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>memory.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.5.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Memory management routine</a>
+<a name="ln3"> * Copyright (C) 1998 Kunihiro Ishiguro</a>
+<a name="ln4"> *</a>
+<a name="ln5"> * This file is part of GNU Zebra.</a>
+<a name="ln6"> *</a>
+<a name="ln7"> * GNU Zebra is free software; you can redistribute it and/or modify it</a>
+<a name="ln8"> * under the terms of the GNU General Public License as published by the</a>
+<a name="ln9"> * Free Software Foundation; either version 2, or (at your option) any</a>
+<a name="ln10"> * later version.</a>
+<a name="ln11"> *</a>
+<a name="ln12"> * GNU Zebra is distributed in the hope that it will be useful, but</a>
+<a name="ln13"> * WITHOUT ANY WARRANTY; without even the implied warranty of</a>
+<a name="ln14"> * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU</a>
+<a name="ln15"> * General Public License for more details.</a>
+<a name="ln16"> *</a>
+<a name="ln17"> * You should have received a copy of the GNU General Public License</a>
+<a name="ln18"> * along with GNU Zebra; see the file COPYING.  If not, write to the Free</a>
+<a name="ln19"> * Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA</a>
+<a name="ln20"> * 02111-1307, USA.  </a>
+<a name="ln21"> */</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &lt;zebra.h&gt;</a>
+<a name="ln24">/* malloc.h is generally obsolete, however GNU Libc mallinfo wants it. */</a>
+<a name="ln25">#if !defined(HAVE_STDLIB_H) || (defined(GNU_LINUX) &amp;&amp; defined(HAVE_MALLINFO))</a>
+<a name="ln26">#include &lt;malloc.h&gt;</a>
+<a name="ln27">#endif /* !HAVE_STDLIB_H || HAVE_MALLINFO */</a>
+<a name="ln28"> </a>
+<a name="ln29">#include &quot;log.h&quot;</a>
+<a name="ln30">#include &quot;memory.h&quot;</a>
+<a name="ln31"> </a>
+<a name="ln32">static void alloc_inc (int);</a>
+<a name="ln33">static void alloc_dec (int);</a>
+<a name="ln34">static void log_memstats(int log_priority);</a>
+<a name="ln35"> </a>
+<a name="ln36">static const struct message mstr [] =</a>
+<a name="ln37">{</a>
+<a name="ln38">  { MTYPE_THREAD, &quot;thread&quot; },</a>
+<a name="ln39">  { MTYPE_THREAD_MASTER, &quot;thread_master&quot; },</a>
+<a name="ln40">  { MTYPE_VECTOR, &quot;vector&quot; },</a>
+<a name="ln41">  { MTYPE_VECTOR_INDEX, &quot;vector_index&quot; },</a>
+<a name="ln42">  { MTYPE_IF, &quot;interface&quot; },</a>
+<a name="ln43">  { 0, NULL },</a>
+<a name="ln44">};</a>
+<a name="ln45"> </a>
+<a name="ln46">/* Fatal memory allocation error occurred. */</a>
+<a name="ln47">static void __attribute__ ((noreturn))</a>
+<a name="ln48">zerror (const char *fname, int type, size_t size)</a>
+<a name="ln49">{</a>
+<a name="ln50">  zlog_err (&quot;%s : can't allocate memory for `%s' size %d: %s\n&quot;, </a>
+<a name="ln51">	    fname, lookup (mstr, type), (int) size, safe_strerror(errno));</a>
+<a name="ln52">  log_memstats(LOG_WARNING);</a>
+<a name="ln53">  /* N.B. It might be preferable to call zlog_backtrace_sigsafe here, since</a>
+<a name="ln54">     that function should definitely be safe in an OOM condition.  But</a>
+<a name="ln55">     unfortunately zlog_backtrace_sigsafe does not support syslog logging at</a>
+<a name="ln56">     this time... */</a>
+<a name="ln57">  zlog_backtrace(LOG_WARNING);</a>
+<a name="ln58">  abort();</a>
+<a name="ln59">}</a>
+<a name="ln60"> </a>
+<a name="ln61">/*</a>
+<a name="ln62"> * Allocate memory of a given size, to be tracked by a given type.</a>
+<a name="ln63"> * Effects: Returns a pointer to usable memory.  If memory cannot</a>
+<a name="ln64"> * be allocated, aborts execution.</a>
+<a name="ln65"> */</a>
+<a name="ln66">void *</a>
+<a name="ln67">zmalloc (int type, size_t size)</a>
+<a name="ln68">{</a>
+<a name="ln69">  void *memory;</a>
+<a name="ln70"> </a>
+<a name="ln71">  memory = malloc (size);</a>
+<a name="ln72"> </a>
+<a name="ln73">  if (memory == NULL)</a>
+<a name="ln74">    zerror (&quot;malloc&quot;, type, size);</a>
+<a name="ln75"> </a>
+<a name="ln76">  alloc_inc (type);</a>
+<a name="ln77"> </a>
+<a name="ln78">  return memory;</a>
+<a name="ln79">}</a>
+<a name="ln80"> </a>
+<a name="ln81">/*</a>
+<a name="ln82"> * Allocate memory as in zmalloc, and also clear the memory.</a>
+<a name="ln83"> * Add an extra 'z' prefix to function name to avoid collision when linking</a>
+<a name="ln84"> * statically with zlib that exports the 'zcalloc' symbol.</a>
+<a name="ln85"> */</a>
+<a name="ln86">void *</a>
+<a name="ln87">zzcalloc (int type, size_t size)</a>
+<a name="ln88">{</a>
+<a name="ln89">  void *memory;</a>
+<a name="ln90"> </a>
+<a name="ln91">  memory = calloc (1, size);</a>
+<a name="ln92"> </a>
+<a name="ln93">  if (memory == NULL)</a>
+<a name="ln94">    zerror (&quot;calloc&quot;, type, size);</a>
+<a name="ln95"> </a>
+<a name="ln96">  alloc_inc (type);</a>
+<a name="ln97"> </a>
+<a name="ln98">  return memory;</a>
+<a name="ln99">}</a>
+<a name="ln100"> </a>
+<a name="ln101">/* </a>
+<a name="ln102"> * Given a pointer returned by zmalloc or zzcalloc, free it and</a>
+<a name="ln103"> * return a pointer to a new size, basically acting like realloc().</a>
+<a name="ln104"> * Requires: ptr was returned by zmalloc, zzcalloc, or zrealloc with the</a>
+<a name="ln105"> * same type.</a>
+<a name="ln106"> * Effects: Returns a pointer to the new memory, or aborts.</a>
+<a name="ln107"> */</a>
+<a name="ln108">void *</a>
+<a name="ln109">zrealloc (int type, void *ptr, size_t size)</a>
+<a name="ln110">{</a>
+<a name="ln111">  void *memory;</a>
+<a name="ln112"> </a>
+<a name="ln113">  if (ptr == NULL)              /* is really alloc */</a>
+<a name="ln114">      return zzcalloc(type, size);</a>
+<a name="ln115"> </a>
+<a name="ln116">  memory = realloc (ptr, size);</a>
+<a name="ln117">  if (memory == NULL)</a>
+<a name="ln118">    zerror (&quot;realloc&quot;, type, size);</a>
+<a name="ln119">  if (ptr == NULL)</a>
+<a name="ln120">    alloc_inc (type);</a>
+<a name="ln121"> </a>
+<a name="ln122">  return memory;</a>
+<a name="ln123">}</a>
+<a name="ln124"> </a>
+<a name="ln125">/*</a>
+<a name="ln126"> * Free memory allocated by z*alloc or zstrdup.</a>
+<a name="ln127"> * Requires: ptr was returned by zmalloc, zzcalloc, or zrealloc with the</a>
+<a name="ln128"> * same type.</a>
+<a name="ln129"> * Effects: The memory is freed and may no longer be referenced.</a>
+<a name="ln130"> */</a>
+<a name="ln131">void</a>
+<a name="ln132">zfree (int type, void *ptr)</a>
+<a name="ln133">{</a>
+<a name="ln134">  if (ptr != NULL)</a>
+<a name="ln135">    {</a>
+<a name="ln136">      alloc_dec (type);</a>
+<a name="ln137">      free (ptr);</a>
+<a name="ln138">    }</a>
+<a name="ln139">}</a>
+<a name="ln140"> </a>
+<a name="ln141">/*</a>
+<a name="ln142"> * Duplicate a string, counting memory usage by type.</a>
+<a name="ln143"> * Effects: The string is duplicated, and the return value must</a>
+<a name="ln144"> * eventually be passed to zfree with the same type.  The function will</a>
+<a name="ln145"> * succeed or abort.</a>
+<a name="ln146"> */</a>
+<a name="ln147">char *</a>
+<a name="ln148">zstrdup (int type, const char *str)</a>
+<a name="ln149">{</a>
+<a name="ln150">  void *dup;</a>
+<a name="ln151"> </a>
+<a name="ln152">  dup = strdup (str);</a>
+<a name="ln153">  if (dup == NULL)</a>
+<a name="ln154">    zerror (&quot;strdup&quot;, type, strlen (str));</a>
+<a name="ln155">  alloc_inc (type);</a>
+<a name="ln156">  return dup;</a>
+<a name="ln157">}</a>
+<a name="ln158"> </a>
+<a name="ln159">#ifdef MEMORY_LOG</a>
+<a name="ln160">static struct </a>
+<a name="ln161">{</a>
+<a name="ln162">  const char *name;</a>
+<a name="ln163">  long alloc;</a>
+<a name="ln164">  unsigned long t_malloc;</a>
+<a name="ln165">  unsigned long c_malloc;</a>
+<a name="ln166">  unsigned long t_calloc;</a>
+<a name="ln167">  unsigned long c_calloc;</a>
+<a name="ln168">  unsigned long t_realloc;</a>
+<a name="ln169">  unsigned long t_free;</a>
+<a name="ln170">  unsigned long c_strdup;</a>
+<a name="ln171">} mstat [MTYPE_MAX];</a>
+<a name="ln172"> </a>
+<a name="ln173">static void</a>
+<a name="ln174">mtype_log (char *func, void *memory, const char *file, int line, int type)</a>
+<a name="ln175">{</a>
+<a name="ln176">  zlog_debug (&quot;%s: %s %p %s %d&quot;, func, lookup (mstr, type), memory, file, line);</a>
+<a name="ln177">}</a>
+<a name="ln178"> </a>
+<a name="ln179">void *</a>
+<a name="ln180">mtype_zmalloc (const char *file, int line, int type, size_t size)</a>
+<a name="ln181">{</a>
+<a name="ln182">  void *memory;</a>
+<a name="ln183"> </a>
+<a name="ln184">  mstat[type].c_malloc++;</a>
+<a name="ln185">  mstat[type].t_malloc++;</a>
+<a name="ln186"> </a>
+<a name="ln187">  memory = zmalloc (type, size);</a>
+<a name="ln188">  mtype_log (&quot;zmalloc&quot;, memory, file, line, type);</a>
+<a name="ln189"> </a>
+<a name="ln190">  return memory;</a>
+<a name="ln191">}</a>
+<a name="ln192"> </a>
+<a name="ln193">void *</a>
+<a name="ln194">mtype_zcalloc (const char *file, int line, int type, size_t size)</a>
+<a name="ln195">{</a>
+<a name="ln196">  void *memory;</a>
+<a name="ln197"> </a>
+<a name="ln198">  mstat[type].c_calloc++;</a>
+<a name="ln199">  mstat[type].t_calloc++;</a>
+<a name="ln200"> </a>
+<a name="ln201">  memory = zzcalloc (type, size);</a>
+<a name="ln202">  mtype_log (&quot;xcalloc&quot;, memory, file, line, type);</a>
+<a name="ln203"> </a>
+<a name="ln204">  return memory;</a>
+<a name="ln205">}</a>
+<a name="ln206"> </a>
+<a name="ln207">void *</a>
+<a name="ln208">mtype_zrealloc (const char *file, int line, int type, void *ptr, size_t size)</a>
+<a name="ln209">{</a>
+<a name="ln210">  void *memory;</a>
+<a name="ln211"> </a>
+<a name="ln212">  /* Realloc need before allocated pointer. */</a>
+<a name="ln213">  mstat[type].t_realloc++;</a>
+<a name="ln214"> </a>
+<a name="ln215">  memory = zrealloc (type, ptr, size);</a>
+<a name="ln216"> </a>
+<a name="ln217">  mtype_log (&quot;xrealloc&quot;, memory, file, line, type);</a>
+<a name="ln218"> </a>
+<a name="ln219">  return memory;</a>
+<a name="ln220">}</a>
+<a name="ln221"> </a>
+<a name="ln222">/* Important function. */</a>
+<a name="ln223">void </a>
+<a name="ln224">mtype_zfree (const char *file, int line, int type, void *ptr)</a>
+<a name="ln225">{</a>
+<a name="ln226">  mstat[type].t_free++;</a>
+<a name="ln227"> </a>
+<a name="ln228">  mtype_log (&quot;xfree&quot;, ptr, file, line, type);</a>
+<a name="ln229"> </a>
+<a name="ln230">  zfree (type, ptr);</a>
+<a name="ln231">}</a>
+<a name="ln232"> </a>
+<a name="ln233">char *</a>
+<a name="ln234">mtype_zstrdup (const char *file, int line, int type, const char *str)</a>
+<a name="ln235">{</a>
+<a name="ln236">  char *memory;</a>
+<a name="ln237"> </a>
+<a name="ln238">  mstat[type].c_strdup++;</a>
+<a name="ln239"> </a>
+<a name="ln240">  memory = zstrdup (type, str);</a>
+<a name="ln241">  </a>
+<a name="ln242">  mtype_log (&quot;xstrdup&quot;, memory, file, line, type);</a>
+<a name="ln243"> </a>
+<a name="ln244">  return memory;</a>
+<a name="ln245">}</a>
+<a name="ln246">#else</a>
+<a name="ln247">static struct </a>
+<a name="ln248">{</a>
+<a name="ln249">  char *name;</a>
+<a name="ln250">  long alloc;</a>
+<a name="ln251">} mstat [MTYPE_MAX];</a>
+<a name="ln252">#endif /* MEMORY_LOG */</a>
+<a name="ln253"> </a>
+<a name="ln254">/* Increment allocation counter. */</a>
+<a name="ln255">static void</a>
+<a name="ln256">alloc_inc (int type)</a>
+<a name="ln257">{</a>
+<a name="ln258">  mstat[type].alloc++;</a>
+<a name="ln259">}</a>
+<a name="ln260"> </a>
+<a name="ln261">/* Decrement allocation counter. */</a>
+<a name="ln262">static void</a>
+<a name="ln263">alloc_dec (int type)</a>
+<a name="ln264">{</a>
+<a name="ln265">  mstat[type].alloc--;</a>
+<a name="ln266">}</a>
+<a name="ln267"> </a>
+<a name="ln268">/* Looking up memory status from vty interface. */</a>
+<a name="ln269">#include &quot;vector.h&quot;</a>
+<a name="ln270">#include &quot;vty.h&quot;</a>
+<a name="ln271">#include &quot;command.h&quot;</a>
+<a name="ln272"> </a>
+<a name="ln273">static void</a>
+<a name="ln274">log_memstats(int pri)</a>
+<a name="ln275">{</a>
+<a name="ln276">  struct mlist *ml;</a>
+<a name="ln277"> </a>
+<a name="ln278">  for (ml = mlists; ml-&gt;list; ml++)</a>
+<a name="ln279">    {</a>
+<a name="ln280">      struct memory_list *m;</a>
+<a name="ln281"> </a>
+<a name="ln282">      zlog (NULL, pri, &quot;Memory utilization in module %s:&quot;, ml-&gt;name);</a>
+<a name="ln283">      for (m = ml-&gt;list; m-&gt;index &gt;= 0; m++)</a>
+<a name="ln284">	if (m-&gt;index &amp;&amp; mstat[m-&gt;index].alloc)</a>
+<a name="ln285">	  zlog (NULL, pri, &quot;  %-30s: %10ld&quot;, m-&gt;format, mstat[m-&gt;index].alloc);</a>
+<a name="ln286">    }</a>
+<a name="ln287">}</a>
+<a name="ln288"> </a>
+<a name="ln289">void</a>
+<a name="ln290">log_memstats_stderr (const char *prefix)</a>
+<a name="ln291">{</a>
+<a name="ln292">  struct mlist *ml;</a>
+<a name="ln293">  struct memory_list *m;</a>
+<a name="ln294">  int i;</a>
+<a name="ln295">  int j = 0;</a>
+<a name="ln296"> </a>
+<a name="ln297">  for (ml = mlists; ml-&gt;list; ml++)</a>
+<a name="ln298">    {</a>
+<a name="ln299">      i = 0;</a>
+<a name="ln300"> </a>
+<a name="ln301">      for (m = ml-&gt;list; m-&gt;index &gt;= 0; m++)</a>
+<a name="ln302">        if (m-&gt;index &amp;&amp; mstat[m-&gt;index].alloc)</a>
+<a name="ln303">          {</a>
+<a name="ln304">            if (!i)</a>
+<a name="ln305">              fprintf (stderr,</a>
+<a name="ln306">                       &quot;%s: memstats: Current memory utilization in module %s:\n&quot;,</a>
+<a name="ln307">                       prefix,</a>
+<a name="ln308">                       ml-&gt;name);</a>
+<a name="ln309">            fprintf (stderr,</a>
+<a name="ln310">                     &quot;%s: memstats:  %-30s: %10ld%s\n&quot;,</a>
+<a name="ln311">                     prefix,</a>
+<a name="ln312">                     m-&gt;format,</a>
+<a name="ln313">                     mstat[m-&gt;index].alloc,</a>
+<a name="ln314">                     mstat[m-&gt;index].alloc &lt; 0 ? &quot; (REPORT THIS BUG!)&quot; : &quot;&quot;);</a>
+<a name="ln315">            i = j = 1;</a>
+<a name="ln316">          }</a>
+<a name="ln317">    }</a>
+<a name="ln318"> </a>
+<a name="ln319">  if (j)</a>
+<a name="ln320">    fprintf (stderr,</a>
+<a name="ln321">             &quot;%s: memstats: NOTE: If configuration exists, utilization may be &quot;</a>
+<a name="ln322">             &quot;expected.\n&quot;,</a>
+<a name="ln323">             prefix);</a>
+<a name="ln324">  else</a>
+<a name="ln325">    fprintf (stderr,</a>
+<a name="ln326">             &quot;%s: memstats: No remaining tracked memory utilization.\n&quot;,</a>
+<a name="ln327">             prefix);</a>
+<a name="ln328">}</a>
+<a name="ln329"> </a>
+<a name="ln330">static void</a>
+<a name="ln331">show_separator(struct vty *vty)</a>
+<a name="ln332">{</a>
+<a name="ln333">  vty_out (vty, &quot;-----------------------------\r\n&quot;);</a>
+<a name="ln334">}</a>
+<a name="ln335"> </a>
+<a name="ln336">static int</a>
+<a name="ln337">show_memory_vty (struct vty *vty, struct memory_list *list)</a>
+<a name="ln338">{</a>
+<a name="ln339">  struct memory_list *m;</a>
+<a name="ln340">  int needsep = 0;</a>
+<a name="ln341"> </a>
+<a name="ln342">  for (m = list; m-&gt;index &gt;= 0; m++)</a>
+<a name="ln343">    if (m-&gt;index == 0)</a>
+<a name="ln344">      {</a>
+<a name="ln345">	if (needsep)</a>
+<a name="ln346">	  {</a>
+<a name="ln347">	    show_separator (vty);</a>
+<a name="ln348">	    needsep = 0;</a>
+<a name="ln349">	  }</a>
+<a name="ln350">      }</a>
+<a name="ln351">    else if (mstat[m-&gt;index].alloc)</a>
+<a name="ln352">      {</a>
+<a name="ln353">	vty_out (vty, &quot;%-30s: %10ld\r\n&quot;, m-&gt;format, mstat[m-&gt;index].alloc);</a>
+<a name="ln354">	needsep = 1;</a>
+<a name="ln355">      }</a>
+<a name="ln356">  return needsep;</a>
+<a name="ln357">}</a>
+<a name="ln358"> </a>
+<a name="ln359">#ifdef HAVE_MALLINFO</a>
+<a name="ln360">static int</a>
+<a name="ln361">show_memory_mallinfo (struct vty *vty)</a>
+<a name="ln362">{</a>
+<a name="ln363">  struct mallinfo minfo = mallinfo();</a>
+<a name="ln364">  char buf[MTYPE_MEMSTR_LEN];</a>
+<a name="ln365">  </a>
+<a name="ln366">  vty_out (vty, &quot;System allocator statistics:%s&quot;, VTY_NEWLINE);</a>
+<a name="ln367">  vty_out (vty, &quot;  Total heap allocated:  %s%s&quot;,</a>
+<a name="ln368">           mtype_memstr (buf, MTYPE_MEMSTR_LEN, minfo.arena),</a>
+<a name="ln369">           VTY_NEWLINE);</a>
+<a name="ln370">  vty_out (vty, &quot;  Holding block headers: %s%s&quot;,</a>
+<a name="ln371">           mtype_memstr (buf, MTYPE_MEMSTR_LEN, minfo.hblkhd),</a>
+<a name="ln372">           VTY_NEWLINE);</a>
+<a name="ln373">  vty_out (vty, &quot;  Used small blocks:     %s%s&quot;,</a>
+<a name="ln374">           mtype_memstr (buf, MTYPE_MEMSTR_LEN, minfo.usmblks),</a>
+<a name="ln375">           VTY_NEWLINE);</a>
+<a name="ln376">  vty_out (vty, &quot;  Used ordinary blocks:  %s%s&quot;,</a>
+<a name="ln377">           mtype_memstr (buf, MTYPE_MEMSTR_LEN, minfo.uordblks),</a>
+<a name="ln378">           VTY_NEWLINE);</a>
+<a name="ln379">  vty_out (vty, &quot;  Free small blocks:     %s%s&quot;,</a>
+<a name="ln380">           mtype_memstr (buf, MTYPE_MEMSTR_LEN, minfo.fsmblks),</a>
+<a name="ln381">           VTY_NEWLINE);</a>
+<a name="ln382">  vty_out (vty, &quot;  Free ordinary blocks:  %s%s&quot;,</a>
+<a name="ln383">           mtype_memstr (buf, MTYPE_MEMSTR_LEN, minfo.fordblks),</a>
+<a name="ln384">           VTY_NEWLINE);</a>
+<a name="ln385">  vty_out (vty, &quot;  Ordinary blocks:       %ld%s&quot;,</a>
+<a name="ln386">           (unsigned long)minfo.ordblks,</a>
+<a name="ln387">           VTY_NEWLINE);</a>
+<a name="ln388">  vty_out (vty, &quot;  Small blocks:          %ld%s&quot;,</a>
+<a name="ln389">           (unsigned long)minfo.smblks,</a>
+<a name="ln390">           VTY_NEWLINE);</a>
+<a name="ln391">  vty_out (vty, &quot;  Holding blocks:        %ld%s&quot;,</a>
+<a name="ln392">           (unsigned long)minfo.hblks,</a>
+<a name="ln393">           VTY_NEWLINE);</a>
+<a name="ln394">  vty_out (vty, &quot;(see system documentation for 'mallinfo' for meaning)%s&quot;,</a>
+<a name="ln395">           VTY_NEWLINE);</a>
+<a name="ln396">  return 1;</a>
+<a name="ln397">}</a>
+<a name="ln398">#endif /* HAVE_MALLINFO */</a>
+<a name="ln399"> </a>
+<a name="ln400">DEFUN (show_memory,</a>
+<a name="ln401">       show_memory_cmd,</a>
+<a name="ln402">       &quot;show memory&quot;,</a>
+<a name="ln403">       &quot;Show running system information\n&quot;</a>
+<a name="ln404">       &quot;Memory statistics\n&quot;)</a>
+<a name="ln405">{</a>
+<a name="ln406">  struct mlist *ml;</a>
+<a name="ln407">  int needsep = 0;</a>
+<a name="ln408">  </a>
+<a name="ln409">#ifdef HAVE_MALLINFO</a>
+<a name="ln410">  needsep = show_memory_mallinfo (vty);</a>
+<a name="ln411">#endif /* HAVE_MALLINFO */</a>
+<a name="ln412">  </a>
+<a name="ln413">  for (ml = mlists; ml-&gt;list; ml++)</a>
+<a name="ln414">    {</a>
+<a name="ln415">      if (needsep)</a>
+<a name="ln416">	show_separator (vty);</a>
+<a name="ln417">      needsep = show_memory_vty (vty, ml-&gt;list);</a>
+<a name="ln418">    }</a>
+<a name="ln419"> </a>
+<a name="ln420">  return CMD_SUCCESS;</a>
+<a name="ln421">}</a>
+<a name="ln422"> </a>
+<a name="ln423"> </a>
+<a name="ln424">void</a>
+<a name="ln425">memory_init (void)</a>
+<a name="ln426">{</a>
+<a name="ln427">  install_element (RESTRICTED_NODE, &amp;show_memory_cmd);</a>
+<a name="ln428"> </a>
+<a name="ln429">  install_element (VIEW_NODE, &amp;show_memory_cmd);</a>
+<a name="ln430">}</a>
+<a name="ln431"> </a>
+<a name="ln432">/* Stats querying from users */</a>
+<a name="ln433">/* Return a pointer to a human friendly string describing</a>
+<a name="ln434"> * the byte count passed in. E.g:</a>
+<a name="ln435"> * &quot;0 bytes&quot;, &quot;2048 bytes&quot;, &quot;110kB&quot;, &quot;500MiB&quot;, &quot;11GiB&quot;, etc.</a>
+<a name="ln436"> * Up to 4 significant figures will be given.</a>
+<a name="ln437"> * The pointer returned may be NULL (indicating an error)</a>
+<a name="ln438"> * or point to the given buffer, or point to static storage.</a>
+<a name="ln439"> */</a>
+<a name="ln440">const char *</a>
+<a name="ln441">mtype_memstr (char *buf, size_t len, unsigned long bytes)</a>
+<a name="ln442">{</a>
+<a name="ln443">  unsigned int m, k;</a>
+<a name="ln444"> </a>
+<a name="ln445">  /* easy cases */</a>
+<a name="ln446">  if (!bytes)</a>
+<a name="ln447">    return &quot;0 bytes&quot;;</a>
+<a name="ln448">  if (bytes == 1)</a>
+<a name="ln449">    return &quot;1 byte&quot;;</a>
+<a name="ln450"> </a>
+<a name="ln451">  /*</a>
+<a name="ln452">   * When we pass the 2gb barrier mallinfo() can no longer report</a>
+<a name="ln453">   * correct data so it just does something odd...</a>
+<a name="ln454">   * Reporting like Terrabytes of data.  Which makes users...</a>
+<a name="ln455">   * edgy.. yes edgy that's the term for it.</a>
+<a name="ln456">   * So let's just give up gracefully</a>
+<a name="ln457">   */</a>
+<a name="ln458">  if (bytes &gt; 0x7fffffff)</a>
+<a name="ln459">    return &quot;&gt; 2GB&quot;;</a>
+<a name="ln460"> </a>
+<a name="ln461">  m = bytes &gt;&gt; 20;</a>
+<a name="ln462">  k = bytes &gt;&gt; 10;</a>
+<a name="ln463"> </a>
+<a name="ln464"> if (m &gt; 10)</a>
+<a name="ln465">    {</a>
+<a name="ln466">      if (bytes &amp; (1 &lt;&lt; 19))</a>
+<a name="ln467">        m++;</a>
+<a name="ln468">      snprintf (buf, len, &quot;%d MiB&quot;, m);</a>
+<a name="ln469">    }</a>
+<a name="ln470">  else if (k &gt; 10)</a>
+<a name="ln471">    {</a>
+<a name="ln472">      if (bytes &amp; (1 &lt;&lt; 9))</a>
+<a name="ln473">        k++;</a>
+<a name="ln474">      snprintf (buf, len, &quot;%d KiB&quot;, k);</a>
+<a name="ln475">    }</a>
+<a name="ln476">  else</a>
+<a name="ln477">    snprintf (buf, len, &quot;%ld bytes&quot;, bytes);</a>
+<a name="ln478">  </a>
+<a name="ln479">  return buf;</a>
+<a name="ln480">}</a>
+<a name="ln481"> </a>
+<a name="ln482">unsigned long</a>
+<a name="ln483">mtype_stats_alloc (int type)</a>
+<a name="ln484">{</a>
+<a name="ln485">  return mstat[type].alloc;</a>
+<a name="ln486">}</a>
+
+</code></pre>
+<div class="balloon" rel="8"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1042/" target="_blank">V1042</a> This file is marked with copyleft license, which requires you to open the derived source code.</p></div>
+<div class="balloon" rel="119"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v547/" target="_blank">V547</a> Expression 'ptr == NULL' is always false.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

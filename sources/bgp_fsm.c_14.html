@@ -1,0 +1,1251 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>bgp_fsm.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.5.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/* BGP-4 Finite State Machine   </a>
+<a name="ln2">   From RFC1771 [A Border Gateway Protocol 4 (BGP-4)]</a>
+<a name="ln3">   Copyright (C) 1996, 97, 98 Kunihiro Ishiguro</a>
+<a name="ln4"> </a>
+<a name="ln5">This file is part of GNU Zebra.</a>
+<a name="ln6"> </a>
+<a name="ln7">GNU Zebra is free software; you can redistribute it and/or modify it</a>
+<a name="ln8">under the terms of the GNU General Public License as published by the</a>
+<a name="ln9">Free Software Foundation; either version 2, or (at your option) any</a>
+<a name="ln10">later version.</a>
+<a name="ln11"> </a>
+<a name="ln12">GNU Zebra is distributed in the hope that it will be useful, but</a>
+<a name="ln13">WITHOUT ANY WARRANTY; without even the implied warranty of</a>
+<a name="ln14">MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU</a>
+<a name="ln15">General Public License for more details.</a>
+<a name="ln16"> </a>
+<a name="ln17">You should have received a copy of the GNU General Public License</a>
+<a name="ln18">along with GNU Zebra; see the file COPYING.  If not, write to the Free</a>
+<a name="ln19">Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA</a>
+<a name="ln20">02111-1307, USA.  */</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &lt;zebra.h&gt;</a>
+<a name="ln23"> </a>
+<a name="ln24">#include &quot;linklist.h&quot;</a>
+<a name="ln25">#include &quot;prefix.h&quot;</a>
+<a name="ln26">#include &quot;vty.h&quot;</a>
+<a name="ln27">#include &quot;sockunion.h&quot;</a>
+<a name="ln28">#include &quot;thread.h&quot;</a>
+<a name="ln29">#include &quot;log.h&quot;</a>
+<a name="ln30">#include &quot;stream.h&quot;</a>
+<a name="ln31">#include &quot;memory.h&quot;</a>
+<a name="ln32">#include &quot;plist.h&quot;</a>
+<a name="ln33">#include &quot;workqueue.h&quot;</a>
+<a name="ln34">#include &quot;filter.h&quot;</a>
+<a name="ln35"> </a>
+<a name="ln36">#include &quot;bgpd/bgpd.h&quot;</a>
+<a name="ln37">#include &quot;bgpd/bgp_attr.h&quot;</a>
+<a name="ln38">#include &quot;bgpd/bgp_debug.h&quot;</a>
+<a name="ln39">#include &quot;bgpd/bgp_fsm.h&quot;</a>
+<a name="ln40">#include &quot;bgpd/bgp_packet.h&quot;</a>
+<a name="ln41">#include &quot;bgpd/bgp_network.h&quot;</a>
+<a name="ln42">#include &quot;bgpd/bgp_route.h&quot;</a>
+<a name="ln43">#include &quot;bgpd/bgp_dump.h&quot;</a>
+<a name="ln44">#include &quot;bgpd/bgp_open.h&quot;</a>
+<a name="ln45">#include &quot;bgpd/bgp_nht.h&quot;</a>
+<a name="ln46">#ifdef HAVE_SNMP</a>
+<a name="ln47">#include &quot;bgpd/bgp_snmp.h&quot;</a>
+<a name="ln48">#endif /* HAVE_SNMP */</a>
+<a name="ln49"> </a>
+<a name="ln50">/* BGP FSM (finite state machine) has three types of functions.  Type</a>
+<a name="ln51">   one is thread functions.  Type two is event functions.  Type three</a>
+<a name="ln52">   is FSM functions.  Timer functions are set by bgp_timer_set</a>
+<a name="ln53">   function. */</a>
+<a name="ln54"> </a>
+<a name="ln55">/* BGP event function. */</a>
+<a name="ln56">int bgp_event (struct thread *);</a>
+<a name="ln57"> </a>
+<a name="ln58">/* BGP thread functions. */</a>
+<a name="ln59">static int bgp_start_timer (struct thread *);</a>
+<a name="ln60">static int bgp_connect_timer (struct thread *);</a>
+<a name="ln61">static int bgp_holdtime_timer (struct thread *);</a>
+<a name="ln62">static int bgp_keepalive_timer (struct thread *);</a>
+<a name="ln63"> </a>
+<a name="ln64">/* BGP FSM functions. */</a>
+<a name="ln65">static int bgp_start (struct peer *);</a>
+<a name="ln66"> </a>
+<a name="ln67">/* BGP start timer jitter. */</a>
+<a name="ln68">static int</a>
+<a name="ln69">bgp_start_jitter (int time)</a>
+<a name="ln70">{</a>
+<a name="ln71">  return ((random () % (time + 1)) - (time / 2));</a>
+<a name="ln72">}</a>
+<a name="ln73"> </a>
+<a name="ln74">/* Check if suppress start/restart of sessions to peer. */</a>
+<a name="ln75">#define BGP_PEER_START_SUPPRESSED(P) \</a>
+<a name="ln76">  (CHECK_FLAG ((P)-&gt;flags, PEER_FLAG_SHUTDOWN) \</a>
+<a name="ln77">   || CHECK_FLAG ((P)-&gt;sflags, PEER_STATUS_PREFIX_OVERFLOW))</a>
+<a name="ln78"> </a>
+<a name="ln79">/* Hook function called after bgp event is occered.  And vty's</a>
+<a name="ln80">   neighbor command invoke this function after making neighbor</a>
+<a name="ln81">   structure. */</a>
+<a name="ln82">void</a>
+<a name="ln83">bgp_timer_set (struct peer *peer)</a>
+<a name="ln84">{</a>
+<a name="ln85">  int jitter = 0;</a>
+<a name="ln86"> </a>
+<a name="ln87">  switch (peer-&gt;status)</a>
+<a name="ln88">    {</a>
+<a name="ln89">    case Idle:</a>
+<a name="ln90">      /* First entry point of peer's finite state machine.  In Idle</a>
+<a name="ln91">	 status start timer is on unless peer is shutdown or peer is</a>
+<a name="ln92">	 inactive.  All other timer must be turned off */</a>
+<a name="ln93">      if (BGP_PEER_START_SUPPRESSED (peer) || ! peer_active (peer))</a>
+<a name="ln94">	{</a>
+<a name="ln95">	  BGP_TIMER_OFF (peer-&gt;t_start);</a>
+<a name="ln96">	}</a>
+<a name="ln97">      else</a>
+<a name="ln98">	{</a>
+<a name="ln99">	  jitter = bgp_start_jitter (peer-&gt;v_start);</a>
+<a name="ln100">	  BGP_TIMER_ON (peer-&gt;t_start, bgp_start_timer,</a>
+<a name="ln101">			peer-&gt;v_start + jitter);</a>
+<a name="ln102">	}</a>
+<a name="ln103">      BGP_TIMER_OFF (peer-&gt;t_connect);</a>
+<a name="ln104">      BGP_TIMER_OFF (peer-&gt;t_holdtime);</a>
+<a name="ln105">      BGP_TIMER_OFF (peer-&gt;t_keepalive);</a>
+<a name="ln106">      BGP_TIMER_OFF (peer-&gt;t_routeadv);</a>
+<a name="ln107">      break;</a>
+<a name="ln108"> </a>
+<a name="ln109">    case Connect:</a>
+<a name="ln110">      /* After start timer is expired, the peer moves to Connect</a>
+<a name="ln111">         status.  Make sure start timer is off and connect timer is</a>
+<a name="ln112">         on. */</a>
+<a name="ln113">      BGP_TIMER_OFF (peer-&gt;t_start);</a>
+<a name="ln114">      BGP_TIMER_ON (peer-&gt;t_connect, bgp_connect_timer, peer-&gt;v_connect);</a>
+<a name="ln115">      BGP_TIMER_OFF (peer-&gt;t_holdtime);</a>
+<a name="ln116">      BGP_TIMER_OFF (peer-&gt;t_keepalive);</a>
+<a name="ln117">      BGP_TIMER_OFF (peer-&gt;t_routeadv);</a>
+<a name="ln118">      break;</a>
+<a name="ln119"> </a>
+<a name="ln120">    case Active:</a>
+<a name="ln121">      /* Active is waiting connection from remote peer.  And if</a>
+<a name="ln122">         connect timer is expired, change status to Connect. */</a>
+<a name="ln123">      BGP_TIMER_OFF (peer-&gt;t_start);</a>
+<a name="ln124">      /* If peer is passive mode, do not set connect timer. */</a>
+<a name="ln125">      if (CHECK_FLAG (peer-&gt;flags, PEER_FLAG_PASSIVE)</a>
+<a name="ln126">	  || CHECK_FLAG (peer-&gt;sflags, PEER_STATUS_NSF_WAIT))</a>
+<a name="ln127">	{</a>
+<a name="ln128">	  BGP_TIMER_OFF (peer-&gt;t_connect);</a>
+<a name="ln129">	}</a>
+<a name="ln130">      else</a>
+<a name="ln131">	{</a>
+<a name="ln132">	  BGP_TIMER_ON (peer-&gt;t_connect, bgp_connect_timer, peer-&gt;v_connect);</a>
+<a name="ln133">	}</a>
+<a name="ln134">      BGP_TIMER_OFF (peer-&gt;t_holdtime);</a>
+<a name="ln135">      BGP_TIMER_OFF (peer-&gt;t_keepalive);</a>
+<a name="ln136">      BGP_TIMER_OFF (peer-&gt;t_routeadv);</a>
+<a name="ln137">      break;</a>
+<a name="ln138"> </a>
+<a name="ln139">    case OpenSent:</a>
+<a name="ln140">      /* OpenSent status. */</a>
+<a name="ln141">      BGP_TIMER_OFF (peer-&gt;t_start);</a>
+<a name="ln142">      BGP_TIMER_OFF (peer-&gt;t_connect);</a>
+<a name="ln143">      if (peer-&gt;v_holdtime != 0)</a>
+<a name="ln144">	{</a>
+<a name="ln145">	  BGP_TIMER_ON (peer-&gt;t_holdtime, bgp_holdtime_timer, </a>
+<a name="ln146">			peer-&gt;v_holdtime);</a>
+<a name="ln147">	}</a>
+<a name="ln148">      else</a>
+<a name="ln149">	{</a>
+<a name="ln150">	  BGP_TIMER_OFF (peer-&gt;t_holdtime);</a>
+<a name="ln151">	}</a>
+<a name="ln152">      BGP_TIMER_OFF (peer-&gt;t_keepalive);</a>
+<a name="ln153">      BGP_TIMER_OFF (peer-&gt;t_routeadv);</a>
+<a name="ln154">      break;</a>
+<a name="ln155"> </a>
+<a name="ln156">    case OpenConfirm:</a>
+<a name="ln157">      /* OpenConfirm status. */</a>
+<a name="ln158">      BGP_TIMER_OFF (peer-&gt;t_start);</a>
+<a name="ln159">      BGP_TIMER_OFF (peer-&gt;t_connect);</a>
+<a name="ln160"> </a>
+<a name="ln161">      /* If the negotiated Hold Time value is zero, then the Hold Time</a>
+<a name="ln162">         timer and KeepAlive timers are not started. */</a>
+<a name="ln163">      if (peer-&gt;v_holdtime == 0)</a>
+<a name="ln164">	{</a>
+<a name="ln165">	  BGP_TIMER_OFF (peer-&gt;t_holdtime);</a>
+<a name="ln166">	  BGP_TIMER_OFF (peer-&gt;t_keepalive);</a>
+<a name="ln167">	}</a>
+<a name="ln168">      else</a>
+<a name="ln169">	{</a>
+<a name="ln170">	  BGP_TIMER_ON (peer-&gt;t_holdtime, bgp_holdtime_timer,</a>
+<a name="ln171">			peer-&gt;v_holdtime);</a>
+<a name="ln172">	  BGP_TIMER_ON (peer-&gt;t_keepalive, bgp_keepalive_timer, </a>
+<a name="ln173">			peer-&gt;v_keepalive);</a>
+<a name="ln174">	}</a>
+<a name="ln175">      BGP_TIMER_OFF (peer-&gt;t_routeadv);</a>
+<a name="ln176">      break;</a>
+<a name="ln177"> </a>
+<a name="ln178">    case Established:</a>
+<a name="ln179">      /* In Established status start and connect timer is turned</a>
+<a name="ln180">         off. */</a>
+<a name="ln181">      BGP_TIMER_OFF (peer-&gt;t_start);</a>
+<a name="ln182">      BGP_TIMER_OFF (peer-&gt;t_connect);</a>
+<a name="ln183"> </a>
+<a name="ln184">      /* Same as OpenConfirm, if holdtime is zero then both holdtime</a>
+<a name="ln185">         and keepalive must be turned off. */</a>
+<a name="ln186">      if (peer-&gt;v_holdtime == 0)</a>
+<a name="ln187">	{</a>
+<a name="ln188">	  BGP_TIMER_OFF (peer-&gt;t_holdtime);</a>
+<a name="ln189">	  BGP_TIMER_OFF (peer-&gt;t_keepalive);</a>
+<a name="ln190">	}</a>
+<a name="ln191">      else</a>
+<a name="ln192">	{</a>
+<a name="ln193">	  BGP_TIMER_ON (peer-&gt;t_holdtime, bgp_holdtime_timer,</a>
+<a name="ln194">			peer-&gt;v_holdtime);</a>
+<a name="ln195">	  BGP_TIMER_ON (peer-&gt;t_keepalive, bgp_keepalive_timer,</a>
+<a name="ln196">			peer-&gt;v_keepalive);</a>
+<a name="ln197">	}</a>
+<a name="ln198">      break;</a>
+<a name="ln199">    case Deleted:</a>
+<a name="ln200">      BGP_TIMER_OFF (peer-&gt;t_gr_restart);</a>
+<a name="ln201">      BGP_TIMER_OFF (peer-&gt;t_gr_stale);</a>
+<a name="ln202">      BGP_TIMER_OFF (peer-&gt;t_pmax_restart);</a>
+<a name="ln203">    case Clearing:</a>
+<a name="ln204">      BGP_TIMER_OFF (peer-&gt;t_start);</a>
+<a name="ln205">      BGP_TIMER_OFF (peer-&gt;t_connect);</a>
+<a name="ln206">      BGP_TIMER_OFF (peer-&gt;t_holdtime);</a>
+<a name="ln207">      BGP_TIMER_OFF (peer-&gt;t_keepalive);</a>
+<a name="ln208">      BGP_TIMER_OFF (peer-&gt;t_routeadv);</a>
+<a name="ln209">    }</a>
+<a name="ln210">}</a>
+<a name="ln211"> </a>
+<a name="ln212">/* BGP start timer.  This function set BGP_Start event to thread value</a>
+<a name="ln213">   and process event. */</a>
+<a name="ln214">static int</a>
+<a name="ln215">bgp_start_timer (struct thread *thread)</a>
+<a name="ln216">{</a>
+<a name="ln217">  struct peer *peer;</a>
+<a name="ln218"> </a>
+<a name="ln219">  peer = THREAD_ARG (thread);</a>
+<a name="ln220">  peer-&gt;t_start = NULL;</a>
+<a name="ln221"> </a>
+<a name="ln222">  if (BGP_DEBUG (fsm, FSM))</a>
+<a name="ln223">    zlog (peer-&gt;log, LOG_DEBUG,</a>
+<a name="ln224">	  &quot;%s [FSM] Timer (start timer expire).&quot;, peer-&gt;host);</a>
+<a name="ln225"> </a>
+<a name="ln226">  THREAD_VAL (thread) = BGP_Start;</a>
+<a name="ln227">  bgp_event (thread);  /* bgp_event unlocks peer */</a>
+<a name="ln228"> </a>
+<a name="ln229">  return 0;</a>
+<a name="ln230">}</a>
+<a name="ln231"> </a>
+<a name="ln232">/* BGP connect retry timer. */</a>
+<a name="ln233">static int</a>
+<a name="ln234">bgp_connect_timer (struct thread *thread)</a>
+<a name="ln235">{</a>
+<a name="ln236">  struct peer *peer;</a>
+<a name="ln237"> </a>
+<a name="ln238">  peer = THREAD_ARG (thread);</a>
+<a name="ln239">  peer-&gt;t_connect = NULL;</a>
+<a name="ln240"> </a>
+<a name="ln241">  if (BGP_DEBUG (fsm, FSM))</a>
+<a name="ln242">    zlog (peer-&gt;log, LOG_DEBUG, &quot;%s [FSM] Timer (connect timer expire)&quot;,</a>
+<a name="ln243">	  peer-&gt;host);</a>
+<a name="ln244"> </a>
+<a name="ln245">  THREAD_VAL (thread) = ConnectRetry_timer_expired;</a>
+<a name="ln246">  bgp_event (thread); /* bgp_event unlocks peer */</a>
+<a name="ln247"> </a>
+<a name="ln248">  return 0;</a>
+<a name="ln249">}</a>
+<a name="ln250"> </a>
+<a name="ln251">/* BGP holdtime timer. */</a>
+<a name="ln252">static int</a>
+<a name="ln253">bgp_holdtime_timer (struct thread *thread)</a>
+<a name="ln254">{</a>
+<a name="ln255">  struct peer *peer;</a>
+<a name="ln256"> </a>
+<a name="ln257">  peer = THREAD_ARG (thread);</a>
+<a name="ln258">  peer-&gt;t_holdtime = NULL;</a>
+<a name="ln259"> </a>
+<a name="ln260">  if (BGP_DEBUG (fsm, FSM))</a>
+<a name="ln261">    zlog (peer-&gt;log, LOG_DEBUG,</a>
+<a name="ln262">	  &quot;%s [FSM] Timer (holdtime timer expire)&quot;,</a>
+<a name="ln263">	  peer-&gt;host);</a>
+<a name="ln264"> </a>
+<a name="ln265">  THREAD_VAL (thread) = Hold_Timer_expired;</a>
+<a name="ln266">  bgp_event (thread); /* bgp_event unlocks peer */</a>
+<a name="ln267"> </a>
+<a name="ln268">  return 0;</a>
+<a name="ln269">}</a>
+<a name="ln270"> </a>
+<a name="ln271">/* BGP keepalive fire ! */</a>
+<a name="ln272">static int</a>
+<a name="ln273">bgp_keepalive_timer (struct thread *thread)</a>
+<a name="ln274">{</a>
+<a name="ln275">  struct peer *peer;</a>
+<a name="ln276"> </a>
+<a name="ln277">  peer = THREAD_ARG (thread);</a>
+<a name="ln278">  peer-&gt;t_keepalive = NULL;</a>
+<a name="ln279"> </a>
+<a name="ln280">  if (BGP_DEBUG (fsm, FSM))</a>
+<a name="ln281">    zlog (peer-&gt;log, LOG_DEBUG,</a>
+<a name="ln282">	  &quot;%s [FSM] Timer (keepalive timer expire)&quot;,</a>
+<a name="ln283">	  peer-&gt;host);</a>
+<a name="ln284"> </a>
+<a name="ln285">  THREAD_VAL (thread) = KeepAlive_timer_expired;</a>
+<a name="ln286">  bgp_event (thread); /* bgp_event unlocks peer */</a>
+<a name="ln287"> </a>
+<a name="ln288">  return 0;</a>
+<a name="ln289">}</a>
+<a name="ln290"> </a>
+<a name="ln291">static int</a>
+<a name="ln292">bgp_routeadv_timer (struct thread *thread)</a>
+<a name="ln293">{</a>
+<a name="ln294">  struct peer *peer;</a>
+<a name="ln295"> </a>
+<a name="ln296">  peer = THREAD_ARG (thread);</a>
+<a name="ln297">  peer-&gt;t_routeadv = NULL;</a>
+<a name="ln298"> </a>
+<a name="ln299">  if (BGP_DEBUG (fsm, FSM))</a>
+<a name="ln300">    zlog (peer-&gt;log, LOG_DEBUG,</a>
+<a name="ln301">	  &quot;%s [FSM] Timer (routeadv timer expire)&quot;,</a>
+<a name="ln302">	  peer-&gt;host);</a>
+<a name="ln303"> </a>
+<a name="ln304">  peer-&gt;synctime = bgp_clock ();</a>
+<a name="ln305"> </a>
+<a name="ln306">  BGP_WRITE_ON (peer-&gt;t_write, bgp_write, peer-&gt;fd);</a>
+<a name="ln307"> </a>
+<a name="ln308">  BGP_TIMER_ON (peer-&gt;t_routeadv, bgp_routeadv_timer,</a>
+<a name="ln309">		peer-&gt;v_routeadv);</a>
+<a name="ln310"> </a>
+<a name="ln311">  return 0;</a>
+<a name="ln312">}</a>
+<a name="ln313"> </a>
+<a name="ln314">/* BGP Peer Down Cause */</a>
+<a name="ln315">const char *peer_down_str[] =</a>
+<a name="ln316">{</a>
+<a name="ln317">  &quot;&quot;,</a>
+<a name="ln318">  &quot;Router ID changed&quot;,</a>
+<a name="ln319">  &quot;Remote AS changed&quot;,</a>
+<a name="ln320">  &quot;Local AS change&quot;,</a>
+<a name="ln321">  &quot;Cluster ID changed&quot;,</a>
+<a name="ln322">  &quot;Confederation identifier changed&quot;,</a>
+<a name="ln323">  &quot;Confederation peer changed&quot;,</a>
+<a name="ln324">  &quot;RR client config change&quot;,</a>
+<a name="ln325">  &quot;RS client config change&quot;,</a>
+<a name="ln326">  &quot;Update source change&quot;,</a>
+<a name="ln327">  &quot;Address family activated&quot;,</a>
+<a name="ln328">  &quot;Admin. shutdown&quot;,</a>
+<a name="ln329">  &quot;User reset&quot;,</a>
+<a name="ln330">  &quot;BGP Notification received&quot;,</a>
+<a name="ln331">  &quot;BGP Notification send&quot;,</a>
+<a name="ln332">  &quot;Peer closed the session&quot;,</a>
+<a name="ln333">  &quot;Neighbor deleted&quot;,</a>
+<a name="ln334">  &quot;Peer-group add member&quot;,</a>
+<a name="ln335">  &quot;Peer-group delete member&quot;,</a>
+<a name="ln336">  &quot;Capability changed&quot;,</a>
+<a name="ln337">  &quot;Passive config change&quot;,</a>
+<a name="ln338">  &quot;Multihop config change&quot;,</a>
+<a name="ln339">  &quot;NSF peer closed the session&quot;</a>
+<a name="ln340">};</a>
+<a name="ln341"> </a>
+<a name="ln342">static int</a>
+<a name="ln343">bgp_graceful_restart_timer_expire (struct thread *thread)</a>
+<a name="ln344">{</a>
+<a name="ln345">  struct peer *peer;</a>
+<a name="ln346">  afi_t afi;</a>
+<a name="ln347">  safi_t safi;</a>
+<a name="ln348"> </a>
+<a name="ln349">  peer = THREAD_ARG (thread);</a>
+<a name="ln350">  peer-&gt;t_gr_restart = NULL;</a>
+<a name="ln351"> </a>
+<a name="ln352">  /* NSF delete stale route */</a>
+<a name="ln353">  for (afi = AFI_IP ; afi &lt; AFI_MAX ; afi++)</a>
+<a name="ln354">    for (safi = SAFI_UNICAST ; safi &lt; SAFI_RESERVED_3 ; safi++)</a>
+<a name="ln355">      if (peer-&gt;nsf[afi][safi])</a>
+<a name="ln356">	bgp_clear_stale_route (peer, afi, safi);</a>
+<a name="ln357"> </a>
+<a name="ln358">  UNSET_FLAG (peer-&gt;sflags, PEER_STATUS_NSF_WAIT);</a>
+<a name="ln359">  BGP_TIMER_OFF (peer-&gt;t_gr_stale);</a>
+<a name="ln360"> </a>
+<a name="ln361">  if (BGP_DEBUG (events, EVENTS))</a>
+<a name="ln362">    {</a>
+<a name="ln363">      zlog_debug (&quot;%s graceful restart timer expired&quot;, peer-&gt;host);</a>
+<a name="ln364">      zlog_debug (&quot;%s graceful restart stalepath timer stopped&quot;, peer-&gt;host);</a>
+<a name="ln365">    }</a>
+<a name="ln366"> </a>
+<a name="ln367">  bgp_timer_set (peer);</a>
+<a name="ln368"> </a>
+<a name="ln369">  return 0;</a>
+<a name="ln370">}</a>
+<a name="ln371"> </a>
+<a name="ln372">static int</a>
+<a name="ln373">bgp_graceful_stale_timer_expire (struct thread *thread)</a>
+<a name="ln374">{</a>
+<a name="ln375">  struct peer *peer;</a>
+<a name="ln376">  afi_t afi;</a>
+<a name="ln377">  safi_t safi;</a>
+<a name="ln378"> </a>
+<a name="ln379">  peer = THREAD_ARG (thread);</a>
+<a name="ln380">  peer-&gt;t_gr_stale = NULL;</a>
+<a name="ln381"> </a>
+<a name="ln382">  if (BGP_DEBUG (events, EVENTS))</a>
+<a name="ln383">    zlog_debug (&quot;%s graceful restart stalepath timer expired&quot;, peer-&gt;host);</a>
+<a name="ln384"> </a>
+<a name="ln385">  /* NSF delete stale route */</a>
+<a name="ln386">  for (afi = AFI_IP ; afi &lt; AFI_MAX ; afi++)</a>
+<a name="ln387">    for (safi = SAFI_UNICAST ; safi &lt; SAFI_RESERVED_3 ; safi++)</a>
+<a name="ln388">      if (peer-&gt;nsf[afi][safi])</a>
+<a name="ln389">	bgp_clear_stale_route (peer, afi, safi);</a>
+<a name="ln390"> </a>
+<a name="ln391">  return 0;</a>
+<a name="ln392">}</a>
+<a name="ln393"> </a>
+<a name="ln394">/* Called after event occurred, this function change status and reset</a>
+<a name="ln395">   read/write and timer thread. */</a>
+<a name="ln396">void</a>
+<a name="ln397">bgp_fsm_change_status (struct peer *peer, int status)</a>
+<a name="ln398">{</a>
+<a name="ln399">  bgp_dump_state (peer, peer-&gt;status, status);</a>
+<a name="ln400"> </a>
+<a name="ln401">  /* Transition into Clearing or Deleted must /always/ clear all routes.. </a>
+<a name="ln402">   * (and must do so before actually changing into Deleted..</a>
+<a name="ln403">   */</a>
+<a name="ln404">  if (status &gt;= Clearing)</a>
+<a name="ln405">    {</a>
+<a name="ln406">      bgp_clear_route_all (peer);</a>
+<a name="ln407"> </a>
+<a name="ln408">      /* If no route was queued for the clear-node processing, generate the</a>
+<a name="ln409">       * completion event here. This is needed because if there are no routes</a>
+<a name="ln410">       * to trigger the background clear-node thread, the event won't get</a>
+<a name="ln411">       * generated and the peer would be stuck in Clearing. Note that this</a>
+<a name="ln412">       * event is for the peer and helps the peer transition out of Clearing</a>
+<a name="ln413">       * state; it should not be generated per (AFI,SAFI). The event is</a>
+<a name="ln414">       * directly posted here without calling clear_node_complete() as we</a>
+<a name="ln415">       * shouldn't do an extra unlock. This event will get processed after</a>
+<a name="ln416">       * the state change that happens below, so peer will be in Clearing</a>
+<a name="ln417">       * (or Deleted).</a>
+<a name="ln418">       */</a>
+<a name="ln419">      if (!work_queue_is_scheduled (peer-&gt;clear_node_queue))</a>
+<a name="ln420">        BGP_EVENT_ADD (peer, Clearing_Completed);</a>
+<a name="ln421">    }</a>
+<a name="ln422">  </a>
+<a name="ln423">  /* Preserve old status and change into new status. */</a>
+<a name="ln424">  peer-&gt;ostatus = peer-&gt;status;</a>
+<a name="ln425">  peer-&gt;status = status;</a>
+<a name="ln426">  </a>
+<a name="ln427">  if (BGP_DEBUG (normal, NORMAL))</a>
+<a name="ln428">    zlog_debug (&quot;%s went from %s to %s&quot;,</a>
+<a name="ln429">		peer-&gt;host,</a>
+<a name="ln430">		LOOKUP (bgp_status_msg, peer-&gt;ostatus),</a>
+<a name="ln431">		LOOKUP (bgp_status_msg, peer-&gt;status));</a>
+<a name="ln432">}</a>
+<a name="ln433"> </a>
+<a name="ln434">/* Flush the event queue and ensure the peer is shut down */</a>
+<a name="ln435">static int</a>
+<a name="ln436">bgp_clearing_completed (struct peer *peer)</a>
+<a name="ln437">{</a>
+<a name="ln438">  int rc = bgp_stop(peer);</a>
+<a name="ln439">  BGP_EVENT_FLUSH (peer);</a>
+<a name="ln440"> </a>
+<a name="ln441">  return rc;</a>
+<a name="ln442">}</a>
+<a name="ln443"> </a>
+<a name="ln444">/* Administrative BGP peer stop event. */</a>
+<a name="ln445">/* May be called multiple times for the same peer */</a>
+<a name="ln446">int</a>
+<a name="ln447">bgp_stop (struct peer *peer)</a>
+<a name="ln448">{</a>
+<a name="ln449">  afi_t afi;</a>
+<a name="ln450">  safi_t safi;</a>
+<a name="ln451">  char orf_name[BUFSIZ];</a>
+<a name="ln452"> </a>
+<a name="ln453">  /* Can't do this in Clearing; events are used for state transitions */</a>
+<a name="ln454">  if (peer-&gt;status != Clearing)</a>
+<a name="ln455">    {</a>
+<a name="ln456">      /* Delete all existing events of the peer */</a>
+<a name="ln457">      BGP_EVENT_FLUSH (peer);</a>
+<a name="ln458">    }</a>
+<a name="ln459"> </a>
+<a name="ln460">  /* Increment Dropped count. */</a>
+<a name="ln461">  if (peer-&gt;status == Established)</a>
+<a name="ln462">    {</a>
+<a name="ln463">      peer-&gt;dropped++;</a>
+<a name="ln464"> </a>
+<a name="ln465">      /* bgp log-neighbor-changes of neighbor Down */</a>
+<a name="ln466">      if (bgp_flag_check (peer-&gt;bgp, BGP_FLAG_LOG_NEIGHBOR_CHANGES))</a>
+<a name="ln467">	zlog_info (&quot;%%ADJCHANGE: neighbor %s Down %s&quot;, peer-&gt;host,</a>
+<a name="ln468">                   peer_down_str [(int) peer-&gt;last_reset]);</a>
+<a name="ln469"> </a>
+<a name="ln470">      /* graceful restart */</a>
+<a name="ln471">      if (peer-&gt;t_gr_stale)</a>
+<a name="ln472">	{</a>
+<a name="ln473">	  BGP_TIMER_OFF (peer-&gt;t_gr_stale);</a>
+<a name="ln474">	  if (BGP_DEBUG (events, EVENTS))</a>
+<a name="ln475">	    zlog_debug (&quot;%s graceful restart stalepath timer stopped&quot;, peer-&gt;host);</a>
+<a name="ln476">	}</a>
+<a name="ln477">      if (CHECK_FLAG (peer-&gt;sflags, PEER_STATUS_NSF_WAIT))</a>
+<a name="ln478">	{</a>
+<a name="ln479">	  if (BGP_DEBUG (events, EVENTS))</a>
+<a name="ln480">	    {</a>
+<a name="ln481">	      zlog_debug (&quot;%s graceful restart timer started for %d sec&quot;,</a>
+<a name="ln482">			  peer-&gt;host, peer-&gt;v_gr_restart);</a>
+<a name="ln483">	      zlog_debug (&quot;%s graceful restart stalepath timer started for %d sec&quot;,</a>
+<a name="ln484">			  peer-&gt;host, peer-&gt;bgp-&gt;stalepath_time);</a>
+<a name="ln485">	    }</a>
+<a name="ln486">	  BGP_TIMER_ON (peer-&gt;t_gr_restart, bgp_graceful_restart_timer_expire,</a>
+<a name="ln487">			peer-&gt;v_gr_restart);</a>
+<a name="ln488">	  BGP_TIMER_ON (peer-&gt;t_gr_stale, bgp_graceful_stale_timer_expire,</a>
+<a name="ln489">			peer-&gt;bgp-&gt;stalepath_time);</a>
+<a name="ln490">	}</a>
+<a name="ln491">      else</a>
+<a name="ln492">	{</a>
+<a name="ln493">	  UNSET_FLAG (peer-&gt;sflags, PEER_STATUS_NSF_MODE);</a>
+<a name="ln494"> </a>
+<a name="ln495">	  for (afi = AFI_IP ; afi &lt; AFI_MAX ; afi++)</a>
+<a name="ln496">	    for (safi = SAFI_UNICAST ; safi &lt; SAFI_RESERVED_3 ; safi++)</a>
+<a name="ln497">	      peer-&gt;nsf[afi][safi] = 0;</a>
+<a name="ln498">	}</a>
+<a name="ln499"> </a>
+<a name="ln500">      /* set last reset time */</a>
+<a name="ln501">      peer-&gt;resettime = peer-&gt;uptime = bgp_clock ();</a>
+<a name="ln502"> </a>
+<a name="ln503">#ifdef HAVE_SNMP</a>
+<a name="ln504">      bgpTrapBackwardTransition (peer);</a>
+<a name="ln505">#endif /* HAVE_SNMP */</a>
+<a name="ln506"> </a>
+<a name="ln507">      /* Reset peer synctime */</a>
+<a name="ln508">      peer-&gt;synctime = 0;</a>
+<a name="ln509">    }</a>
+<a name="ln510">  </a>
+<a name="ln511">  /* Stop read and write threads when exists. */</a>
+<a name="ln512">  BGP_READ_OFF (peer-&gt;t_read);</a>
+<a name="ln513">  BGP_WRITE_OFF (peer-&gt;t_write);</a>
+<a name="ln514"> </a>
+<a name="ln515">  /* Stop all timers. */</a>
+<a name="ln516">  BGP_TIMER_OFF (peer-&gt;t_start);</a>
+<a name="ln517">  BGP_TIMER_OFF (peer-&gt;t_connect);</a>
+<a name="ln518">  BGP_TIMER_OFF (peer-&gt;t_holdtime);</a>
+<a name="ln519">  BGP_TIMER_OFF (peer-&gt;t_keepalive);</a>
+<a name="ln520">  BGP_TIMER_OFF (peer-&gt;t_routeadv);</a>
+<a name="ln521"> </a>
+<a name="ln522">  /* Stream reset. */</a>
+<a name="ln523">  peer-&gt;packet_size = 0;</a>
+<a name="ln524"> </a>
+<a name="ln525">  /* Clear input and output buffer.  */</a>
+<a name="ln526">  if (peer-&gt;ibuf)</a>
+<a name="ln527">    stream_reset (peer-&gt;ibuf);</a>
+<a name="ln528">  if (peer-&gt;work)</a>
+<a name="ln529">    stream_reset (peer-&gt;work);</a>
+<a name="ln530">  if (peer-&gt;obuf)</a>
+<a name="ln531">    stream_fifo_clean (peer-&gt;obuf);</a>
+<a name="ln532"> </a>
+<a name="ln533">  /* Close of file descriptor. */</a>
+<a name="ln534">  if (peer-&gt;fd &gt;= 0)</a>
+<a name="ln535">    {</a>
+<a name="ln536">      close (peer-&gt;fd);</a>
+<a name="ln537">      peer-&gt;fd = -1;</a>
+<a name="ln538">    }</a>
+<a name="ln539"> </a>
+<a name="ln540">  for (afi = AFI_IP ; afi &lt; AFI_MAX ; afi++)</a>
+<a name="ln541">    for (safi = SAFI_UNICAST ; safi &lt; SAFI_MAX ; safi++)</a>
+<a name="ln542">      {</a>
+<a name="ln543">        /* Reset all negotiated variables */</a>
+<a name="ln544">        peer-&gt;afc_nego[afi][safi] = 0;</a>
+<a name="ln545">        peer-&gt;afc_adv[afi][safi] = 0;</a>
+<a name="ln546">        peer-&gt;afc_recv[afi][safi] = 0;</a>
+<a name="ln547"> </a>
+<a name="ln548">	/* peer address family capability flags*/</a>
+<a name="ln549">	peer-&gt;af_cap[afi][safi] = 0;</a>
+<a name="ln550"> </a>
+<a name="ln551">	/* peer address family status flags*/</a>
+<a name="ln552">	peer-&gt;af_sflags[afi][safi] = 0;</a>
+<a name="ln553"> </a>
+<a name="ln554">	/* Received ORF prefix-filter */</a>
+<a name="ln555">	peer-&gt;orf_plist[afi][safi] = NULL;</a>
+<a name="ln556"> </a>
+<a name="ln557">        /* ORF received prefix-filter pnt */</a>
+<a name="ln558">        sprintf (orf_name, &quot;%s.%d.%d&quot;, peer-&gt;host, afi, safi);</a>
+<a name="ln559">        prefix_bgp_orf_remove_all (afi, orf_name);</a>
+<a name="ln560">      }</a>
+<a name="ln561"> </a>
+<a name="ln562">  /* Reset keepalive and holdtime */</a>
+<a name="ln563">  if (CHECK_FLAG (peer-&gt;config, PEER_CONFIG_TIMER))</a>
+<a name="ln564">    {</a>
+<a name="ln565">      peer-&gt;v_keepalive = peer-&gt;keepalive;</a>
+<a name="ln566">      peer-&gt;v_holdtime = peer-&gt;holdtime;</a>
+<a name="ln567">    }</a>
+<a name="ln568">  else</a>
+<a name="ln569">    {</a>
+<a name="ln570">      peer-&gt;v_keepalive = peer-&gt;bgp-&gt;default_keepalive;</a>
+<a name="ln571">      peer-&gt;v_holdtime = peer-&gt;bgp-&gt;default_holdtime;</a>
+<a name="ln572">    }</a>
+<a name="ln573"> </a>
+<a name="ln574">  peer-&gt;update_time = 0;</a>
+<a name="ln575"> </a>
+<a name="ln576">  /* Until we are sure that there is no problem about prefix count</a>
+<a name="ln577">     this should be commented out.*/</a>
+<a name="ln578">#if 0</a>
+<a name="ln579">  /* Reset prefix count */</a>
+<a name="ln580">  peer-&gt;pcount[AFI_IP][SAFI_UNICAST] = 0;</a>
+<a name="ln581">  peer-&gt;pcount[AFI_IP][SAFI_MULTICAST] = 0;</a>
+<a name="ln582">  peer-&gt;pcount[AFI_IP][SAFI_MPLS_VPN] = 0;</a>
+<a name="ln583">  peer-&gt;pcount[AFI_IP6][SAFI_UNICAST] = 0;</a>
+<a name="ln584">  peer-&gt;pcount[AFI_IP6][SAFI_MULTICAST] = 0;</a>
+<a name="ln585">#endif /* 0 */</a>
+<a name="ln586"> </a>
+<a name="ln587">  return 0;</a>
+<a name="ln588">}</a>
+<a name="ln589"> </a>
+<a name="ln590">/* first-val * 2**x back-off, where x is the number of sucessive calls </a>
+<a name="ln591"> * originally used for peer v_start back-off </a>
+<a name="ln592"> */</a>
+<a name="ln593">__attribute__((unused))</a>
+<a name="ln594">static int</a>
+<a name="ln595">back_off_exp2 (const int first, int val, const int max) </a>
+<a name="ln596">{</a>
+<a name="ln597">  val &lt;&lt;= 1;</a>
+<a name="ln598">  return (val &lt; max ? val : max);</a>
+<a name="ln599">}</a>
+<a name="ln600"> </a>
+<a name="ln601">/* exponential back off, but biased downward by the initial value. </a>
+<a name="ln602"> * this bias is significant at lower values, and tends to</a>
+<a name="ln603"> * insignificance fairly quickly, so it is equal to the previous at</a>
+<a name="ln604"> * scale.  Is below first-val * 1.7**x at x == 6, and below first-val</a>
+<a name="ln605"> * * 1.75**x at x=10.</a>
+<a name="ln606"> *</a>
+<a name="ln607"> * I.e., this function is useful to get slower growth for the initial</a>
+<a name="ln608"> * points of x.</a>
+<a name="ln609"> */</a>
+<a name="ln610">__attribute__((unused))</a>
+<a name="ln611">static int</a>
+<a name="ln612">back_off_exp2_bias (const int first, int val, const int max)</a>
+<a name="ln613">{</a>
+<a name="ln614">  val = (val &lt;&lt; 1) - (val &gt; first ? first : 0);</a>
+<a name="ln615">  return (val &lt; max ? val : max);</a>
+<a name="ln616">}</a>
+<a name="ln617"> </a>
+<a name="ln618">/* BGP peer is stoped by the error. */</a>
+<a name="ln619">static int</a>
+<a name="ln620">bgp_stop_with_error (struct peer *peer)</a>
+<a name="ln621">{</a>
+<a name="ln622">  peer-&gt;v_start</a>
+<a name="ln623">   = back_off_exp2_bias (BGP_INIT_START_TIMER, peer-&gt;v_start, 60);</a>
+<a name="ln624">  bgp_stop (peer);</a>
+<a name="ln625">  return 0;</a>
+<a name="ln626">}</a>
+<a name="ln627"> </a>
+<a name="ln628"> </a>
+<a name="ln629">/* something went wrong, send notify and tear down */</a>
+<a name="ln630">static int</a>
+<a name="ln631">bgp_stop_with_notify (struct peer *peer, u_char code, u_char sub_code)</a>
+<a name="ln632">{</a>
+<a name="ln633">  /* Send notify to remote peer */</a>
+<a name="ln634">  bgp_notify_send (peer, code, sub_code);</a>
+<a name="ln635"> </a>
+<a name="ln636">  /* Sweep if it is temporary peer. */</a>
+<a name="ln637">  if (CHECK_FLAG (peer-&gt;sflags, PEER_STATUS_ACCEPT_PEER))</a>
+<a name="ln638">    {</a>
+<a name="ln639">      zlog_info (&quot;%s [Event] Accepting BGP peer is deleted&quot;, peer-&gt;host);</a>
+<a name="ln640">      peer_delete (peer);</a>
+<a name="ln641">      return -1;</a>
+<a name="ln642">    }</a>
+<a name="ln643"> </a>
+<a name="ln644">  /* Clear start timer value to default. */</a>
+<a name="ln645">  peer-&gt;v_start = BGP_INIT_START_TIMER;</a>
+<a name="ln646"> </a>
+<a name="ln647">  /* bgp_stop needs to be invoked while in Established state */</a>
+<a name="ln648">  bgp_stop(peer);</a>
+<a name="ln649"> </a>
+<a name="ln650">  return 0;</a>
+<a name="ln651">}</a>
+<a name="ln652"> </a>
+<a name="ln653"> </a>
+<a name="ln654">/* TCP connection open.  Next we send open message to remote peer. And</a>
+<a name="ln655">   add read thread for reading open message. */</a>
+<a name="ln656">static int</a>
+<a name="ln657">bgp_connect_success (struct peer *peer)</a>
+<a name="ln658">{</a>
+<a name="ln659">  struct peer *realpeer;</a>
+<a name="ln660">  </a>
+<a name="ln661">  if (peer-&gt;fd &lt; 0)</a>
+<a name="ln662">    {</a>
+<a name="ln663">      zlog_err (&quot;bgp_connect_success peer's fd is negative value %d&quot;,</a>
+<a name="ln664">		peer-&gt;fd);</a>
+<a name="ln665">      return -1;</a>
+<a name="ln666">    }</a>
+<a name="ln667">  BGP_READ_ON (peer-&gt;t_read, bgp_read, peer-&gt;fd);</a>
+<a name="ln668"> </a>
+<a name="ln669">  if (! CHECK_FLAG (peer-&gt;sflags, PEER_STATUS_ACCEPT_PEER))</a>
+<a name="ln670">    bgp_getsockname (peer);</a>
+<a name="ln671"> </a>
+<a name="ln672">  if (BGP_DEBUG (normal, NORMAL))</a>
+<a name="ln673">    {</a>
+<a name="ln674">      char buf1[SU_ADDRSTRLEN];</a>
+<a name="ln675"> </a>
+<a name="ln676">      if (! CHECK_FLAG (peer-&gt;sflags, PEER_STATUS_ACCEPT_PEER))</a>
+<a name="ln677">	zlog_debug (&quot;%s open active, local address %s&quot;, peer-&gt;host,</a>
+<a name="ln678">		    sockunion2str (peer-&gt;su_local, buf1, SU_ADDRSTRLEN));</a>
+<a name="ln679">      else</a>
+<a name="ln680">	zlog_debug (&quot;%s passive open&quot;, peer-&gt;host);</a>
+<a name="ln681">    }</a>
+<a name="ln682">  </a>
+<a name="ln683">  /* Generally we want to send OPEN ASAP. Except, some partial BGP</a>
+<a name="ln684">   * implementations out there (e.g., conformance test tools / BGP</a>
+<a name="ln685">   * traffic generators) seem to be a bit funny about connection collisions,</a>
+<a name="ln686">   * and OPENs before they have sent.</a>
+<a name="ln687">   *</a>
+<a name="ln688">   * As a hack, delay sending OPEN on an inbound accept-peer session</a>
+<a name="ln689">   * _IF_ we locally have an outbound connection in progress, i.e. </a>
+<a name="ln690">   * we're in middle of a connection collision. If we delay, we delay until</a>
+<a name="ln691">   * an Open is received - as per old Quagga behaviour.</a>
+<a name="ln692">   */</a>
+<a name="ln693">  if (CHECK_FLAG (peer-&gt;sflags, PEER_STATUS_ACCEPT_PEER))</a>
+<a name="ln694">    {</a>
+<a name="ln695">      realpeer = peer_lookup (peer-&gt;bgp, &amp;peer-&gt;su);</a>
+<a name="ln696">      </a>
+<a name="ln697">      if (realpeer-&gt;status &gt; Idle &amp;&amp; realpeer-&gt;status &lt;= Established)</a>
+<a name="ln698">        {</a>
+<a name="ln699">          SET_FLAG (peer-&gt;sflags, PEER_STATUS_OPEN_DEFERRED);</a>
+<a name="ln700">          return 0;</a>
+<a name="ln701">        }</a>
+<a name="ln702">   }</a>
+<a name="ln703">  </a>
+<a name="ln704">  bgp_open_send (peer);</a>
+<a name="ln705"> </a>
+<a name="ln706">  return 0;</a>
+<a name="ln707">}</a>
+<a name="ln708"> </a>
+<a name="ln709">/* TCP connect fail */</a>
+<a name="ln710">static int</a>
+<a name="ln711">bgp_connect_fail (struct peer *peer)</a>
+<a name="ln712">{</a>
+<a name="ln713">  bgp_stop (peer);</a>
+<a name="ln714">  return 0;</a>
+<a name="ln715">}</a>
+<a name="ln716"> </a>
+<a name="ln717">/* This function is the first starting point of all BGP connection. It</a>
+<a name="ln718">   try to connect to remote peer with non-blocking IO. */</a>
+<a name="ln719">int</a>
+<a name="ln720">bgp_start (struct peer *peer)</a>
+<a name="ln721">{</a>
+<a name="ln722">  int status;</a>
+<a name="ln723">  int connected = 0;</a>
+<a name="ln724"> </a>
+<a name="ln725">  if (BGP_PEER_START_SUPPRESSED (peer))</a>
+<a name="ln726">    {</a>
+<a name="ln727">      if (BGP_DEBUG (fsm, FSM))</a>
+<a name="ln728">        plog_err (peer-&gt;log, &quot;%s [FSM] Trying to start suppressed peer&quot;</a>
+<a name="ln729">                  &quot; - this is never supposed to happen!&quot;, peer-&gt;host);</a>
+<a name="ln730">      return -1;</a>
+<a name="ln731">    }</a>
+<a name="ln732"> </a>
+<a name="ln733">  /* Scrub some information that might be left over from a previous,</a>
+<a name="ln734">   * session</a>
+<a name="ln735">   */</a>
+<a name="ln736">  /* Connection information. */</a>
+<a name="ln737">  if (peer-&gt;su_local)</a>
+<a name="ln738">    {</a>
+<a name="ln739">      sockunion_free (peer-&gt;su_local);</a>
+<a name="ln740">      peer-&gt;su_local = NULL;</a>
+<a name="ln741">    }</a>
+<a name="ln742"> </a>
+<a name="ln743">  if (peer-&gt;su_remote)</a>
+<a name="ln744">    {</a>
+<a name="ln745">      sockunion_free (peer-&gt;su_remote);</a>
+<a name="ln746">      peer-&gt;su_remote = NULL;</a>
+<a name="ln747">    }</a>
+<a name="ln748"> </a>
+<a name="ln749">  /* Clear remote router-id. */</a>
+<a name="ln750">  peer-&gt;remote_id.s_addr = 0;</a>
+<a name="ln751"> </a>
+<a name="ln752">  /* Clear peer capability flag. */</a>
+<a name="ln753">  peer-&gt;cap = 0;</a>
+<a name="ln754">    </a>
+<a name="ln755">  /* If the peer is passive mode, force to move to Active mode. */</a>
+<a name="ln756">  if (CHECK_FLAG (peer-&gt;flags, PEER_FLAG_PASSIVE))</a>
+<a name="ln757">    {</a>
+<a name="ln758">      BGP_EVENT_ADD (peer, TCP_connection_open_failed);</a>
+<a name="ln759">      return 0;</a>
+<a name="ln760">    }</a>
+<a name="ln761"> </a>
+<a name="ln762">  /* Register to be notified on peer up */</a>
+<a name="ln763">  if ((peer_ttl(peer) == 1 || peer-&gt;gtsm_hops == 1) &amp;&amp;</a>
+<a name="ln764">      ! CHECK_FLAG (peer-&gt;flags, PEER_FLAG_DISABLE_CONNECTED_CHECK))</a>
+<a name="ln765">    connected = 1;</a>
+<a name="ln766"> </a>
+<a name="ln767">  bgp_ensure_nexthop (NULL, peer, connected);</a>
+<a name="ln768">  status = bgp_connect (peer);</a>
+<a name="ln769"> </a>
+<a name="ln770">  switch (status)</a>
+<a name="ln771">    {</a>
+<a name="ln772">    case connect_error:</a>
+<a name="ln773">      if (BGP_DEBUG (fsm, FSM))</a>
+<a name="ln774">	plog_debug (peer-&gt;log, &quot;%s [FSM] Connect error&quot;, peer-&gt;host);</a>
+<a name="ln775">      BGP_EVENT_ADD (peer, TCP_connection_open_failed);</a>
+<a name="ln776">      break;</a>
+<a name="ln777">    case connect_success:</a>
+<a name="ln778">      if (BGP_DEBUG (fsm, FSM))</a>
+<a name="ln779">	plog_debug (peer-&gt;log, &quot;%s [FSM] Connect immediately success&quot;,</a>
+<a name="ln780">		   peer-&gt;host);</a>
+<a name="ln781">      BGP_EVENT_ADD (peer, TCP_connection_open);</a>
+<a name="ln782">      break;</a>
+<a name="ln783">    case connect_in_progress:</a>
+<a name="ln784">      /* To check nonblocking connect, we wait until socket is</a>
+<a name="ln785">         readable or writable. */</a>
+<a name="ln786">      if (BGP_DEBUG (fsm, FSM))</a>
+<a name="ln787">	plog_debug (peer-&gt;log, &quot;%s [FSM] Non blocking connect waiting result&quot;,</a>
+<a name="ln788">		   peer-&gt;host);</a>
+<a name="ln789">      if (peer-&gt;fd &lt; 0)</a>
+<a name="ln790">	{</a>
+<a name="ln791">	  zlog_err (&quot;bgp_start peer's fd is negative value %d&quot;,</a>
+<a name="ln792">		    peer-&gt;fd);</a>
+<a name="ln793">	  return -1;</a>
+<a name="ln794">	}</a>
+<a name="ln795">      BGP_READ_ON (peer-&gt;t_read, bgp_read, peer-&gt;fd);</a>
+<a name="ln796">      BGP_WRITE_ON (peer-&gt;t_write, bgp_write, peer-&gt;fd);</a>
+<a name="ln797">      break;</a>
+<a name="ln798">    }</a>
+<a name="ln799">  return 0;</a>
+<a name="ln800">}</a>
+<a name="ln801"> </a>
+<a name="ln802">/* Connect retry timer is expired when the peer status is Connect. */</a>
+<a name="ln803">static int</a>
+<a name="ln804">bgp_reconnect (struct peer *peer)</a>
+<a name="ln805">{</a>
+<a name="ln806">  bgp_stop (peer);</a>
+<a name="ln807">  bgp_start (peer);</a>
+<a name="ln808">  return 0;</a>
+<a name="ln809">}</a>
+<a name="ln810"> </a>
+<a name="ln811">static int</a>
+<a name="ln812">bgp_fsm_open (struct peer *peer)</a>
+<a name="ln813">{</a>
+<a name="ln814">  /* Send keepalive and make keepalive timer */</a>
+<a name="ln815">  bgp_keepalive_send (peer);</a>
+<a name="ln816"> </a>
+<a name="ln817">  /* Reset holdtimer value. */</a>
+<a name="ln818">  BGP_TIMER_OFF (peer-&gt;t_holdtime);</a>
+<a name="ln819"> </a>
+<a name="ln820">  return 0;</a>
+<a name="ln821">}</a>
+<a name="ln822"> </a>
+<a name="ln823">/* Keepalive send to peer. */</a>
+<a name="ln824">static int</a>
+<a name="ln825">bgp_fsm_keepalive_expire (struct peer *peer)</a>
+<a name="ln826">{</a>
+<a name="ln827">  bgp_keepalive_send (peer);</a>
+<a name="ln828">  return 0;</a>
+<a name="ln829">}</a>
+<a name="ln830"> </a>
+<a name="ln831">/* FSM error, unexpected event.  This is error of BGP connection. So cut the</a>
+<a name="ln832">   peer and change to Idle status. */</a>
+<a name="ln833">static int</a>
+<a name="ln834">bgp_fsm_event_error (struct peer *peer)</a>
+<a name="ln835">{</a>
+<a name="ln836">  plog_err (peer-&gt;log, &quot;%s [FSM] unexpected packet received in state %s&quot;,</a>
+<a name="ln837">	    peer-&gt;host, LOOKUP (bgp_status_msg, peer-&gt;status));</a>
+<a name="ln838"> </a>
+<a name="ln839">  return bgp_stop_with_notify (peer, BGP_NOTIFY_FSM_ERR, 0);</a>
+<a name="ln840">}</a>
+<a name="ln841"> </a>
+<a name="ln842">/* Hold timer expire.  This is error of BGP connection. So cut the</a>
+<a name="ln843">   peer and change to Idle status. */</a>
+<a name="ln844">static int</a>
+<a name="ln845">bgp_fsm_holdtime_expire (struct peer *peer)</a>
+<a name="ln846">{</a>
+<a name="ln847">  if (BGP_DEBUG (fsm, FSM))</a>
+<a name="ln848">    plog_debug (peer-&gt;log, &quot;%s [FSM] Hold timer expire&quot;, peer-&gt;host);</a>
+<a name="ln849"> </a>
+<a name="ln850">  return bgp_stop_with_notify (peer, BGP_NOTIFY_HOLD_ERR, 0);</a>
+<a name="ln851">}</a>
+<a name="ln852"> </a>
+<a name="ln853">/* Status goes to Established.  Send keepalive packet then make first</a>
+<a name="ln854">   update information. */</a>
+<a name="ln855">static int</a>
+<a name="ln856">bgp_establish (struct peer *peer)</a>
+<a name="ln857">{</a>
+<a name="ln858">  struct bgp_notify *notify;</a>
+<a name="ln859">  afi_t afi;</a>
+<a name="ln860">  safi_t safi;</a>
+<a name="ln861">  int nsf_af_count = 0;</a>
+<a name="ln862"> </a>
+<a name="ln863">  /* Reset capability open status flag. */</a>
+<a name="ln864">  if (! CHECK_FLAG (peer-&gt;sflags, PEER_STATUS_CAPABILITY_OPEN))</a>
+<a name="ln865">    SET_FLAG (peer-&gt;sflags, PEER_STATUS_CAPABILITY_OPEN);</a>
+<a name="ln866"> </a>
+<a name="ln867">  /* Clear last notification data. */</a>
+<a name="ln868">  notify = &amp;peer-&gt;notify;</a>
+<a name="ln869">  if (notify-&gt;data)</a>
+<a name="ln870">    XFREE (MTYPE_TMP, notify-&gt;data);</a>
+<a name="ln871">  memset (notify, 0, sizeof (struct bgp_notify));</a>
+<a name="ln872"> </a>
+<a name="ln873">  /* Clear start timer value to default. */</a>
+<a name="ln874">  peer-&gt;v_start = BGP_INIT_START_TIMER;</a>
+<a name="ln875"> </a>
+<a name="ln876">  /* Increment established count. */</a>
+<a name="ln877">  peer-&gt;established++;</a>
+<a name="ln878">  bgp_fsm_change_status (peer, Established);</a>
+<a name="ln879"> </a>
+<a name="ln880">  /* bgp log-neighbor-changes of neighbor Up */</a>
+<a name="ln881">  if (bgp_flag_check (peer-&gt;bgp, BGP_FLAG_LOG_NEIGHBOR_CHANGES))</a>
+<a name="ln882">    zlog_info (&quot;%%ADJCHANGE: neighbor %s Up&quot;, peer-&gt;host);</a>
+<a name="ln883"> </a>
+<a name="ln884">  /* graceful restart */</a>
+<a name="ln885">  UNSET_FLAG (peer-&gt;sflags, PEER_STATUS_NSF_WAIT);</a>
+<a name="ln886">  for (afi = AFI_IP ; afi &lt; AFI_MAX ; afi++)</a>
+<a name="ln887">    for (safi = SAFI_UNICAST ; safi &lt; SAFI_RESERVED_3 ; safi++)</a>
+<a name="ln888">      {</a>
+<a name="ln889">	if (peer-&gt;afc_nego[afi][safi]</a>
+<a name="ln890">	    &amp;&amp; CHECK_FLAG (peer-&gt;cap, PEER_CAP_RESTART_ADV)</a>
+<a name="ln891">	    &amp;&amp; CHECK_FLAG (peer-&gt;af_cap[afi][safi], PEER_CAP_RESTART_AF_RCV))</a>
+<a name="ln892">	  {</a>
+<a name="ln893">	    if (peer-&gt;nsf[afi][safi]</a>
+<a name="ln894">		&amp;&amp; ! CHECK_FLAG (peer-&gt;af_cap[afi][safi], PEER_CAP_RESTART_AF_PRESERVE_RCV))</a>
+<a name="ln895">	      bgp_clear_stale_route (peer, afi, safi);</a>
+<a name="ln896"> </a>
+<a name="ln897">	    peer-&gt;nsf[afi][safi] = 1;</a>
+<a name="ln898">	    nsf_af_count++;</a>
+<a name="ln899">	  }</a>
+<a name="ln900">	else</a>
+<a name="ln901">	  {</a>
+<a name="ln902">	    if (peer-&gt;nsf[afi][safi])</a>
+<a name="ln903">	      bgp_clear_stale_route (peer, afi, safi);</a>
+<a name="ln904">	    peer-&gt;nsf[afi][safi] = 0;</a>
+<a name="ln905">	  }</a>
+<a name="ln906">      }</a>
+<a name="ln907"> </a>
+<a name="ln908">  if (nsf_af_count)</a>
+<a name="ln909">    SET_FLAG (peer-&gt;sflags, PEER_STATUS_NSF_MODE);</a>
+<a name="ln910">  else</a>
+<a name="ln911">    {</a>
+<a name="ln912">      UNSET_FLAG (peer-&gt;sflags, PEER_STATUS_NSF_MODE);</a>
+<a name="ln913">      if (peer-&gt;t_gr_stale)</a>
+<a name="ln914">	{</a>
+<a name="ln915">	  BGP_TIMER_OFF (peer-&gt;t_gr_stale);</a>
+<a name="ln916">	  if (BGP_DEBUG (events, EVENTS))</a>
+<a name="ln917">	    zlog_debug (&quot;%s graceful restart stalepath timer stopped&quot;, peer-&gt;host);</a>
+<a name="ln918">	}</a>
+<a name="ln919">    }</a>
+<a name="ln920"> </a>
+<a name="ln921">  if (peer-&gt;t_gr_restart)</a>
+<a name="ln922">    {</a>
+<a name="ln923">      BGP_TIMER_OFF (peer-&gt;t_gr_restart);</a>
+<a name="ln924">      if (BGP_DEBUG (events, EVENTS))</a>
+<a name="ln925">	zlog_debug (&quot;%s graceful restart timer stopped&quot;, peer-&gt;host);</a>
+<a name="ln926">    }</a>
+<a name="ln927"> </a>
+<a name="ln928">#ifdef HAVE_SNMP</a>
+<a name="ln929">  bgpTrapEstablished (peer);</a>
+<a name="ln930">#endif /* HAVE_SNMP */</a>
+<a name="ln931"> </a>
+<a name="ln932">  /* Reset uptime, send keepalive, send current table. */</a>
+<a name="ln933">  peer-&gt;uptime = bgp_clock ();</a>
+<a name="ln934"> </a>
+<a name="ln935">  /* Send route-refresh when ORF is enabled */</a>
+<a name="ln936">  for (afi = AFI_IP ; afi &lt; AFI_MAX ; afi++)</a>
+<a name="ln937">    for (safi = SAFI_UNICAST ; safi &lt; SAFI_MAX ; safi++)</a>
+<a name="ln938">      if (CHECK_FLAG (peer-&gt;af_cap[afi][safi], PEER_CAP_ORF_PREFIX_SM_ADV))</a>
+<a name="ln939">	{</a>
+<a name="ln940">	  if (CHECK_FLAG (peer-&gt;af_cap[afi][safi], PEER_CAP_ORF_PREFIX_RM_RCV))</a>
+<a name="ln941">	    bgp_route_refresh_send (peer, afi, safi, ORF_TYPE_PREFIX,</a>
+<a name="ln942">				    REFRESH_IMMEDIATE, 0);</a>
+<a name="ln943">	  else if (CHECK_FLAG (peer-&gt;af_cap[afi][safi], PEER_CAP_ORF_PREFIX_RM_OLD_RCV))</a>
+<a name="ln944">	    bgp_route_refresh_send (peer, afi, safi, ORF_TYPE_PREFIX_OLD,</a>
+<a name="ln945">				    REFRESH_IMMEDIATE, 0);</a>
+<a name="ln946">	}</a>
+<a name="ln947"> </a>
+<a name="ln948">  if (peer-&gt;v_keepalive)</a>
+<a name="ln949">    bgp_keepalive_send (peer);</a>
+<a name="ln950"> </a>
+<a name="ln951">  /* First update is deferred until ORF or ROUTE-REFRESH is received */</a>
+<a name="ln952">  for (afi = AFI_IP ; afi &lt; AFI_MAX ; afi++)</a>
+<a name="ln953">    for (safi = SAFI_UNICAST ; safi &lt; SAFI_MAX ; safi++)</a>
+<a name="ln954">      if (CHECK_FLAG (peer-&gt;af_cap[afi][safi], PEER_CAP_ORF_PREFIX_RM_ADV))</a>
+<a name="ln955">	if (CHECK_FLAG (peer-&gt;af_cap[afi][safi], PEER_CAP_ORF_PREFIX_SM_RCV)</a>
+<a name="ln956">	    || CHECK_FLAG (peer-&gt;af_cap[afi][safi], PEER_CAP_ORF_PREFIX_SM_OLD_RCV))</a>
+<a name="ln957">	  SET_FLAG (peer-&gt;af_sflags[afi][safi], PEER_STATUS_ORF_WAIT_REFRESH);</a>
+<a name="ln958"> </a>
+<a name="ln959">  bgp_announce_route_all (peer);</a>
+<a name="ln960"> </a>
+<a name="ln961">  BGP_TIMER_ON (peer-&gt;t_routeadv, bgp_routeadv_timer, 1);</a>
+<a name="ln962"> </a>
+<a name="ln963">  return 0;</a>
+<a name="ln964">}</a>
+<a name="ln965"> </a>
+<a name="ln966">/* Keepalive packet is received. */</a>
+<a name="ln967">static int</a>
+<a name="ln968">bgp_fsm_keepalive (struct peer *peer)</a>
+<a name="ln969">{</a>
+<a name="ln970">  /* peer count update */</a>
+<a name="ln971">  peer-&gt;keepalive_in++;</a>
+<a name="ln972"> </a>
+<a name="ln973">  BGP_TIMER_OFF (peer-&gt;t_holdtime);</a>
+<a name="ln974">  return 0;</a>
+<a name="ln975">}</a>
+<a name="ln976"> </a>
+<a name="ln977">/* Update packet is received. */</a>
+<a name="ln978">static int</a>
+<a name="ln979">bgp_fsm_update (struct peer *peer)</a>
+<a name="ln980">{</a>
+<a name="ln981">  BGP_TIMER_OFF (peer-&gt;t_holdtime);</a>
+<a name="ln982">  return 0;</a>
+<a name="ln983">}</a>
+<a name="ln984"> </a>
+<a name="ln985">/* This is empty event. */</a>
+<a name="ln986">static int</a>
+<a name="ln987">bgp_ignore (struct peer *peer)</a>
+<a name="ln988">{</a>
+<a name="ln989">  if (BGP_DEBUG (fsm, FSM))</a>
+<a name="ln990">    zlog (peer-&gt;log, LOG_DEBUG, &quot;%s [FSM] bgp_ignore called&quot;, peer-&gt;host);</a>
+<a name="ln991">  return 0;</a>
+<a name="ln992">}</a>
+<a name="ln993"> </a>
+<a name="ln994">/* Finite State Machine structure */</a>
+<a name="ln995">static const struct {</a>
+<a name="ln996">  int (*func) (struct peer *);</a>
+<a name="ln997">  int next_state;</a>
+<a name="ln998">} FSM [BGP_STATUS_MAX - 1][BGP_EVENTS_MAX - 1] = </a>
+<a name="ln999">{</a>
+<a name="ln1000">  {</a>
+<a name="ln1001">    /* Idle state: In Idle state, all events other than BGP_Start is</a>
+<a name="ln1002">       ignored.  With BGP_Start event, finite state machine calls</a>
+<a name="ln1003">       bgp_start(). */</a>
+<a name="ln1004">    {bgp_start,  Connect},	/* BGP_Start                    */</a>
+<a name="ln1005">    {bgp_stop,   Idle},		/* BGP_Stop                     */</a>
+<a name="ln1006">    {bgp_stop,   Idle},		/* TCP_connection_open          */</a>
+<a name="ln1007">    {bgp_stop,   Idle},		/* TCP_connection_closed        */</a>
+<a name="ln1008">    {bgp_ignore, Idle},		/* TCP_connection_open_failed   */</a>
+<a name="ln1009">    {bgp_stop,   Idle},		/* TCP_fatal_error              */</a>
+<a name="ln1010">    {bgp_ignore, Idle},		/* ConnectRetry_timer_expired   */</a>
+<a name="ln1011">    {bgp_ignore, Idle},		/* Hold_Timer_expired           */</a>
+<a name="ln1012">    {bgp_ignore, Idle},		/* KeepAlive_timer_expired      */</a>
+<a name="ln1013">    {bgp_ignore, Idle},		/* Receive_OPEN_message         */</a>
+<a name="ln1014">    {bgp_ignore, Idle},		/* Receive_KEEPALIVE_message    */</a>
+<a name="ln1015">    {bgp_ignore, Idle},		/* Receive_UPDATE_message       */</a>
+<a name="ln1016">    {bgp_ignore, Idle},		/* Receive_NOTIFICATION_message */</a>
+<a name="ln1017">    {bgp_ignore, Idle},         /* Clearing_Completed           */</a>
+<a name="ln1018">    {bgp_ignore, Idle},         /* BGP_Stop_with_error          */</a>
+<a name="ln1019">  },</a>
+<a name="ln1020">  {</a>
+<a name="ln1021">    /* Connect */</a>
+<a name="ln1022">    {bgp_ignore,  Connect},	/* BGP_Start                    */</a>
+<a name="ln1023">    {bgp_stop,    Idle},	/* BGP_Stop                     */</a>
+<a name="ln1024">    {bgp_connect_success, OpenSent}, /* TCP_connection_open          */</a>
+<a name="ln1025">    {bgp_stop, Idle},		/* TCP_connection_closed        */</a>
+<a name="ln1026">    {bgp_connect_fail, Active}, /* TCP_connection_open_failed   */</a>
+<a name="ln1027">    {bgp_connect_fail, Idle},	/* TCP_fatal_error              */</a>
+<a name="ln1028">    {bgp_reconnect, Connect},	/* ConnectRetry_timer_expired   */</a>
+<a name="ln1029">    {bgp_ignore,  Idle},	/* Hold_Timer_expired           */</a>
+<a name="ln1030">    {bgp_ignore,  Idle},	/* KeepAlive_timer_expired      */</a>
+<a name="ln1031">    {bgp_ignore,  Idle},	/* Receive_OPEN_message         */</a>
+<a name="ln1032">    {bgp_ignore,  Idle},	/* Receive_KEEPALIVE_message    */</a>
+<a name="ln1033">    {bgp_ignore,  Idle},	/* Receive_UPDATE_message       */</a>
+<a name="ln1034">    {bgp_stop,    Idle},	/* Receive_NOTIFICATION_message */</a>
+<a name="ln1035">    {bgp_ignore,  Idle},         /* Clearing_Completed           */</a>
+<a name="ln1036">    {bgp_stop_with_error, Idle},/* BGP_Stop_with_error          */</a>
+<a name="ln1037">  },</a>
+<a name="ln1038">  {</a>
+<a name="ln1039">    /* Active, */</a>
+<a name="ln1040">    {bgp_ignore,  Active},	/* BGP_Start                    */</a>
+<a name="ln1041">    {bgp_stop,    Idle},	/* BGP_Stop                     */</a>
+<a name="ln1042">    {bgp_connect_success, OpenSent}, /* TCP_connection_open          */</a>
+<a name="ln1043">    {bgp_stop,    Idle},	/* TCP_connection_closed        */</a>
+<a name="ln1044">    {bgp_ignore,  Active},	/* TCP_connection_open_failed   */</a>
+<a name="ln1045">    {bgp_ignore,  Idle},	/* TCP_fatal_error              */</a>
+<a name="ln1046">    {bgp_start,   Connect},	/* ConnectRetry_timer_expired   */</a>
+<a name="ln1047">    {bgp_ignore,  Idle},	/* Hold_Timer_expired           */</a>
+<a name="ln1048">    {bgp_ignore,  Idle},	/* KeepAlive_timer_expired      */</a>
+<a name="ln1049">    {bgp_ignore,  Idle},	/* Receive_OPEN_message         */</a>
+<a name="ln1050">    {bgp_ignore,  Idle},	/* Receive_KEEPALIVE_message    */</a>
+<a name="ln1051">    {bgp_ignore,  Idle},	/* Receive_UPDATE_message       */</a>
+<a name="ln1052">    {bgp_stop_with_error, Idle}, /* Receive_NOTIFICATION_message */</a>
+<a name="ln1053">    {bgp_ignore, Idle},         /* Clearing_Completed           */</a>
+<a name="ln1054">    {bgp_stop_with_error, Idle},/* BGP_Stop_with_error          */</a>
+<a name="ln1055">  },</a>
+<a name="ln1056">  {</a>
+<a name="ln1057">    /* OpenSent, */</a>
+<a name="ln1058">    {bgp_ignore,  OpenSent},	/* BGP_Start                    */</a>
+<a name="ln1059">    {bgp_stop,    Idle},	/* BGP_Stop                     */</a>
+<a name="ln1060">    {bgp_stop,    Active},	/* TCP_connection_open          */</a>
+<a name="ln1061">    {bgp_stop,    Active},	/* TCP_connection_closed        */</a>
+<a name="ln1062">    {bgp_stop,    Active},	/* TCP_connection_open_failed   */</a>
+<a name="ln1063">    {bgp_stop,    Active},	/* TCP_fatal_error              */</a>
+<a name="ln1064">    {bgp_ignore,  Idle},	/* ConnectRetry_timer_expired   */</a>
+<a name="ln1065">    {bgp_fsm_holdtime_expire, Idle},	/* Hold_Timer_expired           */</a>
+<a name="ln1066">    {bgp_ignore,  Idle},	/* KeepAlive_timer_expired      */</a>
+<a name="ln1067">    {bgp_fsm_open,    OpenConfirm},	/* Receive_OPEN_message         */</a>
+<a name="ln1068">    {bgp_fsm_event_error, Idle}, /* Receive_KEEPALIVE_message    */</a>
+<a name="ln1069">    {bgp_fsm_event_error, Idle}, /* Receive_UPDATE_message       */</a>
+<a name="ln1070">    {bgp_stop_with_error, Idle}, /* Receive_NOTIFICATION_message */</a>
+<a name="ln1071">    {bgp_ignore, Idle},         /* Clearing_Completed           */</a>
+<a name="ln1072">    {bgp_stop_with_error, Idle},/* BGP_Stop_with_error          */</a>
+<a name="ln1073">  },</a>
+<a name="ln1074">  {</a>
+<a name="ln1075">    /* OpenConfirm, */</a>
+<a name="ln1076">    {bgp_ignore,  OpenConfirm},	/* BGP_Start                    */</a>
+<a name="ln1077">    {bgp_stop,    Idle},	/* BGP_Stop                     */</a>
+<a name="ln1078">    {bgp_stop,    Idle},	/* TCP_connection_open          */</a>
+<a name="ln1079">    {bgp_stop,    Idle},	/* TCP_connection_closed        */</a>
+<a name="ln1080">    {bgp_stop,    Idle},	/* TCP_connection_open_failed   */</a>
+<a name="ln1081">    {bgp_stop,    Idle},	/* TCP_fatal_error              */</a>
+<a name="ln1082">    {bgp_ignore,  Idle},	/* ConnectRetry_timer_expired   */</a>
+<a name="ln1083">    {bgp_fsm_holdtime_expire, Idle},	/* Hold_Timer_expired           */</a>
+<a name="ln1084">    {bgp_ignore,  OpenConfirm},	/* KeepAlive_timer_expired      */</a>
+<a name="ln1085">    {bgp_ignore,  Idle},	/* Receive_OPEN_message         */</a>
+<a name="ln1086">    {bgp_establish, Established}, /* Receive_KEEPALIVE_message    */</a>
+<a name="ln1087">    {bgp_ignore,  Idle},	/* Receive_UPDATE_message       */</a>
+<a name="ln1088">    {bgp_stop_with_error, Idle}, /* Receive_NOTIFICATION_message */</a>
+<a name="ln1089">    {bgp_ignore, Idle},         /* Clearing_Completed           */</a>
+<a name="ln1090">    {bgp_stop_with_error, Idle},/* BGP_Stop_with_error          */</a>
+<a name="ln1091">  },</a>
+<a name="ln1092">  {</a>
+<a name="ln1093">    /* Established, */</a>
+<a name="ln1094">    {bgp_ignore,               Established}, /* BGP_Start                    */</a>
+<a name="ln1095">    {bgp_stop,                    Clearing}, /* BGP_Stop                     */</a>
+<a name="ln1096">    {bgp_stop,                    Clearing}, /* TCP_connection_open          */</a>
+<a name="ln1097">    {bgp_stop,                    Clearing}, /* TCP_connection_closed        */</a>
+<a name="ln1098">    {bgp_stop,                 Clearing},	/* TCP_connection_open_failed   */</a>
+<a name="ln1099">    {bgp_stop,                    Clearing}, /* TCP_fatal_error              */</a>
+<a name="ln1100">    {bgp_stop,                 Clearing},	/* ConnectRetry_timer_expired   */</a>
+<a name="ln1101">    {bgp_fsm_holdtime_expire,     Clearing}, /* Hold_Timer_expired           */</a>
+<a name="ln1102">    {bgp_fsm_keepalive_expire, Established}, /* KeepAlive_timer_expired      */</a>
+<a name="ln1103">    {bgp_stop,                    Clearing}, /* Receive_OPEN_message         */</a>
+<a name="ln1104">    {bgp_fsm_keepalive,        Established}, /* Receive_KEEPALIVE_message    */</a>
+<a name="ln1105">    {bgp_fsm_update,           Established}, /* Receive_UPDATE_message       */</a>
+<a name="ln1106">    {bgp_stop_with_error,         Clearing}, /* Receive_NOTIFICATION_message */</a>
+<a name="ln1107">    {bgp_ignore,                      Idle}, /* Clearing_Completed           */</a>
+<a name="ln1108">    {bgp_stop_with_error,         Clearing}, /* BGP_Stop_with_error          */</a>
+<a name="ln1109">  },</a>
+<a name="ln1110">  {</a>
+<a name="ln1111">    /* Clearing, */</a>
+<a name="ln1112">    {bgp_ignore,  Clearing},	/* BGP_Start                    */</a>
+<a name="ln1113">    {bgp_stop,			Clearing},	/* BGP_Stop                     */</a>
+<a name="ln1114">    {bgp_stop,			Clearing},	/* TCP_connection_open          */</a>
+<a name="ln1115">    {bgp_stop,			Clearing},	/* TCP_connection_closed        */</a>
+<a name="ln1116">    {bgp_stop,			Clearing},	/* TCP_connection_open_failed   */</a>
+<a name="ln1117">    {bgp_stop,			Clearing},	/* TCP_fatal_error              */</a>
+<a name="ln1118">    {bgp_stop,			Clearing},	/* ConnectRetry_timer_expired   */</a>
+<a name="ln1119">    {bgp_stop,			Clearing},	/* Hold_Timer_expired           */</a>
+<a name="ln1120">    {bgp_stop,			Clearing},	/* KeepAlive_timer_expired      */</a>
+<a name="ln1121">    {bgp_stop,			Clearing},	/* Receive_OPEN_message         */</a>
+<a name="ln1122">    {bgp_stop,			Clearing},	/* Receive_KEEPALIVE_message    */</a>
+<a name="ln1123">    {bgp_stop,			Clearing},	/* Receive_UPDATE_message       */</a>
+<a name="ln1124">    {bgp_stop,			Clearing},	/* Receive_NOTIFICATION_message */</a>
+<a name="ln1125">    {bgp_clearing_completed,    Idle},		/* Clearing_Completed           */</a>
+<a name="ln1126">    {bgp_stop_with_error,       Clearing},      /* BGP_Stop_with_error          */</a>
+<a name="ln1127">  },</a>
+<a name="ln1128">  {</a>
+<a name="ln1129">    /* Deleted, */</a>
+<a name="ln1130">    {bgp_ignore,  Deleted},	/* BGP_Start                    */</a>
+<a name="ln1131">    {bgp_ignore,  Deleted},	/* BGP_Stop                     */</a>
+<a name="ln1132">    {bgp_ignore,  Deleted},	/* TCP_connection_open          */</a>
+<a name="ln1133">    {bgp_ignore,  Deleted},	/* TCP_connection_closed        */</a>
+<a name="ln1134">    {bgp_ignore,  Deleted},	/* TCP_connection_open_failed   */</a>
+<a name="ln1135">    {bgp_ignore,  Deleted},	/* TCP_fatal_error              */</a>
+<a name="ln1136">    {bgp_ignore,  Deleted},	/* ConnectRetry_timer_expired   */</a>
+<a name="ln1137">    {bgp_ignore,  Deleted},	/* Hold_Timer_expired           */</a>
+<a name="ln1138">    {bgp_ignore,  Deleted},	/* KeepAlive_timer_expired      */</a>
+<a name="ln1139">    {bgp_ignore,  Deleted},	/* Receive_OPEN_message         */</a>
+<a name="ln1140">    {bgp_ignore,  Deleted},	/* Receive_KEEPALIVE_message    */</a>
+<a name="ln1141">    {bgp_ignore,  Deleted},	/* Receive_UPDATE_message       */</a>
+<a name="ln1142">    {bgp_ignore,  Deleted},	/* Receive_NOTIFICATION_message */</a>
+<a name="ln1143">    {bgp_ignore,  Deleted},	/* Clearing_Completed           */</a>
+<a name="ln1144">    {bgp_ignore,  Deleted},     /* BGP_Stop_with_error          */</a>
+<a name="ln1145">  },</a>
+<a name="ln1146">};</a>
+<a name="ln1147"> </a>
+<a name="ln1148">static const char *bgp_event_str[] =</a>
+<a name="ln1149">{</a>
+<a name="ln1150">  NULL,</a>
+<a name="ln1151">  &quot;BGP_Start&quot;,</a>
+<a name="ln1152">  &quot;BGP_Stop&quot;,</a>
+<a name="ln1153">  &quot;TCP_connection_open&quot;,</a>
+<a name="ln1154">  &quot;TCP_connection_closed&quot;,</a>
+<a name="ln1155">  &quot;TCP_connection_open_failed&quot;,</a>
+<a name="ln1156">  &quot;TCP_fatal_error&quot;,</a>
+<a name="ln1157">  &quot;ConnectRetry_timer_expired&quot;,</a>
+<a name="ln1158">  &quot;Hold_Timer_expired&quot;,</a>
+<a name="ln1159">  &quot;KeepAlive_timer_expired&quot;,</a>
+<a name="ln1160">  &quot;Receive_OPEN_message&quot;,</a>
+<a name="ln1161">  &quot;Receive_KEEPALIVE_message&quot;,</a>
+<a name="ln1162">  &quot;Receive_UPDATE_message&quot;,</a>
+<a name="ln1163">  &quot;Receive_NOTIFICATION_message&quot;,</a>
+<a name="ln1164">  &quot;Clearing_Completed&quot;,</a>
+<a name="ln1165">  &quot;BGP_Stop_with_error&quot;,</a>
+<a name="ln1166">};</a>
+<a name="ln1167"> </a>
+<a name="ln1168">/* Execute event process. */</a>
+<a name="ln1169">int</a>
+<a name="ln1170">bgp_event (struct thread *thread)</a>
+<a name="ln1171">{</a>
+<a name="ln1172">  int ret = 0;</a>
+<a name="ln1173">  int event;</a>
+<a name="ln1174">  int next;</a>
+<a name="ln1175">  struct peer *peer;</a>
+<a name="ln1176"> </a>
+<a name="ln1177">  peer = THREAD_ARG (thread);</a>
+<a name="ln1178">  event = THREAD_VAL (thread);</a>
+<a name="ln1179"> </a>
+<a name="ln1180">  /* Logging this event. */</a>
+<a name="ln1181">  next = FSM [peer-&gt;status -1][event - 1].next_state;</a>
+<a name="ln1182"> </a>
+<a name="ln1183">  if (BGP_DEBUG (fsm, FSM) &amp;&amp; peer-&gt;status != next)</a>
+<a name="ln1184">    plog_debug (peer-&gt;log, &quot;%s [FSM] %s (%s-&gt;%s)&quot;, peer-&gt;host, </a>
+<a name="ln1185">	       bgp_event_str[event],</a>
+<a name="ln1186">	       LOOKUP (bgp_status_msg, peer-&gt;status),</a>
+<a name="ln1187">	       LOOKUP (bgp_status_msg, next));</a>
+<a name="ln1188"> </a>
+<a name="ln1189">  /* Call function. */</a>
+<a name="ln1190">  if (FSM [peer-&gt;status -1][event - 1].func)</a>
+<a name="ln1191">    ret = (*(FSM [peer-&gt;status - 1][event - 1].func))(peer);</a>
+<a name="ln1192"> </a>
+<a name="ln1193">  /* When function do not want proceed next job return -1. */</a>
+<a name="ln1194">  if (ret &gt;= 0)</a>
+<a name="ln1195">    {</a>
+<a name="ln1196">      /* If status is changed. */</a>
+<a name="ln1197">      if (next != peer-&gt;status)</a>
+<a name="ln1198">        bgp_fsm_change_status (peer, next);</a>
+<a name="ln1199">      </a>
+<a name="ln1200">      /* Make sure timer is set. */</a>
+<a name="ln1201">      bgp_timer_set (peer);</a>
+<a name="ln1202">    }</a>
+<a name="ln1203">  </a>
+<a name="ln1204">  return ret;</a>
+<a name="ln1205">}</a>
+
+</code></pre>
+<div class="balloon" rel="8"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1042/" target="_blank">V1042</a> This file is marked with copyleft license, which requires you to open the derived source code.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

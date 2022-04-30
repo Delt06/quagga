@@ -1,0 +1,1481 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>pim_igmp.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.5.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2">  PIM for Quagga</a>
+<a name="ln3">  Copyright (C) 2008  Everton da Silva Marques</a>
+<a name="ln4"> </a>
+<a name="ln5">  This program is free software; you can redistribute it and/or modify</a>
+<a name="ln6">  it under the terms of the GNU General Public License as published by</a>
+<a name="ln7">  the Free Software Foundation; either version 2 of the License, or</a>
+<a name="ln8">  (at your option) any later version.</a>
+<a name="ln9"> </a>
+<a name="ln10">  This program is distributed in the hope that it will be useful, but</a>
+<a name="ln11">  WITHOUT ANY WARRANTY; without even the implied warranty of</a>
+<a name="ln12">  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU</a>
+<a name="ln13">  General Public License for more details.</a>
+<a name="ln14">  </a>
+<a name="ln15">  You should have received a copy of the GNU General Public License</a>
+<a name="ln16">  along with this program; see the file COPYING; if not, write to the</a>
+<a name="ln17">  Free Software Foundation, Inc., 51 Franklin St, Fifth Floor, Boston,</a>
+<a name="ln18">  MA 02110-1301 USA</a>
+<a name="ln19">  </a>
+<a name="ln20">  $QuaggaId: $Format:%an, %ai, %h$ $</a>
+<a name="ln21">*/</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &lt;zebra.h&gt;</a>
+<a name="ln24"> </a>
+<a name="ln25">#include &quot;memory.h&quot;</a>
+<a name="ln26"> </a>
+<a name="ln27">#include &quot;pimd.h&quot;</a>
+<a name="ln28">#include &quot;pim_igmp.h&quot;</a>
+<a name="ln29">#include &quot;pim_igmpv3.h&quot;</a>
+<a name="ln30">#include &quot;pim_iface.h&quot;</a>
+<a name="ln31">#include &quot;pim_sock.h&quot;</a>
+<a name="ln32">#include &quot;pim_mroute.h&quot;</a>
+<a name="ln33">#include &quot;pim_str.h&quot;</a>
+<a name="ln34">#include &quot;pim_util.h&quot;</a>
+<a name="ln35">#include &quot;pim_time.h&quot;</a>
+<a name="ln36">#include &quot;pim_zebra.h&quot;</a>
+<a name="ln37"> </a>
+<a name="ln38">#define IGMP_GRP_REC_TYPE_MODE_IS_INCLUDE        (1)</a>
+<a name="ln39">#define IGMP_GRP_REC_TYPE_MODE_IS_EXCLUDE        (2)</a>
+<a name="ln40">#define IGMP_GRP_REC_TYPE_CHANGE_TO_INCLUDE_MODE (3)</a>
+<a name="ln41">#define IGMP_GRP_REC_TYPE_CHANGE_TO_EXCLUDE_MODE (4)</a>
+<a name="ln42">#define IGMP_GRP_REC_TYPE_ALLOW_NEW_SOURCES      (5)</a>
+<a name="ln43">#define IGMP_GRP_REC_TYPE_BLOCK_OLD_SOURCES      (6)</a>
+<a name="ln44"> </a>
+<a name="ln45">static void group_timer_off(struct igmp_group *group);</a>
+<a name="ln46"> </a>
+<a name="ln47">static struct igmp_group *find_group_by_addr(struct igmp_sock *igmp,</a>
+<a name="ln48">					     struct in_addr group_addr);</a>
+<a name="ln49"> </a>
+<a name="ln50">static int igmp_sock_open(struct in_addr ifaddr, ifindex_t ifindex, </a>
+<a name="ln51">                          uint32_t pim_options)</a>
+<a name="ln52">{</a>
+<a name="ln53">  int fd;</a>
+<a name="ln54">  int join = 0;</a>
+<a name="ln55">  struct in_addr group;</a>
+<a name="ln56"> </a>
+<a name="ln57">  fd = pim_socket_mcast(IPPROTO_IGMP, ifaddr, 1 /* loop=true */);</a>
+<a name="ln58">  if (fd &lt; 0)</a>
+<a name="ln59">    return -1;</a>
+<a name="ln60"> </a>
+<a name="ln61">  if (PIM_IF_TEST_IGMP_LISTEN_ALLROUTERS(pim_options)) {</a>
+<a name="ln62">    if (inet_aton(PIM_ALL_ROUTERS, &amp;group)) {</a>
+<a name="ln63">      if (!pim_socket_join(fd, group, ifaddr, ifindex))</a>
+<a name="ln64">	++join;</a>
+<a name="ln65">    }</a>
+<a name="ln66">    else {</a>
+<a name="ln67">      zlog_warn(&quot;%s %s: IGMP socket fd=%d interface %s: could not solve %s to group address: errno=%d: %s&quot;,</a>
+<a name="ln68">		__FILE__, __PRETTY_FUNCTION__, fd, inet_ntoa(ifaddr),</a>
+<a name="ln69">		PIM_ALL_ROUTERS, errno, safe_strerror(errno));</a>
+<a name="ln70">    }</a>
+<a name="ln71">  }</a>
+<a name="ln72"> </a>
+<a name="ln73">  /*</a>
+<a name="ln74">    IGMP routers periodically send IGMP general queries to AllSystems=224.0.0.1</a>
+<a name="ln75">    IGMP routers must receive general queries for querier election.</a>
+<a name="ln76">  */</a>
+<a name="ln77">  if (inet_aton(PIM_ALL_SYSTEMS, &amp;group)) {</a>
+<a name="ln78">    if (!pim_socket_join(fd, group, ifaddr, ifindex))</a>
+<a name="ln79">      ++join;</a>
+<a name="ln80">  }</a>
+<a name="ln81">  else {</a>
+<a name="ln82">    zlog_warn(&quot;%s %s: IGMP socket fd=%d interface %s: could not solve %s to group address: errno=%d: %s&quot;,</a>
+<a name="ln83">	      __FILE__, __PRETTY_FUNCTION__, fd, inet_ntoa(ifaddr),</a>
+<a name="ln84">	      PIM_ALL_SYSTEMS, errno, safe_strerror(errno));</a>
+<a name="ln85">  }</a>
+<a name="ln86"> </a>
+<a name="ln87">  if (inet_aton(PIM_ALL_IGMP_ROUTERS, &amp;group)) {</a>
+<a name="ln88">    if (!pim_socket_join(fd, group, ifaddr, ifindex)) {</a>
+<a name="ln89">      ++join;</a>
+<a name="ln90">    }</a>
+<a name="ln91">  }</a>
+<a name="ln92">  else {</a>
+<a name="ln93">      zlog_warn(&quot;%s %s: IGMP socket fd=%d interface %s: could not solve %s to group address: errno=%d: %s&quot;,</a>
+<a name="ln94">		__FILE__, __PRETTY_FUNCTION__, fd, inet_ntoa(ifaddr),</a>
+<a name="ln95">		PIM_ALL_IGMP_ROUTERS, errno, safe_strerror(errno));</a>
+<a name="ln96">  }    </a>
+<a name="ln97"> </a>
+<a name="ln98">  if (!join) {</a>
+<a name="ln99">    zlog_err(&quot;IGMP socket fd=%d could not join any group on interface address %s&quot;,</a>
+<a name="ln100">	     fd, inet_ntoa(ifaddr));</a>
+<a name="ln101">    close(fd);</a>
+<a name="ln102">    fd = -1;</a>
+<a name="ln103">  }</a>
+<a name="ln104"> </a>
+<a name="ln105">  return fd;</a>
+<a name="ln106">}</a>
+<a name="ln107"> </a>
+<a name="ln108">#undef IGMP_SOCK_DUMP</a>
+<a name="ln109"> </a>
+<a name="ln110">#ifdef IGMP_SOCK_DUMP</a>
+<a name="ln111">static void igmp_sock_dump(array_t *igmp_sock_array)</a>
+<a name="ln112">{</a>
+<a name="ln113">  int size = array_size(igmp_sock_array);</a>
+<a name="ln114">  int i;</a>
+<a name="ln115">  </a>
+<a name="ln116">  for (i = 0; i &lt; size; ++i) {</a>
+<a name="ln117">    </a>
+<a name="ln118">    struct igmp_sock *igmp = array_get(igmp_sock_array, i);</a>
+<a name="ln119">    </a>
+<a name="ln120">    zlog_debug(&quot;%s %s: [%d/%d] igmp_addr=%s fd=%d&quot;,</a>
+<a name="ln121">	       __FILE__, __PRETTY_FUNCTION__,</a>
+<a name="ln122">	       i, size,</a>
+<a name="ln123">	       inet_ntoa(igmp-&gt;ifaddr),</a>
+<a name="ln124">	       igmp-&gt;fd);</a>
+<a name="ln125">  }</a>
+<a name="ln126">}</a>
+<a name="ln127">#endif</a>
+<a name="ln128"> </a>
+<a name="ln129">struct igmp_sock *pim_igmp_sock_lookup_ifaddr(struct list *igmp_sock_list,</a>
+<a name="ln130">					      struct in_addr ifaddr)</a>
+<a name="ln131">{</a>
+<a name="ln132">  struct listnode  *sock_node;</a>
+<a name="ln133">  struct igmp_sock *igmp;</a>
+<a name="ln134"> </a>
+<a name="ln135">#ifdef IGMP_SOCK_DUMP</a>
+<a name="ln136">  igmp_sock_dump(igmp_sock_list);</a>
+<a name="ln137">#endif</a>
+<a name="ln138"> </a>
+<a name="ln139">  for (ALL_LIST_ELEMENTS_RO(igmp_sock_list, sock_node, igmp))</a>
+<a name="ln140">    if (ifaddr.s_addr == igmp-&gt;ifaddr.s_addr)</a>
+<a name="ln141">      return igmp;</a>
+<a name="ln142"> </a>
+<a name="ln143">  return 0;</a>
+<a name="ln144">}</a>
+<a name="ln145"> </a>
+<a name="ln146">struct igmp_sock *igmp_sock_lookup_by_fd(struct list *igmp_sock_list,</a>
+<a name="ln147">					 int fd)</a>
+<a name="ln148">{</a>
+<a name="ln149">  struct listnode  *sock_node;</a>
+<a name="ln150">  struct igmp_sock *igmp;</a>
+<a name="ln151"> </a>
+<a name="ln152">  for (ALL_LIST_ELEMENTS_RO(igmp_sock_list, sock_node, igmp))</a>
+<a name="ln153">    if (fd == igmp-&gt;fd)</a>
+<a name="ln154">      return igmp;</a>
+<a name="ln155"> </a>
+<a name="ln156">  return 0;</a>
+<a name="ln157">}</a>
+<a name="ln158"> </a>
+<a name="ln159">static int pim_igmp_other_querier_expire(struct thread *t)</a>
+<a name="ln160">{</a>
+<a name="ln161">  struct igmp_sock *igmp;</a>
+<a name="ln162"> </a>
+<a name="ln163">  zassert(t);</a>
+<a name="ln164">  igmp = THREAD_ARG(t);</a>
+<a name="ln165">  zassert(igmp);</a>
+<a name="ln166"> </a>
+<a name="ln167">  zassert(igmp-&gt;t_other_querier_timer);</a>
+<a name="ln168">  zassert(!igmp-&gt;t_igmp_query_timer);</a>
+<a name="ln169"> </a>
+<a name="ln170">  if (PIM_DEBUG_IGMP_TRACE) {</a>
+<a name="ln171">    char ifaddr_str[100];</a>
+<a name="ln172">    pim_inet4_dump(&quot;&lt;ifaddr?&gt;&quot;, igmp-&gt;ifaddr, ifaddr_str, sizeof(ifaddr_str));</a>
+<a name="ln173">    zlog_debug(&quot;%s: Querier %s resuming&quot;,</a>
+<a name="ln174">	       __PRETTY_FUNCTION__,</a>
+<a name="ln175">	       ifaddr_str);</a>
+<a name="ln176">  }</a>
+<a name="ln177"> </a>
+<a name="ln178">  igmp-&gt;t_other_querier_timer = 0;</a>
+<a name="ln179"> </a>
+<a name="ln180">  /*</a>
+<a name="ln181">    We are the current querier, then</a>
+<a name="ln182">    re-start sending general queries.</a>
+<a name="ln183">  */</a>
+<a name="ln184">  pim_igmp_general_query_on(igmp);</a>
+<a name="ln185"> </a>
+<a name="ln186">  return 0;</a>
+<a name="ln187">}</a>
+<a name="ln188"> </a>
+<a name="ln189">void pim_igmp_other_querier_timer_on(struct igmp_sock *igmp)</a>
+<a name="ln190">{</a>
+<a name="ln191">  long other_querier_present_interval_msec;</a>
+<a name="ln192">  struct pim_interface *pim_ifp;</a>
+<a name="ln193"> </a>
+<a name="ln194">  zassert(igmp);</a>
+<a name="ln195">  zassert(igmp-&gt;interface);</a>
+<a name="ln196">  zassert(igmp-&gt;interface-&gt;info);</a>
+<a name="ln197"> </a>
+<a name="ln198">  pim_ifp = igmp-&gt;interface-&gt;info;</a>
+<a name="ln199"> </a>
+<a name="ln200">  if (igmp-&gt;t_other_querier_timer) {</a>
+<a name="ln201">    /*</a>
+<a name="ln202">      There is other querier present already,</a>
+<a name="ln203">      then reset the other-querier-present timer.</a>
+<a name="ln204">    */</a>
+<a name="ln205"> </a>
+<a name="ln206">    if (PIM_DEBUG_IGMP_TRACE) {</a>
+<a name="ln207">      char ifaddr_str[100];</a>
+<a name="ln208">      pim_inet4_dump(&quot;&lt;ifaddr?&gt;&quot;, igmp-&gt;ifaddr, ifaddr_str, sizeof(ifaddr_str));</a>
+<a name="ln209">      zlog_debug(&quot;Querier %s resetting TIMER event for Other-Querier-Present&quot;,</a>
+<a name="ln210">		 ifaddr_str);</a>
+<a name="ln211">    }</a>
+<a name="ln212"> </a>
+<a name="ln213">    THREAD_OFF(igmp-&gt;t_other_querier_timer);</a>
+<a name="ln214">    zassert(!igmp-&gt;t_other_querier_timer);</a>
+<a name="ln215">  }</a>
+<a name="ln216">  else {</a>
+<a name="ln217">    /*</a>
+<a name="ln218">      We are the current querier, then stop sending general queries:</a>
+<a name="ln219">      igmp-&gt;t_igmp_query_timer = 0;</a>
+<a name="ln220">    */</a>
+<a name="ln221">    pim_igmp_general_query_off(igmp);</a>
+<a name="ln222">  }</a>
+<a name="ln223"> </a>
+<a name="ln224">  /*</a>
+<a name="ln225">    Since this socket is starting the other-querier-present timer,</a>
+<a name="ln226">    there should not be periodic query timer for this socket.</a>
+<a name="ln227">   */</a>
+<a name="ln228">  zassert(!igmp-&gt;t_igmp_query_timer);</a>
+<a name="ln229"> </a>
+<a name="ln230">  /*</a>
+<a name="ln231">    RFC 3376: 8.5. Other Querier Present Interval</a>
+<a name="ln232"> </a>
+<a name="ln233">    The Other Querier Present Interval is the length of time that must</a>
+<a name="ln234">    pass before a multicast router decides that there is no longer</a>
+<a name="ln235">    another multicast router which should be the querier.  This value</a>
+<a name="ln236">    MUST be ((the Robustness Variable) times (the Query Interval)) plus</a>
+<a name="ln237">    (one half of one Query Response Interval).</a>
+<a name="ln238"> </a>
+<a name="ln239">    other_querier_present_interval_msec = \</a>
+<a name="ln240">      igmp-&gt;querier_robustness_variable * \</a>
+<a name="ln241">      1000 * igmp-&gt;querier_query_interval + \</a>
+<a name="ln242">      100 * (pim_ifp-&gt;query_max_response_time_dsec &gt;&gt; 1);</a>
+<a name="ln243">  */</a>
+<a name="ln244">  other_querier_present_interval_msec =</a>
+<a name="ln245">    PIM_IGMP_OQPI_MSEC(igmp-&gt;querier_robustness_variable,</a>
+<a name="ln246">		       igmp-&gt;querier_query_interval,</a>
+<a name="ln247">		       pim_ifp-&gt;igmp_query_max_response_time_dsec);</a>
+<a name="ln248">  </a>
+<a name="ln249">  if (PIM_DEBUG_IGMP_TRACE) {</a>
+<a name="ln250">    char ifaddr_str[100];</a>
+<a name="ln251">    pim_inet4_dump(&quot;&lt;ifaddr?&gt;&quot;, igmp-&gt;ifaddr, ifaddr_str, sizeof(ifaddr_str));</a>
+<a name="ln252">    zlog_debug(&quot;Querier %s scheduling %ld.%03ld sec TIMER event for Other-Querier-Present&quot;,</a>
+<a name="ln253">	       ifaddr_str,</a>
+<a name="ln254">	       other_querier_present_interval_msec / 1000,</a>
+<a name="ln255">	       other_querier_present_interval_msec % 1000);</a>
+<a name="ln256">  }</a>
+<a name="ln257">  </a>
+<a name="ln258">  THREAD_TIMER_MSEC_ON(master, igmp-&gt;t_other_querier_timer,</a>
+<a name="ln259">		       pim_igmp_other_querier_expire,</a>
+<a name="ln260">		       igmp, other_querier_present_interval_msec);</a>
+<a name="ln261">}</a>
+<a name="ln262"> </a>
+<a name="ln263">void pim_igmp_other_querier_timer_off(struct igmp_sock *igmp)</a>
+<a name="ln264">{</a>
+<a name="ln265">  zassert(igmp);</a>
+<a name="ln266"> </a>
+<a name="ln267">  if (PIM_DEBUG_IGMP_TRACE) {</a>
+<a name="ln268">    if (igmp-&gt;t_other_querier_timer) {</a>
+<a name="ln269">      char ifaddr_str[100];</a>
+<a name="ln270">      pim_inet4_dump(&quot;&lt;ifaddr?&gt;&quot;, igmp-&gt;ifaddr, ifaddr_str, sizeof(ifaddr_str));</a>
+<a name="ln271">      zlog_debug(&quot;IGMP querier %s fd=%d cancelling other-querier-present TIMER event on %s&quot;,</a>
+<a name="ln272">		 ifaddr_str, igmp-&gt;fd, igmp-&gt;interface-&gt;name);</a>
+<a name="ln273">    }</a>
+<a name="ln274">  }</a>
+<a name="ln275">  THREAD_OFF(igmp-&gt;t_other_querier_timer);</a>
+<a name="ln276">  zassert(!igmp-&gt;t_other_querier_timer);</a>
+<a name="ln277">}</a>
+<a name="ln278"> </a>
+<a name="ln279">static int recv_igmp_query(struct igmp_sock *igmp, int query_version,</a>
+<a name="ln280">			   int max_resp_code,</a>
+<a name="ln281">			   struct in_addr from, const char *from_str,</a>
+<a name="ln282">			   char *igmp_msg, int igmp_msg_len)</a>
+<a name="ln283">{</a>
+<a name="ln284">  struct interface     *ifp;</a>
+<a name="ln285">  struct pim_interface *pim_ifp;</a>
+<a name="ln286">  uint8_t               resv_s_qrv = 0;</a>
+<a name="ln287">  uint8_t               s_flag = 0;</a>
+<a name="ln288">  uint8_t               qrv = 0;</a>
+<a name="ln289">  struct in_addr        group_addr;</a>
+<a name="ln290">  uint16_t              recv_checksum;</a>
+<a name="ln291">  uint16_t              checksum;</a>
+<a name="ln292">  int                   i;</a>
+<a name="ln293"> </a>
+<a name="ln294">  //group_addr = *(struct in_addr *)(igmp_msg + 4);</a>
+<a name="ln295">  memcpy(&amp;group_addr, igmp_msg + 4, sizeof(struct in_addr));</a>
+<a name="ln296"> </a>
+<a name="ln297">  ifp = igmp-&gt;interface;</a>
+<a name="ln298">  pim_ifp = ifp-&gt;info;</a>
+<a name="ln299"> </a>
+<a name="ln300">  recv_checksum = *(uint16_t *) (igmp_msg + IGMP_V3_CHECKSUM_OFFSET);</a>
+<a name="ln301"> </a>
+<a name="ln302">  /* for computing checksum */</a>
+<a name="ln303">  *(uint16_t *) (igmp_msg + IGMP_V3_CHECKSUM_OFFSET) = 0;</a>
+<a name="ln304"> </a>
+<a name="ln305">  checksum = in_cksum(igmp_msg, igmp_msg_len);</a>
+<a name="ln306">  if (checksum != recv_checksum) {</a>
+<a name="ln307">    zlog_warn(&quot;Recv IGMP query v%d from %s on %s: checksum mismatch: received=%x computed=%x&quot;,</a>
+<a name="ln308">	      query_version, from_str, ifp-&gt;name, recv_checksum, checksum);</a>
+<a name="ln309">    return -1;</a>
+<a name="ln310">  }</a>
+<a name="ln311"> </a>
+<a name="ln312">  if (PIM_DEBUG_IGMP_PACKETS) {</a>
+<a name="ln313">    char group_str[100];</a>
+<a name="ln314">    pim_inet4_dump(&quot;&lt;group?&gt;&quot;, group_addr, group_str, sizeof(group_str));</a>
+<a name="ln315">    zlog_debug(&quot;Recv IGMP query v%d from %s on %s: size=%d checksum=%x group=%s&quot;,</a>
+<a name="ln316">	       query_version, from_str, ifp-&gt;name,</a>
+<a name="ln317">	       igmp_msg_len, checksum, group_str);</a>
+<a name="ln318">  }</a>
+<a name="ln319"> </a>
+<a name="ln320">  /*</a>
+<a name="ln321">    RFC 3376: 6.6.2. Querier Election</a>
+<a name="ln322"> </a>
+<a name="ln323">    When a router receives a query with a lower IP address, it sets</a>
+<a name="ln324">    the Other-Querier-Present timer to Other Querier Present Interval</a>
+<a name="ln325">    and ceases to send queries on the network if it was the previously</a>
+<a name="ln326">    elected querier.</a>
+<a name="ln327">   */</a>
+<a name="ln328">  if (ntohl(from.s_addr) &lt; ntohl(igmp-&gt;ifaddr.s_addr)) {</a>
+<a name="ln329">    </a>
+<a name="ln330">    if (PIM_DEBUG_IGMP_TRACE) {</a>
+<a name="ln331">      char ifaddr_str[100];</a>
+<a name="ln332">      pim_inet4_dump(&quot;&lt;ifaddr?&gt;&quot;, igmp-&gt;ifaddr, ifaddr_str, sizeof(ifaddr_str));</a>
+<a name="ln333">      zlog_debug(&quot;%s: local address %s (%u) lost querier election to %s (%u)&quot;,</a>
+<a name="ln334">		 ifp-&gt;name,</a>
+<a name="ln335">		 ifaddr_str, ntohl(igmp-&gt;ifaddr.s_addr),</a>
+<a name="ln336">		 from_str, ntohl(from.s_addr));</a>
+<a name="ln337">    }</a>
+<a name="ln338"> </a>
+<a name="ln339">    pim_igmp_other_querier_timer_on(igmp);</a>
+<a name="ln340">  }</a>
+<a name="ln341"> </a>
+<a name="ln342">  if (query_version == 3) {</a>
+<a name="ln343">    /*</a>
+<a name="ln344">      RFC 3376: 4.1.6. QRV (Querier's Robustness Variable)</a>
+<a name="ln345"> </a>
+<a name="ln346">      Routers adopt the QRV value from the most recently received Query</a>
+<a name="ln347">      as their own [Robustness Variable] value, unless that most</a>
+<a name="ln348">      recently received QRV was zero, in which case the receivers use</a>
+<a name="ln349">      the default [Robustness Variable] value specified in section 8.1</a>
+<a name="ln350">      or a statically configured value.</a>
+<a name="ln351">    */</a>
+<a name="ln352">    resv_s_qrv = igmp_msg[8];</a>
+<a name="ln353">    qrv = 7 &amp; resv_s_qrv;</a>
+<a name="ln354">    igmp-&gt;querier_robustness_variable = qrv ? qrv : pim_ifp-&gt;igmp_default_robustness_variable;</a>
+<a name="ln355">  }</a>
+<a name="ln356"> </a>
+<a name="ln357">  /*</a>
+<a name="ln358">    RFC 3376: 4.1.7. QQIC (Querier's Query Interval Code)</a>
+<a name="ln359"> </a>
+<a name="ln360">    Multicast routers that are not the current querier adopt the QQI</a>
+<a name="ln361">    value from the most recently received Query as their own [Query</a>
+<a name="ln362">    Interval] value, unless that most recently received QQI was zero,</a>
+<a name="ln363">    in which case the receiving routers use the default.</a>
+<a name="ln364">  */</a>
+<a name="ln365">  if (igmp-&gt;t_other_querier_timer &amp;&amp; query_version == 3) {</a>
+<a name="ln366">    /* other querier present */</a>
+<a name="ln367">    uint8_t  qqic;</a>
+<a name="ln368">    uint16_t qqi;</a>
+<a name="ln369">    qqic = igmp_msg[9];</a>
+<a name="ln370">    qqi = igmp_msg_decode8to16(qqic);</a>
+<a name="ln371">    igmp-&gt;querier_query_interval = qqi ? qqi : pim_ifp-&gt;igmp_default_query_interval;</a>
+<a name="ln372"> </a>
+<a name="ln373">    if (PIM_DEBUG_IGMP_TRACE) {</a>
+<a name="ln374">      char ifaddr_str[100];</a>
+<a name="ln375">      pim_inet4_dump(&quot;&lt;ifaddr?&gt;&quot;, igmp-&gt;ifaddr, ifaddr_str, sizeof(ifaddr_str));</a>
+<a name="ln376">      zlog_debug(&quot;Querier %s new query interval is %s QQI=%u sec (recv QQIC=%02x from %s)&quot;,</a>
+<a name="ln377">		 ifaddr_str,</a>
+<a name="ln378">		 qqi ? &quot;recv-non-default&quot; : &quot;default&quot;,</a>
+<a name="ln379">		 igmp-&gt;querier_query_interval,</a>
+<a name="ln380">		 qqic,</a>
+<a name="ln381">		 from_str);</a>
+<a name="ln382">    }</a>
+<a name="ln383">  }</a>
+<a name="ln384"> </a>
+<a name="ln385">  /*</a>
+<a name="ln386">    RFC 3376: 6.6.1. Timer Updates</a>
+<a name="ln387"> </a>
+<a name="ln388">    When a router sends or receives a query with a clear Suppress</a>
+<a name="ln389">    Router-Side Processing flag, it must update its timers to reflect</a>
+<a name="ln390">    the correct timeout values for the group or sources being queried.</a>
+<a name="ln391"> </a>
+<a name="ln392">    General queries don't trigger timer update.</a>
+<a name="ln393">  */</a>
+<a name="ln394">  if (query_version == 3) {</a>
+<a name="ln395">    s_flag = (1 &lt;&lt; 3) &amp; resv_s_qrv;</a>
+<a name="ln396">  }</a>
+<a name="ln397">  else {</a>
+<a name="ln398">    /* Neither V1 nor V2 have this field. Pimd should really go into</a>
+<a name="ln399">     * a compatibility mode here and run as V2 (or V1) but it doesn't</a>
+<a name="ln400">     * so for now, lets just set the flag to suppress these timer updates.</a>
+<a name="ln401">     */</a>
+<a name="ln402">    s_flag = 1;</a>
+<a name="ln403">  }</a>
+<a name="ln404">  </a>
+<a name="ln405">  if (!s_flag) {</a>
+<a name="ln406">    /* s_flag is clear */</a>
+<a name="ln407"> </a>
+<a name="ln408">    if (PIM_INADDR_IS_ANY(group_addr)) {</a>
+<a name="ln409">      /* this is a general query */</a>
+<a name="ln410"> </a>
+<a name="ln411">      /* log that general query should have the s_flag set */</a>
+<a name="ln412">      zlog_warn(&quot;General IGMP query v%d from %s on %s: Suppress Router-Side Processing flag is clear&quot;,</a>
+<a name="ln413">		query_version, from_str, ifp-&gt;name);</a>
+<a name="ln414">    }</a>
+<a name="ln415">    else {</a>
+<a name="ln416">      struct igmp_group *group;</a>
+<a name="ln417"> </a>
+<a name="ln418">      /* this is a non-general query: perform timer updates */</a>
+<a name="ln419"> </a>
+<a name="ln420">      group = find_group_by_addr(igmp, group_addr);</a>
+<a name="ln421">      if (group) {</a>
+<a name="ln422">	int recv_num_sources = ntohs(*(uint16_t *)(igmp_msg + IGMP_V3_NUMSOURCES_OFFSET));</a>
+<a name="ln423"> </a>
+<a name="ln424">	/*</a>
+<a name="ln425">	  RFC 3376: 6.6.1. Timer Updates</a>
+<a name="ln426">	  Query Q(G,A): Source Timer for sources in A are lowered to LMQT</a>
+<a name="ln427">	  Query Q(G): Group Timer is lowered to LMQT</a>
+<a name="ln428">	*/</a>
+<a name="ln429">	if (recv_num_sources &lt; 1) {</a>
+<a name="ln430">	  /* Query Q(G): Group Timer is lowered to LMQT */</a>
+<a name="ln431"> </a>
+<a name="ln432">	  igmp_group_timer_lower_to_lmqt(group);</a>
+<a name="ln433">	}</a>
+<a name="ln434">	else {</a>
+<a name="ln435">	  /* Query Q(G,A): Source Timer for sources in A are lowered to LMQT */</a>
+<a name="ln436"> </a>
+<a name="ln437">	  /* Scan sources in query and lower their timers to LMQT */</a>
+<a name="ln438">	  struct in_addr *sources = (struct in_addr *)(igmp_msg + IGMP_V3_SOURCES_OFFSET);</a>
+<a name="ln439">	  for (i = 0; i &lt; recv_num_sources; ++i) {</a>
+<a name="ln440">	    //struct in_addr src_addr = sources[i];</a>
+<a name="ln441">	    //struct igmp_source *src = igmp_find_source_by_addr(group, src_addr);</a>
+<a name="ln442">	    struct in_addr src_addr;</a>
+<a name="ln443">	    struct igmp_source *src;</a>
+<a name="ln444">            memcpy(&amp;src_addr, sources + i, sizeof(struct in_addr));</a>
+<a name="ln445">	    src = igmp_find_source_by_addr(group, src_addr);</a>
+<a name="ln446">	    if (src) {</a>
+<a name="ln447">	      igmp_source_timer_lower_to_lmqt(src);</a>
+<a name="ln448">	    }</a>
+<a name="ln449">	  }</a>
+<a name="ln450">	}</a>
+<a name="ln451"> </a>
+<a name="ln452">      }</a>
+<a name="ln453">      else {</a>
+<a name="ln454">	char group_str[100];</a>
+<a name="ln455">	pim_inet4_dump(&quot;&lt;group?&gt;&quot;, group_addr, group_str, sizeof(group_str));</a>
+<a name="ln456">	zlog_warn(&quot;IGMP query v%d from %s on %s: could not find group %s for timer update&quot;,</a>
+<a name="ln457">		  query_version, from_str, ifp-&gt;name, group_str);</a>
+<a name="ln458">      }</a>
+<a name="ln459">    }</a>
+<a name="ln460">  } /* s_flag is clear: timer updates */</a>
+<a name="ln461">  </a>
+<a name="ln462">  return 0;</a>
+<a name="ln463">}</a>
+<a name="ln464"> </a>
+<a name="ln465">static int igmp_v3_report(struct igmp_sock *igmp,</a>
+<a name="ln466">			  struct in_addr from, const char *from_str,</a>
+<a name="ln467">			  char *igmp_msg, int igmp_msg_len)</a>
+<a name="ln468">{</a>
+<a name="ln469">  uint16_t          recv_checksum;</a>
+<a name="ln470">  uint16_t          checksum;</a>
+<a name="ln471">  int               num_groups;</a>
+<a name="ln472">  uint8_t          *group_record;</a>
+<a name="ln473">  uint8_t          *report_pastend = (uint8_t *) igmp_msg + igmp_msg_len;</a>
+<a name="ln474">  struct interface *ifp = igmp-&gt;interface;</a>
+<a name="ln475">  int               i;</a>
+<a name="ln476"> </a>
+<a name="ln477">  if (igmp_msg_len &lt; IGMP_V3_MSG_MIN_SIZE) {</a>
+<a name="ln478">    zlog_warn(&quot;Recv IGMP report v3 from %s on %s: size=%d shorter than minimum=%d&quot;,</a>
+<a name="ln479">	      from_str, ifp-&gt;name, igmp_msg_len, IGMP_V3_MSG_MIN_SIZE);</a>
+<a name="ln480">    return -1;</a>
+<a name="ln481">  }</a>
+<a name="ln482"> </a>
+<a name="ln483">  recv_checksum = *(uint16_t *) (igmp_msg + IGMP_V3_CHECKSUM_OFFSET);</a>
+<a name="ln484"> </a>
+<a name="ln485">  /* for computing checksum */</a>
+<a name="ln486">  *(uint16_t *) (igmp_msg + IGMP_V3_CHECKSUM_OFFSET) = 0;</a>
+<a name="ln487"> </a>
+<a name="ln488">  checksum = in_cksum(igmp_msg, igmp_msg_len);</a>
+<a name="ln489">  if (checksum != recv_checksum) {</a>
+<a name="ln490">    zlog_warn(&quot;Recv IGMP report v3 from %s on %s: checksum mismatch: received=%x computed=%x&quot;,</a>
+<a name="ln491">	      from_str, ifp-&gt;name, recv_checksum, checksum);</a>
+<a name="ln492">    return -1;</a>
+<a name="ln493">  }</a>
+<a name="ln494"> </a>
+<a name="ln495">  num_groups = ntohs(*(uint16_t *) (igmp_msg + IGMP_V3_REPORT_NUMGROUPS_OFFSET));</a>
+<a name="ln496">  if (num_groups &lt; 1) {</a>
+<a name="ln497">    zlog_warn(&quot;Recv IGMP report v3 from %s on %s: missing group records&quot;,</a>
+<a name="ln498">	      from_str, ifp-&gt;name);</a>
+<a name="ln499">    return -1;</a>
+<a name="ln500">  }</a>
+<a name="ln501"> </a>
+<a name="ln502">  if (PIM_DEBUG_IGMP_PACKETS) {</a>
+<a name="ln503">    zlog_debug(&quot;Recv IGMP report v3 from %s on %s: size=%d checksum=%x groups=%d&quot;,</a>
+<a name="ln504">	       from_str, ifp-&gt;name, igmp_msg_len, checksum, num_groups);</a>
+<a name="ln505">  }</a>
+<a name="ln506"> </a>
+<a name="ln507">  group_record = (uint8_t *) igmp_msg + IGMP_V3_REPORT_GROUPPRECORD_OFFSET;</a>
+<a name="ln508"> </a>
+<a name="ln509">  /* Scan groups */</a>
+<a name="ln510">  for (i = 0; i &lt; num_groups; ++i) {</a>
+<a name="ln511">    struct in_addr  rec_group;</a>
+<a name="ln512">    uint8_t        *sources;</a>
+<a name="ln513">    uint8_t        *src;</a>
+<a name="ln514">    int             rec_type;</a>
+<a name="ln515">    int             rec_auxdatalen;</a>
+<a name="ln516">    int             rec_num_sources;</a>
+<a name="ln517">    int             j;</a>
+<a name="ln518"> </a>
+<a name="ln519">    if ((group_record + IGMP_V3_GROUP_RECORD_MIN_SIZE) &gt; report_pastend) {</a>
+<a name="ln520">      zlog_warn(&quot;Recv IGMP report v3 from %s on %s: group record beyond report end&quot;,</a>
+<a name="ln521">		from_str, ifp-&gt;name);</a>
+<a name="ln522">      return -1;</a>
+<a name="ln523">    }</a>
+<a name="ln524"> </a>
+<a name="ln525">    rec_type        = group_record[IGMP_V3_GROUP_RECORD_TYPE_OFFSET];</a>
+<a name="ln526">    rec_auxdatalen  = group_record[IGMP_V3_GROUP_RECORD_AUXDATALEN_OFFSET];</a>
+<a name="ln527">    rec_num_sources = ntohs(* (uint16_t *) (group_record + IGMP_V3_GROUP_RECORD_NUMSOURCES_OFFSET));</a>
+<a name="ln528"> </a>
+<a name="ln529">    //rec_group = *(struct in_addr *)(group_record + IGMP_V3_GROUP_RECORD_GROUP_OFFSET);</a>
+<a name="ln530">    memcpy(&amp;rec_group, group_record + IGMP_V3_GROUP_RECORD_GROUP_OFFSET, sizeof(struct in_addr));</a>
+<a name="ln531"> </a>
+<a name="ln532">    if (PIM_DEBUG_IGMP_PACKETS) {</a>
+<a name="ln533">      zlog_debug(&quot;Recv IGMP report v3 from %s on %s: record=%d type=%d auxdatalen=%d sources=%d group=%s&quot;,</a>
+<a name="ln534">		 from_str, ifp-&gt;name, i, rec_type, rec_auxdatalen, rec_num_sources, inet_ntoa(rec_group));</a>
+<a name="ln535">    }</a>
+<a name="ln536"> </a>
+<a name="ln537">    /* Scan sources */</a>
+<a name="ln538">    </a>
+<a name="ln539">    sources = group_record + IGMP_V3_GROUP_RECORD_SOURCE_OFFSET;</a>
+<a name="ln540"> </a>
+<a name="ln541">    for (j = 0, src = sources; j &lt; rec_num_sources; ++j, src += 4) {</a>
+<a name="ln542"> </a>
+<a name="ln543">      if ((src + 4) &gt; report_pastend) {</a>
+<a name="ln544">	zlog_warn(&quot;Recv IGMP report v3 from %s on %s: group source beyond report end&quot;,</a>
+<a name="ln545">		  from_str, ifp-&gt;name);</a>
+<a name="ln546">	return -1;</a>
+<a name="ln547">      }</a>
+<a name="ln548"> </a>
+<a name="ln549">      if (PIM_DEBUG_IGMP_PACKETS) {</a>
+<a name="ln550">	char src_str[200];</a>
+<a name="ln551"> </a>
+<a name="ln552">	if (!inet_ntop(AF_INET, src, src_str , sizeof(src_str)))</a>
+<a name="ln553">	  sprintf(src_str, &quot;&lt;source?&gt;&quot;);</a>
+<a name="ln554">	</a>
+<a name="ln555">	zlog_debug(&quot;Recv IGMP report v3 from %s on %s: record=%d group=%s source=%s&quot;,</a>
+<a name="ln556">		   from_str, ifp-&gt;name, i, inet_ntoa(rec_group), src_str);</a>
+<a name="ln557">      }</a>
+<a name="ln558">    } /* for (sources) */</a>
+<a name="ln559"> </a>
+<a name="ln560">    switch (rec_type) {</a>
+<a name="ln561">    case IGMP_GRP_REC_TYPE_MODE_IS_INCLUDE:</a>
+<a name="ln562">      igmpv3_report_isin(igmp, from, rec_group, rec_num_sources, (struct in_addr *) sources);</a>
+<a name="ln563">      break;</a>
+<a name="ln564">    case IGMP_GRP_REC_TYPE_MODE_IS_EXCLUDE:</a>
+<a name="ln565">      igmpv3_report_isex(igmp, from, rec_group, rec_num_sources, (struct in_addr *) sources);</a>
+<a name="ln566">      break;</a>
+<a name="ln567">    case IGMP_GRP_REC_TYPE_CHANGE_TO_INCLUDE_MODE:</a>
+<a name="ln568">      igmpv3_report_toin(igmp, from, rec_group, rec_num_sources, (struct in_addr *) sources);</a>
+<a name="ln569">      break;</a>
+<a name="ln570">    case IGMP_GRP_REC_TYPE_CHANGE_TO_EXCLUDE_MODE:</a>
+<a name="ln571">      igmpv3_report_toex(igmp, from, rec_group, rec_num_sources, (struct in_addr *) sources);</a>
+<a name="ln572">      break;</a>
+<a name="ln573">    case IGMP_GRP_REC_TYPE_ALLOW_NEW_SOURCES:</a>
+<a name="ln574">      igmpv3_report_allow(igmp, from, rec_group, rec_num_sources, (struct in_addr *) sources);</a>
+<a name="ln575">      break;</a>
+<a name="ln576">    case IGMP_GRP_REC_TYPE_BLOCK_OLD_SOURCES:</a>
+<a name="ln577">      igmpv3_report_block(igmp, from, rec_group, rec_num_sources, (struct in_addr *) sources);</a>
+<a name="ln578">      break;</a>
+<a name="ln579">    default:</a>
+<a name="ln580">      zlog_warn(&quot;Recv IGMP report v3 from %s on %s: unknown record type: type=%d&quot;,</a>
+<a name="ln581">		from_str, ifp-&gt;name, rec_type);</a>
+<a name="ln582">    }</a>
+<a name="ln583"> </a>
+<a name="ln584">    group_record += 8 + (rec_num_sources &lt;&lt; 2) + (rec_auxdatalen &lt;&lt; 2);</a>
+<a name="ln585"> </a>
+<a name="ln586">  } /* for (group records) */</a>
+<a name="ln587"> </a>
+<a name="ln588">  return 0;</a>
+<a name="ln589">}</a>
+<a name="ln590"> </a>
+<a name="ln591">static void on_trace(const char *label,</a>
+<a name="ln592">		     struct interface *ifp, struct in_addr from)</a>
+<a name="ln593">{</a>
+<a name="ln594">  if (PIM_DEBUG_IGMP_TRACE) {</a>
+<a name="ln595">    char from_str[100];</a>
+<a name="ln596">    pim_inet4_dump(&quot;&lt;from?&gt;&quot;, from, from_str, sizeof(from_str));</a>
+<a name="ln597">    zlog_debug(&quot;%s: from %s on %s&quot;,</a>
+<a name="ln598">	       label, from_str, ifp-&gt;name);</a>
+<a name="ln599">  }</a>
+<a name="ln600">}</a>
+<a name="ln601"> </a>
+<a name="ln602">static int igmp_v2_report(struct igmp_sock *igmp,</a>
+<a name="ln603">			  struct in_addr from, const char *from_str,</a>
+<a name="ln604">			  char *igmp_msg, int igmp_msg_len)</a>
+<a name="ln605">{</a>
+<a name="ln606">  struct interface *ifp = igmp-&gt;interface;</a>
+<a name="ln607">  struct igmp_group *group;</a>
+<a name="ln608">  struct in_addr group_addr;</a>
+<a name="ln609"> </a>
+<a name="ln610">  on_trace(__PRETTY_FUNCTION__, igmp-&gt;interface, from);</a>
+<a name="ln611"> </a>
+<a name="ln612">  if (igmp_msg_len != IGMP_V12_MSG_SIZE) {</a>
+<a name="ln613">    zlog_warn(&quot;Recv IGMP report v2 from %s on %s: size=%d other than correct=%d&quot;,</a>
+<a name="ln614">	      from_str, ifp-&gt;name, igmp_msg_len, IGMP_V12_MSG_SIZE);</a>
+<a name="ln615">    return -1;</a>
+<a name="ln616">  }</a>
+<a name="ln617"> </a>
+<a name="ln618">  if (PIM_DEBUG_IGMP_TRACE) {</a>
+<a name="ln619">    zlog_warn(&quot;%s %s: FIXME WRITEME&quot;,</a>
+<a name="ln620">	      __FILE__, __PRETTY_FUNCTION__);</a>
+<a name="ln621">  }</a>
+<a name="ln622"> </a>
+<a name="ln623">  //group_addr = *(struct in_addr *)(igmp_msg + 4);</a>
+<a name="ln624">  memcpy(&amp;group_addr, igmp_msg + 4, sizeof(struct in_addr));</a>
+<a name="ln625"> </a>
+<a name="ln626">  /* non-existant group is created as INCLUDE {empty} */</a>
+<a name="ln627">  group = igmp_add_group_by_addr(igmp, group_addr);</a>
+<a name="ln628">  if (!group) {</a>
+<a name="ln629">    return -1;</a>
+<a name="ln630">  }</a>
+<a name="ln631"> </a>
+<a name="ln632">  group-&gt;last_igmp_v2_report_dsec = pim_time_monotonic_dsec();</a>
+<a name="ln633"> </a>
+<a name="ln634">  return 0;</a>
+<a name="ln635">}</a>
+<a name="ln636"> </a>
+<a name="ln637">static int igmp_v2_leave(struct igmp_sock *igmp,</a>
+<a name="ln638">			 struct in_addr from, const char *from_str,</a>
+<a name="ln639">			 char *igmp_msg, int igmp_msg_len)</a>
+<a name="ln640">{</a>
+<a name="ln641">  struct interface *ifp = igmp-&gt;interface;</a>
+<a name="ln642"> </a>
+<a name="ln643">  on_trace(__PRETTY_FUNCTION__, igmp-&gt;interface, from);</a>
+<a name="ln644"> </a>
+<a name="ln645">  if (igmp_msg_len != IGMP_V12_MSG_SIZE) {</a>
+<a name="ln646">    zlog_warn(&quot;Recv IGMP leave v2 from %s on %s: size=%d other than correct=%d&quot;,</a>
+<a name="ln647">	      from_str, ifp-&gt;name, igmp_msg_len, IGMP_V12_MSG_SIZE);</a>
+<a name="ln648">    return -1;</a>
+<a name="ln649">  }</a>
+<a name="ln650"> </a>
+<a name="ln651">  if (PIM_DEBUG_IGMP_TRACE) {</a>
+<a name="ln652">    zlog_warn(&quot;%s %s: FIXME WRITEME&quot;,</a>
+<a name="ln653">	      __FILE__, __PRETTY_FUNCTION__);</a>
+<a name="ln654">  }</a>
+<a name="ln655"> </a>
+<a name="ln656">  return 0;</a>
+<a name="ln657">}</a>
+<a name="ln658"> </a>
+<a name="ln659">static int igmp_v1_report(struct igmp_sock *igmp,</a>
+<a name="ln660">			  struct in_addr from, const char *from_str,</a>
+<a name="ln661">			  char *igmp_msg, int igmp_msg_len)</a>
+<a name="ln662">{</a>
+<a name="ln663">  struct interface *ifp = igmp-&gt;interface;</a>
+<a name="ln664">  struct igmp_group *group;</a>
+<a name="ln665">  struct in_addr group_addr;</a>
+<a name="ln666"> </a>
+<a name="ln667">  on_trace(__PRETTY_FUNCTION__, igmp-&gt;interface, from);</a>
+<a name="ln668"> </a>
+<a name="ln669">  if (igmp_msg_len != IGMP_V12_MSG_SIZE) {</a>
+<a name="ln670">    zlog_warn(&quot;Recv IGMP report v1 from %s on %s: size=%d other than correct=%d&quot;,</a>
+<a name="ln671">	      from_str, ifp-&gt;name, igmp_msg_len, IGMP_V12_MSG_SIZE);</a>
+<a name="ln672">    return -1;</a>
+<a name="ln673">  }</a>
+<a name="ln674"> </a>
+<a name="ln675">  if (PIM_DEBUG_IGMP_TRACE) {</a>
+<a name="ln676">    zlog_warn(&quot;%s %s: FIXME WRITEME&quot;,</a>
+<a name="ln677">	      __FILE__, __PRETTY_FUNCTION__);</a>
+<a name="ln678">  }</a>
+<a name="ln679"> </a>
+<a name="ln680">  //group_addr = *(struct in_addr *)(igmp_msg + 4);</a>
+<a name="ln681">  memcpy(&amp;group_addr, igmp_msg + 4, sizeof(struct in_addr));</a>
+<a name="ln682"> </a>
+<a name="ln683">  /* non-existant group is created as INCLUDE {empty} */</a>
+<a name="ln684">  group = igmp_add_group_by_addr(igmp, group_addr);</a>
+<a name="ln685">  if (!group) {</a>
+<a name="ln686">    return -1;</a>
+<a name="ln687">  }</a>
+<a name="ln688"> </a>
+<a name="ln689">  group-&gt;last_igmp_v1_report_dsec = pim_time_monotonic_dsec();</a>
+<a name="ln690"> </a>
+<a name="ln691">  return 0;</a>
+<a name="ln692">}</a>
+<a name="ln693"> </a>
+<a name="ln694">int pim_igmp_packet(struct igmp_sock *igmp, char *buf, size_t len)</a>
+<a name="ln695">{</a>
+<a name="ln696">  struct ip *ip_hdr;</a>
+<a name="ln697">  size_t ip_hlen; /* ip header length in bytes */</a>
+<a name="ln698">  char *igmp_msg;</a>
+<a name="ln699">  int igmp_msg_len;</a>
+<a name="ln700">  int msg_type;</a>
+<a name="ln701">  char from_str[100];</a>
+<a name="ln702">  char to_str[100];</a>
+<a name="ln703">    </a>
+<a name="ln704">  if (len &lt; sizeof(*ip_hdr)) {</a>
+<a name="ln705">    zlog_warn(&quot;IGMP packet size=%zu shorter than minimum=%zu&quot;,</a>
+<a name="ln706">	      len, sizeof(*ip_hdr));</a>
+<a name="ln707">    return -1;</a>
+<a name="ln708">  }</a>
+<a name="ln709"> </a>
+<a name="ln710">  ip_hdr = (struct ip *) buf;</a>
+<a name="ln711"> </a>
+<a name="ln712">  pim_inet4_dump(&quot;&lt;src?&gt;&quot;, ip_hdr-&gt;ip_src, from_str , sizeof(from_str));</a>
+<a name="ln713">  pim_inet4_dump(&quot;&lt;dst?&gt;&quot;, ip_hdr-&gt;ip_dst, to_str , sizeof(to_str));</a>
+<a name="ln714"> </a>
+<a name="ln715">  ip_hlen = ip_hdr-&gt;ip_hl &lt;&lt; 2; /* ip_hl gives length in 4-byte words */</a>
+<a name="ln716"> </a>
+<a name="ln717">  if (PIM_DEBUG_IGMP_PACKETS) {</a>
+<a name="ln718">    zlog_debug(&quot;Recv IP packet from %s to %s on %s: size=%zu ip_header_size=%zu ip_proto=%d&quot;,</a>
+<a name="ln719">	       from_str, to_str, igmp-&gt;interface-&gt;name, len, ip_hlen, ip_hdr-&gt;ip_p);</a>
+<a name="ln720">  }</a>
+<a name="ln721"> </a>
+<a name="ln722">  if (ip_hdr-&gt;ip_p != PIM_IP_PROTO_IGMP) {</a>
+<a name="ln723">    zlog_warn(&quot;IP packet protocol=%d is not IGMP=%d&quot;,</a>
+<a name="ln724">	      ip_hdr-&gt;ip_p, PIM_IP_PROTO_IGMP);</a>
+<a name="ln725">    return -1;</a>
+<a name="ln726">  }</a>
+<a name="ln727"> </a>
+<a name="ln728">  if (ip_hlen &lt; PIM_IP_HEADER_MIN_LEN) {</a>
+<a name="ln729">    zlog_warn(&quot;IP packet header size=%zu shorter than minimum=%d&quot;,</a>
+<a name="ln730">	      ip_hlen, PIM_IP_HEADER_MIN_LEN);</a>
+<a name="ln731">    return -1;</a>
+<a name="ln732">  }</a>
+<a name="ln733">  if (ip_hlen &gt; PIM_IP_HEADER_MAX_LEN) {</a>
+<a name="ln734">    zlog_warn(&quot;IP packet header size=%zu greater than maximum=%d&quot;,</a>
+<a name="ln735">	      ip_hlen, PIM_IP_HEADER_MAX_LEN);</a>
+<a name="ln736">    return -1;</a>
+<a name="ln737">  }</a>
+<a name="ln738"> </a>
+<a name="ln739">  igmp_msg = buf + ip_hlen;</a>
+<a name="ln740">  msg_type = *igmp_msg;</a>
+<a name="ln741">  igmp_msg_len = len - ip_hlen;</a>
+<a name="ln742"> </a>
+<a name="ln743">  if (PIM_DEBUG_IGMP_PACKETS) {</a>
+<a name="ln744">    zlog_debug(&quot;Recv IGMP packet from %s to %s on %s: ttl=%d msg_type=%d msg_size=%d&quot;,</a>
+<a name="ln745">	       from_str, to_str, igmp-&gt;interface-&gt;name, ip_hdr-&gt;ip_ttl, msg_type,</a>
+<a name="ln746">	       igmp_msg_len);</a>
+<a name="ln747">  }</a>
+<a name="ln748"> </a>
+<a name="ln749">  if (igmp_msg_len &lt; PIM_IGMP_MIN_LEN) {</a>
+<a name="ln750">    zlog_warn(&quot;IGMP message size=%d shorter than minimum=%d&quot;,</a>
+<a name="ln751">	      igmp_msg_len, PIM_IGMP_MIN_LEN);</a>
+<a name="ln752">    return -1;</a>
+<a name="ln753">  }</a>
+<a name="ln754"> </a>
+<a name="ln755">  switch (msg_type) {</a>
+<a name="ln756">  case PIM_IGMP_MEMBERSHIP_QUERY:</a>
+<a name="ln757">    {</a>
+<a name="ln758">      int max_resp_code = igmp_msg[1];</a>
+<a name="ln759">      int query_version;</a>
+<a name="ln760"> </a>
+<a name="ln761">      /*</a>
+<a name="ln762">	RFC 3376: 7.1. Query Version Distinctions</a>
+<a name="ln763">	IGMPv1 Query: length = 8 octets AND Max Resp Code field is zero</a>
+<a name="ln764">	IGMPv2 Query: length = 8 octets AND Max Resp Code field is non-zero</a>
+<a name="ln765">	IGMPv3 Query: length &gt;= 12 octets</a>
+<a name="ln766">      */</a>
+<a name="ln767"> </a>
+<a name="ln768">      if (igmp_msg_len == 8) {</a>
+<a name="ln769">	query_version = max_resp_code ? 2 : 1;</a>
+<a name="ln770">      }</a>
+<a name="ln771">      else if (igmp_msg_len &gt;= 12) {</a>
+<a name="ln772">	query_version = 3;</a>
+<a name="ln773">      }</a>
+<a name="ln774">      else {</a>
+<a name="ln775">	zlog_warn(&quot;Unknown IGMP query version&quot;);</a>
+<a name="ln776">	return -1;</a>
+<a name="ln777">      }</a>
+<a name="ln778"> </a>
+<a name="ln779">      return recv_igmp_query(igmp, query_version, max_resp_code,</a>
+<a name="ln780">			     ip_hdr-&gt;ip_src, from_str,</a>
+<a name="ln781">			     igmp_msg, igmp_msg_len);</a>
+<a name="ln782">    }</a>
+<a name="ln783"> </a>
+<a name="ln784">  case PIM_IGMP_V3_MEMBERSHIP_REPORT:</a>
+<a name="ln785">    return igmp_v3_report(igmp, ip_hdr-&gt;ip_src, from_str,</a>
+<a name="ln786">			  igmp_msg, igmp_msg_len);</a>
+<a name="ln787"> </a>
+<a name="ln788">  case PIM_IGMP_V2_MEMBERSHIP_REPORT:</a>
+<a name="ln789">    return igmp_v2_report(igmp, ip_hdr-&gt;ip_src, from_str,</a>
+<a name="ln790">			  igmp_msg, igmp_msg_len);</a>
+<a name="ln791"> </a>
+<a name="ln792">  case PIM_IGMP_V1_MEMBERSHIP_REPORT:</a>
+<a name="ln793">    return igmp_v1_report(igmp, ip_hdr-&gt;ip_src, from_str,</a>
+<a name="ln794">			  igmp_msg, igmp_msg_len);</a>
+<a name="ln795"> </a>
+<a name="ln796">  case PIM_IGMP_V2_LEAVE_GROUP:</a>
+<a name="ln797">    return igmp_v2_leave(igmp, ip_hdr-&gt;ip_src, from_str,</a>
+<a name="ln798">			 igmp_msg, igmp_msg_len);</a>
+<a name="ln799">  }</a>
+<a name="ln800"> </a>
+<a name="ln801">  zlog_warn(&quot;Ignoring unsupported IGMP message type: %d&quot;, msg_type);</a>
+<a name="ln802"> </a>
+<a name="ln803">  return -1;</a>
+<a name="ln804">}</a>
+<a name="ln805"> </a>
+<a name="ln806">static int pim_igmp_general_query(struct thread *t);</a>
+<a name="ln807"> </a>
+<a name="ln808">void pim_igmp_general_query_on(struct igmp_sock *igmp)</a>
+<a name="ln809">{</a>
+<a name="ln810">  struct pim_interface *pim_ifp;</a>
+<a name="ln811">  int startup_mode;</a>
+<a name="ln812">  int query_interval;</a>
+<a name="ln813"> </a>
+<a name="ln814">  zassert(igmp);</a>
+<a name="ln815">  zassert(igmp-&gt;interface);</a>
+<a name="ln816"> </a>
+<a name="ln817">  /*</a>
+<a name="ln818">    Since this socket is starting as querier,</a>
+<a name="ln819">    there should not exist a timer for other-querier-present.</a>
+<a name="ln820">   */</a>
+<a name="ln821">  zassert(!igmp-&gt;t_other_querier_timer);</a>
+<a name="ln822">  pim_ifp = igmp-&gt;interface-&gt;info;</a>
+<a name="ln823">  zassert(pim_ifp);</a>
+<a name="ln824"> </a>
+<a name="ln825">  /*</a>
+<a name="ln826">    RFC 3376: 8.6. Startup Query Interval</a>
+<a name="ln827"> </a>
+<a name="ln828">    The Startup Query Interval is the interval between General Queries</a>
+<a name="ln829">    sent by a Querier on startup.  Default: 1/4 the Query Interval.</a>
+<a name="ln830">  */</a>
+<a name="ln831">  startup_mode = igmp-&gt;startup_query_count &gt; 0;</a>
+<a name="ln832">  if (startup_mode) {</a>
+<a name="ln833">    --igmp-&gt;startup_query_count;</a>
+<a name="ln834"> </a>
+<a name="ln835">    /* query_interval = pim_ifp-&gt;igmp_default_query_interval &gt;&gt; 2; */</a>
+<a name="ln836">    query_interval = PIM_IGMP_SQI(pim_ifp-&gt;igmp_default_query_interval);</a>
+<a name="ln837">  }</a>
+<a name="ln838">  else {</a>
+<a name="ln839">    query_interval = igmp-&gt;querier_query_interval;</a>
+<a name="ln840">  }</a>
+<a name="ln841"> </a>
+<a name="ln842">  if (PIM_DEBUG_IGMP_TRACE) {</a>
+<a name="ln843">    char ifaddr_str[100];</a>
+<a name="ln844">    pim_inet4_dump(&quot;&lt;ifaddr?&gt;&quot;, igmp-&gt;ifaddr, ifaddr_str, sizeof(ifaddr_str));</a>
+<a name="ln845">    zlog_debug(&quot;Querier %s scheduling %d-second (%s) TIMER event for IGMP query on fd=%d&quot;,</a>
+<a name="ln846">	       ifaddr_str,</a>
+<a name="ln847">	       query_interval,</a>
+<a name="ln848">	       startup_mode ? &quot;startup&quot; : &quot;non-startup&quot;,</a>
+<a name="ln849">	       igmp-&gt;fd);</a>
+<a name="ln850">  }</a>
+<a name="ln851">  igmp-&gt;t_igmp_query_timer = 0;</a>
+<a name="ln852">  zassert(!igmp-&gt;t_igmp_query_timer);</a>
+<a name="ln853">  THREAD_TIMER_ON(master, igmp-&gt;t_igmp_query_timer,</a>
+<a name="ln854">		  pim_igmp_general_query,</a>
+<a name="ln855">		  igmp, query_interval);</a>
+<a name="ln856">}</a>
+<a name="ln857"> </a>
+<a name="ln858">void pim_igmp_general_query_off(struct igmp_sock *igmp)</a>
+<a name="ln859">{</a>
+<a name="ln860">  zassert(igmp);</a>
+<a name="ln861"> </a>
+<a name="ln862">  if (PIM_DEBUG_IGMP_TRACE) {</a>
+<a name="ln863">    if (igmp-&gt;t_igmp_query_timer) {</a>
+<a name="ln864">      char ifaddr_str[100];</a>
+<a name="ln865">      pim_inet4_dump(&quot;&lt;ifaddr?&gt;&quot;, igmp-&gt;ifaddr, ifaddr_str, sizeof(ifaddr_str));</a>
+<a name="ln866">      zlog_debug(&quot;IGMP querier %s fd=%d cancelling query TIMER event on %s&quot;,</a>
+<a name="ln867">		 ifaddr_str, igmp-&gt;fd, igmp-&gt;interface-&gt;name);</a>
+<a name="ln868">    }</a>
+<a name="ln869">  }</a>
+<a name="ln870">  THREAD_OFF(igmp-&gt;t_igmp_query_timer);</a>
+<a name="ln871">  zassert(!igmp-&gt;t_igmp_query_timer);</a>
+<a name="ln872">}</a>
+<a name="ln873"> </a>
+<a name="ln874">/* Issue IGMP general query */</a>
+<a name="ln875">static int pim_igmp_general_query(struct thread *t)</a>
+<a name="ln876">{</a>
+<a name="ln877">  char   query_buf[PIM_IGMP_BUFSIZE_WRITE];</a>
+<a name="ln878">  struct igmp_sock *igmp;</a>
+<a name="ln879">  struct in_addr dst_addr;</a>
+<a name="ln880">  struct in_addr group_addr;</a>
+<a name="ln881">  struct pim_interface *pim_ifp;</a>
+<a name="ln882"> </a>
+<a name="ln883">  zassert(t);</a>
+<a name="ln884"> </a>
+<a name="ln885">  igmp = THREAD_ARG(t);</a>
+<a name="ln886"> </a>
+<a name="ln887">  zassert(igmp);</a>
+<a name="ln888">  zassert(igmp-&gt;interface);</a>
+<a name="ln889">  zassert(igmp-&gt;interface-&gt;info);</a>
+<a name="ln890"> </a>
+<a name="ln891">  pim_ifp = igmp-&gt;interface-&gt;info;</a>
+<a name="ln892"> </a>
+<a name="ln893">  /*</a>
+<a name="ln894">    RFC3376: 4.1.12. IP Destination Addresses for Queries</a>
+<a name="ln895"> </a>
+<a name="ln896">    In IGMPv3, General Queries are sent with an IP destination address</a>
+<a name="ln897">    of 224.0.0.1, the all-systems multicast address.  Group-Specific</a>
+<a name="ln898">    and Group-and-Source-Specific Queries are sent with an IP</a>
+<a name="ln899">    destination address equal to the multicast address of interest.</a>
+<a name="ln900">  */</a>
+<a name="ln901"> </a>
+<a name="ln902">  dst_addr.s_addr   = htonl(INADDR_ALLHOSTS_GROUP);</a>
+<a name="ln903">  group_addr.s_addr = PIM_NET_INADDR_ANY;</a>
+<a name="ln904"> </a>
+<a name="ln905">  if (PIM_DEBUG_IGMP_TRACE) {</a>
+<a name="ln906">    char querier_str[100];</a>
+<a name="ln907">    char dst_str[100];</a>
+<a name="ln908">    pim_inet4_dump(&quot;&lt;querier?&gt;&quot;, igmp-&gt;ifaddr, querier_str,</a>
+<a name="ln909">		   sizeof(querier_str));</a>
+<a name="ln910">    pim_inet4_dump(&quot;&lt;dst?&gt;&quot;, dst_addr, dst_str, sizeof(dst_str));</a>
+<a name="ln911">    zlog_debug(&quot;Querier %s issuing IGMP general query to %s on %s&quot;,</a>
+<a name="ln912">	       querier_str, dst_str, igmp-&gt;interface-&gt;name);</a>
+<a name="ln913">  }</a>
+<a name="ln914"> </a>
+<a name="ln915">  pim_igmp_send_membership_query(0 /* igmp_group */,</a>
+<a name="ln916">				 igmp-&gt;fd,</a>
+<a name="ln917">				 igmp-&gt;interface-&gt;name,</a>
+<a name="ln918">				 query_buf,</a>
+<a name="ln919">				 sizeof(query_buf),</a>
+<a name="ln920">				 0 /* num_sources */,</a>
+<a name="ln921">				 dst_addr,</a>
+<a name="ln922">				 group_addr,</a>
+<a name="ln923">				 pim_ifp-&gt;igmp_query_max_response_time_dsec,</a>
+<a name="ln924">				 1 /* s_flag: always set for general queries */,</a>
+<a name="ln925">				 igmp-&gt;querier_robustness_variable,</a>
+<a name="ln926">				 igmp-&gt;querier_query_interval);</a>
+<a name="ln927"> </a>
+<a name="ln928">  pim_igmp_general_query_on(igmp);</a>
+<a name="ln929"> </a>
+<a name="ln930">  return 0;</a>
+<a name="ln931">}</a>
+<a name="ln932"> </a>
+<a name="ln933">static int pim_igmp_read(struct thread *t);</a>
+<a name="ln934"> </a>
+<a name="ln935">static void igmp_read_on(struct igmp_sock *igmp)</a>
+<a name="ln936">{</a>
+<a name="ln937">  zassert(igmp);</a>
+<a name="ln938"> </a>
+<a name="ln939">  if (PIM_DEBUG_IGMP_TRACE) {</a>
+<a name="ln940">    zlog_debug(&quot;Scheduling READ event on IGMP socket fd=%d&quot;,</a>
+<a name="ln941">	       igmp-&gt;fd);</a>
+<a name="ln942">  }</a>
+<a name="ln943">  igmp-&gt;t_igmp_read = 0;</a>
+<a name="ln944">  zassert(!igmp-&gt;t_igmp_read);</a>
+<a name="ln945">  THREAD_READ_ON(master, igmp-&gt;t_igmp_read, pim_igmp_read, igmp, igmp-&gt;fd);</a>
+<a name="ln946">}</a>
+<a name="ln947"> </a>
+<a name="ln948">static int pim_igmp_read(struct thread *t)</a>
+<a name="ln949">{</a>
+<a name="ln950">  struct igmp_sock *igmp;</a>
+<a name="ln951">  int fd;</a>
+<a name="ln952">  struct sockaddr_in from;</a>
+<a name="ln953">  struct sockaddr_in to;</a>
+<a name="ln954">  socklen_t fromlen = sizeof(from);</a>
+<a name="ln955">  socklen_t tolen = sizeof(to);</a>
+<a name="ln956">  uint8_t buf[PIM_IGMP_BUFSIZE_READ];</a>
+<a name="ln957">  int len;</a>
+<a name="ln958">  ifindex_t ifindex = -1;</a>
+<a name="ln959">  int result = -1; /* defaults to bad */</a>
+<a name="ln960"> </a>
+<a name="ln961">  zassert(t);</a>
+<a name="ln962"> </a>
+<a name="ln963">  igmp = THREAD_ARG(t);</a>
+<a name="ln964"> </a>
+<a name="ln965">  zassert(igmp);</a>
+<a name="ln966"> </a>
+<a name="ln967">  fd = THREAD_FD(t);</a>
+<a name="ln968"> </a>
+<a name="ln969">  zassert(fd == igmp-&gt;fd);</a>
+<a name="ln970"> </a>
+<a name="ln971">  len = pim_socket_recvfromto(fd, buf, sizeof(buf),</a>
+<a name="ln972">			      &amp;from, &amp;fromlen,</a>
+<a name="ln973">			      &amp;to, &amp;tolen,</a>
+<a name="ln974">			      &amp;ifindex);</a>
+<a name="ln975">  if (len &lt; 0) {</a>
+<a name="ln976">    zlog_warn(&quot;Failure receiving IP IGMP packet on fd=%d: errno=%d: %s&quot;,</a>
+<a name="ln977">	      fd, errno, safe_strerror(errno));</a>
+<a name="ln978">    goto done;</a>
+<a name="ln979">  }</a>
+<a name="ln980"> </a>
+<a name="ln981">  if (PIM_DEBUG_IGMP_PACKETS) {</a>
+<a name="ln982">    char from_str[100];</a>
+<a name="ln983">    char to_str[100];</a>
+<a name="ln984">    </a>
+<a name="ln985">    if (!inet_ntop(AF_INET, &amp;from.sin_addr, from_str, sizeof(from_str)))</a>
+<a name="ln986">      sprintf(from_str, &quot;&lt;from?&gt;&quot;);</a>
+<a name="ln987">    if (!inet_ntop(AF_INET, &amp;to.sin_addr, to_str, sizeof(to_str)))</a>
+<a name="ln988">      sprintf(to_str, &quot;&lt;to?&gt;&quot;);</a>
+<a name="ln989">    </a>
+<a name="ln990">    zlog_debug(&quot;Recv IP IGMP pkt size=%d from %s to %s on fd=%d on ifindex=%d (sock_ifindex=%d)&quot;,</a>
+<a name="ln991">	       len, from_str, to_str, fd, ifindex, igmp-&gt;interface-&gt;ifindex);</a>
+<a name="ln992">  }</a>
+<a name="ln993"> </a>
+<a name="ln994">#ifdef PIM_CHECK_RECV_IFINDEX_SANITY</a>
+<a name="ln995">  /* ifindex sanity check */</a>
+<a name="ln996">  if (ifindex != (int) igmp-&gt;interface-&gt;ifindex) {</a>
+<a name="ln997">    char from_str[100];</a>
+<a name="ln998">    char to_str[100];</a>
+<a name="ln999">    struct interface *ifp;</a>
+<a name="ln1000"> </a>
+<a name="ln1001">    if (!inet_ntop(AF_INET, &amp;from.sin_addr, from_str , sizeof(from_str)))</a>
+<a name="ln1002">      sprintf(from_str, &quot;&lt;from?&gt;&quot;);</a>
+<a name="ln1003">    if (!inet_ntop(AF_INET, &amp;to.sin_addr, to_str , sizeof(to_str)))</a>
+<a name="ln1004">      sprintf(to_str, &quot;&lt;to?&gt;&quot;);</a>
+<a name="ln1005"> </a>
+<a name="ln1006">    ifp = if_lookup_by_index(ifindex);</a>
+<a name="ln1007">    if (ifp) {</a>
+<a name="ln1008">      zassert(ifindex == (int) ifp-&gt;ifindex);</a>
+<a name="ln1009">    }</a>
+<a name="ln1010"> </a>
+<a name="ln1011">#ifdef PIM_REPORT_RECV_IFINDEX_MISMATCH</a>
+<a name="ln1012">    zlog_warn(&quot;Interface mismatch: recv IGMP pkt from %s to %s on fd=%d: recv_ifindex=%d (%s) sock_ifindex=%d (%s)&quot;,</a>
+<a name="ln1013">	      from_str, to_str, fd,</a>
+<a name="ln1014">	      ifindex, ifp ? ifp-&gt;name : &quot;&lt;if-notfound&gt;&quot;,</a>
+<a name="ln1015">	      igmp-&gt;interface-&gt;ifindex, igmp-&gt;interface-&gt;name);</a>
+<a name="ln1016">#endif</a>
+<a name="ln1017">    goto done;</a>
+<a name="ln1018">  }</a>
+<a name="ln1019">#endif</a>
+<a name="ln1020"> </a>
+<a name="ln1021">  if (pim_igmp_packet(igmp, (char *)buf, len)) {</a>
+<a name="ln1022">    goto done;</a>
+<a name="ln1023">  }</a>
+<a name="ln1024"> </a>
+<a name="ln1025">  result = 0; /* good */</a>
+<a name="ln1026"> </a>
+<a name="ln1027"> done:</a>
+<a name="ln1028">  igmp_read_on(igmp);</a>
+<a name="ln1029"> </a>
+<a name="ln1030">  return result;</a>
+<a name="ln1031">}</a>
+<a name="ln1032"> </a>
+<a name="ln1033">static void sock_close(struct igmp_sock *igmp)</a>
+<a name="ln1034">{</a>
+<a name="ln1035">  pim_igmp_other_querier_timer_off(igmp);</a>
+<a name="ln1036">  pim_igmp_general_query_off(igmp);</a>
+<a name="ln1037"> </a>
+<a name="ln1038">  if (PIM_DEBUG_IGMP_TRACE) {</a>
+<a name="ln1039">    if (igmp-&gt;t_igmp_read) {</a>
+<a name="ln1040">      zlog_debug(&quot;Cancelling READ event on IGMP socket %s fd=%d on interface %s&quot;,</a>
+<a name="ln1041">		 inet_ntoa(igmp-&gt;ifaddr), igmp-&gt;fd,</a>
+<a name="ln1042">		 igmp-&gt;interface-&gt;name);</a>
+<a name="ln1043">    }</a>
+<a name="ln1044">  }</a>
+<a name="ln1045">  THREAD_OFF(igmp-&gt;t_igmp_read);</a>
+<a name="ln1046">  zassert(!igmp-&gt;t_igmp_read);</a>
+<a name="ln1047">  </a>
+<a name="ln1048">  if (close(igmp-&gt;fd)) {</a>
+<a name="ln1049">    zlog_err(&quot;Failure closing IGMP socket %s fd=%d on interface %s: errno=%d: %s&quot;,</a>
+<a name="ln1050">	     inet_ntoa(igmp-&gt;ifaddr), igmp-&gt;fd, igmp-&gt;interface-&gt;name,</a>
+<a name="ln1051">	     errno, safe_strerror(errno));</a>
+<a name="ln1052">  }</a>
+<a name="ln1053">  </a>
+<a name="ln1054">  if (PIM_DEBUG_IGMP_TRACE) {</a>
+<a name="ln1055">    zlog_debug(&quot;Deleted IGMP socket %s fd=%d on interface %s&quot;,</a>
+<a name="ln1056">	       inet_ntoa(igmp-&gt;ifaddr), igmp-&gt;fd, igmp-&gt;interface-&gt;name);</a>
+<a name="ln1057">  }</a>
+<a name="ln1058">}</a>
+<a name="ln1059"> </a>
+<a name="ln1060">void igmp_startup_mode_on(struct igmp_sock *igmp)</a>
+<a name="ln1061">{</a>
+<a name="ln1062">  struct pim_interface *pim_ifp;</a>
+<a name="ln1063"> </a>
+<a name="ln1064">  pim_ifp = igmp-&gt;interface-&gt;info;</a>
+<a name="ln1065"> </a>
+<a name="ln1066">  /*</a>
+<a name="ln1067">    RFC 3376: 8.7. Startup Query Count</a>
+<a name="ln1068"> </a>
+<a name="ln1069">    The Startup Query Count is the number of Queries sent out on</a>
+<a name="ln1070">    startup, separated by the Startup Query Interval.  Default: the</a>
+<a name="ln1071">    Robustness Variable.</a>
+<a name="ln1072">  */</a>
+<a name="ln1073">  igmp-&gt;startup_query_count = igmp-&gt;querier_robustness_variable;</a>
+<a name="ln1074"> </a>
+<a name="ln1075">  /*</a>
+<a name="ln1076">    Since we're (re)starting, reset QQI to default Query Interval</a>
+<a name="ln1077">  */</a>
+<a name="ln1078">  igmp-&gt;querier_query_interval = pim_ifp-&gt;igmp_default_query_interval;</a>
+<a name="ln1079">}</a>
+<a name="ln1080"> </a>
+<a name="ln1081">static void igmp_group_free(struct igmp_group *group)</a>
+<a name="ln1082">{</a>
+<a name="ln1083">  zassert(!group-&gt;t_group_query_retransmit_timer);</a>
+<a name="ln1084">  zassert(!group-&gt;t_group_timer);</a>
+<a name="ln1085">  zassert(group-&gt;group_source_list);</a>
+<a name="ln1086">  zassert(!listcount(group-&gt;group_source_list));</a>
+<a name="ln1087"> </a>
+<a name="ln1088">  list_free(group-&gt;group_source_list);</a>
+<a name="ln1089"> </a>
+<a name="ln1090">  XFREE(MTYPE_PIM_IGMP_GROUP, group);</a>
+<a name="ln1091">}</a>
+<a name="ln1092"> </a>
+<a name="ln1093">static void igmp_group_delete(struct igmp_group *group)</a>
+<a name="ln1094">{</a>
+<a name="ln1095">  struct listnode *src_node;</a>
+<a name="ln1096">  struct listnode *src_nextnode;</a>
+<a name="ln1097">  struct igmp_source *src;</a>
+<a name="ln1098"> </a>
+<a name="ln1099">  if (PIM_DEBUG_IGMP_TRACE) {</a>
+<a name="ln1100">    char group_str[100];</a>
+<a name="ln1101">    pim_inet4_dump(&quot;&lt;group?&gt;&quot;, group-&gt;group_addr, group_str, sizeof(group_str));</a>
+<a name="ln1102">    zlog_debug(&quot;Deleting IGMP group %s from socket %d interface %s&quot;,</a>
+<a name="ln1103">	       group_str,</a>
+<a name="ln1104">	       group-&gt;group_igmp_sock-&gt;fd,</a>
+<a name="ln1105">	       group-&gt;group_igmp_sock-&gt;interface-&gt;name);</a>
+<a name="ln1106">  }</a>
+<a name="ln1107"> </a>
+<a name="ln1108">  for (ALL_LIST_ELEMENTS(group-&gt;group_source_list, src_node, src_nextnode, src)) {</a>
+<a name="ln1109">    igmp_source_delete(src);</a>
+<a name="ln1110">  }</a>
+<a name="ln1111"> </a>
+<a name="ln1112">  if (group-&gt;t_group_query_retransmit_timer) {</a>
+<a name="ln1113">    THREAD_OFF(group-&gt;t_group_query_retransmit_timer);</a>
+<a name="ln1114">    zassert(!group-&gt;t_group_query_retransmit_timer);</a>
+<a name="ln1115">  }</a>
+<a name="ln1116"> </a>
+<a name="ln1117">  group_timer_off(group);</a>
+<a name="ln1118">  listnode_delete(group-&gt;group_igmp_sock-&gt;igmp_group_list, group);</a>
+<a name="ln1119">  igmp_group_free(group);</a>
+<a name="ln1120">}</a>
+<a name="ln1121"> </a>
+<a name="ln1122">void igmp_group_delete_empty_include(struct igmp_group *group)</a>
+<a name="ln1123">{</a>
+<a name="ln1124">  zassert(!group-&gt;group_filtermode_isexcl);</a>
+<a name="ln1125">  zassert(!listcount(group-&gt;group_source_list));</a>
+<a name="ln1126"> </a>
+<a name="ln1127">  igmp_group_delete(group);</a>
+<a name="ln1128">}</a>
+<a name="ln1129"> </a>
+<a name="ln1130">void igmp_sock_free(struct igmp_sock *igmp)</a>
+<a name="ln1131">{</a>
+<a name="ln1132">  zassert(!igmp-&gt;t_igmp_read);</a>
+<a name="ln1133">  zassert(!igmp-&gt;t_igmp_query_timer);</a>
+<a name="ln1134">  zassert(!igmp-&gt;t_other_querier_timer);</a>
+<a name="ln1135">  zassert(igmp-&gt;igmp_group_list);</a>
+<a name="ln1136">  zassert(!listcount(igmp-&gt;igmp_group_list));</a>
+<a name="ln1137"> </a>
+<a name="ln1138">  list_free(igmp-&gt;igmp_group_list);</a>
+<a name="ln1139"> </a>
+<a name="ln1140">  XFREE(MTYPE_PIM_IGMP_SOCKET, igmp);</a>
+<a name="ln1141">}</a>
+<a name="ln1142"> </a>
+<a name="ln1143">void igmp_sock_delete(struct igmp_sock *igmp)</a>
+<a name="ln1144">{</a>
+<a name="ln1145">  struct pim_interface *pim_ifp;</a>
+<a name="ln1146">  struct listnode      *grp_node;</a>
+<a name="ln1147">  struct listnode      *grp_nextnode;</a>
+<a name="ln1148">  struct igmp_group    *grp;</a>
+<a name="ln1149"> </a>
+<a name="ln1150">  for (ALL_LIST_ELEMENTS(igmp-&gt;igmp_group_list, grp_node, grp_nextnode, grp)) {</a>
+<a name="ln1151">    igmp_group_delete(grp);</a>
+<a name="ln1152">  }</a>
+<a name="ln1153"> </a>
+<a name="ln1154">  sock_close(igmp);</a>
+<a name="ln1155"> </a>
+<a name="ln1156">  pim_ifp = igmp-&gt;interface-&gt;info;</a>
+<a name="ln1157"> </a>
+<a name="ln1158">  listnode_delete(pim_ifp-&gt;igmp_socket_list, igmp);</a>
+<a name="ln1159"> </a>
+<a name="ln1160">  igmp_sock_free(igmp);</a>
+<a name="ln1161">}</a>
+<a name="ln1162"> </a>
+<a name="ln1163">static struct igmp_sock *igmp_sock_new(int fd,</a>
+<a name="ln1164">				       struct in_addr ifaddr,</a>
+<a name="ln1165">				       struct interface *ifp)</a>
+<a name="ln1166">{</a>
+<a name="ln1167">  struct pim_interface *pim_ifp;</a>
+<a name="ln1168">  struct igmp_sock *igmp;</a>
+<a name="ln1169"> </a>
+<a name="ln1170">  pim_ifp = ifp-&gt;info;</a>
+<a name="ln1171"> </a>
+<a name="ln1172">  if (PIM_DEBUG_IGMP_TRACE) {</a>
+<a name="ln1173">    zlog_debug(&quot;Creating IGMP socket fd=%d for address %s on interface %s&quot;,</a>
+<a name="ln1174">	       fd, inet_ntoa(ifaddr), ifp-&gt;name);</a>
+<a name="ln1175">  }</a>
+<a name="ln1176"> </a>
+<a name="ln1177">  igmp = XMALLOC(MTYPE_PIM_IGMP_SOCKET, sizeof(*igmp));</a>
+<a name="ln1178">  if (!igmp) {</a>
+<a name="ln1179">    zlog_warn(&quot;%s %s: XMALLOC() failure&quot;,</a>
+<a name="ln1180">              __FILE__, __PRETTY_FUNCTION__);</a>
+<a name="ln1181">    return 0;</a>
+<a name="ln1182">  }</a>
+<a name="ln1183"> </a>
+<a name="ln1184">  igmp-&gt;igmp_group_list = list_new();</a>
+<a name="ln1185">  if (!igmp-&gt;igmp_group_list) {</a>
+<a name="ln1186">    zlog_err(&quot;%s %s: failure: igmp_group_list = list_new()&quot;,</a>
+<a name="ln1187">	     __FILE__, __PRETTY_FUNCTION__);</a>
+<a name="ln1188">    return 0;</a>
+<a name="ln1189">  }</a>
+<a name="ln1190">  igmp-&gt;igmp_group_list-&gt;del = (void (*)(void *)) igmp_group_free;</a>
+<a name="ln1191"> </a>
+<a name="ln1192">  igmp-&gt;fd                          = fd;</a>
+<a name="ln1193">  igmp-&gt;interface                   = ifp;</a>
+<a name="ln1194">  igmp-&gt;ifaddr                      = ifaddr;</a>
+<a name="ln1195">  igmp-&gt;t_igmp_read                 = 0;</a>
+<a name="ln1196">  igmp-&gt;t_igmp_query_timer          = 0;</a>
+<a name="ln1197">  igmp-&gt;t_other_querier_timer       = 0; /* no other querier present */</a>
+<a name="ln1198">  igmp-&gt;querier_robustness_variable = pim_ifp-&gt;igmp_default_robustness_variable;</a>
+<a name="ln1199">  igmp-&gt;sock_creation               = pim_time_monotonic_sec();</a>
+<a name="ln1200"> </a>
+<a name="ln1201">  /*</a>
+<a name="ln1202">    igmp_startup_mode_on() will reset QQI:</a>
+<a name="ln1203"> </a>
+<a name="ln1204">    igmp-&gt;querier_query_interval = pim_ifp-&gt;igmp_default_query_interval;</a>
+<a name="ln1205">  */</a>
+<a name="ln1206">  igmp_startup_mode_on(igmp);</a>
+<a name="ln1207"> </a>
+<a name="ln1208">  igmp_read_on(igmp);</a>
+<a name="ln1209">  pim_igmp_general_query_on(igmp);</a>
+<a name="ln1210"> </a>
+<a name="ln1211">  return igmp;</a>
+<a name="ln1212">}</a>
+<a name="ln1213"> </a>
+<a name="ln1214">struct igmp_sock *pim_igmp_sock_add(struct list *igmp_sock_list,</a>
+<a name="ln1215">				    struct in_addr ifaddr,</a>
+<a name="ln1216">				    struct interface *ifp)</a>
+<a name="ln1217">{</a>
+<a name="ln1218">  struct pim_interface *pim_ifp;</a>
+<a name="ln1219">  struct igmp_sock *igmp;</a>
+<a name="ln1220">  int fd;</a>
+<a name="ln1221"> </a>
+<a name="ln1222">  pim_ifp = ifp-&gt;info;</a>
+<a name="ln1223"> </a>
+<a name="ln1224">  fd = igmp_sock_open(ifaddr, ifp-&gt;ifindex, pim_ifp-&gt;options);</a>
+<a name="ln1225">  if (fd &lt; 0) {</a>
+<a name="ln1226">    zlog_warn(&quot;Could not open IGMP socket for %s on %s&quot;,</a>
+<a name="ln1227">	      inet_ntoa(ifaddr), ifp-&gt;name);</a>
+<a name="ln1228">    return 0;</a>
+<a name="ln1229">  }</a>
+<a name="ln1230"> </a>
+<a name="ln1231">  igmp = igmp_sock_new(fd, ifaddr, ifp);</a>
+<a name="ln1232">  if (!igmp) {</a>
+<a name="ln1233">    zlog_err(&quot;%s %s: igmp_sock_new() failure&quot;,</a>
+<a name="ln1234">	     __FILE__, __PRETTY_FUNCTION__);</a>
+<a name="ln1235">    close(fd);</a>
+<a name="ln1236">    return 0;</a>
+<a name="ln1237">  }</a>
+<a name="ln1238"> </a>
+<a name="ln1239">  listnode_add(igmp_sock_list, igmp);</a>
+<a name="ln1240"> </a>
+<a name="ln1241">#ifdef IGMP_SOCK_DUMP</a>
+<a name="ln1242">  igmp_sock_dump(igmp_sock_array);</a>
+<a name="ln1243">#endif</a>
+<a name="ln1244"> </a>
+<a name="ln1245">  return igmp;</a>
+<a name="ln1246">}</a>
+<a name="ln1247"> </a>
+<a name="ln1248">/*</a>
+<a name="ln1249">  RFC 3376: 6.5. Switching Router Filter-Modes</a>
+<a name="ln1250"> </a>
+<a name="ln1251">  When a router's filter-mode for a group is EXCLUDE and the group</a>
+<a name="ln1252">  timer expires, the router filter-mode for the group transitions to</a>
+<a name="ln1253">  INCLUDE.</a>
+<a name="ln1254"> </a>
+<a name="ln1255">  A router uses source records with running source timers as its state</a>
+<a name="ln1256">  for the switch to a filter-mode of INCLUDE.  If there are any source</a>
+<a name="ln1257">  records with source timers greater than zero (i.e., requested to be</a>
+<a name="ln1258">  forwarded), a router switches to filter-mode of INCLUDE using those</a>
+<a name="ln1259">  source records.  Source records whose timers are zero (from the</a>
+<a name="ln1260">  previous EXCLUDE mode) are deleted.</a>
+<a name="ln1261"> */</a>
+<a name="ln1262">static int igmp_group_timer(struct thread *t)</a>
+<a name="ln1263">{</a>
+<a name="ln1264">  struct igmp_group *group;</a>
+<a name="ln1265"> </a>
+<a name="ln1266">  zassert(t);</a>
+<a name="ln1267">  group = THREAD_ARG(t);</a>
+<a name="ln1268">  zassert(group);</a>
+<a name="ln1269"> </a>
+<a name="ln1270">  if (PIM_DEBUG_IGMP_TRACE) {</a>
+<a name="ln1271">    char group_str[100];</a>
+<a name="ln1272">    pim_inet4_dump(&quot;&lt;group?&gt;&quot;, group-&gt;group_addr, group_str, sizeof(group_str));</a>
+<a name="ln1273">    zlog_debug(&quot;%s: Timer for group %s on interface %s&quot;,</a>
+<a name="ln1274">	       __PRETTY_FUNCTION__,</a>
+<a name="ln1275">	       group_str, group-&gt;group_igmp_sock-&gt;interface-&gt;name);</a>
+<a name="ln1276">  }</a>
+<a name="ln1277"> </a>
+<a name="ln1278">  zassert(group-&gt;group_filtermode_isexcl);</a>
+<a name="ln1279"> </a>
+<a name="ln1280">  group-&gt;t_group_timer = 0;</a>
+<a name="ln1281">  group-&gt;group_filtermode_isexcl = 0;</a>
+<a name="ln1282"> </a>
+<a name="ln1283">  /* Any source (*,G) is forwarded only if mode is EXCLUDE {empty} */</a>
+<a name="ln1284">  igmp_anysource_forward_stop(group);</a>
+<a name="ln1285"> </a>
+<a name="ln1286">  igmp_source_delete_expired(group-&gt;group_source_list);</a>
+<a name="ln1287"> </a>
+<a name="ln1288">  zassert(!group-&gt;t_group_timer);</a>
+<a name="ln1289">  zassert(!group-&gt;group_filtermode_isexcl);</a>
+<a name="ln1290"> </a>
+<a name="ln1291">  /*</a>
+<a name="ln1292">    RFC 3376: 6.2.2. Definition of Group Timers</a>
+<a name="ln1293"> </a>
+<a name="ln1294">    If there are no more source records for the group, delete group</a>
+<a name="ln1295">    record.</a>
+<a name="ln1296">  */</a>
+<a name="ln1297">  if (listcount(group-&gt;group_source_list) &lt; 1) {</a>
+<a name="ln1298">    igmp_group_delete_empty_include(group);</a>
+<a name="ln1299">  }</a>
+<a name="ln1300"> </a>
+<a name="ln1301">  return 0;</a>
+<a name="ln1302">}</a>
+<a name="ln1303"> </a>
+<a name="ln1304">static void group_timer_off(struct igmp_group *group)</a>
+<a name="ln1305">{</a>
+<a name="ln1306">  if (!group-&gt;t_group_timer)</a>
+<a name="ln1307">    return;</a>
+<a name="ln1308"> </a>
+<a name="ln1309">  if (PIM_DEBUG_IGMP_TRACE) {</a>
+<a name="ln1310">    char group_str[100];</a>
+<a name="ln1311">    pim_inet4_dump(&quot;&lt;group?&gt;&quot;, group-&gt;group_addr, group_str, sizeof(group_str));</a>
+<a name="ln1312">    zlog_debug(&quot;Cancelling TIMER event for group %s on %s&quot;,</a>
+<a name="ln1313">	       group_str, group-&gt;group_igmp_sock-&gt;interface-&gt;name);</a>
+<a name="ln1314">  }</a>
+<a name="ln1315">    </a>
+<a name="ln1316">  THREAD_OFF(group-&gt;t_group_timer);</a>
+<a name="ln1317">  zassert(!group-&gt;t_group_timer);</a>
+<a name="ln1318">}</a>
+<a name="ln1319"> </a>
+<a name="ln1320">void igmp_group_timer_on(struct igmp_group *group,</a>
+<a name="ln1321">			 long interval_msec, const char *ifname)</a>
+<a name="ln1322">{</a>
+<a name="ln1323">  group_timer_off(group);</a>
+<a name="ln1324"> </a>
+<a name="ln1325">  if (PIM_DEBUG_IGMP_EVENTS) {</a>
+<a name="ln1326">    char group_str[100];</a>
+<a name="ln1327">    pim_inet4_dump(&quot;&lt;group?&gt;&quot;, group-&gt;group_addr, group_str, sizeof(group_str));</a>
+<a name="ln1328">    zlog_debug(&quot;Scheduling %ld.%03ld sec TIMER event for group %s on %s&quot;,</a>
+<a name="ln1329">	       interval_msec / 1000,</a>
+<a name="ln1330">	       interval_msec % 1000,</a>
+<a name="ln1331">	       group_str, ifname);</a>
+<a name="ln1332">  }</a>
+<a name="ln1333"> </a>
+<a name="ln1334">  /*</a>
+<a name="ln1335">    RFC 3376: 6.2.2. Definition of Group Timers</a>
+<a name="ln1336"> </a>
+<a name="ln1337">    The group timer is only used when a group is in EXCLUDE mode and</a>
+<a name="ln1338">    it represents the time for the *filter-mode* of the group to</a>
+<a name="ln1339">    expire and switch to INCLUDE mode.</a>
+<a name="ln1340">  */</a>
+<a name="ln1341">  zassert(group-&gt;group_filtermode_isexcl);</a>
+<a name="ln1342"> </a>
+<a name="ln1343">  THREAD_TIMER_MSEC_ON(master, group-&gt;t_group_timer,</a>
+<a name="ln1344">		       igmp_group_timer,</a>
+<a name="ln1345">		       group, interval_msec);</a>
+<a name="ln1346">}</a>
+<a name="ln1347"> </a>
+<a name="ln1348">static struct igmp_group *find_group_by_addr(struct igmp_sock *igmp,</a>
+<a name="ln1349">					     struct in_addr group_addr)</a>
+<a name="ln1350">{</a>
+<a name="ln1351">  struct igmp_group *group;</a>
+<a name="ln1352">  struct listnode   *node;</a>
+<a name="ln1353"> </a>
+<a name="ln1354">  for (ALL_LIST_ELEMENTS_RO(igmp-&gt;igmp_group_list, node, group))</a>
+<a name="ln1355">    if (group_addr.s_addr == group-&gt;group_addr.s_addr)</a>
+<a name="ln1356">      return group;</a>
+<a name="ln1357"> </a>
+<a name="ln1358">  return 0;</a>
+<a name="ln1359">}</a>
+<a name="ln1360"> </a>
+<a name="ln1361">struct igmp_group *igmp_add_group_by_addr(struct igmp_sock *igmp,</a>
+<a name="ln1362">					  struct in_addr group_addr)</a>
+<a name="ln1363">{</a>
+<a name="ln1364">  struct igmp_group *group;</a>
+<a name="ln1365"> </a>
+<a name="ln1366">  group = find_group_by_addr(igmp, group_addr);</a>
+<a name="ln1367">  if (group) {</a>
+<a name="ln1368">    return group;</a>
+<a name="ln1369">  }</a>
+<a name="ln1370"> </a>
+<a name="ln1371">  /*</a>
+<a name="ln1372">    Non-existant group is created as INCLUDE {empty}:</a>
+<a name="ln1373"> </a>
+<a name="ln1374">    RFC 3376 - 5.1. Action on Change of Interface State</a>
+<a name="ln1375"> </a>
+<a name="ln1376">    If no interface state existed for that multicast address before</a>
+<a name="ln1377">    the change (i.e., the change consisted of creating a new</a>
+<a name="ln1378">    per-interface record), or if no state exists after the change</a>
+<a name="ln1379">    (i.e., the change consisted of deleting a per-interface record),</a>
+<a name="ln1380">    then the &quot;non-existent&quot; state is considered to have a filter mode</a>
+<a name="ln1381">    of INCLUDE and an empty source list.</a>
+<a name="ln1382">  */</a>
+<a name="ln1383"> </a>
+<a name="ln1384">  group = XMALLOC(MTYPE_PIM_IGMP_GROUP, sizeof(*group));</a>
+<a name="ln1385">  if (!group) {</a>
+<a name="ln1386">    zlog_warn(&quot;%s %s: XMALLOC() failure&quot;,</a>
+<a name="ln1387">	      __FILE__, __PRETTY_FUNCTION__);</a>
+<a name="ln1388">    return 0; /* error, not found, could not create */</a>
+<a name="ln1389">  }</a>
+<a name="ln1390"> </a>
+<a name="ln1391">  group-&gt;group_source_list = list_new();</a>
+<a name="ln1392">  if (!group-&gt;group_source_list) {</a>
+<a name="ln1393">    zlog_warn(&quot;%s %s: list_new() failure&quot;,</a>
+<a name="ln1394">	      __FILE__, __PRETTY_FUNCTION__);</a>
+<a name="ln1395">    XFREE(MTYPE_PIM_IGMP_GROUP, group); /* discard group */</a>
+<a name="ln1396">    return 0; /* error, not found, could not initialize */</a>
+<a name="ln1397">  }</a>
+<a name="ln1398">  group-&gt;group_source_list-&gt;del = (void (*)(void *)) igmp_source_free;</a>
+<a name="ln1399"> </a>
+<a name="ln1400">  group-&gt;t_group_timer                         = NULL;</a>
+<a name="ln1401">  group-&gt;t_group_query_retransmit_timer        = NULL;</a>
+<a name="ln1402">  group-&gt;group_specific_query_retransmit_count = 0;</a>
+<a name="ln1403">  group-&gt;group_addr                            = group_addr;</a>
+<a name="ln1404">  group-&gt;group_igmp_sock                       = igmp;</a>
+<a name="ln1405">  group-&gt;last_igmp_v1_report_dsec              = -1;</a>
+<a name="ln1406">  group-&gt;last_igmp_v2_report_dsec              = -1;</a>
+<a name="ln1407">  group-&gt;group_creation                        = pim_time_monotonic_sec();</a>
+<a name="ln1408"> </a>
+<a name="ln1409">  /* initialize new group as INCLUDE {empty} */</a>
+<a name="ln1410">  group-&gt;group_filtermode_isexcl = 0; /* 0=INCLUDE, 1=EXCLUDE */</a>
+<a name="ln1411"> </a>
+<a name="ln1412">  listnode_add(igmp-&gt;igmp_group_list, group);</a>
+<a name="ln1413"> </a>
+<a name="ln1414">  if (PIM_DEBUG_IGMP_TRACE) {</a>
+<a name="ln1415">    char group_str[100];</a>
+<a name="ln1416">    pim_inet4_dump(&quot;&lt;group?&gt;&quot;, group-&gt;group_addr, group_str, sizeof(group_str));</a>
+<a name="ln1417">    zlog_debug(&quot;Creating new IGMP group %s on socket %d interface %s&quot;,</a>
+<a name="ln1418">	       group_str, igmp-&gt;fd, igmp-&gt;interface-&gt;name);</a>
+<a name="ln1419">  }</a>
+<a name="ln1420"> </a>
+<a name="ln1421">  /*</a>
+<a name="ln1422">    RFC 3376: 6.2.2. Definition of Group Timers</a>
+<a name="ln1423"> </a>
+<a name="ln1424">    The group timer is only used when a group is in EXCLUDE mode and</a>
+<a name="ln1425">    it represents the time for the *filter-mode* of the group to</a>
+<a name="ln1426">    expire and switch to INCLUDE mode.</a>
+<a name="ln1427">  */</a>
+<a name="ln1428">  zassert(!group-&gt;group_filtermode_isexcl); /* INCLUDE mode */</a>
+<a name="ln1429">  zassert(!group-&gt;t_group_timer); /* group timer == 0 */</a>
+<a name="ln1430"> </a>
+<a name="ln1431">  /* Any source (*,G) is forwarded only if mode is EXCLUDE {empty} */</a>
+<a name="ln1432">  igmp_anysource_forward_stop(group);</a>
+<a name="ln1433"> </a>
+<a name="ln1434">  return group;</a>
+<a name="ln1435">}</a>
+
+</code></pre>
+<div class="balloon" rel="6"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1042/" target="_blank">V1042</a> This file is marked with copyleft license, which requires you to open the derived source code.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,2923 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>vtysh.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.5.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/* Virtual terminal interface shell.</a>
+<a name="ln2"> * Copyright (C) 2000 Kunihiro Ishiguro</a>
+<a name="ln3"> *</a>
+<a name="ln4"> * This file is part of GNU Zebra.</a>
+<a name="ln5"> *</a>
+<a name="ln6"> * GNU Zebra is free software; you can redistribute it and/or modify it</a>
+<a name="ln7"> * under the terms of the GNU General Public License as published by the</a>
+<a name="ln8"> * Free Software Foundation; either version 2, or (at your option) any</a>
+<a name="ln9"> * later version.</a>
+<a name="ln10"> *</a>
+<a name="ln11"> * GNU Zebra is distributed in the hope that it will be useful, but</a>
+<a name="ln12"> * WITHOUT ANY WARRANTY; without even the implied warranty of</a>
+<a name="ln13"> * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU</a>
+<a name="ln14"> * General Public License for more details.</a>
+<a name="ln15"> *</a>
+<a name="ln16"> * You should have received a copy of the GNU General Public License</a>
+<a name="ln17"> * along with GNU Zebra; see the file COPYING.  If not, write to the Free</a>
+<a name="ln18"> * Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA</a>
+<a name="ln19"> * 02111-1307, USA.  </a>
+<a name="ln20"> */</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &lt;zebra.h&gt;</a>
+<a name="ln23"> </a>
+<a name="ln24">#include &lt;sys/un.h&gt;</a>
+<a name="ln25">#include &lt;setjmp.h&gt;</a>
+<a name="ln26">#include &lt;sys/wait.h&gt;</a>
+<a name="ln27">#include &lt;sys/resource.h&gt;</a>
+<a name="ln28">#include &lt;sys/stat.h&gt;</a>
+<a name="ln29"> </a>
+<a name="ln30">#include &lt;readline/readline.h&gt;</a>
+<a name="ln31">#include &lt;readline/history.h&gt;</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &quot;command.h&quot;</a>
+<a name="ln34">#include &quot;memory.h&quot;</a>
+<a name="ln35">#include &quot;vtysh/vtysh.h&quot;</a>
+<a name="ln36">#include &quot;log.h&quot;</a>
+<a name="ln37">#include &quot;bgpd/bgp_vty.h&quot;</a>
+<a name="ln38">#include &quot;vrf.h&quot;</a>
+<a name="ln39"> </a>
+<a name="ln40">/* Struct VTY. */</a>
+<a name="ln41">struct vty *vty;</a>
+<a name="ln42"> </a>
+<a name="ln43">/* VTY shell pager name. */</a>
+<a name="ln44">char *vtysh_pager_name = NULL;</a>
+<a name="ln45"> </a>
+<a name="ln46">/* VTY shell client structure. */</a>
+<a name="ln47">struct vtysh_client</a>
+<a name="ln48">{</a>
+<a name="ln49">  int fd;</a>
+<a name="ln50">  const char *name;</a>
+<a name="ln51">  int flag;</a>
+<a name="ln52">  const char *path;</a>
+<a name="ln53">} vtysh_client[] =</a>
+<a name="ln54">{</a>
+<a name="ln55">  { .fd = -1, .name = &quot;zebra&quot;, .flag = VTYSH_ZEBRA, .path = ZEBRA_VTYSH_PATH},</a>
+<a name="ln56">  { .fd = -1, .name = &quot;ripd&quot;, .flag = VTYSH_RIPD, .path = RIP_VTYSH_PATH},</a>
+<a name="ln57">  { .fd = -1, .name = &quot;ripngd&quot;, .flag = VTYSH_RIPNGD, .path = RIPNG_VTYSH_PATH},</a>
+<a name="ln58">  { .fd = -1, .name = &quot;ospfd&quot;, .flag = VTYSH_OSPFD, .path = OSPF_VTYSH_PATH},</a>
+<a name="ln59">  { .fd = -1, .name = &quot;ospf6d&quot;, .flag = VTYSH_OSPF6D, .path = OSPF6_VTYSH_PATH},</a>
+<a name="ln60">  { .fd = -1, .name = &quot;bgpd&quot;, .flag = VTYSH_BGPD, .path = BGP_VTYSH_PATH},</a>
+<a name="ln61">  { .fd = -1, .name = &quot;isisd&quot;, .flag = VTYSH_ISISD, .path = ISIS_VTYSH_PATH},</a>
+<a name="ln62">  { .fd = -1, .name = &quot;pimd&quot;, .flag = VTYSH_PIMD, .path = PIM_VTYSH_PATH},</a>
+<a name="ln63">  { .fd = -1, .name = &quot;nhrpd&quot;, .flag = VTYSH_NHRPD, .path = NHRP_VTYSH_PATH},</a>
+<a name="ln64">};</a>
+<a name="ln65"> </a>
+<a name="ln66"> </a>
+<a name="ln67">/* We need direct access to ripd to implement vtysh_exit_ripd_only. */</a>
+<a name="ln68">static struct vtysh_client *ripd_client = NULL;</a>
+<a name="ln69"> </a>
+<a name="ln70"> </a>
+<a name="ln71">/* Using integrated config from Quagga.conf. Default is no. */</a>
+<a name="ln72">int vtysh_writeconfig_integrated = 0;</a>
+<a name="ln73"> </a>
+<a name="ln74">extern char config_default[];</a>
+<a name="ln75"> </a>
+<a name="ln76">static void</a>
+<a name="ln77">vclient_close (struct vtysh_client *vclient)</a>
+<a name="ln78">{</a>
+<a name="ln79">  if (vclient-&gt;fd &gt;= 0)</a>
+<a name="ln80">    {</a>
+<a name="ln81">      fprintf(stderr,</a>
+<a name="ln82">	      &quot;Warning: closing connection to %s because of an I/O error!\n&quot;,</a>
+<a name="ln83">	      vclient-&gt;name);</a>
+<a name="ln84">      close (vclient-&gt;fd);</a>
+<a name="ln85">      vclient-&gt;fd = -1;</a>
+<a name="ln86">    }</a>
+<a name="ln87">}</a>
+<a name="ln88"> </a>
+<a name="ln89">/* Return true if str begins with prefix, else return false */</a>
+<a name="ln90">static int</a>
+<a name="ln91">begins_with(const char *str, const char *prefix)</a>
+<a name="ln92">{</a>
+<a name="ln93">  if (!str || !prefix)</a>
+<a name="ln94">    return 0;</a>
+<a name="ln95">  size_t lenstr = strlen(str);</a>
+<a name="ln96">  size_t lenprefix = strlen(prefix);</a>
+<a name="ln97">  if (lenprefix &gt;  lenstr)</a>
+<a name="ln98">    return 0;</a>
+<a name="ln99">  return strncmp(str, prefix, lenprefix) == 0;</a>
+<a name="ln100">}</a>
+<a name="ln101"> </a>
+<a name="ln102">/* Following filled with debug code to trace a problematic condition</a>
+<a name="ln103"> * under load - it SHOULD handle it. */</a>
+<a name="ln104">#define ERR_WHERE_STRING &quot;vtysh(): vtysh_client_execute(): &quot;</a>
+<a name="ln105">static int</a>
+<a name="ln106">vtysh_client_execute (struct vtysh_client *vclient, const char *line, FILE *fp)</a>
+<a name="ln107">{</a>
+<a name="ln108">  int ret;</a>
+<a name="ln109">  char *buf;</a>
+<a name="ln110">  size_t bufsz;</a>
+<a name="ln111">  char *pbuf;</a>
+<a name="ln112">  size_t left;</a>
+<a name="ln113">  char *eoln;</a>
+<a name="ln114">  int nbytes;</a>
+<a name="ln115">  int i;</a>
+<a name="ln116">  int readln;</a>
+<a name="ln117">  int numnulls = 0;</a>
+<a name="ln118"> </a>
+<a name="ln119">  if (vclient-&gt;fd &lt; 0)</a>
+<a name="ln120">    return CMD_SUCCESS;</a>
+<a name="ln121"> </a>
+<a name="ln122">  ret = write (vclient-&gt;fd, line, strlen (line) + 1);</a>
+<a name="ln123">  if (ret &lt;= 0)</a>
+<a name="ln124">    {</a>
+<a name="ln125">      vclient_close (vclient);</a>
+<a name="ln126">      return CMD_SUCCESS;</a>
+<a name="ln127">    }</a>
+<a name="ln128">	</a>
+<a name="ln129">  /* Allow enough room for buffer to read more than a few pages from socket. */</a>
+<a name="ln130">  bufsz = 5 * getpagesize() + 1;</a>
+<a name="ln131">  buf = XMALLOC(MTYPE_TMP, bufsz);</a>
+<a name="ln132">  memset(buf, 0, bufsz);</a>
+<a name="ln133">  pbuf = buf;</a>
+<a name="ln134"> </a>
+<a name="ln135">  while (1)</a>
+<a name="ln136">    {</a>
+<a name="ln137">      if (pbuf &gt;= ((buf + bufsz) -1))</a>
+<a name="ln138">	{</a>
+<a name="ln139">	  fprintf (stderr, ERR_WHERE_STRING \</a>
+<a name="ln140">		   &quot;warning - pbuf beyond buffer end.\n&quot;);</a>
+<a name="ln141">	  XFREE(MTYPE_TMP, buf);</a>
+<a name="ln142">	  return CMD_WARNING;</a>
+<a name="ln143">	}</a>
+<a name="ln144"> </a>
+<a name="ln145">      readln = (buf + bufsz) - pbuf - 1;</a>
+<a name="ln146">      nbytes = read (vclient-&gt;fd, pbuf, readln);</a>
+<a name="ln147"> </a>
+<a name="ln148">      if (nbytes &lt;= 0)</a>
+<a name="ln149">	{</a>
+<a name="ln150"> </a>
+<a name="ln151">	  if (errno == EINTR)</a>
+<a name="ln152">	    continue;</a>
+<a name="ln153"> </a>
+<a name="ln154">	  fprintf(stderr, ERR_WHERE_STRING &quot;(%u)&quot;, errno);</a>
+<a name="ln155">	  perror(&quot;&quot;);</a>
+<a name="ln156"> </a>
+<a name="ln157">	  if (errno == EAGAIN || errno == EIO)</a>
+<a name="ln158">	    continue;</a>
+<a name="ln159"> </a>
+<a name="ln160">	  vclient_close (vclient);</a>
+<a name="ln161">	  XFREE(MTYPE_TMP, buf);</a>
+<a name="ln162">	  return CMD_SUCCESS;</a>
+<a name="ln163">	}</a>
+<a name="ln164">      /* If we have already seen 3 nulls, then current byte is ret code */</a>
+<a name="ln165">      if ((numnulls == 3) &amp;&amp; (nbytes == 1))</a>
+<a name="ln166">        {</a>
+<a name="ln167">           ret = pbuf[0];</a>
+<a name="ln168">           break;</a>
+<a name="ln169">        }</a>
+<a name="ln170"> </a>
+<a name="ln171">      pbuf[nbytes] = '\0';</a>
+<a name="ln172"> </a>
+<a name="ln173">       /* If the config needs to be written in file or stdout */</a>
+<a name="ln174">       if (fp)</a>
+<a name="ln175">       {</a>
+<a name="ln176">         fputs(pbuf, fp);</a>
+<a name="ln177">         fflush (fp);</a>
+<a name="ln178">       }</a>
+<a name="ln179"> </a>
+<a name="ln180">       /* At max look last four bytes */</a>
+<a name="ln181">       if (nbytes &gt;= 4)</a>
+<a name="ln182">       {</a>
+<a name="ln183">         i = nbytes - 4;</a>
+<a name="ln184">         numnulls = 0;</a>
+<a name="ln185">       }</a>
+<a name="ln186">       else</a>
+<a name="ln187">         i = 0;</a>
+<a name="ln188"> </a>
+<a name="ln189">       /* Count the numnulls */ </a>
+<a name="ln190">       while (i &lt; nbytes &amp;&amp; numnulls &lt;3)</a>
+<a name="ln191">       {</a>
+<a name="ln192">         if (pbuf[i++] == '\0')</a>
+<a name="ln193">            numnulls++;</a>
+<a name="ln194">         else</a>
+<a name="ln195">            numnulls = 0;</a>
+<a name="ln196">       }</a>
+<a name="ln197">       /* We might have seen 3 consecutive nulls so store the ret code before updating pbuf*/</a>
+<a name="ln198">       ret = pbuf[nbytes-1];</a>
+<a name="ln199">       pbuf += nbytes;</a>
+<a name="ln200"> </a>
+<a name="ln201">       /* See if a line exists in buffer, if so parse and consume it, and</a>
+<a name="ln202">        * reset read position. If 3 nulls has been encountered consume the buffer before </a>
+<a name="ln203">        * next read.</a>
+<a name="ln204">        */</a>
+<a name="ln205">       if (((eoln = strrchr(buf, '\n')) == NULL) &amp;&amp; (numnulls&lt;3))</a>
+<a name="ln206">         continue;</a>
+<a name="ln207"> </a>
+<a name="ln208">       if (eoln &gt;= ((buf + bufsz) - 1))</a>
+<a name="ln209">       {</a>
+<a name="ln210">          fprintf (stderr, ERR_WHERE_STRING \</a>
+<a name="ln211">               &quot;warning - eoln beyond buffer end.\n&quot;);</a>
+<a name="ln212">       }</a>
+<a name="ln213"> </a>
+<a name="ln214">       /* If the config needs parsing, consume it */</a>
+<a name="ln215">       if(!fp)</a>
+<a name="ln216">         vtysh_config_parse(buf);</a>
+<a name="ln217"> </a>
+<a name="ln218">       eoln++;</a>
+<a name="ln219">       left = (size_t)(buf + bufsz - eoln);</a>
+<a name="ln220">       /*</a>
+<a name="ln221">        * This check is required since when a config line split between two consecutive reads, </a>
+<a name="ln222">        * then buf will have first half of config line and current read will bring rest of the </a>
+<a name="ln223">        * line. So in this case eoln will be 1 here, hence calculation of left will be wrong. </a>
+<a name="ln224">        * In this case we don't need to do memmove, because we have already seen 3 nulls.  </a>
+<a name="ln225">        */</a>
+<a name="ln226">       if(left &lt; bufsz)</a>
+<a name="ln227">         memmove(buf, eoln, left);</a>
+<a name="ln228"> </a>
+<a name="ln229">       buf[bufsz-1] = '\0';</a>
+<a name="ln230">       pbuf = buf + strlen(buf);</a>
+<a name="ln231">       /* got 3 or more trailing NULs? */</a>
+<a name="ln232">       if ((numnulls &gt;=3) &amp;&amp; (i &lt; nbytes))</a>
+<a name="ln233">       {</a>
+<a name="ln234">          break;</a>
+<a name="ln235">       }</a>
+<a name="ln236">    }</a>
+<a name="ln237"> </a>
+<a name="ln238">  if(!fp)</a>
+<a name="ln239">    vtysh_config_parse (buf);</a>
+<a name="ln240"> </a>
+<a name="ln241">  XFREE(MTYPE_TMP, buf);</a>
+<a name="ln242">  return ret;</a>
+<a name="ln243">}</a>
+<a name="ln244"> </a>
+<a name="ln245"> </a>
+<a name="ln246">void</a>
+<a name="ln247">vtysh_pager_init (void)</a>
+<a name="ln248">{</a>
+<a name="ln249">  char *pager_defined;</a>
+<a name="ln250"> </a>
+<a name="ln251">  pager_defined = getenv (&quot;VTYSH_PAGER&quot;);</a>
+<a name="ln252"> </a>
+<a name="ln253">  if (pager_defined)</a>
+<a name="ln254">    vtysh_pager_name = strdup (pager_defined);</a>
+<a name="ln255">  else</a>
+<a name="ln256">    vtysh_pager_name = strdup (&quot;more&quot;);</a>
+<a name="ln257">}</a>
+<a name="ln258"> </a>
+<a name="ln259">/* Command execution over the vty interface. */</a>
+<a name="ln260">static int</a>
+<a name="ln261">vtysh_execute_func (const char *line, int pager)</a>
+<a name="ln262">{</a>
+<a name="ln263">  int ret, cmd_stat;</a>
+<a name="ln264">  u_int i;</a>
+<a name="ln265">  vector vline;</a>
+<a name="ln266">  struct cmd_element *cmd;</a>
+<a name="ln267">  FILE *fp = NULL;</a>
+<a name="ln268">  int closepager = 0;</a>
+<a name="ln269">  int tried = 0;</a>
+<a name="ln270">  int saved_ret, saved_node;</a>
+<a name="ln271"> </a>
+<a name="ln272">  /* Split readline string up into the vector. */</a>
+<a name="ln273">  vline = cmd_make_strvec (line);</a>
+<a name="ln274"> </a>
+<a name="ln275">  if (vline == NULL)</a>
+<a name="ln276">    return CMD_SUCCESS;</a>
+<a name="ln277"> </a>
+<a name="ln278">  saved_ret = ret = cmd_execute_command (vline, vty, &amp;cmd, 1);</a>
+<a name="ln279">  saved_node = vty-&gt;node;</a>
+<a name="ln280"> </a>
+<a name="ln281">  /* If command doesn't succeeded in current node, try to walk up in node tree.</a>
+<a name="ln282">   * Changing vty-&gt;node is enough to try it just out without actual walkup in</a>
+<a name="ln283">   * the vtysh. */</a>
+<a name="ln284">  while (ret != CMD_SUCCESS &amp;&amp; ret != CMD_SUCCESS_DAEMON &amp;&amp; ret != CMD_WARNING</a>
+<a name="ln285">	 &amp;&amp; vty-&gt;node &gt; CONFIG_NODE)</a>
+<a name="ln286">    {</a>
+<a name="ln287">      vty-&gt;node = node_parent(vty-&gt;node);</a>
+<a name="ln288">      ret = cmd_execute_command (vline, vty, &amp;cmd, 1);</a>
+<a name="ln289">      tried++;</a>
+<a name="ln290">    }</a>
+<a name="ln291"> </a>
+<a name="ln292">  vty-&gt;node = saved_node;</a>
+<a name="ln293"> </a>
+<a name="ln294">  /* If command succeeded in any other node than current (tried &gt; 0) we have</a>
+<a name="ln295">   * to move into node in the vtysh where it succeeded. */</a>
+<a name="ln296">  if (ret == CMD_SUCCESS || ret == CMD_SUCCESS_DAEMON || ret == CMD_WARNING)</a>
+<a name="ln297">    {</a>
+<a name="ln298">      if ((saved_node == BGP_VPNV4_NODE || saved_node == BGP_VPNV6_NODE</a>
+<a name="ln299">	   || saved_node == BGP_ENCAP_NODE || saved_node == BGP_ENCAPV6_NODE</a>
+<a name="ln300">           || saved_node == BGP_IPV4_NODE</a>
+<a name="ln301">	   || saved_node == BGP_IPV6_NODE || saved_node == BGP_IPV4M_NODE</a>
+<a name="ln302">	   || saved_node == BGP_IPV6M_NODE)</a>
+<a name="ln303">	  &amp;&amp; (tried == 1))</a>
+<a name="ln304">	{</a>
+<a name="ln305">	  vtysh_execute(&quot;exit-address-family&quot;);</a>
+<a name="ln306">	}</a>
+<a name="ln307">      else if ((saved_node == KEYCHAIN_KEY_NODE) &amp;&amp; (tried == 1))</a>
+<a name="ln308">	{</a>
+<a name="ln309">	  vtysh_execute(&quot;exit&quot;);</a>
+<a name="ln310">	}</a>
+<a name="ln311">      else if (tried)</a>
+<a name="ln312">	{</a>
+<a name="ln313">	  vtysh_execute (&quot;end&quot;);</a>
+<a name="ln314">	  vtysh_execute (&quot;configure terminal&quot;);</a>
+<a name="ln315">	}</a>
+<a name="ln316">    }</a>
+<a name="ln317">  /* If command didn't succeed in any node, continue with return value from</a>
+<a name="ln318">   * first try. */</a>
+<a name="ln319">  else if (tried)</a>
+<a name="ln320">    {</a>
+<a name="ln321">      ret = saved_ret;</a>
+<a name="ln322">    }</a>
+<a name="ln323"> </a>
+<a name="ln324">  cmd_free_strvec (vline);</a>
+<a name="ln325"> </a>
+<a name="ln326">  cmd_stat = ret;</a>
+<a name="ln327">  switch (ret)</a>
+<a name="ln328">    {</a>
+<a name="ln329">    case CMD_WARNING:</a>
+<a name="ln330">      if (vty-&gt;type == VTY_FILE)</a>
+<a name="ln331">	fprintf (stdout,&quot;Warning...\n&quot;);</a>
+<a name="ln332">      break;</a>
+<a name="ln333">    case CMD_ERR_AMBIGUOUS:</a>
+<a name="ln334">      fprintf (stdout,&quot;%% Ambiguous command.\n&quot;);</a>
+<a name="ln335">      break;</a>
+<a name="ln336">    case CMD_ERR_NO_MATCH:</a>
+<a name="ln337">      fprintf (stdout,&quot;%% Unknown command.\n&quot;);</a>
+<a name="ln338">      break;</a>
+<a name="ln339">    case CMD_ERR_INCOMPLETE:</a>
+<a name="ln340">      fprintf (stdout,&quot;%% Command incomplete.\n&quot;);</a>
+<a name="ln341">      break;</a>
+<a name="ln342">    case CMD_SUCCESS_DAEMON:</a>
+<a name="ln343">      {</a>
+<a name="ln344">	/* FIXME: Don't open pager for exit commands. popen() causes problems</a>
+<a name="ln345">	 * if exited from vtysh at all. This hack shouldn't cause any problem</a>
+<a name="ln346">	 * but is really ugly. */</a>
+<a name="ln347">	if (pager &amp;&amp; vtysh_pager_name &amp;&amp; (strncmp(line, &quot;exit&quot;, 4) != 0))</a>
+<a name="ln348">	  {</a>
+<a name="ln349">	    fp = popen (vtysh_pager_name, &quot;w&quot;);</a>
+<a name="ln350">	    if (fp == NULL)</a>
+<a name="ln351">	      {</a>
+<a name="ln352">		perror (&quot;popen failed for pager&quot;);</a>
+<a name="ln353">		fp = stdout;</a>
+<a name="ln354">	      }</a>
+<a name="ln355">	    else</a>
+<a name="ln356">	      closepager=1;</a>
+<a name="ln357">	  }</a>
+<a name="ln358">	else</a>
+<a name="ln359">	  fp = stdout;</a>
+<a name="ln360"> </a>
+<a name="ln361">	if (! strcmp(cmd-&gt;string,&quot;configure terminal&quot;))</a>
+<a name="ln362">	  {</a>
+<a name="ln363">	    for (i = 0; i &lt; array_size(vtysh_client); i++)</a>
+<a name="ln364">	      {</a>
+<a name="ln365">	        cmd_stat = vtysh_client_execute(&amp;vtysh_client[i], line, fp);</a>
+<a name="ln366">		if (cmd_stat == CMD_WARNING)</a>
+<a name="ln367">		  break;</a>
+<a name="ln368">	      }</a>
+<a name="ln369"> </a>
+<a name="ln370">	    if (cmd_stat)</a>
+<a name="ln371">	      {</a>
+<a name="ln372">		line = &quot;end&quot;;</a>
+<a name="ln373">		vline = cmd_make_strvec (line);</a>
+<a name="ln374"> </a>
+<a name="ln375">		if (vline == NULL)</a>
+<a name="ln376">		  {</a>
+<a name="ln377">		    if (pager &amp;&amp; vtysh_pager_name &amp;&amp; fp &amp;&amp; closepager)</a>
+<a name="ln378">		      {</a>
+<a name="ln379">			if (pclose (fp) == -1)</a>
+<a name="ln380">			  {</a>
+<a name="ln381">			    perror (&quot;pclose failed for pager&quot;);</a>
+<a name="ln382">			  }</a>
+<a name="ln383">			fp = NULL;</a>
+<a name="ln384">		      }</a>
+<a name="ln385">		    return CMD_SUCCESS;</a>
+<a name="ln386">		  }</a>
+<a name="ln387"> </a>
+<a name="ln388">		ret = cmd_execute_command (vline, vty, &amp;cmd, 1);</a>
+<a name="ln389">		cmd_free_strvec (vline);</a>
+<a name="ln390">		if (ret != CMD_SUCCESS_DAEMON)</a>
+<a name="ln391">		  break;</a>
+<a name="ln392">	      }</a>
+<a name="ln393">	    else</a>
+<a name="ln394">	      if (cmd-&gt;func)</a>
+<a name="ln395">		{</a>
+<a name="ln396">		  (*cmd-&gt;func) (cmd, vty, 0, NULL);</a>
+<a name="ln397">		  break;</a>
+<a name="ln398">		}</a>
+<a name="ln399">	  }</a>
+<a name="ln400"> </a>
+<a name="ln401">	cmd_stat = CMD_SUCCESS;</a>
+<a name="ln402">	for (i = 0; i &lt; array_size(vtysh_client); i++)</a>
+<a name="ln403">	  {</a>
+<a name="ln404">	    if (cmd-&gt;daemon &amp; vtysh_client[i].flag)</a>
+<a name="ln405">	      {</a>
+<a name="ln406">	        cmd_stat = vtysh_client_execute(&amp;vtysh_client[i], line, fp);</a>
+<a name="ln407">		if (cmd_stat != CMD_SUCCESS)</a>
+<a name="ln408">		  break;</a>
+<a name="ln409">	      }</a>
+<a name="ln410">	  }</a>
+<a name="ln411">	if (cmd_stat != CMD_SUCCESS)</a>
+<a name="ln412">	  break;</a>
+<a name="ln413"> </a>
+<a name="ln414">	if (cmd-&gt;func)</a>
+<a name="ln415">	  (*cmd-&gt;func) (cmd, vty, 0, NULL);</a>
+<a name="ln416">      }</a>
+<a name="ln417">    }</a>
+<a name="ln418">  if (pager &amp;&amp; vtysh_pager_name &amp;&amp; fp &amp;&amp; closepager)</a>
+<a name="ln419">    {</a>
+<a name="ln420">      if (pclose (fp) == -1)</a>
+<a name="ln421">	{</a>
+<a name="ln422">	  perror (&quot;pclose failed for pager&quot;);</a>
+<a name="ln423">	}</a>
+<a name="ln424">      fp = NULL;</a>
+<a name="ln425">    }</a>
+<a name="ln426">  return cmd_stat;</a>
+<a name="ln427">}</a>
+<a name="ln428"> </a>
+<a name="ln429">int</a>
+<a name="ln430">vtysh_execute_no_pager (const char *line)</a>
+<a name="ln431">{</a>
+<a name="ln432">  return vtysh_execute_func (line, 0);</a>
+<a name="ln433">}</a>
+<a name="ln434"> </a>
+<a name="ln435">int</a>
+<a name="ln436">vtysh_execute (const char *line)</a>
+<a name="ln437">{</a>
+<a name="ln438">  return vtysh_execute_func (line, 1);</a>
+<a name="ln439">}</a>
+<a name="ln440"> </a>
+<a name="ln441">/* Configration make from file. */</a>
+<a name="ln442">int</a>
+<a name="ln443">vtysh_config_from_file (struct vty *vty, FILE *fp)</a>
+<a name="ln444">{</a>
+<a name="ln445">  int ret;</a>
+<a name="ln446">  struct cmd_element *cmd;</a>
+<a name="ln447"> </a>
+<a name="ln448">  while (fgets (vty-&gt;buf, vty-&gt;max, fp))</a>
+<a name="ln449">    {</a>
+<a name="ln450">      ret = command_config_read_one_line (vty, &amp;cmd, 1);</a>
+<a name="ln451"> </a>
+<a name="ln452">      switch (ret)</a>
+<a name="ln453">	{</a>
+<a name="ln454">	case CMD_WARNING:</a>
+<a name="ln455">	  if (vty-&gt;type == VTY_FILE)</a>
+<a name="ln456">	    fprintf (stdout,&quot;Warning...\n&quot;);</a>
+<a name="ln457">	  break;</a>
+<a name="ln458">	case CMD_ERR_AMBIGUOUS:</a>
+<a name="ln459">	  fprintf (stdout,&quot;%% Ambiguous command.\n&quot;);</a>
+<a name="ln460">	  break;</a>
+<a name="ln461">	case CMD_ERR_NO_MATCH:</a>
+<a name="ln462">	  fprintf (stdout,&quot;%% Unknown command: %s&quot;, vty-&gt;buf);</a>
+<a name="ln463">	  break;</a>
+<a name="ln464">	case CMD_ERR_INCOMPLETE:</a>
+<a name="ln465">	  fprintf (stdout,&quot;%% Command incomplete.\n&quot;);</a>
+<a name="ln466">	  break;</a>
+<a name="ln467">	case CMD_SUCCESS_DAEMON:</a>
+<a name="ln468">	  {</a>
+<a name="ln469">	    u_int i;</a>
+<a name="ln470">	    int cmd_stat = CMD_SUCCESS;</a>
+<a name="ln471"> </a>
+<a name="ln472">	    for (i = 0; i &lt; array_size(vtysh_client); i++)</a>
+<a name="ln473">	      {</a>
+<a name="ln474">	        if (cmd-&gt;daemon &amp; vtysh_client[i].flag)</a>
+<a name="ln475">		  {</a>
+<a name="ln476">		    cmd_stat = vtysh_client_execute (&amp;vtysh_client[i],</a>
+<a name="ln477">						     vty-&gt;buf, stdout);</a>
+<a name="ln478">		    if (cmd_stat != CMD_SUCCESS)</a>
+<a name="ln479">		      break;</a>
+<a name="ln480">		  }</a>
+<a name="ln481">	      }</a>
+<a name="ln482">	    if (cmd_stat != CMD_SUCCESS)</a>
+<a name="ln483">	      break;</a>
+<a name="ln484"> </a>
+<a name="ln485">	    if (cmd-&gt;func)</a>
+<a name="ln486">	      (*cmd-&gt;func) (cmd, vty, 0, NULL);</a>
+<a name="ln487">	  }</a>
+<a name="ln488">	}</a>
+<a name="ln489">    }</a>
+<a name="ln490">  return CMD_SUCCESS;</a>
+<a name="ln491">}</a>
+<a name="ln492"> </a>
+<a name="ln493">/* We don't care about the point of the cursor when '?' is typed. */</a>
+<a name="ln494">static int</a>
+<a name="ln495">vtysh_rl_describe (void)</a>
+<a name="ln496">{</a>
+<a name="ln497">  int ret;</a>
+<a name="ln498">  unsigned int i;</a>
+<a name="ln499">  vector vline;</a>
+<a name="ln500">  vector describe;</a>
+<a name="ln501">  int width;</a>
+<a name="ln502">  struct cmd_token *token;</a>
+<a name="ln503"> </a>
+<a name="ln504">  vline = cmd_make_strvec (rl_line_buffer);</a>
+<a name="ln505"> </a>
+<a name="ln506">  /* In case of '&gt; ?'. */</a>
+<a name="ln507">  if (vline == NULL)</a>
+<a name="ln508">    {</a>
+<a name="ln509">      vline = vector_init (1);</a>
+<a name="ln510">      vector_set (vline, NULL);</a>
+<a name="ln511">    }</a>
+<a name="ln512">  else </a>
+<a name="ln513">    if (rl_end &amp;&amp; isspace ((int) rl_line_buffer[rl_end - 1]))</a>
+<a name="ln514">      vector_set (vline, NULL);</a>
+<a name="ln515"> </a>
+<a name="ln516">  describe = cmd_describe_command (vline, vty, &amp;ret);</a>
+<a name="ln517"> </a>
+<a name="ln518">  fprintf (stdout,&quot;\n&quot;);</a>
+<a name="ln519"> </a>
+<a name="ln520">  /* Ambiguous and no match error. */</a>
+<a name="ln521">  switch (ret)</a>
+<a name="ln522">    {</a>
+<a name="ln523">    case CMD_ERR_AMBIGUOUS:</a>
+<a name="ln524">      cmd_free_strvec (vline);</a>
+<a name="ln525">      fprintf (stdout,&quot;%% Ambiguous command.\n&quot;);</a>
+<a name="ln526">      rl_on_new_line ();</a>
+<a name="ln527">      return 0;</a>
+<a name="ln528">      break;</a>
+<a name="ln529">    case CMD_ERR_NO_MATCH:</a>
+<a name="ln530">      cmd_free_strvec (vline);</a>
+<a name="ln531">      fprintf (stdout,&quot;%% There is no matched command.\n&quot;);</a>
+<a name="ln532">      rl_on_new_line ();</a>
+<a name="ln533">      return 0;</a>
+<a name="ln534">      break;</a>
+<a name="ln535">    }  </a>
+<a name="ln536"> </a>
+<a name="ln537">  /* Get width of command string. */</a>
+<a name="ln538">  width = 0;</a>
+<a name="ln539">  for (i = 0; i &lt; vector_active (describe); i++)</a>
+<a name="ln540">    if ((token = vector_slot (describe, i)) != NULL)</a>
+<a name="ln541">      {</a>
+<a name="ln542">	int len;</a>
+<a name="ln543"> </a>
+<a name="ln544">	if (token-&gt;cmd[0] == '\0')</a>
+<a name="ln545">	  continue;</a>
+<a name="ln546"> </a>
+<a name="ln547">	len = strlen (token-&gt;cmd);</a>
+<a name="ln548">	if (token-&gt;cmd[0] == '.')</a>
+<a name="ln549">	  len--;</a>
+<a name="ln550"> </a>
+<a name="ln551">	if (width &lt; len)</a>
+<a name="ln552">	  width = len;</a>
+<a name="ln553">      }</a>
+<a name="ln554"> </a>
+<a name="ln555">  for (i = 0; i &lt; vector_active (describe); i++)</a>
+<a name="ln556">    if ((token = vector_slot (describe, i)) != NULL)</a>
+<a name="ln557">      {</a>
+<a name="ln558">	if (token-&gt;cmd[0] == '\0')</a>
+<a name="ln559">	  continue;</a>
+<a name="ln560"> </a>
+<a name="ln561">	if (! token-&gt;desc)</a>
+<a name="ln562">	  fprintf (stdout,&quot;  %-s\n&quot;,</a>
+<a name="ln563">		   token-&gt;cmd[0] == '.' ? token-&gt;cmd + 1 : token-&gt;cmd);</a>
+<a name="ln564">	else</a>
+<a name="ln565">	  fprintf (stdout,&quot;  %-*s  %s\n&quot;,</a>
+<a name="ln566">		   width,</a>
+<a name="ln567">		   token-&gt;cmd[0] == '.' ? token-&gt;cmd + 1 : token-&gt;cmd,</a>
+<a name="ln568">		   token-&gt;desc);</a>
+<a name="ln569">      }</a>
+<a name="ln570"> </a>
+<a name="ln571">  cmd_free_strvec (vline);</a>
+<a name="ln572">  vector_free (describe);</a>
+<a name="ln573"> </a>
+<a name="ln574">  rl_on_new_line();</a>
+<a name="ln575"> </a>
+<a name="ln576">  return 0;</a>
+<a name="ln577">}</a>
+<a name="ln578"> </a>
+<a name="ln579">/* Result of cmd_complete_command() call will be stored here</a>
+<a name="ln580"> * and used in new_completion() in order to put the space in</a>
+<a name="ln581"> * correct places only. */</a>
+<a name="ln582">int complete_status;</a>
+<a name="ln583"> </a>
+<a name="ln584">static char *</a>
+<a name="ln585">command_generator (const char *text, int state)</a>
+<a name="ln586">{</a>
+<a name="ln587">  vector vline;</a>
+<a name="ln588">  static char **matched = NULL;</a>
+<a name="ln589">  static int index = 0;</a>
+<a name="ln590"> </a>
+<a name="ln591">  /* First call. */</a>
+<a name="ln592">  if (! state)</a>
+<a name="ln593">    {</a>
+<a name="ln594">      index = 0;</a>
+<a name="ln595"> </a>
+<a name="ln596">      if (vty-&gt;node == AUTH_NODE || vty-&gt;node == AUTH_ENABLE_NODE)</a>
+<a name="ln597">	return NULL;</a>
+<a name="ln598"> </a>
+<a name="ln599">      vline = cmd_make_strvec (rl_line_buffer);</a>
+<a name="ln600">      if (vline == NULL)</a>
+<a name="ln601">	return NULL;</a>
+<a name="ln602"> </a>
+<a name="ln603">      if (rl_end &amp;&amp; isspace ((int) rl_line_buffer[rl_end - 1]))</a>
+<a name="ln604">        vector_set (vline, NULL);</a>
+<a name="ln605"> </a>
+<a name="ln606">      matched = cmd_complete_command (vline, vty, &amp;complete_status);</a>
+<a name="ln607">    }</a>
+<a name="ln608"> </a>
+<a name="ln609">  if (matched &amp;&amp; matched[index])</a>
+<a name="ln610">    return matched[index++];</a>
+<a name="ln611"> </a>
+<a name="ln612">  return NULL;</a>
+<a name="ln613">}</a>
+<a name="ln614"> </a>
+<a name="ln615">static char **</a>
+<a name="ln616">new_completion (char *text, int start, int end)</a>
+<a name="ln617">{</a>
+<a name="ln618">  char **matches;</a>
+<a name="ln619"> </a>
+<a name="ln620">  matches = rl_completion_matches (text, command_generator);</a>
+<a name="ln621"> </a>
+<a name="ln622">  if (matches)</a>
+<a name="ln623">    {</a>
+<a name="ln624">      rl_point = rl_end;</a>
+<a name="ln625">      if (complete_status != CMD_COMPLETE_FULL_MATCH)</a>
+<a name="ln626">        /* only append a space on full match */</a>
+<a name="ln627">        rl_completion_append_character = '\0';</a>
+<a name="ln628">    }</a>
+<a name="ln629"> </a>
+<a name="ln630">  return matches;</a>
+<a name="ln631">}</a>
+<a name="ln632"> </a>
+<a name="ln633">#if 0</a>
+<a name="ln634">/* This function is not actually being used. */</a>
+<a name="ln635">static char **</a>
+<a name="ln636">vtysh_completion (char *text, int start, int end)</a>
+<a name="ln637">{</a>
+<a name="ln638">  int ret;</a>
+<a name="ln639">  vector vline;</a>
+<a name="ln640">  char **matched = NULL;</a>
+<a name="ln641"> </a>
+<a name="ln642">  if (vty-&gt;node == AUTH_NODE || vty-&gt;node == AUTH_ENABLE_NODE)</a>
+<a name="ln643">    return NULL;</a>
+<a name="ln644"> </a>
+<a name="ln645">  vline = cmd_make_strvec (rl_line_buffer);</a>
+<a name="ln646">  if (vline == NULL)</a>
+<a name="ln647">    return NULL;</a>
+<a name="ln648"> </a>
+<a name="ln649">  /* In case of 'help \t'. */</a>
+<a name="ln650">  if (rl_end &amp;&amp; isspace ((int) rl_line_buffer[rl_end - 1]))</a>
+<a name="ln651">    vector_set (vline, '\0');</a>
+<a name="ln652"> </a>
+<a name="ln653">  matched = cmd_complete_command (vline, vty, &amp;ret);</a>
+<a name="ln654"> </a>
+<a name="ln655">  cmd_free_strvec (vline);</a>
+<a name="ln656"> </a>
+<a name="ln657">  return (char **) matched;</a>
+<a name="ln658">}</a>
+<a name="ln659">#endif</a>
+<a name="ln660"> </a>
+<a name="ln661">/* Vty node structures. */</a>
+<a name="ln662">static struct cmd_node bgp_node =</a>
+<a name="ln663">{</a>
+<a name="ln664">  BGP_NODE,</a>
+<a name="ln665">  &quot;%s(config-router)# &quot;,</a>
+<a name="ln666">};</a>
+<a name="ln667"> </a>
+<a name="ln668">static struct cmd_node rip_node =</a>
+<a name="ln669">{</a>
+<a name="ln670">  RIP_NODE,</a>
+<a name="ln671">  &quot;%s(config-router)# &quot;,</a>
+<a name="ln672">};</a>
+<a name="ln673"> </a>
+<a name="ln674">static struct cmd_node isis_node =</a>
+<a name="ln675">{</a>
+<a name="ln676">  ISIS_NODE,</a>
+<a name="ln677">  &quot;%s(config-router)# &quot;,</a>
+<a name="ln678">};</a>
+<a name="ln679"> </a>
+<a name="ln680">static struct cmd_node interface_node =</a>
+<a name="ln681">{</a>
+<a name="ln682">  INTERFACE_NODE,</a>
+<a name="ln683">  &quot;%s(config-if)# &quot;,</a>
+<a name="ln684">};</a>
+<a name="ln685"> </a>
+<a name="ln686">static struct cmd_node rmap_node =</a>
+<a name="ln687">{</a>
+<a name="ln688">  RMAP_NODE,</a>
+<a name="ln689">  &quot;%s(config-route-map)# &quot;</a>
+<a name="ln690">};</a>
+<a name="ln691"> </a>
+<a name="ln692">static struct cmd_node zebra_node =</a>
+<a name="ln693">{</a>
+<a name="ln694">  ZEBRA_NODE,</a>
+<a name="ln695">  &quot;%s(config-router)# &quot;</a>
+<a name="ln696">};</a>
+<a name="ln697"> </a>
+<a name="ln698">static struct cmd_node bgp_vpnv4_node =</a>
+<a name="ln699">{</a>
+<a name="ln700">  BGP_VPNV4_NODE,</a>
+<a name="ln701">  &quot;%s(config-router-af)# &quot;</a>
+<a name="ln702">};</a>
+<a name="ln703"> </a>
+<a name="ln704">static struct cmd_node bgp_vpnv6_node =</a>
+<a name="ln705">{</a>
+<a name="ln706">  BGP_VPNV6_NODE,</a>
+<a name="ln707">  &quot;%s(config-router-af)# &quot;</a>
+<a name="ln708">};</a>
+<a name="ln709"> </a>
+<a name="ln710">static struct cmd_node bgp_encap_node =</a>
+<a name="ln711">{</a>
+<a name="ln712">  BGP_ENCAP_NODE,</a>
+<a name="ln713">  &quot;%s(config-router-af)# &quot;</a>
+<a name="ln714">};</a>
+<a name="ln715"> </a>
+<a name="ln716">static struct cmd_node bgp_encapv6_node =</a>
+<a name="ln717">{</a>
+<a name="ln718">  BGP_ENCAPV6_NODE,</a>
+<a name="ln719">  &quot;%s(config-router-af)# &quot;</a>
+<a name="ln720">};</a>
+<a name="ln721"> </a>
+<a name="ln722">static struct cmd_node bgp_ipv4_node =</a>
+<a name="ln723">{</a>
+<a name="ln724">  BGP_IPV4_NODE,</a>
+<a name="ln725">  &quot;%s(config-router-af)# &quot;</a>
+<a name="ln726">};</a>
+<a name="ln727"> </a>
+<a name="ln728">static struct cmd_node bgp_ipv4m_node =</a>
+<a name="ln729">{</a>
+<a name="ln730">  BGP_IPV4M_NODE,</a>
+<a name="ln731">  &quot;%s(config-router-af)# &quot;</a>
+<a name="ln732">};</a>
+<a name="ln733"> </a>
+<a name="ln734">static struct cmd_node bgp_ipv6_node =</a>
+<a name="ln735">{</a>
+<a name="ln736">  BGP_IPV6_NODE,</a>
+<a name="ln737">  &quot;%s(config-router-af)# &quot;</a>
+<a name="ln738">};</a>
+<a name="ln739"> </a>
+<a name="ln740">static struct cmd_node bgp_ipv6m_node =</a>
+<a name="ln741">{</a>
+<a name="ln742">  BGP_IPV6M_NODE,</a>
+<a name="ln743">  &quot;%s(config-router-af)# &quot;</a>
+<a name="ln744">};</a>
+<a name="ln745"> </a>
+<a name="ln746">static struct cmd_node ospf_node =</a>
+<a name="ln747">{</a>
+<a name="ln748">  OSPF_NODE,</a>
+<a name="ln749">  &quot;%s(config-router)# &quot;</a>
+<a name="ln750">};</a>
+<a name="ln751"> </a>
+<a name="ln752">static struct cmd_node ripng_node =</a>
+<a name="ln753">{</a>
+<a name="ln754">  RIPNG_NODE,</a>
+<a name="ln755">  &quot;%s(config-router)# &quot;</a>
+<a name="ln756">};</a>
+<a name="ln757"> </a>
+<a name="ln758">static struct cmd_node ospf6_node =</a>
+<a name="ln759">{</a>
+<a name="ln760">  OSPF6_NODE,</a>
+<a name="ln761">  &quot;%s(config-ospf6)# &quot;</a>
+<a name="ln762">};</a>
+<a name="ln763"> </a>
+<a name="ln764">static struct cmd_node babel_node =</a>
+<a name="ln765">{</a>
+<a name="ln766">  BABEL_NODE,</a>
+<a name="ln767">  &quot;%s(config-babel)# &quot;</a>
+<a name="ln768">};</a>
+<a name="ln769"> </a>
+<a name="ln770">static struct cmd_node keychain_node =</a>
+<a name="ln771">{</a>
+<a name="ln772">  KEYCHAIN_NODE,</a>
+<a name="ln773">  &quot;%s(config-keychain)# &quot;</a>
+<a name="ln774">};</a>
+<a name="ln775"> </a>
+<a name="ln776">static struct cmd_node keychain_key_node =</a>
+<a name="ln777">{</a>
+<a name="ln778">  KEYCHAIN_KEY_NODE,</a>
+<a name="ln779">  &quot;%s(config-keychain-key)# &quot;</a>
+<a name="ln780">};</a>
+<a name="ln781"> </a>
+<a name="ln782">struct cmd_node link_params_node =</a>
+<a name="ln783">{</a>
+<a name="ln784">  LINK_PARAMS_NODE,</a>
+<a name="ln785">  &quot;%s(config-link-params)# &quot;,</a>
+<a name="ln786">};</a>
+<a name="ln787"> </a>
+<a name="ln788">/* Defined in lib/vty.c */</a>
+<a name="ln789">extern struct cmd_node vty_node;</a>
+<a name="ln790"> </a>
+<a name="ln791">/* When '^Z' is received from vty, move down to the enable mode. */</a>
+<a name="ln792">static int</a>
+<a name="ln793">vtysh_end (void)</a>
+<a name="ln794">{</a>
+<a name="ln795">  switch (vty-&gt;node)</a>
+<a name="ln796">    {</a>
+<a name="ln797">    case VIEW_NODE:</a>
+<a name="ln798">    case ENABLE_NODE:</a>
+<a name="ln799">      /* Nothing to do. */</a>
+<a name="ln800">      break;</a>
+<a name="ln801">    default:</a>
+<a name="ln802">      vty-&gt;node = ENABLE_NODE;</a>
+<a name="ln803">      break;</a>
+<a name="ln804">    }</a>
+<a name="ln805">  return CMD_SUCCESS;</a>
+<a name="ln806">}</a>
+<a name="ln807"> </a>
+<a name="ln808">DEFUNSH (VTYSH_ALL,</a>
+<a name="ln809">	 vtysh_end_all,</a>
+<a name="ln810">	 vtysh_end_all_cmd,</a>
+<a name="ln811">	 &quot;end&quot;,</a>
+<a name="ln812">	 &quot;End current mode and change to enable mode\n&quot;)</a>
+<a name="ln813">{</a>
+<a name="ln814">  return vtysh_end ();</a>
+<a name="ln815">}</a>
+<a name="ln816"> </a>
+<a name="ln817">DEFUNSH (VTYSH_BGPD,</a>
+<a name="ln818">	 router_bgp,</a>
+<a name="ln819">	 router_bgp_cmd,</a>
+<a name="ln820">	 &quot;router bgp &quot; CMD_AS_RANGE,</a>
+<a name="ln821">	 ROUTER_STR</a>
+<a name="ln822">	 BGP_STR</a>
+<a name="ln823">	 AS_STR)</a>
+<a name="ln824">{</a>
+<a name="ln825">  vty-&gt;node = BGP_NODE;</a>
+<a name="ln826">  return CMD_SUCCESS;</a>
+<a name="ln827">}</a>
+<a name="ln828"> </a>
+<a name="ln829">ALIAS_SH (VTYSH_BGPD,</a>
+<a name="ln830">	  router_bgp,</a>
+<a name="ln831">	  router_bgp_view_cmd,</a>
+<a name="ln832">	  &quot;router bgp &quot; CMD_AS_RANGE &quot; view WORD&quot;,</a>
+<a name="ln833">	  ROUTER_STR</a>
+<a name="ln834">	  BGP_STR</a>
+<a name="ln835">	  AS_STR</a>
+<a name="ln836">	  &quot;BGP view\n&quot;</a>
+<a name="ln837">	  &quot;view name\n&quot;)</a>
+<a name="ln838"> </a>
+<a name="ln839">DEFUNSH (VTYSH_BGPD,</a>
+<a name="ln840">	 address_family_vpnv4,</a>
+<a name="ln841">	 address_family_vpnv4_cmd,</a>
+<a name="ln842">	 &quot;address-family vpnv4&quot;,</a>
+<a name="ln843">	 &quot;Enter Address Family command mode\n&quot;</a>
+<a name="ln844">	 &quot;Address family\n&quot;)</a>
+<a name="ln845">{</a>
+<a name="ln846">  vty-&gt;node = BGP_VPNV4_NODE;</a>
+<a name="ln847">  return CMD_SUCCESS;</a>
+<a name="ln848">}</a>
+<a name="ln849"> </a>
+<a name="ln850">DEFUNSH (VTYSH_BGPD,</a>
+<a name="ln851">	 address_family_vpnv4_unicast,</a>
+<a name="ln852">	 address_family_vpnv4_unicast_cmd,</a>
+<a name="ln853">	 &quot;address-family vpnv4 unicast&quot;,</a>
+<a name="ln854">	 &quot;Enter Address Family command mode\n&quot;</a>
+<a name="ln855">	 &quot;Address family\n&quot;</a>
+<a name="ln856">	 &quot;Address Family Modifier\n&quot;)</a>
+<a name="ln857">{</a>
+<a name="ln858">  vty-&gt;node = BGP_VPNV4_NODE;</a>
+<a name="ln859">  return CMD_SUCCESS;</a>
+<a name="ln860">}</a>
+<a name="ln861"> </a>
+<a name="ln862">DEFUNSH (VTYSH_BGPD,</a>
+<a name="ln863">	 address_family_vpnv6,</a>
+<a name="ln864">	 address_family_vpnv6_cmd,</a>
+<a name="ln865">	 &quot;address-family vpnv6&quot;,</a>
+<a name="ln866">	 &quot;Enter Address Family command mode\n&quot;</a>
+<a name="ln867">	 &quot;Address family\n&quot;)</a>
+<a name="ln868">{</a>
+<a name="ln869">  vty-&gt;node = BGP_VPNV6_NODE;</a>
+<a name="ln870">  return CMD_SUCCESS;</a>
+<a name="ln871">}</a>
+<a name="ln872"> </a>
+<a name="ln873">DEFUNSH (VTYSH_BGPD,</a>
+<a name="ln874">	 address_family_vpnv6_unicast,</a>
+<a name="ln875">	 address_family_vpnv6_unicast_cmd,</a>
+<a name="ln876">	 &quot;address-family vpnv6 unicast&quot;,</a>
+<a name="ln877">	 &quot;Enter Address Family command mode\n&quot;</a>
+<a name="ln878">	 &quot;Address family\n&quot;</a>
+<a name="ln879">	 &quot;Address Family Modifier\n&quot;)</a>
+<a name="ln880">{</a>
+<a name="ln881">  vty-&gt;node = BGP_VPNV6_NODE;</a>
+<a name="ln882">  return CMD_SUCCESS;</a>
+<a name="ln883">}</a>
+<a name="ln884"> </a>
+<a name="ln885">DEFUNSH (VTYSH_BGPD,</a>
+<a name="ln886">	 address_family_encap,</a>
+<a name="ln887">	 address_family_encap_cmd,</a>
+<a name="ln888">	 &quot;address-family encap&quot;,</a>
+<a name="ln889">	 &quot;Enter Address Family command mode\n&quot;</a>
+<a name="ln890">	 &quot;Address family\n&quot;)</a>
+<a name="ln891">{</a>
+<a name="ln892">  vty-&gt;node = BGP_ENCAP_NODE;</a>
+<a name="ln893">  return CMD_SUCCESS;</a>
+<a name="ln894">}</a>
+<a name="ln895"> </a>
+<a name="ln896">DEFUNSH (VTYSH_BGPD,</a>
+<a name="ln897">	 address_family_encapv4,</a>
+<a name="ln898">	 address_family_encapv4_cmd,</a>
+<a name="ln899">	 &quot;address-family encapv4&quot;,</a>
+<a name="ln900">	 &quot;Enter Address Family command mode\n&quot;</a>
+<a name="ln901">	 &quot;Address family\n&quot;)</a>
+<a name="ln902">{</a>
+<a name="ln903">  vty-&gt;node = BGP_ENCAP_NODE;</a>
+<a name="ln904">  return CMD_SUCCESS;</a>
+<a name="ln905">}</a>
+<a name="ln906"> </a>
+<a name="ln907">DEFUNSH (VTYSH_BGPD,</a>
+<a name="ln908">	 address_family_encapv6,</a>
+<a name="ln909">	 address_family_encapv6_cmd,</a>
+<a name="ln910">	 &quot;address-family encapv6&quot;,</a>
+<a name="ln911">	 &quot;Enter Address Family command mode\n&quot;</a>
+<a name="ln912">	 &quot;Address family\n&quot;)</a>
+<a name="ln913">{</a>
+<a name="ln914">  vty-&gt;node = BGP_ENCAPV6_NODE;</a>
+<a name="ln915">  return CMD_SUCCESS;</a>
+<a name="ln916">}</a>
+<a name="ln917"> </a>
+<a name="ln918">DEFUNSH (VTYSH_BGPD,</a>
+<a name="ln919">	 address_family_ipv4_unicast,</a>
+<a name="ln920">	 address_family_ipv4_unicast_cmd,</a>
+<a name="ln921">	 &quot;address-family ipv4 unicast&quot;,</a>
+<a name="ln922">	 &quot;Enter Address Family command mode\n&quot;</a>
+<a name="ln923">	 &quot;Address family\n&quot;</a>
+<a name="ln924">	 &quot;Address Family Modifier\n&quot;)</a>
+<a name="ln925">{</a>
+<a name="ln926">  vty-&gt;node = BGP_IPV4_NODE;</a>
+<a name="ln927">  return CMD_SUCCESS;</a>
+<a name="ln928">}</a>
+<a name="ln929"> </a>
+<a name="ln930">DEFUNSH (VTYSH_BGPD,</a>
+<a name="ln931">	 address_family_ipv4_multicast,</a>
+<a name="ln932">	 address_family_ipv4_multicast_cmd,</a>
+<a name="ln933">	 &quot;address-family ipv4 multicast&quot;,</a>
+<a name="ln934">	 &quot;Enter Address Family command mode\n&quot;</a>
+<a name="ln935">	 &quot;Address family\n&quot;</a>
+<a name="ln936">	 &quot;Address Family Modifier\n&quot;)</a>
+<a name="ln937">{</a>
+<a name="ln938">  vty-&gt;node = BGP_IPV4M_NODE;</a>
+<a name="ln939">  return CMD_SUCCESS;</a>
+<a name="ln940">}</a>
+<a name="ln941"> </a>
+<a name="ln942">DEFUNSH (VTYSH_BGPD,</a>
+<a name="ln943">	 address_family_ipv6,</a>
+<a name="ln944">	 address_family_ipv6_cmd,</a>
+<a name="ln945">	 &quot;address-family ipv6&quot;,</a>
+<a name="ln946">	 &quot;Enter Address Family command mode\n&quot;</a>
+<a name="ln947">	 &quot;Address family\n&quot;)</a>
+<a name="ln948">{</a>
+<a name="ln949">  vty-&gt;node = BGP_IPV6_NODE;</a>
+<a name="ln950">  return CMD_SUCCESS;</a>
+<a name="ln951">}</a>
+<a name="ln952"> </a>
+<a name="ln953">DEFUNSH (VTYSH_BGPD,</a>
+<a name="ln954">	 address_family_ipv6_unicast,</a>
+<a name="ln955">	 address_family_ipv6_unicast_cmd,</a>
+<a name="ln956">	 &quot;address-family ipv6 unicast&quot;,</a>
+<a name="ln957">	 &quot;Enter Address Family command mode\n&quot;</a>
+<a name="ln958">	 &quot;Address family\n&quot;</a>
+<a name="ln959">	 &quot;Address Family Modifier\n&quot;)</a>
+<a name="ln960">{</a>
+<a name="ln961">  vty-&gt;node = BGP_IPV6_NODE;</a>
+<a name="ln962">  return CMD_SUCCESS;</a>
+<a name="ln963">}</a>
+<a name="ln964"> </a>
+<a name="ln965">DEFUNSH (VTYSH_BGPD,</a>
+<a name="ln966">	 address_family_ipv6_multicast,</a>
+<a name="ln967">	 address_family_ipv6_multicast_cmd,</a>
+<a name="ln968">	 &quot;address-family ipv6 multicast&quot;,</a>
+<a name="ln969">	 &quot;Enter Address Family command mode\n&quot;</a>
+<a name="ln970">	 &quot;Address family\n&quot;</a>
+<a name="ln971">	 &quot;Address Family Modifier\n&quot;)</a>
+<a name="ln972">{</a>
+<a name="ln973">  vty-&gt;node = BGP_IPV6M_NODE;</a>
+<a name="ln974">  return CMD_SUCCESS;</a>
+<a name="ln975">}</a>
+<a name="ln976"> </a>
+<a name="ln977">DEFUNSH (VTYSH_RIPD,</a>
+<a name="ln978">	 key_chain,</a>
+<a name="ln979">	 key_chain_cmd,</a>
+<a name="ln980">	 &quot;key chain WORD&quot;,</a>
+<a name="ln981">	 &quot;Authentication key management\n&quot;</a>
+<a name="ln982">	 &quot;Key-chain management\n&quot;</a>
+<a name="ln983">	 &quot;Key-chain name\n&quot;)</a>
+<a name="ln984">{</a>
+<a name="ln985">  vty-&gt;node = KEYCHAIN_NODE;</a>
+<a name="ln986">  return CMD_SUCCESS;</a>
+<a name="ln987">}	 </a>
+<a name="ln988"> </a>
+<a name="ln989">DEFUNSH (VTYSH_RIPD,</a>
+<a name="ln990">	 key,</a>
+<a name="ln991">	 key_cmd,</a>
+<a name="ln992">	 &quot;key &lt;0-2147483647&gt;&quot;,</a>
+<a name="ln993">	 &quot;Configure a key\n&quot;</a>
+<a name="ln994">	 &quot;Key identifier number\n&quot;)</a>
+<a name="ln995">{</a>
+<a name="ln996">  vty-&gt;node = KEYCHAIN_KEY_NODE;</a>
+<a name="ln997">  return CMD_SUCCESS;</a>
+<a name="ln998">}</a>
+<a name="ln999"> </a>
+<a name="ln1000">DEFUNSH (VTYSH_RIPD,</a>
+<a name="ln1001">	 router_rip,</a>
+<a name="ln1002">	 router_rip_cmd,</a>
+<a name="ln1003">	 &quot;router rip&quot;,</a>
+<a name="ln1004">	 ROUTER_STR</a>
+<a name="ln1005">	 &quot;RIP&quot;)</a>
+<a name="ln1006">{</a>
+<a name="ln1007">  vty-&gt;node = RIP_NODE;</a>
+<a name="ln1008">  return CMD_SUCCESS;</a>
+<a name="ln1009">}</a>
+<a name="ln1010"> </a>
+<a name="ln1011">DEFUNSH (VTYSH_RIPNGD,</a>
+<a name="ln1012">	 router_ripng,</a>
+<a name="ln1013">	 router_ripng_cmd,</a>
+<a name="ln1014">	 &quot;router ripng&quot;,</a>
+<a name="ln1015">	 ROUTER_STR</a>
+<a name="ln1016">	 &quot;RIPng&quot;)</a>
+<a name="ln1017">{</a>
+<a name="ln1018">  vty-&gt;node = RIPNG_NODE;</a>
+<a name="ln1019">  return CMD_SUCCESS;</a>
+<a name="ln1020">}</a>
+<a name="ln1021"> </a>
+<a name="ln1022">DEFUNSH (VTYSH_OSPFD,</a>
+<a name="ln1023">	 router_ospf,</a>
+<a name="ln1024">	 router_ospf_cmd,</a>
+<a name="ln1025">	 &quot;router ospf&quot;,</a>
+<a name="ln1026">	 &quot;Enable a routing process\n&quot;</a>
+<a name="ln1027">	 &quot;Start OSPF configuration\n&quot;)</a>
+<a name="ln1028">{</a>
+<a name="ln1029">  vty-&gt;node = OSPF_NODE;</a>
+<a name="ln1030">  return CMD_SUCCESS;</a>
+<a name="ln1031">}</a>
+<a name="ln1032"> </a>
+<a name="ln1033">DEFUNSH (VTYSH_OSPF6D,</a>
+<a name="ln1034">	 router_ospf6,</a>
+<a name="ln1035">	 router_ospf6_cmd,</a>
+<a name="ln1036">	 &quot;router ospf6&quot;,</a>
+<a name="ln1037">	 OSPF6_ROUTER_STR</a>
+<a name="ln1038">	 OSPF6_STR)</a>
+<a name="ln1039">{</a>
+<a name="ln1040">  vty-&gt;node = OSPF6_NODE;</a>
+<a name="ln1041">  return CMD_SUCCESS;</a>
+<a name="ln1042">}</a>
+<a name="ln1043"> </a>
+<a name="ln1044">DEFUNSH (VTYSH_ISISD,</a>
+<a name="ln1045">	 router_isis,</a>
+<a name="ln1046">	 router_isis_cmd,</a>
+<a name="ln1047">	 &quot;router isis WORD&quot;,</a>
+<a name="ln1048">	 ROUTER_STR</a>
+<a name="ln1049">	 &quot;ISO IS-IS\n&quot;</a>
+<a name="ln1050">	 &quot;ISO Routing area tag&quot;)</a>
+<a name="ln1051">{</a>
+<a name="ln1052">  vty-&gt;node = ISIS_NODE;</a>
+<a name="ln1053">  return CMD_SUCCESS;</a>
+<a name="ln1054">}</a>
+<a name="ln1055"> </a>
+<a name="ln1056">DEFUNSH (VTYSH_RMAP,</a>
+<a name="ln1057">	 route_map,</a>
+<a name="ln1058">	 route_map_cmd,</a>
+<a name="ln1059">	 &quot;route-map WORD (deny|permit) &lt;1-65535&gt;&quot;,</a>
+<a name="ln1060">	 &quot;Create route-map or enter route-map command mode\n&quot;</a>
+<a name="ln1061">	 &quot;Route map tag\n&quot;</a>
+<a name="ln1062">	 &quot;Route map denies set operations\n&quot;</a>
+<a name="ln1063">	 &quot;Route map permits set operations\n&quot;</a>
+<a name="ln1064">	 &quot;Sequence to insert to/delete from existing route-map entry\n&quot;)</a>
+<a name="ln1065">{</a>
+<a name="ln1066">  vty-&gt;node = RMAP_NODE;</a>
+<a name="ln1067">  return CMD_SUCCESS;</a>
+<a name="ln1068">}</a>
+<a name="ln1069"> </a>
+<a name="ln1070">DEFUNSH (VTYSH_ALL,</a>
+<a name="ln1071">	 vtysh_line_vty,</a>
+<a name="ln1072">	 vtysh_line_vty_cmd,</a>
+<a name="ln1073">	 &quot;line vty&quot;,</a>
+<a name="ln1074">	 &quot;Configure a terminal line\n&quot;</a>
+<a name="ln1075">	 &quot;Virtual terminal\n&quot;)</a>
+<a name="ln1076">{</a>
+<a name="ln1077">  vty-&gt;node = VTY_NODE;</a>
+<a name="ln1078">  return CMD_SUCCESS;</a>
+<a name="ln1079">}</a>
+<a name="ln1080"> </a>
+<a name="ln1081">DEFUNSH (VTYSH_ALL,</a>
+<a name="ln1082">	 vtysh_enable, </a>
+<a name="ln1083">	 vtysh_enable_cmd,</a>
+<a name="ln1084">	 &quot;enable&quot;,</a>
+<a name="ln1085">	 &quot;Turn on privileged mode command\n&quot;)</a>
+<a name="ln1086">{</a>
+<a name="ln1087">  vty-&gt;node = ENABLE_NODE;</a>
+<a name="ln1088">  return CMD_SUCCESS;</a>
+<a name="ln1089">}</a>
+<a name="ln1090"> </a>
+<a name="ln1091">DEFUNSH (VTYSH_ALL,</a>
+<a name="ln1092">	 vtysh_disable, </a>
+<a name="ln1093">	 vtysh_disable_cmd,</a>
+<a name="ln1094">	 &quot;disable&quot;,</a>
+<a name="ln1095">	 &quot;Turn off privileged mode command\n&quot;)</a>
+<a name="ln1096">{</a>
+<a name="ln1097">  if (vty-&gt;node == ENABLE_NODE)</a>
+<a name="ln1098">    vty-&gt;node = VIEW_NODE;</a>
+<a name="ln1099">  return CMD_SUCCESS;</a>
+<a name="ln1100">}</a>
+<a name="ln1101"> </a>
+<a name="ln1102">DEFUNSH (VTYSH_ALL,</a>
+<a name="ln1103">	 vtysh_config_terminal,</a>
+<a name="ln1104">	 vtysh_config_terminal_cmd,</a>
+<a name="ln1105">	 &quot;configure terminal&quot;,</a>
+<a name="ln1106">	 &quot;Configuration from vty interface\n&quot;</a>
+<a name="ln1107">	 &quot;Configuration terminal\n&quot;)</a>
+<a name="ln1108">{</a>
+<a name="ln1109">  vty-&gt;node = CONFIG_NODE;</a>
+<a name="ln1110">  return CMD_SUCCESS;</a>
+<a name="ln1111">}</a>
+<a name="ln1112"> </a>
+<a name="ln1113">static int</a>
+<a name="ln1114">vtysh_exit (struct vty *vty)</a>
+<a name="ln1115">{</a>
+<a name="ln1116">  switch (vty-&gt;node)</a>
+<a name="ln1117">    {</a>
+<a name="ln1118">    case VIEW_NODE:</a>
+<a name="ln1119">    case ENABLE_NODE:</a>
+<a name="ln1120">      exit (0);</a>
+<a name="ln1121">      break;</a>
+<a name="ln1122">    case CONFIG_NODE:</a>
+<a name="ln1123">      vty-&gt;node = ENABLE_NODE;</a>
+<a name="ln1124">      break;</a>
+<a name="ln1125">    case INTERFACE_NODE:</a>
+<a name="ln1126">    case ZEBRA_NODE:</a>
+<a name="ln1127">    case BGP_NODE:</a>
+<a name="ln1128">    case RIP_NODE:</a>
+<a name="ln1129">    case RIPNG_NODE:</a>
+<a name="ln1130">    case OSPF_NODE:</a>
+<a name="ln1131">    case OSPF6_NODE:</a>
+<a name="ln1132">    case BABEL_NODE:</a>
+<a name="ln1133">    case ISIS_NODE:</a>
+<a name="ln1134">    case MASC_NODE:</a>
+<a name="ln1135">    case RMAP_NODE:</a>
+<a name="ln1136">    case VTY_NODE:</a>
+<a name="ln1137">    case KEYCHAIN_NODE:</a>
+<a name="ln1138">      vtysh_execute(&quot;end&quot;);</a>
+<a name="ln1139">      vtysh_execute(&quot;configure terminal&quot;);</a>
+<a name="ln1140">      vty-&gt;node = CONFIG_NODE;</a>
+<a name="ln1141">      break;</a>
+<a name="ln1142">    case BGP_VPNV4_NODE:</a>
+<a name="ln1143">    case BGP_VPNV6_NODE:</a>
+<a name="ln1144">    case BGP_ENCAP_NODE:</a>
+<a name="ln1145">    case BGP_ENCAPV6_NODE:</a>
+<a name="ln1146">    case BGP_IPV4_NODE:</a>
+<a name="ln1147">    case BGP_IPV4M_NODE:</a>
+<a name="ln1148">    case BGP_IPV6_NODE:</a>
+<a name="ln1149">    case BGP_IPV6M_NODE:</a>
+<a name="ln1150">      vty-&gt;node = BGP_NODE;</a>
+<a name="ln1151">      break;</a>
+<a name="ln1152">    case KEYCHAIN_KEY_NODE:</a>
+<a name="ln1153">      vty-&gt;node = KEYCHAIN_NODE;</a>
+<a name="ln1154">      break;</a>
+<a name="ln1155">    case LINK_PARAMS_NODE:</a>
+<a name="ln1156">      vty-&gt;node = INTERFACE_NODE;</a>
+<a name="ln1157">      break;</a>
+<a name="ln1158">    default:</a>
+<a name="ln1159">      break;</a>
+<a name="ln1160">    }</a>
+<a name="ln1161">  return CMD_SUCCESS;</a>
+<a name="ln1162">}</a>
+<a name="ln1163"> </a>
+<a name="ln1164">DEFUNSH (VTYSH_ALL,</a>
+<a name="ln1165">	 vtysh_exit_all,</a>
+<a name="ln1166">	 vtysh_exit_all_cmd,</a>
+<a name="ln1167">	 &quot;exit&quot;,</a>
+<a name="ln1168">	 &quot;Exit current mode and down to previous mode\n&quot;)</a>
+<a name="ln1169">{</a>
+<a name="ln1170">  return vtysh_exit (vty);</a>
+<a name="ln1171">}</a>
+<a name="ln1172"> </a>
+<a name="ln1173">ALIAS (vtysh_exit_all,</a>
+<a name="ln1174">       vtysh_quit_all_cmd,</a>
+<a name="ln1175">       &quot;quit&quot;,</a>
+<a name="ln1176">       &quot;Exit current mode and down to previous mode\n&quot;)</a>
+<a name="ln1177"> </a>
+<a name="ln1178">DEFUNSH (VTYSH_BGPD,</a>
+<a name="ln1179">	 exit_address_family,</a>
+<a name="ln1180">	 exit_address_family_cmd,</a>
+<a name="ln1181">	 &quot;exit-address-family&quot;,</a>
+<a name="ln1182">	 &quot;Exit from Address Family configuration mode\n&quot;)</a>
+<a name="ln1183">{</a>
+<a name="ln1184">  if (vty-&gt;node == BGP_IPV4_NODE</a>
+<a name="ln1185">      || vty-&gt;node == BGP_IPV4M_NODE</a>
+<a name="ln1186">      || vty-&gt;node == BGP_VPNV4_NODE</a>
+<a name="ln1187">      || vty-&gt;node == BGP_VPNV6_NODE</a>
+<a name="ln1188">      || vty-&gt;node == BGP_ENCAP_NODE</a>
+<a name="ln1189">      || vty-&gt;node == BGP_ENCAPV6_NODE</a>
+<a name="ln1190">      || vty-&gt;node == BGP_IPV6_NODE</a>
+<a name="ln1191">      || vty-&gt;node == BGP_IPV6M_NODE)</a>
+<a name="ln1192">    vty-&gt;node = BGP_NODE;</a>
+<a name="ln1193">  return CMD_SUCCESS;</a>
+<a name="ln1194">}</a>
+<a name="ln1195"> </a>
+<a name="ln1196">DEFUNSH (VTYSH_ZEBRA,</a>
+<a name="ln1197">	 vtysh_exit_zebra,</a>
+<a name="ln1198">	 vtysh_exit_zebra_cmd,</a>
+<a name="ln1199">	 &quot;exit&quot;,</a>
+<a name="ln1200">	 &quot;Exit current mode and down to previous mode\n&quot;)</a>
+<a name="ln1201">{</a>
+<a name="ln1202">  return vtysh_exit (vty);</a>
+<a name="ln1203">}</a>
+<a name="ln1204"> </a>
+<a name="ln1205">ALIAS (vtysh_exit_zebra,</a>
+<a name="ln1206">       vtysh_quit_zebra_cmd,</a>
+<a name="ln1207">       &quot;quit&quot;,</a>
+<a name="ln1208">       &quot;Exit current mode and down to previous mode\n&quot;)</a>
+<a name="ln1209"> </a>
+<a name="ln1210">DEFUNSH (VTYSH_RIPD,</a>
+<a name="ln1211">	 vtysh_exit_ripd,</a>
+<a name="ln1212">	 vtysh_exit_ripd_cmd,</a>
+<a name="ln1213">	 &quot;exit&quot;,</a>
+<a name="ln1214">	 &quot;Exit current mode and down to previous mode\n&quot;)</a>
+<a name="ln1215">{</a>
+<a name="ln1216">  return vtysh_exit (vty);</a>
+<a name="ln1217">}</a>
+<a name="ln1218"> </a>
+<a name="ln1219">ALIAS (vtysh_exit_ripd,</a>
+<a name="ln1220">       vtysh_quit_ripd_cmd,</a>
+<a name="ln1221">       &quot;quit&quot;,</a>
+<a name="ln1222">       &quot;Exit current mode and down to previous mode\n&quot;)</a>
+<a name="ln1223"> </a>
+<a name="ln1224">DEFUNSH (VTYSH_RIPNGD,</a>
+<a name="ln1225">	 vtysh_exit_ripngd,</a>
+<a name="ln1226">	 vtysh_exit_ripngd_cmd,</a>
+<a name="ln1227">	 &quot;exit&quot;,</a>
+<a name="ln1228">	 &quot;Exit current mode and down to previous mode\n&quot;)</a>
+<a name="ln1229">{</a>
+<a name="ln1230">  return vtysh_exit (vty);</a>
+<a name="ln1231">}</a>
+<a name="ln1232"> </a>
+<a name="ln1233">ALIAS (vtysh_exit_ripngd,</a>
+<a name="ln1234">       vtysh_quit_ripngd_cmd,</a>
+<a name="ln1235">       &quot;quit&quot;,</a>
+<a name="ln1236">       &quot;Exit current mode and down to previous mode\n&quot;)</a>
+<a name="ln1237"> </a>
+<a name="ln1238">DEFUNSH (VTYSH_RMAP,</a>
+<a name="ln1239">	 vtysh_exit_rmap,</a>
+<a name="ln1240">	 vtysh_exit_rmap_cmd,</a>
+<a name="ln1241">	 &quot;exit&quot;,</a>
+<a name="ln1242">	 &quot;Exit current mode and down to previous mode\n&quot;)</a>
+<a name="ln1243">{</a>
+<a name="ln1244">  return vtysh_exit (vty);</a>
+<a name="ln1245">}</a>
+<a name="ln1246"> </a>
+<a name="ln1247">ALIAS (vtysh_exit_rmap,</a>
+<a name="ln1248">       vtysh_quit_rmap_cmd,</a>
+<a name="ln1249">       &quot;quit&quot;,</a>
+<a name="ln1250">       &quot;Exit current mode and down to previous mode\n&quot;)</a>
+<a name="ln1251"> </a>
+<a name="ln1252">DEFUNSH (VTYSH_BGPD,</a>
+<a name="ln1253">	 vtysh_exit_bgpd,</a>
+<a name="ln1254">	 vtysh_exit_bgpd_cmd,</a>
+<a name="ln1255">	 &quot;exit&quot;,</a>
+<a name="ln1256">	 &quot;Exit current mode and down to previous mode\n&quot;)</a>
+<a name="ln1257">{</a>
+<a name="ln1258">  return vtysh_exit (vty);</a>
+<a name="ln1259">}</a>
+<a name="ln1260"> </a>
+<a name="ln1261">ALIAS (vtysh_exit_bgpd,</a>
+<a name="ln1262">       vtysh_quit_bgpd_cmd,</a>
+<a name="ln1263">       &quot;quit&quot;,</a>
+<a name="ln1264">       &quot;Exit current mode and down to previous mode\n&quot;)</a>
+<a name="ln1265"> </a>
+<a name="ln1266">DEFUNSH (VTYSH_OSPFD,</a>
+<a name="ln1267">	 vtysh_exit_ospfd,</a>
+<a name="ln1268">	 vtysh_exit_ospfd_cmd,</a>
+<a name="ln1269">	 &quot;exit&quot;,</a>
+<a name="ln1270">	 &quot;Exit current mode and down to previous mode\n&quot;)</a>
+<a name="ln1271">{</a>
+<a name="ln1272">  return vtysh_exit (vty);</a>
+<a name="ln1273">}</a>
+<a name="ln1274"> </a>
+<a name="ln1275">ALIAS (vtysh_exit_ospfd,</a>
+<a name="ln1276">       vtysh_quit_ospfd_cmd,</a>
+<a name="ln1277">       &quot;quit&quot;,</a>
+<a name="ln1278">       &quot;Exit current mode and down to previous mode\n&quot;)</a>
+<a name="ln1279"> </a>
+<a name="ln1280">DEFUNSH (VTYSH_OSPF6D,</a>
+<a name="ln1281">	 vtysh_exit_ospf6d,</a>
+<a name="ln1282">	 vtysh_exit_ospf6d_cmd,</a>
+<a name="ln1283">	 &quot;exit&quot;,</a>
+<a name="ln1284">	 &quot;Exit current mode and down to previous mode\n&quot;)</a>
+<a name="ln1285">{</a>
+<a name="ln1286">  return vtysh_exit (vty);</a>
+<a name="ln1287">}</a>
+<a name="ln1288"> </a>
+<a name="ln1289">ALIAS (vtysh_exit_ospf6d,</a>
+<a name="ln1290">       vtysh_quit_ospf6d_cmd,</a>
+<a name="ln1291">       &quot;quit&quot;,</a>
+<a name="ln1292">       &quot;Exit current mode and down to previous mode\n&quot;)</a>
+<a name="ln1293"> </a>
+<a name="ln1294">DEFUNSH (VTYSH_ISISD,</a>
+<a name="ln1295">	 vtysh_exit_isisd,</a>
+<a name="ln1296">	 vtysh_exit_isisd_cmd,</a>
+<a name="ln1297">	 &quot;exit&quot;,</a>
+<a name="ln1298">	 &quot;Exit current mode and down to previous mode\n&quot;)</a>
+<a name="ln1299">{</a>
+<a name="ln1300">  return vtysh_exit (vty);</a>
+<a name="ln1301">}</a>
+<a name="ln1302"> </a>
+<a name="ln1303">ALIAS (vtysh_exit_isisd,</a>
+<a name="ln1304">       vtysh_quit_isisd_cmd,</a>
+<a name="ln1305">       &quot;quit&quot;,</a>
+<a name="ln1306">       &quot;Exit current mode and down to previous mode\n&quot;)</a>
+<a name="ln1307"> </a>
+<a name="ln1308">DEFUNSH (VTYSH_ALL,</a>
+<a name="ln1309">         vtysh_exit_line_vty,</a>
+<a name="ln1310">         vtysh_exit_line_vty_cmd,</a>
+<a name="ln1311">         &quot;exit&quot;,</a>
+<a name="ln1312">         &quot;Exit current mode and down to previous mode\n&quot;)</a>
+<a name="ln1313">{</a>
+<a name="ln1314">  return vtysh_exit (vty);</a>
+<a name="ln1315">}</a>
+<a name="ln1316"> </a>
+<a name="ln1317">ALIAS (vtysh_exit_line_vty,</a>
+<a name="ln1318">       vtysh_quit_line_vty_cmd,</a>
+<a name="ln1319">       &quot;quit&quot;,</a>
+<a name="ln1320">       &quot;Exit current mode and down to previous mode\n&quot;)</a>
+<a name="ln1321"> </a>
+<a name="ln1322">DEFUNSH (VTYSH_INTERFACE,</a>
+<a name="ln1323">	 vtysh_interface,</a>
+<a name="ln1324">	 vtysh_interface_cmd,</a>
+<a name="ln1325">	 &quot;interface IFNAME&quot;,</a>
+<a name="ln1326">	 &quot;Select an interface to configure\n&quot;</a>
+<a name="ln1327">	 &quot;Interface's name\n&quot;)</a>
+<a name="ln1328">{</a>
+<a name="ln1329">  vty-&gt;node = INTERFACE_NODE;</a>
+<a name="ln1330">  return CMD_SUCCESS;</a>
+<a name="ln1331">}</a>
+<a name="ln1332"> </a>
+<a name="ln1333">ALIAS_SH (VTYSH_ZEBRA,</a>
+<a name="ln1334">	 vtysh_interface,</a>
+<a name="ln1335">	 vtysh_interface_vrf_cmd,</a>
+<a name="ln1336">	 &quot;interface IFNAME &quot; VRF_CMD_STR,</a>
+<a name="ln1337">	 &quot;Select an interface to configure\n&quot;</a>
+<a name="ln1338">	 &quot;Interface's name\n&quot;</a>
+<a name="ln1339">	 VRF_CMD_HELP_STR)</a>
+<a name="ln1340"> </a>
+<a name="ln1341">DEFSH (VTYSH_INTERFACE,</a>
+<a name="ln1342">       vtysh_no_interface_cmd,</a>
+<a name="ln1343">       &quot;no interface IFNAME&quot;,</a>
+<a name="ln1344">       NO_STR</a>
+<a name="ln1345">       &quot;Delete a pseudo interface's configuration\n&quot;</a>
+<a name="ln1346">       &quot;Interface's name\n&quot;)</a>
+<a name="ln1347"> </a>
+<a name="ln1348">DEFSH (VTYSH_ZEBRA,</a>
+<a name="ln1349">       vtysh_no_interface_vrf_cmd,</a>
+<a name="ln1350">       &quot;no interface IFNAME &quot; VRF_CMD_STR,</a>
+<a name="ln1351">       NO_STR</a>
+<a name="ln1352">       &quot;Delete a pseudo interface's configuration\n&quot;</a>
+<a name="ln1353">       &quot;Interface's name\n&quot;</a>
+<a name="ln1354">       VRF_CMD_HELP_STR)</a>
+<a name="ln1355"> </a>
+<a name="ln1356">/* TODO Implement interface description commands in ripngd, ospf6d</a>
+<a name="ln1357"> * and isisd. */</a>
+<a name="ln1358">DEFSH (VTYSH_ZEBRA|VTYSH_RIPD|VTYSH_OSPFD,</a>
+<a name="ln1359">       interface_desc_cmd,</a>
+<a name="ln1360">       &quot;description .LINE&quot;,</a>
+<a name="ln1361">       &quot;Interface specific description\n&quot;</a>
+<a name="ln1362">       &quot;Characters describing this interface\n&quot;)</a>
+<a name="ln1363">       </a>
+<a name="ln1364">DEFSH (VTYSH_ZEBRA|VTYSH_RIPD|VTYSH_OSPFD,</a>
+<a name="ln1365">       no_interface_desc_cmd,</a>
+<a name="ln1366">       &quot;no description&quot;,</a>
+<a name="ln1367">       NO_STR</a>
+<a name="ln1368">       &quot;Interface specific description\n&quot;)</a>
+<a name="ln1369"> </a>
+<a name="ln1370">DEFSH (VTYSH_RIPD|VTYSH_RIPNGD,</a>
+<a name="ln1371">       distribute_list_all_cmd,</a>
+<a name="ln1372">       &quot;distribute-list WORD (in|out)&quot;,</a>
+<a name="ln1373">       &quot;Filter networks in routing updates\n&quot;</a>
+<a name="ln1374">       &quot;Access-list name\n&quot;</a>
+<a name="ln1375">       &quot;Filter incoming routing updates\n&quot;</a>
+<a name="ln1376">       &quot;Filter outgoing routing updates\n&quot;)</a>
+<a name="ln1377"> </a>
+<a name="ln1378">DEFSH (VTYSH_RIPD|VTYSH_RIPNGD,</a>
+<a name="ln1379">       no_distribute_list_all_cmd,</a>
+<a name="ln1380">       &quot;no distribute-list WORD (in|out)&quot;,</a>
+<a name="ln1381">       NO_STR</a>
+<a name="ln1382">       &quot;Filter networks in routing updates\n&quot;</a>
+<a name="ln1383">       &quot;Access-list name\n&quot;</a>
+<a name="ln1384">       &quot;Filter incoming routing updates\n&quot;</a>
+<a name="ln1385">       &quot;Filter outgoing routing updates\n&quot;)</a>
+<a name="ln1386"> </a>
+<a name="ln1387">DEFSH (VTYSH_RIPD|VTYSH_RIPNGD,</a>
+<a name="ln1388">       distribute_list_cmd,</a>
+<a name="ln1389">       &quot;distribute-list WORD (in|out) WORD&quot;,</a>
+<a name="ln1390">       &quot;Filter networks in routing updates\n&quot;</a>
+<a name="ln1391">       &quot;Access-list name\n&quot;</a>
+<a name="ln1392">       &quot;Filter incoming routing updates\n&quot;</a>
+<a name="ln1393">       &quot;Filter outgoing routing updates\n&quot;</a>
+<a name="ln1394">       &quot;Interface name\n&quot;)</a>
+<a name="ln1395"> </a>
+<a name="ln1396">DEFSH (VTYSH_RIPD|VTYSH_RIPNGD,</a>
+<a name="ln1397">       no_distribute_list_cmd,</a>
+<a name="ln1398">       &quot;no distribute-list WORD (in|out) WORD&quot;,</a>
+<a name="ln1399">       NO_STR</a>
+<a name="ln1400">       &quot;Filter networks in routing updates\n&quot;</a>
+<a name="ln1401">       &quot;Access-list name\n&quot;</a>
+<a name="ln1402">       &quot;Filter incoming routing updates\n&quot;</a>
+<a name="ln1403">       &quot;Filter outgoing routing updates\n&quot;</a>
+<a name="ln1404">       &quot;Interface name\n&quot;)</a>
+<a name="ln1405"> </a>
+<a name="ln1406">DEFSH (VTYSH_RIPD|VTYSH_RIPNGD,</a>
+<a name="ln1407">       distribute_list_prefix_all_cmd,</a>
+<a name="ln1408">       &quot;distribute-list prefix WORD (in|out)&quot;,</a>
+<a name="ln1409">       &quot;Filter networks in routing updates\n&quot;</a>
+<a name="ln1410">       &quot;Filter prefixes in routing updates\n&quot;</a>
+<a name="ln1411">       &quot;Name of an IP prefix-list\n&quot;</a>
+<a name="ln1412">       &quot;Filter incoming routing updates\n&quot;</a>
+<a name="ln1413">       &quot;Filter outgoing routing updates\n&quot;)</a>
+<a name="ln1414"> </a>
+<a name="ln1415">DEFSH (VTYSH_RIPD|VTYSH_RIPNGD,</a>
+<a name="ln1416">       no_distribute_list_prefix_all_cmd,</a>
+<a name="ln1417">       &quot;no distribute-list prefix WORD (in|out)&quot;,</a>
+<a name="ln1418">       NO_STR</a>
+<a name="ln1419">       &quot;Filter networks in routing updates\n&quot;</a>
+<a name="ln1420">       &quot;Filter prefixes in routing updates\n&quot;</a>
+<a name="ln1421">       &quot;Name of an IP prefix-list\n&quot;</a>
+<a name="ln1422">       &quot;Filter incoming routing updates\n&quot;</a>
+<a name="ln1423">       &quot;Filter outgoing routing updates\n&quot;)</a>
+<a name="ln1424"> </a>
+<a name="ln1425">DEFSH (VTYSH_RIPD|VTYSH_RIPNGD,</a>
+<a name="ln1426">       distribute_list_prefix_cmd,</a>
+<a name="ln1427">       &quot;distribute-list prefix WORD (in|out) WORD&quot;,</a>
+<a name="ln1428">       &quot;Filter networks in routing updates\n&quot;</a>
+<a name="ln1429">       &quot;Filter prefixes in routing updates\n&quot;</a>
+<a name="ln1430">       &quot;Name of an IP prefix-list\n&quot;</a>
+<a name="ln1431">       &quot;Filter incoming routing updates\n&quot;</a>
+<a name="ln1432">       &quot;Filter outgoing routing updates\n&quot;</a>
+<a name="ln1433">       &quot;Interface name\n&quot;)</a>
+<a name="ln1434"> </a>
+<a name="ln1435">DEFSH (VTYSH_RIPD|VTYSH_RIPNGD,</a>
+<a name="ln1436">       no_distribute_list_prefix_cmd,</a>
+<a name="ln1437">       &quot;no distribute-list prefix WORD (in|out) WORD&quot;,</a>
+<a name="ln1438">       NO_STR</a>
+<a name="ln1439">       &quot;Filter networks in routing updates\n&quot;</a>
+<a name="ln1440">       &quot;Filter prefixes in routing updates\n&quot;</a>
+<a name="ln1441">       &quot;Name of an IP prefix-list\n&quot;</a>
+<a name="ln1442">       &quot;Filter incoming routing updates\n&quot;</a>
+<a name="ln1443">       &quot;Filter outgoing routing updates\n&quot;</a>
+<a name="ln1444">       &quot;Interface name\n&quot;)</a>
+<a name="ln1445"> </a>
+<a name="ln1446">DEFSH (VTYSH_RIPNGD,</a>
+<a name="ln1447">       ipv6_distribute_list_all_cmd,</a>
+<a name="ln1448">       &quot;ipv6 distribute-list WORD (in|out)&quot;,</a>
+<a name="ln1449">       &quot;Filter networks in routing updates\n&quot;</a>
+<a name="ln1450">       &quot;Access-list name\n&quot;</a>
+<a name="ln1451">       &quot;Filter incoming routing updates\n&quot;</a>
+<a name="ln1452">       &quot;Filter outgoing routing updates\n&quot;)</a>
+<a name="ln1453"> </a>
+<a name="ln1454">DEFSH (VTYSH_RIPNGD,</a>
+<a name="ln1455">       no_ipv6_distribute_list_all_cmd,</a>
+<a name="ln1456">       &quot;no ipv6 distribute-list WORD (in|out)&quot;,</a>
+<a name="ln1457">       NO_STR</a>
+<a name="ln1458">       &quot;Filter networks in routing updates\n&quot;</a>
+<a name="ln1459">       &quot;Access-list name\n&quot;</a>
+<a name="ln1460">       &quot;Filter incoming routing updates\n&quot;</a>
+<a name="ln1461">       &quot;Filter outgoing routing updates\n&quot;)</a>
+<a name="ln1462"> </a>
+<a name="ln1463">DEFSH (VTYSH_RIPNGD,</a>
+<a name="ln1464">       ipv6_distribute_list_cmd,</a>
+<a name="ln1465">       &quot;ipv6 distribute-list WORD (in|out) WORD&quot;,</a>
+<a name="ln1466">       &quot;Filter networks in routing updates\n&quot;</a>
+<a name="ln1467">       &quot;Access-list name\n&quot;</a>
+<a name="ln1468">       &quot;Filter incoming routing updates\n&quot;</a>
+<a name="ln1469">       &quot;Filter outgoing routing updates\n&quot;</a>
+<a name="ln1470">       &quot;Interface name\n&quot;)</a>
+<a name="ln1471"> </a>
+<a name="ln1472">DEFSH (VTYSH_RIPNGD,</a>
+<a name="ln1473">       no_ipv6_distribute_list_cmd,</a>
+<a name="ln1474">       &quot;no ipv6 distribute-list WORD (in|out) WORD&quot;,</a>
+<a name="ln1475">       NO_STR</a>
+<a name="ln1476">       &quot;Filter networks in routing updates\n&quot;</a>
+<a name="ln1477">       &quot;Access-list name\n&quot;</a>
+<a name="ln1478">       &quot;Filter incoming routing updates\n&quot;</a>
+<a name="ln1479">       &quot;Filter outgoing routing updates\n&quot;</a>
+<a name="ln1480">       &quot;Interface name\n&quot;)</a>
+<a name="ln1481"> </a>
+<a name="ln1482">DEFSH (VTYSH_RIPNGD,</a>
+<a name="ln1483">       ipv6_distribute_list_prefix_all_cmd,</a>
+<a name="ln1484">       &quot;ipv6 distribute-list prefix WORD (in|out)&quot;,</a>
+<a name="ln1485">       &quot;Filter networks in routing updates\n&quot;</a>
+<a name="ln1486">       &quot;Filter prefixes in routing updates\n&quot;</a>
+<a name="ln1487">       &quot;Name of an IP prefix-list\n&quot;</a>
+<a name="ln1488">       &quot;Filter incoming routing updates\n&quot;</a>
+<a name="ln1489">       &quot;Filter outgoing routing updates\n&quot;)</a>
+<a name="ln1490"> </a>
+<a name="ln1491">DEFSH (VTYSH_RIPNGD,</a>
+<a name="ln1492">       no_ipv6_distribute_list_prefix_all_cmd,</a>
+<a name="ln1493">       &quot;no ipv6 distribute-list prefix WORD (in|out)&quot;,</a>
+<a name="ln1494">       NO_STR</a>
+<a name="ln1495">       &quot;Filter networks in routing updates\n&quot;</a>
+<a name="ln1496">       &quot;Filter prefixes in routing updates\n&quot;</a>
+<a name="ln1497">       &quot;Name of an IP prefix-list\n&quot;</a>
+<a name="ln1498">       &quot;Filter incoming routing updates\n&quot;</a>
+<a name="ln1499">       &quot;Filter outgoing routing updates\n&quot;)</a>
+<a name="ln1500"> </a>
+<a name="ln1501">DEFSH (VTYSH_RIPNGD,</a>
+<a name="ln1502">       ipv6_distribute_list_prefix_cmd,</a>
+<a name="ln1503">       &quot;ipv6 distribute-list prefix WORD (in|out) WORD&quot;,</a>
+<a name="ln1504">       &quot;Filter networks in routing updates\n&quot;</a>
+<a name="ln1505">       &quot;Filter prefixes in routing updates\n&quot;</a>
+<a name="ln1506">       &quot;Name of an IP prefix-list\n&quot;</a>
+<a name="ln1507">       &quot;Filter incoming routing updates\n&quot;</a>
+<a name="ln1508">       &quot;Filter outgoing routing updates\n&quot;</a>
+<a name="ln1509">       &quot;Interface name\n&quot;)</a>
+<a name="ln1510"> </a>
+<a name="ln1511">DEFSH (VTYSH_RIPNGD,</a>
+<a name="ln1512">       no_ipv6_distribute_list_prefix_cmd,</a>
+<a name="ln1513">       &quot;no ipv6 distribute-list prefix WORD (in|out) WORD&quot;,</a>
+<a name="ln1514">       NO_STR</a>
+<a name="ln1515">       &quot;Filter networks in routing updates\n&quot;</a>
+<a name="ln1516">       &quot;Filter prefixes in routing updates\n&quot;</a>
+<a name="ln1517">       &quot;Name of an IP prefix-list\n&quot;</a>
+<a name="ln1518">       &quot;Filter incoming routing updates\n&quot;</a>
+<a name="ln1519">       &quot;Filter outgoing routing updates\n&quot;</a>
+<a name="ln1520">       &quot;Interface name\n&quot;)</a>
+<a name="ln1521"> </a>
+<a name="ln1522">DEFUNSH (VTYSH_INTERFACE,</a>
+<a name="ln1523">	 vtysh_exit_interface,</a>
+<a name="ln1524">	 vtysh_exit_interface_cmd,</a>
+<a name="ln1525">	 &quot;exit&quot;,</a>
+<a name="ln1526">	 &quot;Exit current mode and down to previous mode\n&quot;)</a>
+<a name="ln1527">{</a>
+<a name="ln1528">  return vtysh_exit (vty);</a>
+<a name="ln1529">}</a>
+<a name="ln1530"> </a>
+<a name="ln1531">ALIAS (vtysh_exit_interface,</a>
+<a name="ln1532">       vtysh_quit_interface_cmd,</a>
+<a name="ln1533">       &quot;quit&quot;,</a>
+<a name="ln1534">       &quot;Exit current mode and down to previous mode\n&quot;)</a>
+<a name="ln1535"> </a>
+<a name="ln1536">DEFUN (vtysh_show_thread,</a>
+<a name="ln1537">       vtysh_show_thread_cmd,</a>
+<a name="ln1538">       &quot;show thread cpu [FILTER]&quot;,</a>
+<a name="ln1539">      SHOW_STR</a>
+<a name="ln1540">      &quot;Thread information\n&quot;</a>
+<a name="ln1541">      &quot;Thread CPU usage\n&quot;</a>
+<a name="ln1542">      &quot;Display filter (rwtexb)\n&quot;)</a>
+<a name="ln1543">{</a>
+<a name="ln1544">  unsigned int i;</a>
+<a name="ln1545">  int ret = CMD_SUCCESS;</a>
+<a name="ln1546">  char line[100];</a>
+<a name="ln1547"> </a>
+<a name="ln1548">  sprintf(line, &quot;show thread cpu %s\n&quot;, (argc == 1) ? argv[0] : &quot;&quot;);</a>
+<a name="ln1549">  for (i = 0; i &lt; array_size(vtysh_client); i++)</a>
+<a name="ln1550">    if ( vtysh_client[i].fd &gt;= 0 )</a>
+<a name="ln1551">      {</a>
+<a name="ln1552">        fprintf (stdout, &quot;Thread statistics for %s:\n&quot;,</a>
+<a name="ln1553">                 vtysh_client[i].name);</a>
+<a name="ln1554">        ret = vtysh_client_execute (&amp;vtysh_client[i], line, stdout);</a>
+<a name="ln1555">        fprintf (stdout,&quot;\n&quot;);</a>
+<a name="ln1556">      }</a>
+<a name="ln1557">  return ret;</a>
+<a name="ln1558">}</a>
+<a name="ln1559"> </a>
+<a name="ln1560">DEFUN (vtysh_show_work_queues,</a>
+<a name="ln1561">       vtysh_show_work_queues_cmd,</a>
+<a name="ln1562">       &quot;show work-queues&quot;,</a>
+<a name="ln1563">       SHOW_STR</a>
+<a name="ln1564">       &quot;Work Queue information\n&quot;)</a>
+<a name="ln1565">{</a>
+<a name="ln1566">  unsigned int i;</a>
+<a name="ln1567">  int ret = CMD_SUCCESS;</a>
+<a name="ln1568">  char line[] = &quot;show work-queues\n&quot;;</a>
+<a name="ln1569"> </a>
+<a name="ln1570">  for (i = 0; i &lt; array_size(vtysh_client); i++)</a>
+<a name="ln1571">    if ( vtysh_client[i].fd &gt;= 0 )</a>
+<a name="ln1572">      {</a>
+<a name="ln1573">        fprintf (stdout, &quot;Work queue statistics for %s:\n&quot;,</a>
+<a name="ln1574">                 vtysh_client[i].name);</a>
+<a name="ln1575">        ret = vtysh_client_execute (&amp;vtysh_client[i], line, stdout);</a>
+<a name="ln1576">        fprintf (stdout,&quot;\n&quot;);</a>
+<a name="ln1577">      }</a>
+<a name="ln1578"> </a>
+<a name="ln1579">  return ret;</a>
+<a name="ln1580">}</a>
+<a name="ln1581"> </a>
+<a name="ln1582">DEFUN (vtysh_show_work_queues_daemon,</a>
+<a name="ln1583">       vtysh_show_work_queues_daemon_cmd,</a>
+<a name="ln1584">       &quot;show work-queues (zebra|ripd|ripngd|ospfd|ospf6d|bgpd|isisd)&quot;,</a>
+<a name="ln1585">       SHOW_STR</a>
+<a name="ln1586">       &quot;Work Queue information\n&quot;</a>
+<a name="ln1587">       &quot;For the zebra daemon\n&quot;</a>
+<a name="ln1588">       &quot;For the rip daemon\n&quot;</a>
+<a name="ln1589">       &quot;For the ripng daemon\n&quot;</a>
+<a name="ln1590">       &quot;For the ospf daemon\n&quot;</a>
+<a name="ln1591">       &quot;For the ospfv6 daemon\n&quot;</a>
+<a name="ln1592">       &quot;For the bgp daemon\n&quot;</a>
+<a name="ln1593">       &quot;For the isis daemon\n&quot;)</a>
+<a name="ln1594">{</a>
+<a name="ln1595">  unsigned int i;</a>
+<a name="ln1596">  int ret = CMD_SUCCESS;</a>
+<a name="ln1597"> </a>
+<a name="ln1598">  for (i = 0; i &lt; array_size(vtysh_client); i++)</a>
+<a name="ln1599">    {</a>
+<a name="ln1600">      if (begins_with(vtysh_client[i].name, argv[0]))</a>
+<a name="ln1601">        break;</a>
+<a name="ln1602">    }</a>
+<a name="ln1603"> </a>
+<a name="ln1604">  ret = vtysh_client_execute(&amp;vtysh_client[i], &quot;show work-queues\n&quot;, stdout);</a>
+<a name="ln1605"> </a>
+<a name="ln1606">  return ret;</a>
+<a name="ln1607">}</a>
+<a name="ln1608"> </a>
+<a name="ln1609">DEFUNSH (VTYSH_ZEBRA,</a>
+<a name="ln1610">         vtysh_link_params,</a>
+<a name="ln1611">         vtysh_link_params_cmd,</a>
+<a name="ln1612">         &quot;link-params&quot;,</a>
+<a name="ln1613">         LINK_PARAMS_STR</a>
+<a name="ln1614">         )</a>
+<a name="ln1615">{</a>
+<a name="ln1616">  vty-&gt;node = LINK_PARAMS_NODE;</a>
+<a name="ln1617">  return CMD_SUCCESS;</a>
+<a name="ln1618">}</a>
+<a name="ln1619"> </a>
+<a name="ln1620">DEFUNSH (VTYSH_ZEBRA,</a>
+<a name="ln1621">	 exit_link_params,</a>
+<a name="ln1622">	 exit_link_params_cmd,</a>
+<a name="ln1623">	 &quot;exit-link-params&quot;,</a>
+<a name="ln1624">	 &quot;Exit from Link Params configuration node\n&quot;)</a>
+<a name="ln1625">{</a>
+<a name="ln1626">  if (vty-&gt;node == LINK_PARAMS_NODE)</a>
+<a name="ln1627">    vty-&gt;node = INTERFACE_NODE;</a>
+<a name="ln1628">  return CMD_SUCCESS;</a>
+<a name="ln1629">}</a>
+<a name="ln1630"> </a>
+<a name="ln1631">/* Memory */</a>
+<a name="ln1632">DEFUN (vtysh_show_memory,</a>
+<a name="ln1633">       vtysh_show_memory_cmd,</a>
+<a name="ln1634">       &quot;show memory&quot;,</a>
+<a name="ln1635">       SHOW_STR</a>
+<a name="ln1636">       &quot;Memory statistics\n&quot;)</a>
+<a name="ln1637">{</a>
+<a name="ln1638">  unsigned int i;</a>
+<a name="ln1639">  int ret = CMD_SUCCESS;</a>
+<a name="ln1640">  char line[] = &quot;show memory\n&quot;;</a>
+<a name="ln1641">  </a>
+<a name="ln1642">  for (i = 0; i &lt; array_size(vtysh_client); i++)</a>
+<a name="ln1643">    if ( vtysh_client[i].fd &gt;= 0 )</a>
+<a name="ln1644">      {</a>
+<a name="ln1645">        fprintf (stdout, &quot;Memory statistics for %s:\n&quot;, </a>
+<a name="ln1646">                 vtysh_client[i].name);</a>
+<a name="ln1647">        ret = vtysh_client_execute (&amp;vtysh_client[i], line, stdout);</a>
+<a name="ln1648">        fprintf (stdout,&quot;\n&quot;);</a>
+<a name="ln1649">      }</a>
+<a name="ln1650">  </a>
+<a name="ln1651">  return ret;</a>
+<a name="ln1652">}</a>
+<a name="ln1653"> </a>
+<a name="ln1654">/* Logging commands. */</a>
+<a name="ln1655">DEFUN (vtysh_show_logging,</a>
+<a name="ln1656">       vtysh_show_logging_cmd,</a>
+<a name="ln1657">       &quot;show logging&quot;,</a>
+<a name="ln1658">       SHOW_STR</a>
+<a name="ln1659">       &quot;Show current logging configuration\n&quot;)</a>
+<a name="ln1660">{</a>
+<a name="ln1661">  unsigned int i;</a>
+<a name="ln1662">  int ret = CMD_SUCCESS;</a>
+<a name="ln1663">  char line[] = &quot;show logging\n&quot;;</a>
+<a name="ln1664">  </a>
+<a name="ln1665">  for (i = 0; i &lt; array_size(vtysh_client); i++)</a>
+<a name="ln1666">    if ( vtysh_client[i].fd &gt;= 0 )</a>
+<a name="ln1667">      {</a>
+<a name="ln1668">        fprintf (stdout,&quot;Logging configuration for %s:\n&quot;, </a>
+<a name="ln1669">                 vtysh_client[i].name);</a>
+<a name="ln1670">        ret = vtysh_client_execute (&amp;vtysh_client[i], line, stdout);</a>
+<a name="ln1671">        fprintf (stdout,&quot;\n&quot;);</a>
+<a name="ln1672">      }</a>
+<a name="ln1673">  </a>
+<a name="ln1674">  return ret;</a>
+<a name="ln1675">}</a>
+<a name="ln1676"> </a>
+<a name="ln1677">DEFUNSH (VTYSH_ALL,</a>
+<a name="ln1678">	 vtysh_log_stdout,</a>
+<a name="ln1679">	 vtysh_log_stdout_cmd,</a>
+<a name="ln1680">	 &quot;log stdout&quot;,</a>
+<a name="ln1681">	 &quot;Logging control\n&quot;</a>
+<a name="ln1682">	 &quot;Set stdout logging level\n&quot;)</a>
+<a name="ln1683">{</a>
+<a name="ln1684">  return CMD_SUCCESS;</a>
+<a name="ln1685">}</a>
+<a name="ln1686"> </a>
+<a name="ln1687">DEFUNSH (VTYSH_ALL,</a>
+<a name="ln1688">	 vtysh_log_stdout_level,</a>
+<a name="ln1689">	 vtysh_log_stdout_level_cmd,</a>
+<a name="ln1690">	 &quot;log stdout &quot;LOG_LEVELS,</a>
+<a name="ln1691">	 &quot;Logging control\n&quot;</a>
+<a name="ln1692">	 &quot;Set stdout logging level\n&quot;</a>
+<a name="ln1693">	 LOG_LEVEL_DESC)</a>
+<a name="ln1694">{</a>
+<a name="ln1695">  return CMD_SUCCESS;</a>
+<a name="ln1696">}</a>
+<a name="ln1697"> </a>
+<a name="ln1698">DEFUNSH (VTYSH_ALL,</a>
+<a name="ln1699">	 no_vtysh_log_stdout,</a>
+<a name="ln1700">	 no_vtysh_log_stdout_cmd,</a>
+<a name="ln1701">	 &quot;no log stdout [LEVEL]&quot;,</a>
+<a name="ln1702">	 NO_STR</a>
+<a name="ln1703">	 &quot;Logging control\n&quot;</a>
+<a name="ln1704">	 &quot;Cancel logging to stdout\n&quot;</a>
+<a name="ln1705">	 &quot;Logging level\n&quot;)</a>
+<a name="ln1706">{</a>
+<a name="ln1707">  return CMD_SUCCESS;</a>
+<a name="ln1708">}</a>
+<a name="ln1709"> </a>
+<a name="ln1710">DEFUNSH (VTYSH_ALL,</a>
+<a name="ln1711">	 vtysh_log_file,</a>
+<a name="ln1712">	 vtysh_log_file_cmd,</a>
+<a name="ln1713">	 &quot;log file FILENAME&quot;,</a>
+<a name="ln1714">	 &quot;Logging control\n&quot;</a>
+<a name="ln1715">	 &quot;Logging to file\n&quot;</a>
+<a name="ln1716">	 &quot;Logging filename\n&quot;)</a>
+<a name="ln1717">{</a>
+<a name="ln1718">  return CMD_SUCCESS;</a>
+<a name="ln1719">}</a>
+<a name="ln1720"> </a>
+<a name="ln1721">DEFUNSH (VTYSH_ALL,</a>
+<a name="ln1722">	 vtysh_log_file_level,</a>
+<a name="ln1723">	 vtysh_log_file_level_cmd,</a>
+<a name="ln1724">	 &quot;log file FILENAME &quot;LOG_LEVELS,</a>
+<a name="ln1725">	 &quot;Logging control\n&quot;</a>
+<a name="ln1726">	 &quot;Logging to file\n&quot;</a>
+<a name="ln1727">	 &quot;Logging filename\n&quot;</a>
+<a name="ln1728">	 LOG_LEVEL_DESC)</a>
+<a name="ln1729">{</a>
+<a name="ln1730">  return CMD_SUCCESS;</a>
+<a name="ln1731">}</a>
+<a name="ln1732"> </a>
+<a name="ln1733">DEFUNSH (VTYSH_ALL,</a>
+<a name="ln1734">	 no_vtysh_log_file,</a>
+<a name="ln1735">	 no_vtysh_log_file_cmd,</a>
+<a name="ln1736">	 &quot;no log file [FILENAME]&quot;,</a>
+<a name="ln1737">	 NO_STR</a>
+<a name="ln1738">	 &quot;Logging control\n&quot;</a>
+<a name="ln1739">	 &quot;Cancel logging to file\n&quot;</a>
+<a name="ln1740">	 &quot;Logging file name\n&quot;)</a>
+<a name="ln1741">{</a>
+<a name="ln1742">  return CMD_SUCCESS;</a>
+<a name="ln1743">}</a>
+<a name="ln1744"> </a>
+<a name="ln1745">ALIAS_SH (VTYSH_ALL,</a>
+<a name="ln1746">	  no_vtysh_log_file,</a>
+<a name="ln1747">	  no_vtysh_log_file_level_cmd,</a>
+<a name="ln1748">	  &quot;no log file FILENAME LEVEL&quot;,</a>
+<a name="ln1749">	  NO_STR</a>
+<a name="ln1750">	  &quot;Logging control\n&quot;</a>
+<a name="ln1751">	  &quot;Cancel logging to file\n&quot;</a>
+<a name="ln1752">	  &quot;Logging file name\n&quot;</a>
+<a name="ln1753">	  &quot;Logging level\n&quot;)</a>
+<a name="ln1754"> </a>
+<a name="ln1755">DEFUNSH (VTYSH_ALL,</a>
+<a name="ln1756">	 vtysh_log_monitor,</a>
+<a name="ln1757">	 vtysh_log_monitor_cmd,</a>
+<a name="ln1758">	 &quot;log monitor&quot;,</a>
+<a name="ln1759">	 &quot;Logging control\n&quot;</a>
+<a name="ln1760">	 &quot;Set terminal line (monitor) logging level\n&quot;)</a>
+<a name="ln1761">{</a>
+<a name="ln1762">  return CMD_SUCCESS;</a>
+<a name="ln1763">}</a>
+<a name="ln1764"> </a>
+<a name="ln1765">DEFUNSH (VTYSH_ALL,</a>
+<a name="ln1766">	 vtysh_log_monitor_level,</a>
+<a name="ln1767">	 vtysh_log_monitor_level_cmd,</a>
+<a name="ln1768">	 &quot;log monitor &quot;LOG_LEVELS,</a>
+<a name="ln1769">	 &quot;Logging control\n&quot;</a>
+<a name="ln1770">	 &quot;Set terminal line (monitor) logging level\n&quot;</a>
+<a name="ln1771">	 LOG_LEVEL_DESC)</a>
+<a name="ln1772">{</a>
+<a name="ln1773">  return CMD_SUCCESS;</a>
+<a name="ln1774">}</a>
+<a name="ln1775"> </a>
+<a name="ln1776">DEFUNSH (VTYSH_ALL,</a>
+<a name="ln1777">	 no_vtysh_log_monitor,</a>
+<a name="ln1778">	 no_vtysh_log_monitor_cmd,</a>
+<a name="ln1779">	 &quot;no log monitor [LEVEL]&quot;,</a>
+<a name="ln1780">	 NO_STR</a>
+<a name="ln1781">	 &quot;Logging control\n&quot;</a>
+<a name="ln1782">	 &quot;Disable terminal line (monitor) logging\n&quot;</a>
+<a name="ln1783">	 &quot;Logging level\n&quot;)</a>
+<a name="ln1784">{</a>
+<a name="ln1785">  return CMD_SUCCESS;</a>
+<a name="ln1786">}</a>
+<a name="ln1787"> </a>
+<a name="ln1788">DEFUNSH (VTYSH_ALL,</a>
+<a name="ln1789">	 vtysh_log_syslog,</a>
+<a name="ln1790">	 vtysh_log_syslog_cmd,</a>
+<a name="ln1791">	 &quot;log syslog&quot;,</a>
+<a name="ln1792">	 &quot;Logging control\n&quot;</a>
+<a name="ln1793">	 &quot;Set syslog logging level\n&quot;)</a>
+<a name="ln1794">{</a>
+<a name="ln1795">  return CMD_SUCCESS;</a>
+<a name="ln1796">}</a>
+<a name="ln1797"> </a>
+<a name="ln1798">DEFUNSH (VTYSH_ALL,</a>
+<a name="ln1799">	 vtysh_log_syslog_level,</a>
+<a name="ln1800">	 vtysh_log_syslog_level_cmd,</a>
+<a name="ln1801">	 &quot;log syslog &quot;LOG_LEVELS,</a>
+<a name="ln1802">	 &quot;Logging control\n&quot;</a>
+<a name="ln1803">	 &quot;Set syslog logging level\n&quot;</a>
+<a name="ln1804">	 LOG_LEVEL_DESC)</a>
+<a name="ln1805">{</a>
+<a name="ln1806">  return CMD_SUCCESS;</a>
+<a name="ln1807">}</a>
+<a name="ln1808"> </a>
+<a name="ln1809">DEFUNSH (VTYSH_ALL,</a>
+<a name="ln1810">	 no_vtysh_log_syslog,</a>
+<a name="ln1811">	 no_vtysh_log_syslog_cmd,</a>
+<a name="ln1812">	 &quot;no log syslog [LEVEL]&quot;,</a>
+<a name="ln1813">	 NO_STR</a>
+<a name="ln1814">	 &quot;Logging control\n&quot;</a>
+<a name="ln1815">	 &quot;Cancel logging to syslog\n&quot;</a>
+<a name="ln1816">	 &quot;Logging level\n&quot;)</a>
+<a name="ln1817">{</a>
+<a name="ln1818">  return CMD_SUCCESS;</a>
+<a name="ln1819">}</a>
+<a name="ln1820"> </a>
+<a name="ln1821">DEFUNSH (VTYSH_ALL,</a>
+<a name="ln1822">	 vtysh_log_facility,</a>
+<a name="ln1823">	 vtysh_log_facility_cmd,</a>
+<a name="ln1824">	 &quot;log facility &quot;LOG_FACILITIES,</a>
+<a name="ln1825">	 &quot;Logging control\n&quot;</a>
+<a name="ln1826">	 &quot;Facility parameter for syslog messages\n&quot;</a>
+<a name="ln1827">	 LOG_FACILITY_DESC)</a>
+<a name="ln1828"> </a>
+<a name="ln1829">{</a>
+<a name="ln1830">  return CMD_SUCCESS;</a>
+<a name="ln1831">}</a>
+<a name="ln1832"> </a>
+<a name="ln1833">DEFUNSH (VTYSH_ALL,</a>
+<a name="ln1834">	 no_vtysh_log_facility,</a>
+<a name="ln1835">	 no_vtysh_log_facility_cmd,</a>
+<a name="ln1836">	 &quot;no log facility [FACILITY]&quot;,</a>
+<a name="ln1837">	 NO_STR</a>
+<a name="ln1838">	 &quot;Logging control\n&quot;</a>
+<a name="ln1839">	 &quot;Reset syslog facility to default (daemon)\n&quot;</a>
+<a name="ln1840">	 &quot;Syslog facility\n&quot;)</a>
+<a name="ln1841"> </a>
+<a name="ln1842">{</a>
+<a name="ln1843">  return CMD_SUCCESS;</a>
+<a name="ln1844">}</a>
+<a name="ln1845"> </a>
+<a name="ln1846">DEFUNSH_DEPRECATED (VTYSH_ALL,</a>
+<a name="ln1847">		    vtysh_log_trap,</a>
+<a name="ln1848">		    vtysh_log_trap_cmd,</a>
+<a name="ln1849">		    &quot;log trap &quot;LOG_LEVELS,</a>
+<a name="ln1850">		    &quot;Logging control\n&quot;</a>
+<a name="ln1851">		    &quot;(Deprecated) Set logging level and default for all destinations\n&quot;</a>
+<a name="ln1852">		    LOG_LEVEL_DESC)</a>
+<a name="ln1853"> </a>
+<a name="ln1854">{</a>
+<a name="ln1855">  return CMD_SUCCESS;</a>
+<a name="ln1856">}</a>
+<a name="ln1857"> </a>
+<a name="ln1858">DEFUNSH_DEPRECATED (VTYSH_ALL,</a>
+<a name="ln1859">		    no_vtysh_log_trap,</a>
+<a name="ln1860">		    no_vtysh_log_trap_cmd,</a>
+<a name="ln1861">		    &quot;no log trap [LEVEL]&quot;,</a>
+<a name="ln1862">		    NO_STR</a>
+<a name="ln1863">		    &quot;Logging control\n&quot;</a>
+<a name="ln1864">		    &quot;Permit all logging information\n&quot;</a>
+<a name="ln1865">		    &quot;Logging level\n&quot;)</a>
+<a name="ln1866">{</a>
+<a name="ln1867">  return CMD_SUCCESS;</a>
+<a name="ln1868">}</a>
+<a name="ln1869"> </a>
+<a name="ln1870">DEFUNSH (VTYSH_ALL,</a>
+<a name="ln1871">	 vtysh_log_record_priority,</a>
+<a name="ln1872">	 vtysh_log_record_priority_cmd,</a>
+<a name="ln1873">	 &quot;log record-priority&quot;,</a>
+<a name="ln1874">	 &quot;Logging control\n&quot;</a>
+<a name="ln1875">	 &quot;Log the priority of the message within the message\n&quot;)</a>
+<a name="ln1876">{</a>
+<a name="ln1877">  return CMD_SUCCESS;</a>
+<a name="ln1878">}</a>
+<a name="ln1879"> </a>
+<a name="ln1880">DEFUNSH (VTYSH_ALL,</a>
+<a name="ln1881">	 no_vtysh_log_record_priority,</a>
+<a name="ln1882">	 no_vtysh_log_record_priority_cmd,</a>
+<a name="ln1883">	 &quot;no log record-priority&quot;,</a>
+<a name="ln1884">	 NO_STR</a>
+<a name="ln1885">	 &quot;Logging control\n&quot;</a>
+<a name="ln1886">	 &quot;Do not log the priority of the message within the message\n&quot;)</a>
+<a name="ln1887">{</a>
+<a name="ln1888">  return CMD_SUCCESS;</a>
+<a name="ln1889">}</a>
+<a name="ln1890"> </a>
+<a name="ln1891">DEFUNSH (VTYSH_ALL,</a>
+<a name="ln1892">	 vtysh_log_timestamp_precision,</a>
+<a name="ln1893">	 vtysh_log_timestamp_precision_cmd,</a>
+<a name="ln1894">	 &quot;log timestamp precision &lt;0-6&gt;&quot;,</a>
+<a name="ln1895">	 &quot;Logging control\n&quot;</a>
+<a name="ln1896">	 &quot;Timestamp configuration\n&quot;</a>
+<a name="ln1897">	 &quot;Set the timestamp precision\n&quot;</a>
+<a name="ln1898">	 &quot;Number of subsecond digits\n&quot;)</a>
+<a name="ln1899">{</a>
+<a name="ln1900">  return CMD_SUCCESS;</a>
+<a name="ln1901">}</a>
+<a name="ln1902"> </a>
+<a name="ln1903">DEFUNSH (VTYSH_ALL,</a>
+<a name="ln1904">	 no_vtysh_log_timestamp_precision,</a>
+<a name="ln1905">	 no_vtysh_log_timestamp_precision_cmd,</a>
+<a name="ln1906">	 &quot;no log timestamp precision&quot;,</a>
+<a name="ln1907">	 NO_STR</a>
+<a name="ln1908">	 &quot;Logging control\n&quot;</a>
+<a name="ln1909">	 &quot;Timestamp configuration\n&quot;</a>
+<a name="ln1910">	 &quot;Reset the timestamp precision to the default value of 0\n&quot;)</a>
+<a name="ln1911">{</a>
+<a name="ln1912">  return CMD_SUCCESS;</a>
+<a name="ln1913">}</a>
+<a name="ln1914"> </a>
+<a name="ln1915">DEFUNSH (VTYSH_ALL,</a>
+<a name="ln1916">	 vtysh_service_password_encrypt,</a>
+<a name="ln1917">	 vtysh_service_password_encrypt_cmd,</a>
+<a name="ln1918">	 &quot;service password-encryption&quot;,</a>
+<a name="ln1919">	 &quot;Set up miscellaneous service\n&quot;</a>
+<a name="ln1920">	 &quot;Enable encrypted passwords\n&quot;)</a>
+<a name="ln1921">{</a>
+<a name="ln1922">  return CMD_SUCCESS;</a>
+<a name="ln1923">}</a>
+<a name="ln1924"> </a>
+<a name="ln1925">DEFUNSH (VTYSH_ALL,</a>
+<a name="ln1926">	 no_vtysh_service_password_encrypt,</a>
+<a name="ln1927">	 no_vtysh_service_password_encrypt_cmd,</a>
+<a name="ln1928">	 &quot;no service password-encryption&quot;,</a>
+<a name="ln1929">	 NO_STR</a>
+<a name="ln1930">	 &quot;Set up miscellaneous service\n&quot;</a>
+<a name="ln1931">	 &quot;Enable encrypted passwords\n&quot;)</a>
+<a name="ln1932">{</a>
+<a name="ln1933">  return CMD_SUCCESS;</a>
+<a name="ln1934">}</a>
+<a name="ln1935"> </a>
+<a name="ln1936">DEFUNSH (VTYSH_ALL,</a>
+<a name="ln1937">	 vtysh_config_password,</a>
+<a name="ln1938">	 vtysh_password_cmd,</a>
+<a name="ln1939">	 &quot;password (8|) WORD&quot;,</a>
+<a name="ln1940">	 &quot;Assign the terminal connection password\n&quot;</a>
+<a name="ln1941">	 &quot;Specifies a HIDDEN password will follow\n&quot;</a>
+<a name="ln1942">	 &quot;dummy string \n&quot;</a>
+<a name="ln1943">	 &quot;The HIDDEN line password string\n&quot;)</a>
+<a name="ln1944">{</a>
+<a name="ln1945">  return CMD_SUCCESS;</a>
+<a name="ln1946">}</a>
+<a name="ln1947"> </a>
+<a name="ln1948">DEFUNSH (VTYSH_ALL,</a>
+<a name="ln1949">	 vtysh_password_text,</a>
+<a name="ln1950">	 vtysh_password_text_cmd,</a>
+<a name="ln1951">	 &quot;password LINE&quot;,</a>
+<a name="ln1952">	 &quot;Assign the terminal connection password\n&quot;</a>
+<a name="ln1953">	 &quot;The UNENCRYPTED (cleartext) line password\n&quot;)</a>
+<a name="ln1954">{</a>
+<a name="ln1955">  return CMD_SUCCESS;</a>
+<a name="ln1956">}</a>
+<a name="ln1957"> </a>
+<a name="ln1958">DEFUNSH (VTYSH_ALL,</a>
+<a name="ln1959">	 vtysh_config_enable_password,</a>
+<a name="ln1960">	 vtysh_enable_password_cmd,</a>
+<a name="ln1961">	 &quot;enable password (8|) WORD&quot;,</a>
+<a name="ln1962">	 &quot;Modify enable password parameters\n&quot;</a>
+<a name="ln1963">	 &quot;Assign the privileged level password\n&quot;</a>
+<a name="ln1964">	 &quot;Specifies a HIDDEN password will follow\n&quot;</a>
+<a name="ln1965">	 &quot;dummy string \n&quot;</a>
+<a name="ln1966">	 &quot;The HIDDEN 'enable' password string\n&quot;)</a>
+<a name="ln1967">{</a>
+<a name="ln1968">  return CMD_SUCCESS;</a>
+<a name="ln1969">}</a>
+<a name="ln1970"> </a>
+<a name="ln1971">DEFUNSH (VTYSH_ALL,</a>
+<a name="ln1972">	 vtysh_enable_password_text,</a>
+<a name="ln1973">	 vtysh_enable_password_text_cmd,</a>
+<a name="ln1974">	 &quot;enable password LINE&quot;,</a>
+<a name="ln1975">	 &quot;Modify enable password parameters\n&quot;</a>
+<a name="ln1976">	 &quot;Assign the privileged level password\n&quot;</a>
+<a name="ln1977">	 &quot;The UNENCRYPTED (cleartext) 'enable' password\n&quot;)</a>
+<a name="ln1978">{</a>
+<a name="ln1979">  return CMD_SUCCESS;</a>
+<a name="ln1980">}</a>
+<a name="ln1981"> </a>
+<a name="ln1982">DEFUNSH (VTYSH_ALL,</a>
+<a name="ln1983">	 no_vtysh_config_enable_password,</a>
+<a name="ln1984">	 no_vtysh_enable_password_cmd,</a>
+<a name="ln1985">	 &quot;no enable password&quot;,</a>
+<a name="ln1986">	 NO_STR</a>
+<a name="ln1987">	 &quot;Modify enable password parameters\n&quot;</a>
+<a name="ln1988">	 &quot;Assign the privileged level password\n&quot;)</a>
+<a name="ln1989">{</a>
+<a name="ln1990">  return CMD_SUCCESS;</a>
+<a name="ln1991">}</a>
+<a name="ln1992"> </a>
+<a name="ln1993">DEFUN (vtysh_write_terminal,</a>
+<a name="ln1994">       vtysh_write_terminal_cmd,</a>
+<a name="ln1995">       &quot;write terminal&quot;,</a>
+<a name="ln1996">       &quot;Write running configuration to memory, network, or terminal\n&quot;</a>
+<a name="ln1997">       &quot;Write to terminal\n&quot;)</a>
+<a name="ln1998">{</a>
+<a name="ln1999">  u_int i;</a>
+<a name="ln2000">  char line[] = &quot;write terminal\n&quot;;</a>
+<a name="ln2001">  FILE *fp = NULL;</a>
+<a name="ln2002"> </a>
+<a name="ln2003">  if (vtysh_pager_name)</a>
+<a name="ln2004">    {</a>
+<a name="ln2005">      fp = popen (vtysh_pager_name, &quot;w&quot;);</a>
+<a name="ln2006">      if (fp == NULL)</a>
+<a name="ln2007">	{</a>
+<a name="ln2008">	  perror (&quot;popen&quot;);</a>
+<a name="ln2009">	  exit (1);</a>
+<a name="ln2010">	}</a>
+<a name="ln2011">    }</a>
+<a name="ln2012">  else</a>
+<a name="ln2013">    fp = stdout;</a>
+<a name="ln2014"> </a>
+<a name="ln2015">  vty_out (vty, &quot;Building configuration...%s&quot;, VTY_NEWLINE);</a>
+<a name="ln2016">  vty_out (vty, &quot;%sCurrent configuration:%s&quot;, VTY_NEWLINE,</a>
+<a name="ln2017">	   VTY_NEWLINE);</a>
+<a name="ln2018">  vty_out (vty, &quot;!%s&quot;, VTY_NEWLINE);</a>
+<a name="ln2019"> </a>
+<a name="ln2020">  for (i = 0; i &lt; array_size(vtysh_client); i++)</a>
+<a name="ln2021">    vtysh_client_execute (&amp;vtysh_client[i], line, NULL);</a>
+<a name="ln2022"> </a>
+<a name="ln2023">  /* Integrate vtysh specific configuration. */</a>
+<a name="ln2024">  vtysh_config_write ();</a>
+<a name="ln2025"> </a>
+<a name="ln2026">  vtysh_config_dump (fp);</a>
+<a name="ln2027"> </a>
+<a name="ln2028">  if (vtysh_pager_name &amp;&amp; fp)</a>
+<a name="ln2029">    {</a>
+<a name="ln2030">      fflush (fp);</a>
+<a name="ln2031">      if (pclose (fp) == -1)</a>
+<a name="ln2032">	{</a>
+<a name="ln2033">	  perror (&quot;pclose&quot;);</a>
+<a name="ln2034">	  exit (1);</a>
+<a name="ln2035">	}</a>
+<a name="ln2036">      fp = NULL;</a>
+<a name="ln2037">    }</a>
+<a name="ln2038"> </a>
+<a name="ln2039">  vty_out (vty, &quot;end%s&quot;, VTY_NEWLINE);</a>
+<a name="ln2040">  </a>
+<a name="ln2041">  return CMD_SUCCESS;</a>
+<a name="ln2042">}</a>
+<a name="ln2043"> </a>
+<a name="ln2044">DEFUN (vtysh_write_terminal_daemon,</a>
+<a name="ln2045">       vtysh_write_terminal_daemon_cmd,</a>
+<a name="ln2046">       &quot;write terminal (zebra|ripd|ripngd|ospfd|ospf6d|bgpd|isisd|babeld)&quot;,</a>
+<a name="ln2047">       &quot;Write running configuration to memory, network, or terminal\n&quot;</a>
+<a name="ln2048">       &quot;Write to terminal\n&quot;</a>
+<a name="ln2049">       &quot;For the zebra daemon\n&quot;</a>
+<a name="ln2050">       &quot;For the rip daemon\n&quot;</a>
+<a name="ln2051">       &quot;For the ripng daemon\n&quot;</a>
+<a name="ln2052">       &quot;For the ospf daemon\n&quot;</a>
+<a name="ln2053">       &quot;For the ospfv6 daemon\n&quot;</a>
+<a name="ln2054">       &quot;For the bgp daemon\n&quot;</a>
+<a name="ln2055">       &quot;For the isis daemon\n&quot;</a>
+<a name="ln2056">       &quot;For the babel daemon\n&quot;)</a>
+<a name="ln2057">{</a>
+<a name="ln2058">  unsigned int i;</a>
+<a name="ln2059">  int ret = CMD_SUCCESS;</a>
+<a name="ln2060"> </a>
+<a name="ln2061">  for (i = 0; i &lt; array_size(vtysh_client); i++)</a>
+<a name="ln2062">    {</a>
+<a name="ln2063">      if (strcmp(vtysh_client[i].name, argv[0]) == 0)</a>
+<a name="ln2064">	break;</a>
+<a name="ln2065">    }</a>
+<a name="ln2066"> </a>
+<a name="ln2067">  if (i == array_size(vtysh_client))</a>
+<a name="ln2068">    return CMD_ERR_NO_MATCH;</a>
+<a name="ln2069"> </a>
+<a name="ln2070">  ret = vtysh_client_execute(&amp;vtysh_client[i], &quot;show running-config\n&quot;, stdout);</a>
+<a name="ln2071"> </a>
+<a name="ln2072">  return ret;</a>
+<a name="ln2073">}</a>
+<a name="ln2074"> </a>
+<a name="ln2075">DEFUN (vtysh_integrated_config,</a>
+<a name="ln2076">       vtysh_integrated_config_cmd,</a>
+<a name="ln2077">       &quot;service integrated-vtysh-config&quot;,</a>
+<a name="ln2078">       &quot;Set up miscellaneous service\n&quot;</a>
+<a name="ln2079">       &quot;Write configuration into integrated file\n&quot;)</a>
+<a name="ln2080">{</a>
+<a name="ln2081">  vtysh_writeconfig_integrated = 1;</a>
+<a name="ln2082">  return CMD_SUCCESS;</a>
+<a name="ln2083">}</a>
+<a name="ln2084"> </a>
+<a name="ln2085">DEFUN (no_vtysh_integrated_config,</a>
+<a name="ln2086">       no_vtysh_integrated_config_cmd,</a>
+<a name="ln2087">       &quot;no service integrated-vtysh-config&quot;,</a>
+<a name="ln2088">       NO_STR</a>
+<a name="ln2089">       &quot;Set up miscellaneous service\n&quot;</a>
+<a name="ln2090">       &quot;Write configuration into integrated file\n&quot;)</a>
+<a name="ln2091">{</a>
+<a name="ln2092">  vtysh_writeconfig_integrated = 0;</a>
+<a name="ln2093">  return CMD_SUCCESS;</a>
+<a name="ln2094">}</a>
+<a name="ln2095"> </a>
+<a name="ln2096">static int</a>
+<a name="ln2097">write_config_integrated(void)</a>
+<a name="ln2098">{</a>
+<a name="ln2099">  u_int i;</a>
+<a name="ln2100">  char line[] = &quot;write terminal\n&quot;;</a>
+<a name="ln2101">  FILE *fp;</a>
+<a name="ln2102">  char *integrate_sav = NULL;</a>
+<a name="ln2103"> </a>
+<a name="ln2104">  integrate_sav = malloc (strlen (integrate_default) +</a>
+<a name="ln2105">			  strlen (CONF_BACKUP_EXT) + 1);</a>
+<a name="ln2106">  strcpy (integrate_sav, integrate_default);</a>
+<a name="ln2107">  strcat (integrate_sav, CONF_BACKUP_EXT);</a>
+<a name="ln2108"> </a>
+<a name="ln2109">  fprintf (stdout,&quot;Building Configuration...\n&quot;);</a>
+<a name="ln2110"> </a>
+<a name="ln2111">  /* Move current configuration file to backup config file. */</a>
+<a name="ln2112">  unlink (integrate_sav);</a>
+<a name="ln2113">  rename (integrate_default, integrate_sav);</a>
+<a name="ln2114">  free (integrate_sav);</a>
+<a name="ln2115"> </a>
+<a name="ln2116">  fp = fopen (integrate_default, &quot;w&quot;);</a>
+<a name="ln2117">  if (fp == NULL)</a>
+<a name="ln2118">    {</a>
+<a name="ln2119">      fprintf (stdout,&quot;%% Can't open configuration file %s.\n&quot;,</a>
+<a name="ln2120">	       integrate_default);</a>
+<a name="ln2121">      return CMD_SUCCESS;</a>
+<a name="ln2122">    }</a>
+<a name="ln2123"> </a>
+<a name="ln2124">  for (i = 0; i &lt; array_size(vtysh_client); i++)</a>
+<a name="ln2125">    vtysh_client_execute (&amp;vtysh_client[i], line, NULL);</a>
+<a name="ln2126"> </a>
+<a name="ln2127">  vtysh_config_write ();</a>
+<a name="ln2128">  vtysh_config_dump (fp);</a>
+<a name="ln2129"> </a>
+<a name="ln2130">  fclose (fp);</a>
+<a name="ln2131"> </a>
+<a name="ln2132">  if (chmod (integrate_default, CONFIGFILE_MASK) != 0)</a>
+<a name="ln2133">    {</a>
+<a name="ln2134">      fprintf (stdout,&quot;%% Can't chmod configuration file %s: %s (%d)\n&quot;, </a>
+<a name="ln2135">	integrate_default, safe_strerror(errno), errno);</a>
+<a name="ln2136">      return CMD_WARNING;</a>
+<a name="ln2137">    }</a>
+<a name="ln2138"> </a>
+<a name="ln2139">  fprintf(stdout,&quot;Integrated configuration saved to %s\n&quot;,integrate_default);</a>
+<a name="ln2140"> </a>
+<a name="ln2141">  fprintf (stdout,&quot;[OK]\n&quot;);</a>
+<a name="ln2142"> </a>
+<a name="ln2143">  return CMD_SUCCESS;</a>
+<a name="ln2144">}</a>
+<a name="ln2145"> </a>
+<a name="ln2146">DEFUN (vtysh_write_memory,</a>
+<a name="ln2147">       vtysh_write_memory_cmd,</a>
+<a name="ln2148">       &quot;write memory&quot;,</a>
+<a name="ln2149">       &quot;Write running configuration to memory, network, or terminal\n&quot;</a>
+<a name="ln2150">       &quot;Write configuration to the file (same as write file)\n&quot;)</a>
+<a name="ln2151">{</a>
+<a name="ln2152">  int ret = CMD_SUCCESS;</a>
+<a name="ln2153">  char line[] = &quot;write memory\n&quot;;</a>
+<a name="ln2154">  u_int i;</a>
+<a name="ln2155">  </a>
+<a name="ln2156">  /* If integrated Quagga.conf explicitely set. */</a>
+<a name="ln2157">  if (vtysh_writeconfig_integrated)</a>
+<a name="ln2158">    return write_config_integrated();</a>
+<a name="ln2159"> </a>
+<a name="ln2160">  fprintf (stdout,&quot;Building Configuration...\n&quot;);</a>
+<a name="ln2161">	  </a>
+<a name="ln2162">  for (i = 0; i &lt; array_size(vtysh_client); i++)</a>
+<a name="ln2163">    ret = vtysh_client_execute (&amp;vtysh_client[i], line, stdout);</a>
+<a name="ln2164">  </a>
+<a name="ln2165">  fprintf (stdout,&quot;[OK]\n&quot;);</a>
+<a name="ln2166"> </a>
+<a name="ln2167">  return ret;</a>
+<a name="ln2168">}</a>
+<a name="ln2169"> </a>
+<a name="ln2170">ALIAS (vtysh_write_memory,</a>
+<a name="ln2171">       vtysh_copy_runningconfig_startupconfig_cmd,</a>
+<a name="ln2172">       &quot;copy running-config startup-config&quot;,  </a>
+<a name="ln2173">       &quot;Copy from one file to another\n&quot;</a>
+<a name="ln2174">       &quot;Copy from current system configuration\n&quot;</a>
+<a name="ln2175">       &quot;Copy to startup configuration\n&quot;)</a>
+<a name="ln2176"> </a>
+<a name="ln2177">ALIAS (vtysh_write_memory,</a>
+<a name="ln2178">       vtysh_write_file_cmd,</a>
+<a name="ln2179">       &quot;write file&quot;,</a>
+<a name="ln2180">       &quot;Write running configuration to memory, network, or terminal\n&quot;</a>
+<a name="ln2181">       &quot;Write configuration to the file (same as write memory)\n&quot;)</a>
+<a name="ln2182"> </a>
+<a name="ln2183">ALIAS (vtysh_write_memory,</a>
+<a name="ln2184">       vtysh_write_cmd,</a>
+<a name="ln2185">       &quot;write&quot;,</a>
+<a name="ln2186">       &quot;Write running configuration to memory, network, or terminal\n&quot;)</a>
+<a name="ln2187"> </a>
+<a name="ln2188">ALIAS (vtysh_write_terminal,</a>
+<a name="ln2189">       vtysh_show_running_config_cmd,</a>
+<a name="ln2190">       &quot;show running-config&quot;,</a>
+<a name="ln2191">       SHOW_STR</a>
+<a name="ln2192">       &quot;Current operating configuration\n&quot;)</a>
+<a name="ln2193"> </a>
+<a name="ln2194">ALIAS (vtysh_write_terminal_daemon,</a>
+<a name="ln2195">       vtysh_show_running_config_daemon_cmd,</a>
+<a name="ln2196">       &quot;show running-config (zebra|ripd|ripngd|ospfd|ospf6d|bgpd|isisd|babeld)&quot;,</a>
+<a name="ln2197">       SHOW_STR</a>
+<a name="ln2198">       &quot;Current operating configuration\n&quot;</a>
+<a name="ln2199">       &quot;For the zebra daemon\n&quot;</a>
+<a name="ln2200">       &quot;For the rip daemon\n&quot;</a>
+<a name="ln2201">       &quot;For the ripng daemon\n&quot;</a>
+<a name="ln2202">       &quot;For the ospf daemon\n&quot;</a>
+<a name="ln2203">       &quot;For the ospfv6 daemon\n&quot;</a>
+<a name="ln2204">       &quot;For the bgp daemon\n&quot;</a>
+<a name="ln2205">       &quot;For the isis daemon\n&quot;</a>
+<a name="ln2206">       &quot;For the babel daemon\n&quot;)</a>
+<a name="ln2207"> </a>
+<a name="ln2208">DEFUN (vtysh_terminal_length,</a>
+<a name="ln2209">       vtysh_terminal_length_cmd,</a>
+<a name="ln2210">       &quot;terminal length &lt;0-512&gt;&quot;,</a>
+<a name="ln2211">       &quot;Set terminal line parameters\n&quot;</a>
+<a name="ln2212">       &quot;Set number of lines on a screen\n&quot;</a>
+<a name="ln2213">       &quot;Number of lines on screen (0 for no pausing)\n&quot;)</a>
+<a name="ln2214">{</a>
+<a name="ln2215">  int lines;</a>
+<a name="ln2216">  char *endptr = NULL;</a>
+<a name="ln2217">  char default_pager[10];</a>
+<a name="ln2218"> </a>
+<a name="ln2219">  lines = strtol (argv[0], &amp;endptr, 10);</a>
+<a name="ln2220">  if (lines &lt; 0 || lines &gt; 512 || *endptr != '\0')</a>
+<a name="ln2221">    {</a>
+<a name="ln2222">      vty_out (vty, &quot;length is malformed%s&quot;, VTY_NEWLINE);</a>
+<a name="ln2223">      return CMD_WARNING;</a>
+<a name="ln2224">    }</a>
+<a name="ln2225"> </a>
+<a name="ln2226">  if (vtysh_pager_name)</a>
+<a name="ln2227">    {</a>
+<a name="ln2228">      free (vtysh_pager_name);</a>
+<a name="ln2229">      vtysh_pager_name = NULL;</a>
+<a name="ln2230">    }</a>
+<a name="ln2231"> </a>
+<a name="ln2232">  if (lines != 0)</a>
+<a name="ln2233">    {</a>
+<a name="ln2234">      snprintf(default_pager, 10, &quot;more -%i&quot;, lines);</a>
+<a name="ln2235">      vtysh_pager_name = strdup (default_pager);</a>
+<a name="ln2236">    }</a>
+<a name="ln2237"> </a>
+<a name="ln2238">  return CMD_SUCCESS;</a>
+<a name="ln2239">}</a>
+<a name="ln2240"> </a>
+<a name="ln2241">DEFUN (vtysh_terminal_no_length,</a>
+<a name="ln2242">       vtysh_terminal_no_length_cmd,</a>
+<a name="ln2243">       &quot;terminal no length&quot;,</a>
+<a name="ln2244">       &quot;Set terminal line parameters\n&quot;</a>
+<a name="ln2245">       NO_STR</a>
+<a name="ln2246">       &quot;Set number of lines on a screen\n&quot;)</a>
+<a name="ln2247">{</a>
+<a name="ln2248">  if (vtysh_pager_name)</a>
+<a name="ln2249">    {</a>
+<a name="ln2250">      free (vtysh_pager_name);</a>
+<a name="ln2251">      vtysh_pager_name = NULL;</a>
+<a name="ln2252">    }</a>
+<a name="ln2253"> </a>
+<a name="ln2254">  vtysh_pager_init();</a>
+<a name="ln2255">  return CMD_SUCCESS;</a>
+<a name="ln2256">}</a>
+<a name="ln2257"> </a>
+<a name="ln2258">DEFUN (vtysh_show_daemons,</a>
+<a name="ln2259">       vtysh_show_daemons_cmd,</a>
+<a name="ln2260">       &quot;show daemons&quot;,</a>
+<a name="ln2261">       SHOW_STR</a>
+<a name="ln2262">       &quot;Show list of running daemons\n&quot;)</a>
+<a name="ln2263">{</a>
+<a name="ln2264">  u_int i;</a>
+<a name="ln2265"> </a>
+<a name="ln2266">  for (i = 0; i &lt; array_size(vtysh_client); i++)</a>
+<a name="ln2267">    if ( vtysh_client[i].fd &gt;= 0 )</a>
+<a name="ln2268">      vty_out(vty, &quot; %s&quot;, vtysh_client[i].name);</a>
+<a name="ln2269">  vty_out(vty, &quot;%s&quot;, VTY_NEWLINE);</a>
+<a name="ln2270"> </a>
+<a name="ln2271">  return CMD_SUCCESS;</a>
+<a name="ln2272">}</a>
+<a name="ln2273"> </a>
+<a name="ln2274">/* Execute command in child process. */</a>
+<a name="ln2275">static int</a>
+<a name="ln2276">execute_command (const char *command, int argc, const char *arg1,</a>
+<a name="ln2277">		 const char *arg2)</a>
+<a name="ln2278">{</a>
+<a name="ln2279">  pid_t pid;</a>
+<a name="ln2280">  int status;</a>
+<a name="ln2281"> </a>
+<a name="ln2282">  /* Call fork(). */</a>
+<a name="ln2283">  pid = fork ();</a>
+<a name="ln2284"> </a>
+<a name="ln2285">  if (pid &lt; 0)</a>
+<a name="ln2286">    {</a>
+<a name="ln2287">      /* Failure of fork(). */</a>
+<a name="ln2288">      fprintf (stderr, &quot;Can't fork: %s\n&quot;, safe_strerror (errno));</a>
+<a name="ln2289">      exit (1);</a>
+<a name="ln2290">    }</a>
+<a name="ln2291">  else if (pid == 0)</a>
+<a name="ln2292">    {</a>
+<a name="ln2293">      /* This is child process. */</a>
+<a name="ln2294">      switch (argc)</a>
+<a name="ln2295">	{</a>
+<a name="ln2296">	case 0:</a>
+<a name="ln2297">	  execlp (command, command, (const char *)NULL);</a>
+<a name="ln2298">	  break;</a>
+<a name="ln2299">	case 1:</a>
+<a name="ln2300">	  execlp (command, command, arg1, (const char *)NULL);</a>
+<a name="ln2301">	  break;</a>
+<a name="ln2302">	case 2:</a>
+<a name="ln2303">	  execlp (command, command, arg1, arg2, (const char *)NULL);</a>
+<a name="ln2304">	  break;</a>
+<a name="ln2305">	}</a>
+<a name="ln2306"> </a>
+<a name="ln2307">      /* When execlp suceed, this part is not executed. */</a>
+<a name="ln2308">      fprintf (stderr, &quot;Can't execute %s: %s\n&quot;, command, safe_strerror (errno));</a>
+<a name="ln2309">      exit (1);</a>
+<a name="ln2310">    }</a>
+<a name="ln2311">  else</a>
+<a name="ln2312">    {</a>
+<a name="ln2313">      /* This is parent. */</a>
+<a name="ln2314">      execute_flag = 1;</a>
+<a name="ln2315">      wait4 (pid, &amp;status, 0, NULL);</a>
+<a name="ln2316">      execute_flag = 0;</a>
+<a name="ln2317">    }</a>
+<a name="ln2318">  return 0;</a>
+<a name="ln2319">}</a>
+<a name="ln2320"> </a>
+<a name="ln2321">DEFUN (vtysh_ping,</a>
+<a name="ln2322">       vtysh_ping_cmd,</a>
+<a name="ln2323">       &quot;ping WORD&quot;,</a>
+<a name="ln2324">       &quot;Send echo messages\n&quot;</a>
+<a name="ln2325">       &quot;Ping destination address or hostname\n&quot;)</a>
+<a name="ln2326">{</a>
+<a name="ln2327">  execute_command (&quot;ping&quot;, 1, argv[0], NULL);</a>
+<a name="ln2328">  return CMD_SUCCESS;</a>
+<a name="ln2329">}</a>
+<a name="ln2330"> </a>
+<a name="ln2331">ALIAS (vtysh_ping,</a>
+<a name="ln2332">       vtysh_ping_ip_cmd,</a>
+<a name="ln2333">       &quot;ping ip WORD&quot;,</a>
+<a name="ln2334">       &quot;Send echo messages\n&quot;</a>
+<a name="ln2335">       &quot;IP echo\n&quot;</a>
+<a name="ln2336">       &quot;Ping destination address or hostname\n&quot;)</a>
+<a name="ln2337"> </a>
+<a name="ln2338">DEFUN (vtysh_traceroute,</a>
+<a name="ln2339">       vtysh_traceroute_cmd,</a>
+<a name="ln2340">       &quot;traceroute WORD&quot;,</a>
+<a name="ln2341">       &quot;Trace route to destination\n&quot;</a>
+<a name="ln2342">       &quot;Trace route to destination address or hostname\n&quot;)</a>
+<a name="ln2343">{</a>
+<a name="ln2344">  execute_command (&quot;traceroute&quot;, 1, argv[0], NULL);</a>
+<a name="ln2345">  return CMD_SUCCESS;</a>
+<a name="ln2346">}</a>
+<a name="ln2347"> </a>
+<a name="ln2348">ALIAS (vtysh_traceroute,</a>
+<a name="ln2349">       vtysh_traceroute_ip_cmd,</a>
+<a name="ln2350">       &quot;traceroute ip WORD&quot;,</a>
+<a name="ln2351">       &quot;Trace route to destination\n&quot;</a>
+<a name="ln2352">       &quot;IP trace\n&quot;</a>
+<a name="ln2353">       &quot;Trace route to destination address or hostname\n&quot;)</a>
+<a name="ln2354"> </a>
+<a name="ln2355">#ifdef HAVE_IPV6</a>
+<a name="ln2356">DEFUN (vtysh_ping6,</a>
+<a name="ln2357">       vtysh_ping6_cmd,</a>
+<a name="ln2358">       &quot;ping ipv6 WORD&quot;,</a>
+<a name="ln2359">       &quot;Send echo messages\n&quot;</a>
+<a name="ln2360">       &quot;IPv6 echo\n&quot;</a>
+<a name="ln2361">       &quot;Ping destination address or hostname\n&quot;)</a>
+<a name="ln2362">{</a>
+<a name="ln2363">  execute_command (&quot;ping6&quot;, 1, argv[0], NULL);</a>
+<a name="ln2364">  return CMD_SUCCESS;</a>
+<a name="ln2365">}</a>
+<a name="ln2366"> </a>
+<a name="ln2367">DEFUN (vtysh_traceroute6,</a>
+<a name="ln2368">       vtysh_traceroute6_cmd,</a>
+<a name="ln2369">       &quot;traceroute ipv6 WORD&quot;,</a>
+<a name="ln2370">       &quot;Trace route to destination\n&quot;</a>
+<a name="ln2371">       &quot;IPv6 trace\n&quot;</a>
+<a name="ln2372">       &quot;Trace route to destination address or hostname\n&quot;)</a>
+<a name="ln2373">{</a>
+<a name="ln2374">  execute_command (&quot;traceroute6&quot;, 1, argv[0], NULL);</a>
+<a name="ln2375">  return CMD_SUCCESS;</a>
+<a name="ln2376">}</a>
+<a name="ln2377">#endif</a>
+<a name="ln2378"> </a>
+<a name="ln2379">DEFUN (vtysh_telnet,</a>
+<a name="ln2380">       vtysh_telnet_cmd,</a>
+<a name="ln2381">       &quot;telnet WORD&quot;,</a>
+<a name="ln2382">       &quot;Open a telnet connection\n&quot;</a>
+<a name="ln2383">       &quot;IP address or hostname of a remote system\n&quot;)</a>
+<a name="ln2384">{</a>
+<a name="ln2385">  execute_command (&quot;telnet&quot;, 1, argv[0], NULL);</a>
+<a name="ln2386">  return CMD_SUCCESS;</a>
+<a name="ln2387">}</a>
+<a name="ln2388"> </a>
+<a name="ln2389">DEFUN (vtysh_telnet_port,</a>
+<a name="ln2390">       vtysh_telnet_port_cmd,</a>
+<a name="ln2391">       &quot;telnet WORD PORT&quot;,</a>
+<a name="ln2392">       &quot;Open a telnet connection\n&quot;</a>
+<a name="ln2393">       &quot;IP address or hostname of a remote system\n&quot;</a>
+<a name="ln2394">       &quot;TCP Port number\n&quot;)</a>
+<a name="ln2395">{</a>
+<a name="ln2396">  execute_command (&quot;telnet&quot;, 2, argv[0], argv[1]);</a>
+<a name="ln2397">  return CMD_SUCCESS;</a>
+<a name="ln2398">}</a>
+<a name="ln2399"> </a>
+<a name="ln2400">DEFUN (vtysh_ssh,</a>
+<a name="ln2401">       vtysh_ssh_cmd,</a>
+<a name="ln2402">       &quot;ssh WORD&quot;,</a>
+<a name="ln2403">       &quot;Open an ssh connection\n&quot;</a>
+<a name="ln2404">       &quot;[user@]host\n&quot;)</a>
+<a name="ln2405">{</a>
+<a name="ln2406">  execute_command (&quot;ssh&quot;, 1, argv[0], NULL);</a>
+<a name="ln2407">  return CMD_SUCCESS;</a>
+<a name="ln2408">}</a>
+<a name="ln2409"> </a>
+<a name="ln2410">DEFUN (vtysh_start_shell,</a>
+<a name="ln2411">       vtysh_start_shell_cmd,</a>
+<a name="ln2412">       &quot;start-shell&quot;,</a>
+<a name="ln2413">       &quot;Start UNIX shell\n&quot;)</a>
+<a name="ln2414">{</a>
+<a name="ln2415">  execute_command (&quot;sh&quot;, 0, NULL, NULL);</a>
+<a name="ln2416">  return CMD_SUCCESS;</a>
+<a name="ln2417">}</a>
+<a name="ln2418"> </a>
+<a name="ln2419">DEFUN (vtysh_start_bash,</a>
+<a name="ln2420">       vtysh_start_bash_cmd,</a>
+<a name="ln2421">       &quot;start-shell bash&quot;,</a>
+<a name="ln2422">       &quot;Start UNIX shell\n&quot;</a>
+<a name="ln2423">       &quot;Start bash\n&quot;)</a>
+<a name="ln2424">{</a>
+<a name="ln2425">  execute_command (&quot;bash&quot;, 0, NULL, NULL);</a>
+<a name="ln2426">  return CMD_SUCCESS;</a>
+<a name="ln2427">}</a>
+<a name="ln2428"> </a>
+<a name="ln2429">DEFUN (vtysh_start_zsh,</a>
+<a name="ln2430">       vtysh_start_zsh_cmd,</a>
+<a name="ln2431">       &quot;start-shell zsh&quot;,</a>
+<a name="ln2432">       &quot;Start UNIX shell\n&quot;</a>
+<a name="ln2433">       &quot;Start Z shell\n&quot;)</a>
+<a name="ln2434">{</a>
+<a name="ln2435">  execute_command (&quot;zsh&quot;, 0, NULL, NULL);</a>
+<a name="ln2436">  return CMD_SUCCESS;</a>
+<a name="ln2437">}</a>
+<a name="ln2438"> </a>
+<a name="ln2439">static void</a>
+<a name="ln2440">vtysh_install_default (enum node_type node)</a>
+<a name="ln2441">{</a>
+<a name="ln2442">  install_element (node, &amp;config_list_cmd);</a>
+<a name="ln2443">}</a>
+<a name="ln2444"> </a>
+<a name="ln2445">/* Making connection to protocol daemon. */</a>
+<a name="ln2446">static int</a>
+<a name="ln2447">vtysh_connect (struct vtysh_client *vclient)</a>
+<a name="ln2448">{</a>
+<a name="ln2449">  int ret;</a>
+<a name="ln2450">  int sock, len;</a>
+<a name="ln2451">  struct sockaddr_un addr;</a>
+<a name="ln2452">  struct stat s_stat;</a>
+<a name="ln2453"> </a>
+<a name="ln2454">  /* Stat socket to see if we have permission to access it. */</a>
+<a name="ln2455">  ret = stat (vclient-&gt;path, &amp;s_stat);</a>
+<a name="ln2456">  if (ret &lt; 0 &amp;&amp; errno != ENOENT)</a>
+<a name="ln2457">    {</a>
+<a name="ln2458">      fprintf  (stderr, &quot;vtysh_connect(%s): stat = %s\n&quot;, </a>
+<a name="ln2459">		vclient-&gt;path, safe_strerror(errno)); </a>
+<a name="ln2460">      exit(1);</a>
+<a name="ln2461">    }</a>
+<a name="ln2462">  </a>
+<a name="ln2463">  if (ret &gt;= 0)</a>
+<a name="ln2464">    {</a>
+<a name="ln2465">      if (! S_ISSOCK(s_stat.st_mode))</a>
+<a name="ln2466">	{</a>
+<a name="ln2467">	  fprintf (stderr, &quot;vtysh_connect(%s): Not a socket\n&quot;,</a>
+<a name="ln2468">		   vclient-&gt;path);</a>
+<a name="ln2469">	  exit (1);</a>
+<a name="ln2470">	}</a>
+<a name="ln2471">      </a>
+<a name="ln2472">    }</a>
+<a name="ln2473"> </a>
+<a name="ln2474">  sock = socket (AF_UNIX, SOCK_STREAM, 0);</a>
+<a name="ln2475">  if (sock &lt; 0)</a>
+<a name="ln2476">    {</a>
+<a name="ln2477">#ifdef DEBUG</a>
+<a name="ln2478">      fprintf(stderr, &quot;vtysh_connect(%s): socket = %s\n&quot;, vclient-&gt;path,</a>
+<a name="ln2479">	      safe_strerror(errno));</a>
+<a name="ln2480">#endif /* DEBUG */</a>
+<a name="ln2481">      return -1;</a>
+<a name="ln2482">    }</a>
+<a name="ln2483"> </a>
+<a name="ln2484">  memset (&amp;addr, 0, sizeof (struct sockaddr_un));</a>
+<a name="ln2485">  addr.sun_family = AF_UNIX;</a>
+<a name="ln2486">  strncpy (addr.sun_path, vclient-&gt;path, strlen (vclient-&gt;path));</a>
+<a name="ln2487">#ifdef HAVE_STRUCT_SOCKADDR_UN_SUN_LEN</a>
+<a name="ln2488">  len = addr.sun_len = SUN_LEN(&amp;addr);</a>
+<a name="ln2489">#else</a>
+<a name="ln2490">  len = sizeof (addr.sun_family) + strlen (addr.sun_path);</a>
+<a name="ln2491">#endif /* HAVE_STRUCT_SOCKADDR_UN_SUN_LEN */</a>
+<a name="ln2492"> </a>
+<a name="ln2493">  ret = connect (sock, (struct sockaddr *) &amp;addr, len);</a>
+<a name="ln2494">  if (ret &lt; 0)</a>
+<a name="ln2495">    {</a>
+<a name="ln2496">#ifdef DEBUG</a>
+<a name="ln2497">      fprintf(stderr, &quot;vtysh_connect(%s): connect = %s\n&quot;, vclient-&gt;path,</a>
+<a name="ln2498">	      safe_strerror(errno));</a>
+<a name="ln2499">#endif /* DEBUG */</a>
+<a name="ln2500">      close (sock);</a>
+<a name="ln2501">      return -1;</a>
+<a name="ln2502">    }</a>
+<a name="ln2503">  vclient-&gt;fd = sock;</a>
+<a name="ln2504"> </a>
+<a name="ln2505">  return 0;</a>
+<a name="ln2506">}</a>
+<a name="ln2507"> </a>
+<a name="ln2508">int</a>
+<a name="ln2509">vtysh_connect_all(const char *daemon_name)</a>
+<a name="ln2510">{</a>
+<a name="ln2511">  u_int i;</a>
+<a name="ln2512">  int rc = 0;</a>
+<a name="ln2513">  int matches = 0;</a>
+<a name="ln2514"> </a>
+<a name="ln2515">  for (i = 0; i &lt; array_size(vtysh_client); i++)</a>
+<a name="ln2516">    {</a>
+<a name="ln2517">      if (!daemon_name || !strcmp(daemon_name, vtysh_client[i].name))</a>
+<a name="ln2518">	{</a>
+<a name="ln2519">	  matches++;</a>
+<a name="ln2520">	  if (vtysh_connect(&amp;vtysh_client[i]) == 0)</a>
+<a name="ln2521">	    rc++;</a>
+<a name="ln2522">	  /* We need direct access to ripd in vtysh_exit_ripd_only. */</a>
+<a name="ln2523">	  if (vtysh_client[i].flag == VTYSH_RIPD)</a>
+<a name="ln2524">	    ripd_client = &amp;vtysh_client[i];</a>
+<a name="ln2525">	}</a>
+<a name="ln2526">    }</a>
+<a name="ln2527">  if (!matches)</a>
+<a name="ln2528">    fprintf(stderr, &quot;Error: no daemons match name %s!\n&quot;, daemon_name);</a>
+<a name="ln2529">  return rc;</a>
+<a name="ln2530">}</a>
+<a name="ln2531"> </a>
+<a name="ln2532">/* To disable readline's filename completion. */</a>
+<a name="ln2533">static char *</a>
+<a name="ln2534">vtysh_completion_entry_function (const char *ignore, int invoking_key)</a>
+<a name="ln2535">{</a>
+<a name="ln2536">  return NULL;</a>
+<a name="ln2537">}</a>
+<a name="ln2538"> </a>
+<a name="ln2539">void</a>
+<a name="ln2540">vtysh_readline_init (void)</a>
+<a name="ln2541">{</a>
+<a name="ln2542">  /* readline related settings. */</a>
+<a name="ln2543">  rl_bind_key ('?', (rl_command_func_t *) vtysh_rl_describe);</a>
+<a name="ln2544">  rl_completion_entry_function = vtysh_completion_entry_function;</a>
+<a name="ln2545">  rl_attempted_completion_function = (rl_completion_func_t *)new_completion;</a>
+<a name="ln2546">}</a>
+<a name="ln2547"> </a>
+<a name="ln2548">char *</a>
+<a name="ln2549">vtysh_prompt (void)</a>
+<a name="ln2550">{</a>
+<a name="ln2551">  static struct utsname names;</a>
+<a name="ln2552">  static char buf[100];</a>
+<a name="ln2553">  const char*hostname;</a>
+<a name="ln2554">  extern struct host host;</a>
+<a name="ln2555"> </a>
+<a name="ln2556">  hostname = host.name;</a>
+<a name="ln2557"> </a>
+<a name="ln2558">  if (!hostname)</a>
+<a name="ln2559">    {</a>
+<a name="ln2560">      if (!names.nodename[0])</a>
+<a name="ln2561">	uname (&amp;names);</a>
+<a name="ln2562">      hostname = names.nodename;</a>
+<a name="ln2563">    }</a>
+<a name="ln2564"> </a>
+<a name="ln2565">  snprintf (buf, sizeof buf, cmd_prompt (vty-&gt;node), hostname);</a>
+<a name="ln2566"> </a>
+<a name="ln2567">  return buf;</a>
+<a name="ln2568">}</a>
+<a name="ln2569"> </a>
+<a name="ln2570">void</a>
+<a name="ln2571">vtysh_init_vty (void)</a>
+<a name="ln2572">{</a>
+<a name="ln2573">  /* Make vty structure. */</a>
+<a name="ln2574">  vty = vty_new ();</a>
+<a name="ln2575">  vty-&gt;type = VTY_SHELL;</a>
+<a name="ln2576">  vty-&gt;node = VIEW_NODE;</a>
+<a name="ln2577"> </a>
+<a name="ln2578">  /* Initialize commands. */</a>
+<a name="ln2579">  cmd_init (0);</a>
+<a name="ln2580"> </a>
+<a name="ln2581">  /* Install nodes. */</a>
+<a name="ln2582">  install_node (&amp;bgp_node, NULL);</a>
+<a name="ln2583">  install_node (&amp;rip_node, NULL);</a>
+<a name="ln2584">  install_node (&amp;interface_node, NULL);</a>
+<a name="ln2585">  install_node (&amp;link_params_node, NULL);</a>
+<a name="ln2586">  install_node (&amp;rmap_node, NULL);</a>
+<a name="ln2587">  install_node (&amp;zebra_node, NULL);</a>
+<a name="ln2588">  install_node (&amp;bgp_vpnv4_node, NULL);</a>
+<a name="ln2589">  install_node (&amp;bgp_vpnv6_node, NULL);</a>
+<a name="ln2590">  install_node (&amp;bgp_encap_node, NULL);</a>
+<a name="ln2591">  install_node (&amp;bgp_encapv6_node, NULL);</a>
+<a name="ln2592">  install_node (&amp;bgp_ipv4_node, NULL);</a>
+<a name="ln2593">  install_node (&amp;bgp_ipv4m_node, NULL);</a>
+<a name="ln2594">/* #ifdef HAVE_IPV6 */</a>
+<a name="ln2595">  install_node (&amp;bgp_ipv6_node, NULL);</a>
+<a name="ln2596">  install_node (&amp;bgp_ipv6m_node, NULL);</a>
+<a name="ln2597">/* #endif */</a>
+<a name="ln2598">  install_node (&amp;ospf_node, NULL);</a>
+<a name="ln2599">/* #ifdef HAVE_IPV6 */</a>
+<a name="ln2600">  install_node (&amp;ripng_node, NULL);</a>
+<a name="ln2601">  install_node (&amp;ospf6_node, NULL);</a>
+<a name="ln2602">/* #endif */</a>
+<a name="ln2603">  install_node (&amp;babel_node, NULL);</a>
+<a name="ln2604">  install_node (&amp;keychain_node, NULL);</a>
+<a name="ln2605">  install_node (&amp;keychain_key_node, NULL);</a>
+<a name="ln2606">  install_node (&amp;isis_node, NULL);</a>
+<a name="ln2607">  install_node (&amp;vty_node, NULL);</a>
+<a name="ln2608"> </a>
+<a name="ln2609">  vtysh_install_default (VIEW_NODE);</a>
+<a name="ln2610">  vtysh_install_default (ENABLE_NODE);</a>
+<a name="ln2611">  vtysh_install_default (CONFIG_NODE);</a>
+<a name="ln2612">  vtysh_install_default (BGP_NODE);</a>
+<a name="ln2613">  vtysh_install_default (RIP_NODE);</a>
+<a name="ln2614">  vtysh_install_default (INTERFACE_NODE);</a>
+<a name="ln2615">  vtysh_install_default (LINK_PARAMS_NODE);</a>
+<a name="ln2616">  vtysh_install_default (RMAP_NODE);</a>
+<a name="ln2617">  vtysh_install_default (ZEBRA_NODE);</a>
+<a name="ln2618">  vtysh_install_default (BGP_VPNV4_NODE);</a>
+<a name="ln2619">  vtysh_install_default (BGP_VPNV6_NODE);</a>
+<a name="ln2620">  vtysh_install_default (BGP_ENCAP_NODE);</a>
+<a name="ln2621">  vtysh_install_default (BGP_ENCAPV6_NODE);</a>
+<a name="ln2622">  vtysh_install_default (BGP_IPV4_NODE);</a>
+<a name="ln2623">  vtysh_install_default (BGP_IPV4M_NODE);</a>
+<a name="ln2624">  vtysh_install_default (BGP_IPV6_NODE);</a>
+<a name="ln2625">  vtysh_install_default (BGP_IPV6M_NODE);</a>
+<a name="ln2626">  vtysh_install_default (OSPF_NODE);</a>
+<a name="ln2627">  vtysh_install_default (RIPNG_NODE);</a>
+<a name="ln2628">  vtysh_install_default (OSPF6_NODE);</a>
+<a name="ln2629">  vtysh_install_default (BABEL_NODE);</a>
+<a name="ln2630">  vtysh_install_default (ISIS_NODE);</a>
+<a name="ln2631">  vtysh_install_default (KEYCHAIN_NODE);</a>
+<a name="ln2632">  vtysh_install_default (KEYCHAIN_KEY_NODE);</a>
+<a name="ln2633">  vtysh_install_default (VTY_NODE);</a>
+<a name="ln2634"> </a>
+<a name="ln2635">  install_element (VIEW_NODE, &amp;vtysh_enable_cmd);</a>
+<a name="ln2636">  install_element (ENABLE_NODE, &amp;vtysh_config_terminal_cmd);</a>
+<a name="ln2637">  install_element (ENABLE_NODE, &amp;vtysh_disable_cmd);</a>
+<a name="ln2638"> </a>
+<a name="ln2639">  /* &quot;exit&quot; command. */</a>
+<a name="ln2640">  install_element (VIEW_NODE, &amp;vtysh_exit_all_cmd);</a>
+<a name="ln2641">  install_element (VIEW_NODE, &amp;vtysh_quit_all_cmd);</a>
+<a name="ln2642">  install_element (CONFIG_NODE, &amp;vtysh_exit_all_cmd);</a>
+<a name="ln2643">  /* install_element (CONFIG_NODE, &amp;vtysh_quit_all_cmd); */</a>
+<a name="ln2644">  install_element (ENABLE_NODE, &amp;vtysh_exit_all_cmd);</a>
+<a name="ln2645">  install_element (ENABLE_NODE, &amp;vtysh_quit_all_cmd);</a>
+<a name="ln2646">  install_element (RIP_NODE, &amp;vtysh_exit_ripd_cmd);</a>
+<a name="ln2647">  install_element (RIP_NODE, &amp;vtysh_quit_ripd_cmd);</a>
+<a name="ln2648">  install_element (RIPNG_NODE, &amp;vtysh_exit_ripngd_cmd);</a>
+<a name="ln2649">  install_element (RIPNG_NODE, &amp;vtysh_quit_ripngd_cmd);</a>
+<a name="ln2650">  install_element (OSPF_NODE, &amp;vtysh_exit_ospfd_cmd);</a>
+<a name="ln2651">  install_element (OSPF_NODE, &amp;vtysh_quit_ospfd_cmd);</a>
+<a name="ln2652">  install_element (OSPF6_NODE, &amp;vtysh_exit_ospf6d_cmd);</a>
+<a name="ln2653">  install_element (OSPF6_NODE, &amp;vtysh_quit_ospf6d_cmd);</a>
+<a name="ln2654">  install_element (BGP_NODE, &amp;vtysh_exit_bgpd_cmd);</a>
+<a name="ln2655">  install_element (BGP_NODE, &amp;vtysh_quit_bgpd_cmd);</a>
+<a name="ln2656">  install_element (BGP_VPNV4_NODE, &amp;vtysh_exit_bgpd_cmd);</a>
+<a name="ln2657">  install_element (BGP_VPNV4_NODE, &amp;vtysh_quit_bgpd_cmd);</a>
+<a name="ln2658">  install_element (BGP_VPNV6_NODE, &amp;vtysh_exit_bgpd_cmd);</a>
+<a name="ln2659">  install_element (BGP_VPNV6_NODE, &amp;vtysh_quit_bgpd_cmd);</a>
+<a name="ln2660">  install_element (BGP_ENCAP_NODE, &amp;vtysh_exit_bgpd_cmd);</a>
+<a name="ln2661">  install_element (BGP_ENCAP_NODE, &amp;vtysh_quit_bgpd_cmd);</a>
+<a name="ln2662">  install_element (BGP_ENCAPV6_NODE, &amp;vtysh_exit_bgpd_cmd);</a>
+<a name="ln2663">  install_element (BGP_ENCAPV6_NODE, &amp;vtysh_quit_bgpd_cmd);</a>
+<a name="ln2664">  install_element (BGP_IPV4_NODE, &amp;vtysh_exit_bgpd_cmd);</a>
+<a name="ln2665">  install_element (BGP_IPV4_NODE, &amp;vtysh_quit_bgpd_cmd);</a>
+<a name="ln2666">  install_element (BGP_IPV4M_NODE, &amp;vtysh_exit_bgpd_cmd);</a>
+<a name="ln2667">  install_element (BGP_IPV4M_NODE, &amp;vtysh_quit_bgpd_cmd);</a>
+<a name="ln2668">  install_element (BGP_IPV6_NODE, &amp;vtysh_exit_bgpd_cmd);</a>
+<a name="ln2669">  install_element (BGP_IPV6_NODE, &amp;vtysh_quit_bgpd_cmd);</a>
+<a name="ln2670">  install_element (BGP_IPV6M_NODE, &amp;vtysh_exit_bgpd_cmd);</a>
+<a name="ln2671">  install_element (BGP_IPV6M_NODE, &amp;vtysh_quit_bgpd_cmd);</a>
+<a name="ln2672">  install_element (ISIS_NODE, &amp;vtysh_exit_isisd_cmd);</a>
+<a name="ln2673">  install_element (ISIS_NODE, &amp;vtysh_quit_isisd_cmd);</a>
+<a name="ln2674">  install_element (KEYCHAIN_NODE, &amp;vtysh_exit_ripd_cmd);</a>
+<a name="ln2675">  install_element (KEYCHAIN_NODE, &amp;vtysh_quit_ripd_cmd);</a>
+<a name="ln2676">  install_element (KEYCHAIN_KEY_NODE, &amp;vtysh_exit_ripd_cmd);</a>
+<a name="ln2677">  install_element (KEYCHAIN_KEY_NODE, &amp;vtysh_quit_ripd_cmd);</a>
+<a name="ln2678">  install_element (RMAP_NODE, &amp;vtysh_exit_rmap_cmd);</a>
+<a name="ln2679">  install_element (RMAP_NODE, &amp;vtysh_quit_rmap_cmd);</a>
+<a name="ln2680">  install_element (VTY_NODE, &amp;vtysh_exit_line_vty_cmd);</a>
+<a name="ln2681">  install_element (VTY_NODE, &amp;vtysh_quit_line_vty_cmd);</a>
+<a name="ln2682"> </a>
+<a name="ln2683">  /* &quot;end&quot; command. */</a>
+<a name="ln2684">  install_element (CONFIG_NODE, &amp;vtysh_end_all_cmd);</a>
+<a name="ln2685">  install_element (ENABLE_NODE, &amp;vtysh_end_all_cmd);</a>
+<a name="ln2686">  install_element (RIP_NODE, &amp;vtysh_end_all_cmd);</a>
+<a name="ln2687">  install_element (RIPNG_NODE, &amp;vtysh_end_all_cmd);</a>
+<a name="ln2688">  install_element (OSPF_NODE, &amp;vtysh_end_all_cmd);</a>
+<a name="ln2689">  install_element (OSPF6_NODE, &amp;vtysh_end_all_cmd);</a>
+<a name="ln2690">  install_element (BABEL_NODE, &amp;vtysh_end_all_cmd);</a>
+<a name="ln2691">  install_element (BGP_NODE, &amp;vtysh_end_all_cmd);</a>
+<a name="ln2692">  install_element (BGP_IPV4_NODE, &amp;vtysh_end_all_cmd);</a>
+<a name="ln2693">  install_element (BGP_IPV4M_NODE, &amp;vtysh_end_all_cmd);</a>
+<a name="ln2694">  install_element (BGP_VPNV4_NODE, &amp;vtysh_end_all_cmd);</a>
+<a name="ln2695">  install_element (BGP_VPNV6_NODE, &amp;vtysh_end_all_cmd);</a>
+<a name="ln2696">  install_element (BGP_ENCAP_NODE, &amp;vtysh_end_all_cmd);</a>
+<a name="ln2697">  install_element (BGP_ENCAPV6_NODE, &amp;vtysh_end_all_cmd);</a>
+<a name="ln2698">  install_element (BGP_IPV6_NODE, &amp;vtysh_end_all_cmd);</a>
+<a name="ln2699">  install_element (BGP_IPV6M_NODE, &amp;vtysh_end_all_cmd);</a>
+<a name="ln2700">  install_element (ISIS_NODE, &amp;vtysh_end_all_cmd);</a>
+<a name="ln2701">  install_element (KEYCHAIN_NODE, &amp;vtysh_end_all_cmd);</a>
+<a name="ln2702">  install_element (KEYCHAIN_KEY_NODE, &amp;vtysh_end_all_cmd);</a>
+<a name="ln2703">  install_element (RMAP_NODE, &amp;vtysh_end_all_cmd);</a>
+<a name="ln2704">  install_element (VTY_NODE, &amp;vtysh_end_all_cmd);</a>
+<a name="ln2705"> </a>
+<a name="ln2706">  install_element (INTERFACE_NODE, &amp;interface_desc_cmd);</a>
+<a name="ln2707">  install_element (INTERFACE_NODE, &amp;no_interface_desc_cmd);</a>
+<a name="ln2708">  install_element (INTERFACE_NODE, &amp;vtysh_end_all_cmd);</a>
+<a name="ln2709">  install_element (INTERFACE_NODE, &amp;vtysh_exit_interface_cmd);</a>
+<a name="ln2710">  install_element (LINK_PARAMS_NODE, &amp;exit_link_params_cmd);</a>
+<a name="ln2711">  install_element (LINK_PARAMS_NODE, &amp;vtysh_end_all_cmd);</a>
+<a name="ln2712">  install_element (LINK_PARAMS_NODE, &amp;vtysh_exit_interface_cmd);</a>
+<a name="ln2713">  install_element (INTERFACE_NODE, &amp;vtysh_quit_interface_cmd);</a>
+<a name="ln2714">  install_element (CONFIG_NODE, &amp;router_rip_cmd);</a>
+<a name="ln2715">#ifdef HAVE_IPV6</a>
+<a name="ln2716">  install_element (CONFIG_NODE, &amp;router_ripng_cmd);</a>
+<a name="ln2717">#endif</a>
+<a name="ln2718">  install_element (CONFIG_NODE, &amp;router_ospf_cmd);</a>
+<a name="ln2719">#ifdef HAVE_IPV6</a>
+<a name="ln2720">  install_element (CONFIG_NODE, &amp;router_ospf6_cmd);</a>
+<a name="ln2721">#endif</a>
+<a name="ln2722">  install_element (CONFIG_NODE, &amp;router_isis_cmd);</a>
+<a name="ln2723">  install_element (CONFIG_NODE, &amp;router_bgp_cmd);</a>
+<a name="ln2724">  install_element (CONFIG_NODE, &amp;router_bgp_view_cmd);</a>
+<a name="ln2725">  install_element (BGP_NODE, &amp;address_family_vpnv4_cmd);</a>
+<a name="ln2726">  install_element (BGP_NODE, &amp;address_family_vpnv4_unicast_cmd);</a>
+<a name="ln2727">  install_element (BGP_NODE, &amp;address_family_vpnv6_cmd);</a>
+<a name="ln2728">  install_element (BGP_NODE, &amp;address_family_vpnv6_unicast_cmd);</a>
+<a name="ln2729">  install_element (BGP_NODE, &amp;address_family_encap_cmd);</a>
+<a name="ln2730">  install_element (BGP_NODE, &amp;address_family_encapv6_cmd);</a>
+<a name="ln2731">  install_element (BGP_NODE, &amp;address_family_ipv4_unicast_cmd);</a>
+<a name="ln2732">  install_element (BGP_NODE, &amp;address_family_ipv4_multicast_cmd);</a>
+<a name="ln2733">#ifdef HAVE_IPV6</a>
+<a name="ln2734">  install_element (BGP_NODE, &amp;address_family_ipv6_cmd);</a>
+<a name="ln2735">  install_element (BGP_NODE, &amp;address_family_ipv6_unicast_cmd);</a>
+<a name="ln2736">  install_element (BGP_NODE, &amp;address_family_ipv6_multicast_cmd);</a>
+<a name="ln2737">#endif</a>
+<a name="ln2738">  install_element (BGP_VPNV4_NODE, &amp;exit_address_family_cmd);</a>
+<a name="ln2739">  install_element (BGP_VPNV6_NODE, &amp;exit_address_family_cmd);</a>
+<a name="ln2740">  install_element (BGP_ENCAP_NODE, &amp;exit_address_family_cmd);</a>
+<a name="ln2741">  install_element (BGP_ENCAPV6_NODE, &amp;exit_address_family_cmd);</a>
+<a name="ln2742">  install_element (BGP_IPV4_NODE, &amp;exit_address_family_cmd);</a>
+<a name="ln2743">  install_element (BGP_IPV4M_NODE, &amp;exit_address_family_cmd);</a>
+<a name="ln2744">  install_element (BGP_IPV6_NODE, &amp;exit_address_family_cmd);</a>
+<a name="ln2745">  install_element (BGP_IPV6M_NODE, &amp;exit_address_family_cmd);</a>
+<a name="ln2746">  install_element (CONFIG_NODE, &amp;key_chain_cmd);</a>
+<a name="ln2747">  install_element (CONFIG_NODE, &amp;route_map_cmd);</a>
+<a name="ln2748">  install_element (CONFIG_NODE, &amp;vtysh_line_vty_cmd);</a>
+<a name="ln2749">  install_element (KEYCHAIN_NODE, &amp;key_cmd);</a>
+<a name="ln2750">  install_element (KEYCHAIN_NODE, &amp;key_chain_cmd);</a>
+<a name="ln2751">  install_element (KEYCHAIN_KEY_NODE, &amp;key_chain_cmd);</a>
+<a name="ln2752">  install_element (CONFIG_NODE, &amp;vtysh_interface_cmd);</a>
+<a name="ln2753">  install_element (CONFIG_NODE, &amp;vtysh_no_interface_cmd);</a>
+<a name="ln2754">  install_element (CONFIG_NODE, &amp;vtysh_interface_vrf_cmd);</a>
+<a name="ln2755">  install_element (CONFIG_NODE, &amp;vtysh_no_interface_vrf_cmd);</a>
+<a name="ln2756">  install_element (INTERFACE_NODE, &amp;vtysh_link_params_cmd);</a>
+<a name="ln2757">  install_element (ENABLE_NODE, &amp;vtysh_show_running_config_cmd);</a>
+<a name="ln2758">  install_element (ENABLE_NODE, &amp;vtysh_show_running_config_daemon_cmd);</a>
+<a name="ln2759">  install_element (ENABLE_NODE, &amp;vtysh_copy_runningconfig_startupconfig_cmd);</a>
+<a name="ln2760">  install_element (ENABLE_NODE, &amp;vtysh_write_file_cmd);</a>
+<a name="ln2761">  install_element (ENABLE_NODE, &amp;vtysh_write_cmd);</a>
+<a name="ln2762">  /* distribute-list commands. (based on lib/distribute.c distribute_list_init()) */</a>
+<a name="ln2763">  install_element (RIP_NODE, &amp;distribute_list_all_cmd);</a>
+<a name="ln2764">  install_element (RIP_NODE, &amp;no_distribute_list_all_cmd);</a>
+<a name="ln2765">  install_element (RIP_NODE, &amp;distribute_list_cmd);</a>
+<a name="ln2766">  install_element (RIP_NODE, &amp;no_distribute_list_cmd);</a>
+<a name="ln2767">  install_element (RIP_NODE, &amp;distribute_list_prefix_all_cmd);</a>
+<a name="ln2768">  install_element (RIP_NODE, &amp;no_distribute_list_prefix_all_cmd);</a>
+<a name="ln2769">  install_element (RIP_NODE, &amp;distribute_list_prefix_cmd);</a>
+<a name="ln2770">  install_element (RIP_NODE, &amp;no_distribute_list_prefix_cmd);</a>
+<a name="ln2771">  install_element (RIPNG_NODE, &amp;ipv6_distribute_list_all_cmd);</a>
+<a name="ln2772">  install_element (RIPNG_NODE, &amp;no_ipv6_distribute_list_all_cmd);</a>
+<a name="ln2773">  install_element (RIPNG_NODE, &amp;ipv6_distribute_list_cmd);</a>
+<a name="ln2774">  install_element (RIPNG_NODE, &amp;no_ipv6_distribute_list_cmd);</a>
+<a name="ln2775">  install_element (RIPNG_NODE, &amp;ipv6_distribute_list_prefix_all_cmd);</a>
+<a name="ln2776">  install_element (RIPNG_NODE, &amp;no_ipv6_distribute_list_prefix_all_cmd);</a>
+<a name="ln2777">  install_element (RIPNG_NODE, &amp;ipv6_distribute_list_prefix_cmd);</a>
+<a name="ln2778">  install_element (RIPNG_NODE, &amp;no_ipv6_distribute_list_prefix_cmd);</a>
+<a name="ln2779">  install_element (RIPNG_NODE, &amp;distribute_list_all_cmd);</a>
+<a name="ln2780">  install_element (RIPNG_NODE, &amp;no_distribute_list_all_cmd);</a>
+<a name="ln2781">  install_element (RIPNG_NODE, &amp;distribute_list_cmd);</a>
+<a name="ln2782">  install_element (RIPNG_NODE, &amp;no_distribute_list_cmd);</a>
+<a name="ln2783">  install_element (RIPNG_NODE, &amp;distribute_list_prefix_all_cmd);</a>
+<a name="ln2784">  install_element (RIPNG_NODE, &amp;no_distribute_list_prefix_all_cmd);</a>
+<a name="ln2785">  install_element (RIPNG_NODE, &amp;distribute_list_prefix_cmd);</a>
+<a name="ln2786">  install_element (RIPNG_NODE, &amp;no_distribute_list_prefix_cmd);</a>
+<a name="ln2787"> </a>
+<a name="ln2788">  /* &quot;write terminal&quot; command. */</a>
+<a name="ln2789">  install_element (ENABLE_NODE, &amp;vtysh_write_terminal_cmd);</a>
+<a name="ln2790">  install_element (ENABLE_NODE, &amp;vtysh_write_terminal_daemon_cmd);</a>
+<a name="ln2791"> </a>
+<a name="ln2792">  install_element (CONFIG_NODE, &amp;vtysh_integrated_config_cmd);</a>
+<a name="ln2793">  install_element (CONFIG_NODE, &amp;no_vtysh_integrated_config_cmd);</a>
+<a name="ln2794"> </a>
+<a name="ln2795">  /* &quot;write memory&quot; command. */</a>
+<a name="ln2796">  install_element (ENABLE_NODE, &amp;vtysh_write_memory_cmd);</a>
+<a name="ln2797"> </a>
+<a name="ln2798">  install_element (VIEW_NODE, &amp;vtysh_terminal_length_cmd);</a>
+<a name="ln2799">  install_element (ENABLE_NODE, &amp;vtysh_terminal_length_cmd);</a>
+<a name="ln2800">  install_element (VIEW_NODE, &amp;vtysh_terminal_no_length_cmd);</a>
+<a name="ln2801">  install_element (ENABLE_NODE, &amp;vtysh_terminal_no_length_cmd);</a>
+<a name="ln2802">  install_element (VIEW_NODE, &amp;vtysh_show_daemons_cmd);</a>
+<a name="ln2803">  install_element (ENABLE_NODE, &amp;vtysh_show_daemons_cmd);</a>
+<a name="ln2804"> </a>
+<a name="ln2805">  install_element (VIEW_NODE, &amp;vtysh_ping_cmd);</a>
+<a name="ln2806">  install_element (VIEW_NODE, &amp;vtysh_ping_ip_cmd);</a>
+<a name="ln2807">  install_element (VIEW_NODE, &amp;vtysh_traceroute_cmd);</a>
+<a name="ln2808">  install_element (VIEW_NODE, &amp;vtysh_traceroute_ip_cmd);</a>
+<a name="ln2809">#ifdef HAVE_IPV6</a>
+<a name="ln2810">  install_element (VIEW_NODE, &amp;vtysh_ping6_cmd);</a>
+<a name="ln2811">  install_element (VIEW_NODE, &amp;vtysh_traceroute6_cmd);</a>
+<a name="ln2812">#endif</a>
+<a name="ln2813">  install_element (VIEW_NODE, &amp;vtysh_telnet_cmd);</a>
+<a name="ln2814">  install_element (VIEW_NODE, &amp;vtysh_telnet_port_cmd);</a>
+<a name="ln2815">  install_element (VIEW_NODE, &amp;vtysh_ssh_cmd);</a>
+<a name="ln2816">  install_element (ENABLE_NODE, &amp;vtysh_ping_cmd);</a>
+<a name="ln2817">  install_element (ENABLE_NODE, &amp;vtysh_ping_ip_cmd);</a>
+<a name="ln2818">  install_element (ENABLE_NODE, &amp;vtysh_traceroute_cmd);</a>
+<a name="ln2819">  install_element (ENABLE_NODE, &amp;vtysh_traceroute_ip_cmd);</a>
+<a name="ln2820">#ifdef HAVE_IPV6</a>
+<a name="ln2821">  install_element (ENABLE_NODE, &amp;vtysh_ping6_cmd);</a>
+<a name="ln2822">  install_element (ENABLE_NODE, &amp;vtysh_traceroute6_cmd);</a>
+<a name="ln2823">#endif</a>
+<a name="ln2824">  install_element (ENABLE_NODE, &amp;vtysh_telnet_cmd);</a>
+<a name="ln2825">  install_element (ENABLE_NODE, &amp;vtysh_telnet_port_cmd);</a>
+<a name="ln2826">  install_element (ENABLE_NODE, &amp;vtysh_ssh_cmd);</a>
+<a name="ln2827">  install_element (ENABLE_NODE, &amp;vtysh_start_shell_cmd);</a>
+<a name="ln2828">  install_element (ENABLE_NODE, &amp;vtysh_start_bash_cmd);</a>
+<a name="ln2829">  install_element (ENABLE_NODE, &amp;vtysh_start_zsh_cmd);</a>
+<a name="ln2830">  </a>
+<a name="ln2831">  install_element (VIEW_NODE, &amp;vtysh_show_memory_cmd);</a>
+<a name="ln2832">  install_element (ENABLE_NODE, &amp;vtysh_show_memory_cmd);</a>
+<a name="ln2833"> </a>
+<a name="ln2834">  install_element (VIEW_NODE, &amp;vtysh_show_work_queues_cmd);</a>
+<a name="ln2835">  install_element (ENABLE_NODE, &amp;vtysh_show_work_queues_cmd);</a>
+<a name="ln2836">  install_element (ENABLE_NODE, &amp;vtysh_show_work_queues_daemon_cmd);</a>
+<a name="ln2837">  install_element (VIEW_NODE, &amp;vtysh_show_work_queues_daemon_cmd);</a>
+<a name="ln2838"> </a>
+<a name="ln2839">  install_element (VIEW_NODE, &amp;vtysh_show_thread_cmd);</a>
+<a name="ln2840">  install_element (ENABLE_NODE, &amp;vtysh_show_thread_cmd);</a>
+<a name="ln2841"> </a>
+<a name="ln2842">  /* Logging */</a>
+<a name="ln2843">  install_element (ENABLE_NODE, &amp;vtysh_show_logging_cmd);</a>
+<a name="ln2844">  install_element (VIEW_NODE, &amp;vtysh_show_logging_cmd);</a>
+<a name="ln2845">  install_element (CONFIG_NODE, &amp;vtysh_log_stdout_cmd);</a>
+<a name="ln2846">  install_element (CONFIG_NODE, &amp;vtysh_log_stdout_level_cmd);</a>
+<a name="ln2847">  install_element (CONFIG_NODE, &amp;no_vtysh_log_stdout_cmd);</a>
+<a name="ln2848">  install_element (CONFIG_NODE, &amp;vtysh_log_file_cmd);</a>
+<a name="ln2849">  install_element (CONFIG_NODE, &amp;vtysh_log_file_level_cmd);</a>
+<a name="ln2850">  install_element (CONFIG_NODE, &amp;no_vtysh_log_file_cmd);</a>
+<a name="ln2851">  install_element (CONFIG_NODE, &amp;no_vtysh_log_file_level_cmd);</a>
+<a name="ln2852">  install_element (CONFIG_NODE, &amp;vtysh_log_monitor_cmd);</a>
+<a name="ln2853">  install_element (CONFIG_NODE, &amp;vtysh_log_monitor_level_cmd);</a>
+<a name="ln2854">  install_element (CONFIG_NODE, &amp;no_vtysh_log_monitor_cmd);</a>
+<a name="ln2855">  install_element (CONFIG_NODE, &amp;vtysh_log_syslog_cmd);</a>
+<a name="ln2856">  install_element (CONFIG_NODE, &amp;vtysh_log_syslog_level_cmd);</a>
+<a name="ln2857">  install_element (CONFIG_NODE, &amp;no_vtysh_log_syslog_cmd);</a>
+<a name="ln2858">  install_element (CONFIG_NODE, &amp;vtysh_log_trap_cmd);</a>
+<a name="ln2859">  install_element (CONFIG_NODE, &amp;no_vtysh_log_trap_cmd);</a>
+<a name="ln2860">  install_element (CONFIG_NODE, &amp;vtysh_log_facility_cmd);</a>
+<a name="ln2861">  install_element (CONFIG_NODE, &amp;no_vtysh_log_facility_cmd);</a>
+<a name="ln2862">  install_element (CONFIG_NODE, &amp;vtysh_log_record_priority_cmd);</a>
+<a name="ln2863">  install_element (CONFIG_NODE, &amp;no_vtysh_log_record_priority_cmd);</a>
+<a name="ln2864">  install_element (CONFIG_NODE, &amp;vtysh_log_timestamp_precision_cmd);</a>
+<a name="ln2865">  install_element (CONFIG_NODE, &amp;no_vtysh_log_timestamp_precision_cmd);</a>
+<a name="ln2866"> </a>
+<a name="ln2867">  install_element (CONFIG_NODE, &amp;vtysh_service_password_encrypt_cmd);</a>
+<a name="ln2868">  install_element (CONFIG_NODE, &amp;no_vtysh_service_password_encrypt_cmd);</a>
+<a name="ln2869"> </a>
+<a name="ln2870">  install_element (CONFIG_NODE, &amp;vtysh_password_cmd);</a>
+<a name="ln2871">  install_element (CONFIG_NODE, &amp;vtysh_password_text_cmd);</a>
+<a name="ln2872">  install_element (CONFIG_NODE, &amp;vtysh_enable_password_cmd);</a>
+<a name="ln2873">  install_element (CONFIG_NODE, &amp;vtysh_enable_password_text_cmd);</a>
+<a name="ln2874">  install_element (CONFIG_NODE, &amp;no_vtysh_enable_password_cmd);</a>
+<a name="ln2875"> </a>
+<a name="ln2876">}</a>
+
+</code></pre>
+<div class="balloon" rel="7"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1042/" target="_blank">V1042</a> This file is marked with copyleft license, which requires you to open the derived source code.</p></div>
+<div class="balloon" rel="2106"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v575/" target="_blank">V575</a> The potential null pointer is passed into 'strcpy' function. Inspect the first argument. Check lines: 2106, 2104.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,1409 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>routemap.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.5.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/* Route map function.</a>
+<a name="ln2">   Copyright (C) 1998, 1999 Kunihiro Ishiguro</a>
+<a name="ln3"> </a>
+<a name="ln4">This file is part of GNU Zebra.</a>
+<a name="ln5"> </a>
+<a name="ln6">GNU Zebra is free software; you can redistribute it and/or modify it</a>
+<a name="ln7">under the terms of the GNU General Public License as published by the</a>
+<a name="ln8">Free Software Foundation; either version 2, or (at your option) any</a>
+<a name="ln9">later version.</a>
+<a name="ln10"> </a>
+<a name="ln11">GNU Zebra is distributed in the hope that it will be useful, but</a>
+<a name="ln12">WITHOUT ANY WARRANTY; without even the implied warranty of</a>
+<a name="ln13">MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU</a>
+<a name="ln14">General Public License for more details.</a>
+<a name="ln15"> </a>
+<a name="ln16">You should have received a copy of the GNU General Public License</a>
+<a name="ln17">along with GNU Zebra; see the file COPYING.  If not, write to the Free</a>
+<a name="ln18">Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA</a>
+<a name="ln19">02111-1307, USA.  */</a>
+<a name="ln20"> </a>
+<a name="ln21">#include &lt;zebra.h&gt;</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &quot;linklist.h&quot;</a>
+<a name="ln24">#include &quot;memory.h&quot;</a>
+<a name="ln25">#include &quot;vector.h&quot;</a>
+<a name="ln26">#include &quot;prefix.h&quot;</a>
+<a name="ln27">#include &quot;routemap.h&quot;</a>
+<a name="ln28">#include &quot;command.h&quot;</a>
+<a name="ln29">#include &quot;vty.h&quot;</a>
+<a name="ln30">#include &quot;log.h&quot;</a>
+<a name="ln31"> </a>
+<a name="ln32">/* Vector for route match rules. */</a>
+<a name="ln33">static vector route_match_vec;</a>
+<a name="ln34"> </a>
+<a name="ln35">/* Vector for route set rules. */</a>
+<a name="ln36">static vector route_set_vec;</a>
+<a name="ln37"> </a>
+<a name="ln38">/* Route map rule. This rule has both `match' rule and `set' rule. */</a>
+<a name="ln39">struct route_map_rule</a>
+<a name="ln40">{</a>
+<a name="ln41">  /* Rule type. */</a>
+<a name="ln42">  struct route_map_rule_cmd *cmd;</a>
+<a name="ln43"> </a>
+<a name="ln44">  /* For pretty printing. */</a>
+<a name="ln45">  char *rule_str;</a>
+<a name="ln46"> </a>
+<a name="ln47">  /* Pre-compiled match rule. */</a>
+<a name="ln48">  void *value;</a>
+<a name="ln49"> </a>
+<a name="ln50">  /* Linked list. */</a>
+<a name="ln51">  struct route_map_rule *next;</a>
+<a name="ln52">  struct route_map_rule *prev;</a>
+<a name="ln53">};</a>
+<a name="ln54"> </a>
+<a name="ln55">/* Making route map list. */</a>
+<a name="ln56">struct route_map_list</a>
+<a name="ln57">{</a>
+<a name="ln58">  struct route_map *head;</a>
+<a name="ln59">  struct route_map *tail;</a>
+<a name="ln60"> </a>
+<a name="ln61">  void (*add_hook) (const char *);</a>
+<a name="ln62">  void (*delete_hook) (const char *);</a>
+<a name="ln63">  void (*event_hook) (route_map_event_t, const char *); </a>
+<a name="ln64">};</a>
+<a name="ln65"> </a>
+<a name="ln66">/* Master list of route map. */</a>
+<a name="ln67">static struct route_map_list route_map_master = { NULL, NULL, NULL, NULL };</a>
+<a name="ln68"> </a>
+<a name="ln69">static void</a>
+<a name="ln70">route_map_rule_delete (struct route_map_rule_list *,</a>
+<a name="ln71">		       struct route_map_rule *);</a>
+<a name="ln72"> </a>
+<a name="ln73">static void</a>
+<a name="ln74">route_map_index_delete (struct route_map_index *, int);</a>
+<a name="ln75"> </a>
+<a name="ln76">/* New route map allocation. Please note route map's name must be</a>
+<a name="ln77">   specified. */</a>
+<a name="ln78">static struct route_map *</a>
+<a name="ln79">route_map_new (const char *name)</a>
+<a name="ln80">{</a>
+<a name="ln81">  struct route_map *new;</a>
+<a name="ln82"> </a>
+<a name="ln83">  new =  XCALLOC (MTYPE_ROUTE_MAP, sizeof (struct route_map));</a>
+<a name="ln84">  new-&gt;name = XSTRDUP (MTYPE_ROUTE_MAP_NAME, name);</a>
+<a name="ln85">  return new;</a>
+<a name="ln86">}</a>
+<a name="ln87"> </a>
+<a name="ln88">/* Add new name to route_map. */</a>
+<a name="ln89">static struct route_map *</a>
+<a name="ln90">route_map_add (const char *name)</a>
+<a name="ln91">{</a>
+<a name="ln92">  struct route_map *map;</a>
+<a name="ln93">  struct route_map_list *list;</a>
+<a name="ln94"> </a>
+<a name="ln95">  map = route_map_new (name);</a>
+<a name="ln96">  list = &amp;route_map_master;</a>
+<a name="ln97">    </a>
+<a name="ln98">  map-&gt;next = NULL;</a>
+<a name="ln99">  map-&gt;prev = list-&gt;tail;</a>
+<a name="ln100">  if (list-&gt;tail)</a>
+<a name="ln101">    list-&gt;tail-&gt;next = map;</a>
+<a name="ln102">  else</a>
+<a name="ln103">    list-&gt;head = map;</a>
+<a name="ln104">  list-&gt;tail = map;</a>
+<a name="ln105"> </a>
+<a name="ln106">  /* Execute hook. */</a>
+<a name="ln107">  if (route_map_master.add_hook)</a>
+<a name="ln108">    (*route_map_master.add_hook) (name);</a>
+<a name="ln109"> </a>
+<a name="ln110">  return map;</a>
+<a name="ln111">}</a>
+<a name="ln112"> </a>
+<a name="ln113">/* Route map delete from list. */</a>
+<a name="ln114">static void</a>
+<a name="ln115">route_map_delete (struct route_map *map)</a>
+<a name="ln116">{</a>
+<a name="ln117">  struct route_map_list *list;</a>
+<a name="ln118">  struct route_map_index *index;</a>
+<a name="ln119">  char *name;</a>
+<a name="ln120">  </a>
+<a name="ln121">  while ((index = map-&gt;head) != NULL)</a>
+<a name="ln122">    route_map_index_delete (index, 0);</a>
+<a name="ln123"> </a>
+<a name="ln124">  name = map-&gt;name;</a>
+<a name="ln125"> </a>
+<a name="ln126">  list = &amp;route_map_master;</a>
+<a name="ln127"> </a>
+<a name="ln128">  if (map-&gt;next)</a>
+<a name="ln129">    map-&gt;next-&gt;prev = map-&gt;prev;</a>
+<a name="ln130">  else</a>
+<a name="ln131">    list-&gt;tail = map-&gt;prev;</a>
+<a name="ln132"> </a>
+<a name="ln133">  if (map-&gt;prev)</a>
+<a name="ln134">    map-&gt;prev-&gt;next = map-&gt;next;</a>
+<a name="ln135">  else</a>
+<a name="ln136">    list-&gt;head = map-&gt;next;</a>
+<a name="ln137"> </a>
+<a name="ln138">  XFREE (MTYPE_ROUTE_MAP, map);</a>
+<a name="ln139"> </a>
+<a name="ln140">  /* Execute deletion hook. */</a>
+<a name="ln141">  if (route_map_master.delete_hook)</a>
+<a name="ln142">    (*route_map_master.delete_hook) (name);</a>
+<a name="ln143"> </a>
+<a name="ln144">  if (name)</a>
+<a name="ln145">    XFREE (MTYPE_ROUTE_MAP_NAME, name);</a>
+<a name="ln146"> </a>
+<a name="ln147">}</a>
+<a name="ln148"> </a>
+<a name="ln149">/* Lookup route map by route map name string. */</a>
+<a name="ln150">struct route_map *</a>
+<a name="ln151">route_map_lookup_by_name (const char *name)</a>
+<a name="ln152">{</a>
+<a name="ln153">  struct route_map *map;</a>
+<a name="ln154"> </a>
+<a name="ln155">  for (map = route_map_master.head; map; map = map-&gt;next)</a>
+<a name="ln156">    if (strcmp (map-&gt;name, name) == 0)</a>
+<a name="ln157">      return map;</a>
+<a name="ln158">  return NULL;</a>
+<a name="ln159">}</a>
+<a name="ln160"> </a>
+<a name="ln161">/* Lookup route map.  If there isn't route map create one and return</a>
+<a name="ln162">   it. */</a>
+<a name="ln163">static struct route_map *</a>
+<a name="ln164">route_map_get (const char *name)</a>
+<a name="ln165">{</a>
+<a name="ln166">  struct route_map *map;</a>
+<a name="ln167"> </a>
+<a name="ln168">  map = route_map_lookup_by_name (name);</a>
+<a name="ln169">  if (map == NULL)</a>
+<a name="ln170">    map = route_map_add (name);</a>
+<a name="ln171">  return map;</a>
+<a name="ln172">}</a>
+<a name="ln173"> </a>
+<a name="ln174">/* Return route map's type string. */</a>
+<a name="ln175">static const char *</a>
+<a name="ln176">route_map_type_str (enum route_map_type type)</a>
+<a name="ln177">{</a>
+<a name="ln178">  switch (type)</a>
+<a name="ln179">    {</a>
+<a name="ln180">    case RMAP_PERMIT:</a>
+<a name="ln181">      return &quot;permit&quot;;</a>
+<a name="ln182">      break;</a>
+<a name="ln183">    case RMAP_DENY:</a>
+<a name="ln184">      return &quot;deny&quot;;</a>
+<a name="ln185">      break;</a>
+<a name="ln186">    default:</a>
+<a name="ln187">      return &quot;&quot;;</a>
+<a name="ln188">      break;</a>
+<a name="ln189">    }</a>
+<a name="ln190">}</a>
+<a name="ln191"> </a>
+<a name="ln192">static int</a>
+<a name="ln193">route_map_empty (struct route_map *map)</a>
+<a name="ln194">{</a>
+<a name="ln195">  if (map-&gt;head == NULL &amp;&amp; map-&gt;tail == NULL)</a>
+<a name="ln196">    return 1;</a>
+<a name="ln197">  else</a>
+<a name="ln198">    return 0;</a>
+<a name="ln199">}</a>
+<a name="ln200"> </a>
+<a name="ln201">/* show route-map */</a>
+<a name="ln202">static void</a>
+<a name="ln203">vty_show_route_map_entry (struct vty *vty, struct route_map *map)</a>
+<a name="ln204">{</a>
+<a name="ln205">  struct route_map_index *index;</a>
+<a name="ln206">  struct route_map_rule *rule;</a>
+<a name="ln207"> </a>
+<a name="ln208">  /* Print the name of the protocol */</a>
+<a name="ln209">  if (zlog_default)</a>
+<a name="ln210">    vty_out (vty, &quot;%s:%s&quot;, zlog_proto_names[zlog_default-&gt;protocol],</a>
+<a name="ln211">             VTY_NEWLINE);</a>
+<a name="ln212"> </a>
+<a name="ln213">  for (index = map-&gt;head; index; index = index-&gt;next)</a>
+<a name="ln214">    {</a>
+<a name="ln215">      vty_out (vty, &quot;route-map %s, %s, sequence %d%s&quot;,</a>
+<a name="ln216">               map-&gt;name, route_map_type_str (index-&gt;type),</a>
+<a name="ln217">               index-&gt;pref, VTY_NEWLINE);</a>
+<a name="ln218"> </a>
+<a name="ln219">      /* Description */</a>
+<a name="ln220">      if (index-&gt;description)</a>
+<a name="ln221">	vty_out (vty, &quot;  Description:%s    %s%s&quot;, VTY_NEWLINE,</a>
+<a name="ln222">		 index-&gt;description, VTY_NEWLINE);</a>
+<a name="ln223">      </a>
+<a name="ln224">      /* Match clauses */</a>
+<a name="ln225">      vty_out (vty, &quot;  Match clauses:%s&quot;, VTY_NEWLINE);</a>
+<a name="ln226">      for (rule = index-&gt;match_list.head; rule; rule = rule-&gt;next)</a>
+<a name="ln227">        vty_out (vty, &quot;    %s %s%s&quot;, </a>
+<a name="ln228">                 rule-&gt;cmd-&gt;str, rule-&gt;rule_str, VTY_NEWLINE);</a>
+<a name="ln229">      </a>
+<a name="ln230">      vty_out (vty, &quot;  Set clauses:%s&quot;, VTY_NEWLINE);</a>
+<a name="ln231">      for (rule = index-&gt;set_list.head; rule; rule = rule-&gt;next)</a>
+<a name="ln232">        vty_out (vty, &quot;    %s %s%s&quot;,</a>
+<a name="ln233">                 rule-&gt;cmd-&gt;str, rule-&gt;rule_str, VTY_NEWLINE);</a>
+<a name="ln234">      </a>
+<a name="ln235">      /* Call clause */</a>
+<a name="ln236">      vty_out (vty, &quot;  Call clause:%s&quot;, VTY_NEWLINE);</a>
+<a name="ln237">      if (index-&gt;nextrm)</a>
+<a name="ln238">        vty_out (vty, &quot;    Call %s%s&quot;, index-&gt;nextrm, VTY_NEWLINE);</a>
+<a name="ln239">      </a>
+<a name="ln240">      /* Exit Policy */</a>
+<a name="ln241">      vty_out (vty, &quot;  Action:%s&quot;, VTY_NEWLINE);</a>
+<a name="ln242">      if (index-&gt;exitpolicy == RMAP_GOTO)</a>
+<a name="ln243">        vty_out (vty, &quot;    Goto %d%s&quot;, index-&gt;nextpref, VTY_NEWLINE);</a>
+<a name="ln244">      else if (index-&gt;exitpolicy == RMAP_NEXT)</a>
+<a name="ln245">        vty_out (vty, &quot;    Continue to next entry%s&quot;, VTY_NEWLINE);</a>
+<a name="ln246">      else if (index-&gt;exitpolicy == RMAP_EXIT)</a>
+<a name="ln247">        vty_out (vty, &quot;    Exit routemap%s&quot;, VTY_NEWLINE);</a>
+<a name="ln248">    }</a>
+<a name="ln249">}</a>
+<a name="ln250"> </a>
+<a name="ln251">static int</a>
+<a name="ln252">vty_show_route_map (struct vty *vty, const char *name)</a>
+<a name="ln253">{</a>
+<a name="ln254">  struct route_map *map;</a>
+<a name="ln255"> </a>
+<a name="ln256">  if (name)</a>
+<a name="ln257">    {</a>
+<a name="ln258">      map = route_map_lookup_by_name (name);</a>
+<a name="ln259"> </a>
+<a name="ln260">      if (map)</a>
+<a name="ln261">        {</a>
+<a name="ln262">          vty_show_route_map_entry (vty, map);</a>
+<a name="ln263">          return CMD_SUCCESS;</a>
+<a name="ln264">        }</a>
+<a name="ln265">      else</a>
+<a name="ln266">        {</a>
+<a name="ln267">          vty_out (vty, &quot;%%route-map %s not found%s&quot;, name, VTY_NEWLINE);</a>
+<a name="ln268">          return CMD_WARNING;</a>
+<a name="ln269">        }</a>
+<a name="ln270">    }</a>
+<a name="ln271">  else</a>
+<a name="ln272">    {</a>
+<a name="ln273">      for (map = route_map_master.head; map; map = map-&gt;next)</a>
+<a name="ln274">	vty_show_route_map_entry (vty, map);</a>
+<a name="ln275">    }</a>
+<a name="ln276">  return CMD_SUCCESS;</a>
+<a name="ln277">}</a>
+<a name="ln278"> </a>
+<a name="ln279"> </a>
+<a name="ln280">/* New route map allocation. Please note route map's name must be</a>
+<a name="ln281">   specified. */</a>
+<a name="ln282">static struct route_map_index *</a>
+<a name="ln283">route_map_index_new (void)</a>
+<a name="ln284">{</a>
+<a name="ln285">  struct route_map_index *new;</a>
+<a name="ln286"> </a>
+<a name="ln287">  new =  XCALLOC (MTYPE_ROUTE_MAP_INDEX, sizeof (struct route_map_index));</a>
+<a name="ln288">  new-&gt;exitpolicy = RMAP_EXIT; /* Default to Cisco-style */</a>
+<a name="ln289">  return new;</a>
+<a name="ln290">}</a>
+<a name="ln291"> </a>
+<a name="ln292">/* Free route map index. */</a>
+<a name="ln293">static void</a>
+<a name="ln294">route_map_index_delete (struct route_map_index *index, int notify)</a>
+<a name="ln295">{</a>
+<a name="ln296">  struct route_map_rule *rule;</a>
+<a name="ln297"> </a>
+<a name="ln298">  /* Free route match. */</a>
+<a name="ln299">  while ((rule = index-&gt;match_list.head) != NULL)</a>
+<a name="ln300">    route_map_rule_delete (&amp;index-&gt;match_list, rule);</a>
+<a name="ln301"> </a>
+<a name="ln302">  /* Free route set. */</a>
+<a name="ln303">  while ((rule = index-&gt;set_list.head) != NULL)</a>
+<a name="ln304">    route_map_rule_delete (&amp;index-&gt;set_list, rule);</a>
+<a name="ln305"> </a>
+<a name="ln306">  /* Remove index from route map list. */</a>
+<a name="ln307">  if (index-&gt;next)</a>
+<a name="ln308">    index-&gt;next-&gt;prev = index-&gt;prev;</a>
+<a name="ln309">  else</a>
+<a name="ln310">    index-&gt;map-&gt;tail = index-&gt;prev;</a>
+<a name="ln311"> </a>
+<a name="ln312">  if (index-&gt;prev)</a>
+<a name="ln313">    index-&gt;prev-&gt;next = index-&gt;next;</a>
+<a name="ln314">  else</a>
+<a name="ln315">    index-&gt;map-&gt;head = index-&gt;next;</a>
+<a name="ln316"> </a>
+<a name="ln317">  /* Free 'char *nextrm' if not NULL */</a>
+<a name="ln318">  if (index-&gt;nextrm)</a>
+<a name="ln319">    XFREE (MTYPE_ROUTE_MAP_NAME, index-&gt;nextrm);</a>
+<a name="ln320"> </a>
+<a name="ln321">    /* Execute event hook. */</a>
+<a name="ln322">  if (route_map_master.event_hook &amp;&amp; notify)</a>
+<a name="ln323">    (*route_map_master.event_hook) (RMAP_EVENT_INDEX_DELETED,</a>
+<a name="ln324">				    index-&gt;map-&gt;name);</a>
+<a name="ln325"> </a>
+<a name="ln326">  XFREE (MTYPE_ROUTE_MAP_INDEX, index);</a>
+<a name="ln327">}</a>
+<a name="ln328"> </a>
+<a name="ln329">/* Lookup index from route map. */</a>
+<a name="ln330">static struct route_map_index *</a>
+<a name="ln331">route_map_index_lookup (struct route_map *map, enum route_map_type type,</a>
+<a name="ln332">			int pref)</a>
+<a name="ln333">{</a>
+<a name="ln334">  struct route_map_index *index;</a>
+<a name="ln335"> </a>
+<a name="ln336">  for (index = map-&gt;head; index; index = index-&gt;next)</a>
+<a name="ln337">    if ((index-&gt;type == type || type == RMAP_ANY)</a>
+<a name="ln338">	&amp;&amp; index-&gt;pref == pref)</a>
+<a name="ln339">      return index;</a>
+<a name="ln340">  return NULL;</a>
+<a name="ln341">}</a>
+<a name="ln342"> </a>
+<a name="ln343">/* Add new index to route map. */</a>
+<a name="ln344">static struct route_map_index *</a>
+<a name="ln345">route_map_index_add (struct route_map *map, enum route_map_type type,</a>
+<a name="ln346">		     int pref)</a>
+<a name="ln347">{</a>
+<a name="ln348">  struct route_map_index *index;</a>
+<a name="ln349">  struct route_map_index *point;</a>
+<a name="ln350"> </a>
+<a name="ln351">  /* Allocate new route map inex. */</a>
+<a name="ln352">  index = route_map_index_new ();</a>
+<a name="ln353">  index-&gt;map = map;</a>
+<a name="ln354">  index-&gt;type = type;</a>
+<a name="ln355">  index-&gt;pref = pref;</a>
+<a name="ln356">  </a>
+<a name="ln357">  /* Compare preference. */</a>
+<a name="ln358">  for (point = map-&gt;head; point; point = point-&gt;next)</a>
+<a name="ln359">    if (point-&gt;pref &gt;= pref)</a>
+<a name="ln360">      break;</a>
+<a name="ln361"> </a>
+<a name="ln362">  if (map-&gt;head == NULL)</a>
+<a name="ln363">    {</a>
+<a name="ln364">      map-&gt;head = map-&gt;tail = index;</a>
+<a name="ln365">    }</a>
+<a name="ln366">  else if (point == NULL)</a>
+<a name="ln367">    {</a>
+<a name="ln368">      index-&gt;prev = map-&gt;tail;</a>
+<a name="ln369">      map-&gt;tail-&gt;next = index;</a>
+<a name="ln370">      map-&gt;tail = index;</a>
+<a name="ln371">    }</a>
+<a name="ln372">  else if (point == map-&gt;head)</a>
+<a name="ln373">    {</a>
+<a name="ln374">      index-&gt;next = map-&gt;head;</a>
+<a name="ln375">      map-&gt;head-&gt;prev = index;</a>
+<a name="ln376">      map-&gt;head = index;</a>
+<a name="ln377">    }</a>
+<a name="ln378">  else</a>
+<a name="ln379">    {</a>
+<a name="ln380">      index-&gt;next = point;</a>
+<a name="ln381">      index-&gt;prev = point-&gt;prev;</a>
+<a name="ln382">      if (point-&gt;prev)</a>
+<a name="ln383">	point-&gt;prev-&gt;next = index;</a>
+<a name="ln384">      point-&gt;prev = index;</a>
+<a name="ln385">    }</a>
+<a name="ln386"> </a>
+<a name="ln387">  /* Execute event hook. */</a>
+<a name="ln388">  if (route_map_master.event_hook)</a>
+<a name="ln389">    (*route_map_master.event_hook) (RMAP_EVENT_INDEX_ADDED,</a>
+<a name="ln390">				    map-&gt;name);</a>
+<a name="ln391"> </a>
+<a name="ln392">  return index;</a>
+<a name="ln393">}</a>
+<a name="ln394"> </a>
+<a name="ln395">/* Get route map index. */</a>
+<a name="ln396">static struct route_map_index *</a>
+<a name="ln397">route_map_index_get (struct route_map *map, enum route_map_type type, </a>
+<a name="ln398">		     int pref)</a>
+<a name="ln399">{</a>
+<a name="ln400">  struct route_map_index *index;</a>
+<a name="ln401"> </a>
+<a name="ln402">  index = route_map_index_lookup (map, RMAP_ANY, pref);</a>
+<a name="ln403">  if (index &amp;&amp; index-&gt;type != type)</a>
+<a name="ln404">    {</a>
+<a name="ln405">      /* Delete index from route map. */</a>
+<a name="ln406">      route_map_index_delete (index, 1);</a>
+<a name="ln407">      index = NULL;</a>
+<a name="ln408">    }</a>
+<a name="ln409">  if (index == NULL)</a>
+<a name="ln410">    index = route_map_index_add (map, type, pref);</a>
+<a name="ln411">  return index;</a>
+<a name="ln412">}</a>
+<a name="ln413"> </a>
+<a name="ln414">/* New route map rule */</a>
+<a name="ln415">static struct route_map_rule *</a>
+<a name="ln416">route_map_rule_new (void)</a>
+<a name="ln417">{</a>
+<a name="ln418">  struct route_map_rule *new;</a>
+<a name="ln419"> </a>
+<a name="ln420">  new = XCALLOC (MTYPE_ROUTE_MAP_RULE, sizeof (struct route_map_rule));</a>
+<a name="ln421">  return new;</a>
+<a name="ln422">}</a>
+<a name="ln423"> </a>
+<a name="ln424">/* Install rule command to the match list. */</a>
+<a name="ln425">void</a>
+<a name="ln426">route_map_install_match (struct route_map_rule_cmd *cmd)</a>
+<a name="ln427">{</a>
+<a name="ln428">  vector_set (route_match_vec, cmd);</a>
+<a name="ln429">}</a>
+<a name="ln430"> </a>
+<a name="ln431">/* Install rule command to the set list. */</a>
+<a name="ln432">void</a>
+<a name="ln433">route_map_install_set (struct route_map_rule_cmd *cmd)</a>
+<a name="ln434">{</a>
+<a name="ln435">  vector_set (route_set_vec, cmd);</a>
+<a name="ln436">}</a>
+<a name="ln437"> </a>
+<a name="ln438">/* Lookup rule command from match list. */</a>
+<a name="ln439">static struct route_map_rule_cmd *</a>
+<a name="ln440">route_map_lookup_match (const char *name)</a>
+<a name="ln441">{</a>
+<a name="ln442">  unsigned int i;</a>
+<a name="ln443">  struct route_map_rule_cmd *rule;</a>
+<a name="ln444"> </a>
+<a name="ln445">  for (i = 0; i &lt; vector_active (route_match_vec); i++)</a>
+<a name="ln446">    if ((rule = vector_slot (route_match_vec, i)) != NULL)</a>
+<a name="ln447">      if (strcmp (rule-&gt;str, name) == 0)</a>
+<a name="ln448">	return rule;</a>
+<a name="ln449">  return NULL;</a>
+<a name="ln450">}</a>
+<a name="ln451"> </a>
+<a name="ln452">/* Lookup rule command from set list. */</a>
+<a name="ln453">static struct route_map_rule_cmd *</a>
+<a name="ln454">route_map_lookup_set (const char *name)</a>
+<a name="ln455">{</a>
+<a name="ln456">  unsigned int i;</a>
+<a name="ln457">  struct route_map_rule_cmd *rule;</a>
+<a name="ln458"> </a>
+<a name="ln459">  for (i = 0; i &lt; vector_active (route_set_vec); i++)</a>
+<a name="ln460">    if ((rule = vector_slot (route_set_vec, i)) != NULL)</a>
+<a name="ln461">      if (strcmp (rule-&gt;str, name) == 0)</a>
+<a name="ln462">	return rule;</a>
+<a name="ln463">  return NULL;</a>
+<a name="ln464">}</a>
+<a name="ln465"> </a>
+<a name="ln466">/* Add match and set rule to rule list. */</a>
+<a name="ln467">static void</a>
+<a name="ln468">route_map_rule_add (struct route_map_rule_list *list,</a>
+<a name="ln469">		    struct route_map_rule *rule)</a>
+<a name="ln470">{</a>
+<a name="ln471">  rule-&gt;next = NULL;</a>
+<a name="ln472">  rule-&gt;prev = list-&gt;tail;</a>
+<a name="ln473">  if (list-&gt;tail)</a>
+<a name="ln474">    list-&gt;tail-&gt;next = rule;</a>
+<a name="ln475">  else</a>
+<a name="ln476">    list-&gt;head = rule;</a>
+<a name="ln477">  list-&gt;tail = rule;</a>
+<a name="ln478">}</a>
+<a name="ln479"> </a>
+<a name="ln480">/* Delete rule from rule list. */</a>
+<a name="ln481">static void</a>
+<a name="ln482">route_map_rule_delete (struct route_map_rule_list *list,</a>
+<a name="ln483">		       struct route_map_rule *rule)</a>
+<a name="ln484">{</a>
+<a name="ln485">  if (rule-&gt;cmd-&gt;func_free)</a>
+<a name="ln486">    (*rule-&gt;cmd-&gt;func_free) (rule-&gt;value);</a>
+<a name="ln487"> </a>
+<a name="ln488">  if (rule-&gt;rule_str)</a>
+<a name="ln489">    XFREE (MTYPE_ROUTE_MAP_RULE_STR, rule-&gt;rule_str);</a>
+<a name="ln490"> </a>
+<a name="ln491">  if (rule-&gt;next)</a>
+<a name="ln492">    rule-&gt;next-&gt;prev = rule-&gt;prev;</a>
+<a name="ln493">  else</a>
+<a name="ln494">    list-&gt;tail = rule-&gt;prev;</a>
+<a name="ln495">  if (rule-&gt;prev)</a>
+<a name="ln496">    rule-&gt;prev-&gt;next = rule-&gt;next;</a>
+<a name="ln497">  else</a>
+<a name="ln498">    list-&gt;head = rule-&gt;next;</a>
+<a name="ln499"> </a>
+<a name="ln500">  XFREE (MTYPE_ROUTE_MAP_RULE, rule);</a>
+<a name="ln501">}</a>
+<a name="ln502"> </a>
+<a name="ln503">/* strcmp wrapper function which don't crush even argument is NULL. */</a>
+<a name="ln504">static int</a>
+<a name="ln505">rulecmp (const char *dst, const char *src)</a>
+<a name="ln506">{</a>
+<a name="ln507">  if (dst == NULL)</a>
+<a name="ln508">    {</a>
+<a name="ln509">      if (src ==  NULL)</a>
+<a name="ln510">	return 0;</a>
+<a name="ln511">      else</a>
+<a name="ln512">	return 1;</a>
+<a name="ln513">    }</a>
+<a name="ln514">  else</a>
+<a name="ln515">    {</a>
+<a name="ln516">      if (src == NULL)</a>
+<a name="ln517">	return 1;</a>
+<a name="ln518">      else</a>
+<a name="ln519">	return strcmp (dst, src);</a>
+<a name="ln520">    }</a>
+<a name="ln521">  return 1;</a>
+<a name="ln522">}</a>
+<a name="ln523"> </a>
+<a name="ln524">/* Add match statement to route map. */</a>
+<a name="ln525">int</a>
+<a name="ln526">route_map_add_match (struct route_map_index *index, const char *match_name,</a>
+<a name="ln527">                     const char *match_arg)</a>
+<a name="ln528">{</a>
+<a name="ln529">  struct route_map_rule *rule;</a>
+<a name="ln530">  struct route_map_rule *next;</a>
+<a name="ln531">  struct route_map_rule_cmd *cmd;</a>
+<a name="ln532">  void *compile;</a>
+<a name="ln533">  int replaced = 0;</a>
+<a name="ln534"> </a>
+<a name="ln535">  /* First lookup rule for add match statement. */</a>
+<a name="ln536">  cmd = route_map_lookup_match (match_name);</a>
+<a name="ln537">  if (cmd == NULL)</a>
+<a name="ln538">    return RMAP_RULE_MISSING;</a>
+<a name="ln539"> </a>
+<a name="ln540">  /* Next call compile function for this match statement. */</a>
+<a name="ln541">  if (cmd-&gt;func_compile)</a>
+<a name="ln542">    {</a>
+<a name="ln543">      compile= (*cmd-&gt;func_compile)(match_arg);</a>
+<a name="ln544">      if (compile == NULL)</a>
+<a name="ln545">	return RMAP_COMPILE_ERROR;</a>
+<a name="ln546">    }</a>
+<a name="ln547">  else</a>
+<a name="ln548">    compile = NULL;</a>
+<a name="ln549"> </a>
+<a name="ln550">  /* If argument is completely same ignore it. */</a>
+<a name="ln551">  for (rule = index-&gt;match_list.head; rule; rule = next)</a>
+<a name="ln552">    {</a>
+<a name="ln553">      next = rule-&gt;next;</a>
+<a name="ln554">      if (rule-&gt;cmd == cmd)</a>
+<a name="ln555">	{	</a>
+<a name="ln556">	  route_map_rule_delete (&amp;index-&gt;match_list, rule);</a>
+<a name="ln557">	  replaced = 1;</a>
+<a name="ln558">	}</a>
+<a name="ln559">    }</a>
+<a name="ln560"> </a>
+<a name="ln561">  /* Add new route map match rule. */</a>
+<a name="ln562">  rule = route_map_rule_new ();</a>
+<a name="ln563">  rule-&gt;cmd = cmd;</a>
+<a name="ln564">  rule-&gt;value = compile;</a>
+<a name="ln565">  if (match_arg)</a>
+<a name="ln566">    rule-&gt;rule_str = XSTRDUP (MTYPE_ROUTE_MAP_RULE_STR, match_arg);</a>
+<a name="ln567">  else</a>
+<a name="ln568">    rule-&gt;rule_str = NULL;</a>
+<a name="ln569"> </a>
+<a name="ln570">  /* Add new route match rule to linked list. */</a>
+<a name="ln571">  route_map_rule_add (&amp;index-&gt;match_list, rule);</a>
+<a name="ln572"> </a>
+<a name="ln573">  /* Execute event hook. */</a>
+<a name="ln574">  if (route_map_master.event_hook)</a>
+<a name="ln575">    (*route_map_master.event_hook) (replaced ?</a>
+<a name="ln576">				    RMAP_EVENT_MATCH_REPLACED:</a>
+<a name="ln577">				    RMAP_EVENT_MATCH_ADDED,</a>
+<a name="ln578">				    index-&gt;map-&gt;name);</a>
+<a name="ln579"> </a>
+<a name="ln580">  return 0;</a>
+<a name="ln581">}</a>
+<a name="ln582"> </a>
+<a name="ln583">/* Delete specified route match rule. */</a>
+<a name="ln584">int</a>
+<a name="ln585">route_map_delete_match (struct route_map_index *index, const char *match_name,</a>
+<a name="ln586">                        const char *match_arg)</a>
+<a name="ln587">{</a>
+<a name="ln588">  struct route_map_rule *rule;</a>
+<a name="ln589">  struct route_map_rule_cmd *cmd;</a>
+<a name="ln590"> </a>
+<a name="ln591">  cmd = route_map_lookup_match (match_name);</a>
+<a name="ln592">  if (cmd == NULL)</a>
+<a name="ln593">    return 1;</a>
+<a name="ln594">  </a>
+<a name="ln595">  for (rule = index-&gt;match_list.head; rule; rule = rule-&gt;next)</a>
+<a name="ln596">    if (rule-&gt;cmd == cmd &amp;&amp; </a>
+<a name="ln597">	(rulecmp (rule-&gt;rule_str, match_arg) == 0 || match_arg == NULL))</a>
+<a name="ln598">      {</a>
+<a name="ln599">	route_map_rule_delete (&amp;index-&gt;match_list, rule);</a>
+<a name="ln600">	/* Execute event hook. */</a>
+<a name="ln601">	if (route_map_master.event_hook)</a>
+<a name="ln602">	  (*route_map_master.event_hook) (RMAP_EVENT_MATCH_DELETED,</a>
+<a name="ln603">					  index-&gt;map-&gt;name);</a>
+<a name="ln604">	return 0;</a>
+<a name="ln605">      }</a>
+<a name="ln606">  /* Can't find matched rule. */</a>
+<a name="ln607">  return 1;</a>
+<a name="ln608">}</a>
+<a name="ln609"> </a>
+<a name="ln610">/* Add route-map set statement to the route map. */</a>
+<a name="ln611">int</a>
+<a name="ln612">route_map_add_set (struct route_map_index *index, const char *set_name,</a>
+<a name="ln613">                   const char *set_arg)</a>
+<a name="ln614">{</a>
+<a name="ln615">  struct route_map_rule *rule;</a>
+<a name="ln616">  struct route_map_rule *next;</a>
+<a name="ln617">  struct route_map_rule_cmd *cmd;</a>
+<a name="ln618">  void *compile;</a>
+<a name="ln619">  int replaced = 0;</a>
+<a name="ln620"> </a>
+<a name="ln621">  cmd = route_map_lookup_set (set_name);</a>
+<a name="ln622">  if (cmd == NULL)</a>
+<a name="ln623">    return RMAP_RULE_MISSING;</a>
+<a name="ln624"> </a>
+<a name="ln625">  /* Next call compile function for this match statement. */</a>
+<a name="ln626">  if (cmd-&gt;func_compile)</a>
+<a name="ln627">    {</a>
+<a name="ln628">      compile= (*cmd-&gt;func_compile)(set_arg);</a>
+<a name="ln629">      if (compile == NULL)</a>
+<a name="ln630">	return RMAP_COMPILE_ERROR;</a>
+<a name="ln631">    }</a>
+<a name="ln632">  else</a>
+<a name="ln633">    compile = NULL;</a>
+<a name="ln634"> </a>
+<a name="ln635"> /* Add by WJL. if old set command of same kind exist, delete it first</a>
+<a name="ln636">    to ensure only one set command of same kind exist under a</a>
+<a name="ln637">    route_map_index. */</a>
+<a name="ln638">  for (rule = index-&gt;set_list.head; rule; rule = next)</a>
+<a name="ln639">    {</a>
+<a name="ln640">      next = rule-&gt;next;</a>
+<a name="ln641">      if (rule-&gt;cmd == cmd)</a>
+<a name="ln642">	{</a>
+<a name="ln643">	  route_map_rule_delete (&amp;index-&gt;set_list, rule);</a>
+<a name="ln644">	  replaced = 1;</a>
+<a name="ln645">	}</a>
+<a name="ln646">    }</a>
+<a name="ln647"> </a>
+<a name="ln648">  /* Add new route map match rule. */</a>
+<a name="ln649">  rule = route_map_rule_new ();</a>
+<a name="ln650">  rule-&gt;cmd = cmd;</a>
+<a name="ln651">  rule-&gt;value = compile;</a>
+<a name="ln652">  if (set_arg)</a>
+<a name="ln653">    rule-&gt;rule_str = XSTRDUP (MTYPE_ROUTE_MAP_RULE_STR, set_arg);</a>
+<a name="ln654">  else</a>
+<a name="ln655">    rule-&gt;rule_str = NULL;</a>
+<a name="ln656"> </a>
+<a name="ln657">  /* Add new route match rule to linked list. */</a>
+<a name="ln658">  route_map_rule_add (&amp;index-&gt;set_list, rule);</a>
+<a name="ln659"> </a>
+<a name="ln660">  /* Execute event hook. */</a>
+<a name="ln661">  if (route_map_master.event_hook)</a>
+<a name="ln662">    (*route_map_master.event_hook) (replaced ?</a>
+<a name="ln663">				    RMAP_EVENT_SET_REPLACED:</a>
+<a name="ln664">				    RMAP_EVENT_SET_ADDED,</a>
+<a name="ln665">				    index-&gt;map-&gt;name);</a>
+<a name="ln666">  return 0;</a>
+<a name="ln667">}</a>
+<a name="ln668"> </a>
+<a name="ln669">/* Delete route map set rule. */</a>
+<a name="ln670">int</a>
+<a name="ln671">route_map_delete_set (struct route_map_index *index, const char *set_name,</a>
+<a name="ln672">                      const char *set_arg)</a>
+<a name="ln673">{</a>
+<a name="ln674">  struct route_map_rule *rule;</a>
+<a name="ln675">  struct route_map_rule_cmd *cmd;</a>
+<a name="ln676"> </a>
+<a name="ln677">  cmd = route_map_lookup_set (set_name);</a>
+<a name="ln678">  if (cmd == NULL)</a>
+<a name="ln679">    return 1;</a>
+<a name="ln680">  </a>
+<a name="ln681">  for (rule = index-&gt;set_list.head; rule; rule = rule-&gt;next)</a>
+<a name="ln682">    if ((rule-&gt;cmd == cmd) &amp;&amp;</a>
+<a name="ln683">         (rulecmp (rule-&gt;rule_str, set_arg) == 0 || set_arg == NULL))</a>
+<a name="ln684">      {</a>
+<a name="ln685">        route_map_rule_delete (&amp;index-&gt;set_list, rule);</a>
+<a name="ln686">	/* Execute event hook. */</a>
+<a name="ln687">	if (route_map_master.event_hook)</a>
+<a name="ln688">	  (*route_map_master.event_hook) (RMAP_EVENT_SET_DELETED,</a>
+<a name="ln689">					  index-&gt;map-&gt;name);</a>
+<a name="ln690">        return 0;</a>
+<a name="ln691">      }</a>
+<a name="ln692">  /* Can't find matched rule. */</a>
+<a name="ln693">  return 1;</a>
+<a name="ln694">}</a>
+<a name="ln695"> </a>
+<a name="ln696">/* Apply route map's each index to the object.</a>
+<a name="ln697"> </a>
+<a name="ln698">   The matrix for a route-map looks like this:</a>
+<a name="ln699">   (note, this includes the description for the &quot;NEXT&quot;</a>
+<a name="ln700">   and &quot;GOTO&quot; frobs now</a>
+<a name="ln701">  </a>
+<a name="ln702">              Match   |   No Match</a>
+<a name="ln703">                      |</a>
+<a name="ln704">    permit    action  |     cont</a>
+<a name="ln705">                      |</a>
+<a name="ln706">    ------------------+---------------</a>
+<a name="ln707">                      |</a>
+<a name="ln708">    deny      deny    |     cont</a>
+<a name="ln709">                      |</a>
+<a name="ln710">  </a>
+<a name="ln711">   action)</a>
+<a name="ln712">      -Apply Set statements, accept route</a>
+<a name="ln713">      -If Call statement is present jump to the specified route-map, if it</a>
+<a name="ln714">         denies the route we finish.</a>
+<a name="ln715">      -If NEXT is specified, goto NEXT statement</a>
+<a name="ln716">      -If GOTO is specified, goto the first clause where pref &gt; nextpref</a>
+<a name="ln717">      -If nothing is specified, do as Cisco and finish</a>
+<a name="ln718">   deny)</a>
+<a name="ln719">      -Route is denied by route-map.</a>
+<a name="ln720">   cont)</a>
+<a name="ln721">      -Goto Next index</a>
+<a name="ln722">  </a>
+<a name="ln723">   If we get no matches after we've processed all updates, then the route</a>
+<a name="ln724">   is dropped too.</a>
+<a name="ln725">  </a>
+<a name="ln726">   Some notes on the new &quot;CALL&quot;, &quot;NEXT&quot; and &quot;GOTO&quot;</a>
+<a name="ln727">     call WORD        - If this clause is matched, then the set statements</a>
+<a name="ln728">                        are executed and then we jump to route-map 'WORD'. If</a>
+<a name="ln729">                        this route-map denies the route, we finish, in other case we</a>
+<a name="ln730">                        do whatever the exit policy (EXIT, NEXT or GOTO) tells.</a>
+<a name="ln731">     on-match next    - If this clause is matched, then the set statements</a>
+<a name="ln732">                        are executed and then we drop through to the next clause</a>
+<a name="ln733">     on-match goto n  - If this clause is matched, then the set statments</a>
+<a name="ln734">                        are executed and then we goto the nth clause, or the</a>
+<a name="ln735">                        first clause greater than this. In order to ensure</a>
+<a name="ln736">                        route-maps *always* exit, you cannot jump backwards.</a>
+<a name="ln737">                        Sorry ;)</a>
+<a name="ln738">  </a>
+<a name="ln739">   We need to make sure our route-map processing matches the above</a>
+<a name="ln740">*/</a>
+<a name="ln741"> </a>
+<a name="ln742">static route_map_result_t</a>
+<a name="ln743">route_map_apply_match (struct route_map_rule_list *match_list,</a>
+<a name="ln744">                       struct prefix *prefix, route_map_object_t type,</a>
+<a name="ln745">                       void *object)</a>
+<a name="ln746">{</a>
+<a name="ln747">  route_map_result_t ret = RMAP_NOMATCH;</a>
+<a name="ln748">  struct route_map_rule *match;</a>
+<a name="ln749"> </a>
+<a name="ln750"> </a>
+<a name="ln751">  /* Check all match rule and if there is no match rule, go to the</a>
+<a name="ln752">     set statement. */</a>
+<a name="ln753">  if (!match_list-&gt;head)</a>
+<a name="ln754">    ret = RMAP_MATCH;</a>
+<a name="ln755">  else</a>
+<a name="ln756">    {</a>
+<a name="ln757">      for (match = match_list-&gt;head; match; match = match-&gt;next)</a>
+<a name="ln758">        {</a>
+<a name="ln759">          /* Try each match statement in turn, If any do not return</a>
+<a name="ln760">             RMAP_MATCH, return, otherwise continue on to next match </a>
+<a name="ln761">             statement. All match statements must match for end-result</a>
+<a name="ln762">             to be a match. */</a>
+<a name="ln763">          ret = (*match-&gt;cmd-&gt;func_apply) (match-&gt;value, prefix,</a>
+<a name="ln764">                                           type, object);</a>
+<a name="ln765">          if (ret != RMAP_MATCH)</a>
+<a name="ln766">            return ret;</a>
+<a name="ln767">        }</a>
+<a name="ln768">    }</a>
+<a name="ln769">  return ret;</a>
+<a name="ln770">}</a>
+<a name="ln771"> </a>
+<a name="ln772">/* Apply route map to the object. */</a>
+<a name="ln773">route_map_result_t</a>
+<a name="ln774">route_map_apply (struct route_map *map, struct prefix *prefix,</a>
+<a name="ln775">                 route_map_object_t type, void *object)</a>
+<a name="ln776">{</a>
+<a name="ln777">  static int recursion = 0;</a>
+<a name="ln778">  int ret = 0;</a>
+<a name="ln779">  struct route_map_index *index;</a>
+<a name="ln780">  struct route_map_rule *set;</a>
+<a name="ln781"> </a>
+<a name="ln782">  if (recursion &gt; RMAP_RECURSION_LIMIT)</a>
+<a name="ln783">    {</a>
+<a name="ln784">      zlog (NULL, LOG_WARNING,</a>
+<a name="ln785">            &quot;route-map recursion limit (%d) reached, discarding route&quot;,</a>
+<a name="ln786">            RMAP_RECURSION_LIMIT);</a>
+<a name="ln787">      recursion = 0;</a>
+<a name="ln788">      return RMAP_DENYMATCH;</a>
+<a name="ln789">    }</a>
+<a name="ln790"> </a>
+<a name="ln791">  if (map == NULL)</a>
+<a name="ln792">    return RMAP_DENYMATCH;</a>
+<a name="ln793"> </a>
+<a name="ln794">  for (index = map-&gt;head; index; index = index-&gt;next)</a>
+<a name="ln795">    {</a>
+<a name="ln796">      /* Apply this index. */</a>
+<a name="ln797">      ret = route_map_apply_match (&amp;index-&gt;match_list, prefix, type, object);</a>
+<a name="ln798"> </a>
+<a name="ln799">      /* Now we apply the matrix from above */</a>
+<a name="ln800">      if (ret == RMAP_NOMATCH)</a>
+<a name="ln801">        /* 'cont' from matrix - continue to next route-map sequence */</a>
+<a name="ln802">        continue;</a>
+<a name="ln803">      else if (ret == RMAP_MATCH)</a>
+<a name="ln804">        {</a>
+<a name="ln805">          if (index-&gt;type == RMAP_PERMIT)</a>
+<a name="ln806">            /* 'action' */</a>
+<a name="ln807">            {</a>
+<a name="ln808">              /* permit+match must execute sets */</a>
+<a name="ln809">              for (set = index-&gt;set_list.head; set; set = set-&gt;next)</a>
+<a name="ln810">                ret = (*set-&gt;cmd-&gt;func_apply) (set-&gt;value, prefix,</a>
+<a name="ln811">                                               type, object);</a>
+<a name="ln812"> </a>
+<a name="ln813">              /* Call another route-map if available */</a>
+<a name="ln814">              if (index-&gt;nextrm)</a>
+<a name="ln815">                {</a>
+<a name="ln816">                  struct route_map *nextrm =</a>
+<a name="ln817">                                    route_map_lookup_by_name (index-&gt;nextrm);</a>
+<a name="ln818"> </a>
+<a name="ln819">                  if (nextrm) /* Target route-map found, jump to it */</a>
+<a name="ln820">                    {</a>
+<a name="ln821">                      recursion++;</a>
+<a name="ln822">                      ret = route_map_apply (nextrm, prefix, type, object);</a>
+<a name="ln823">                      recursion--;</a>
+<a name="ln824">                    }</a>
+<a name="ln825"> </a>
+<a name="ln826">                  /* If nextrm returned 'deny', finish. */</a>
+<a name="ln827">                  if (ret == RMAP_DENYMATCH)</a>
+<a name="ln828">                    return ret;</a>
+<a name="ln829">                }</a>
+<a name="ln830">                </a>
+<a name="ln831">              switch (index-&gt;exitpolicy)</a>
+<a name="ln832">                {</a>
+<a name="ln833">                  case RMAP_EXIT:</a>
+<a name="ln834">                    return ret;</a>
+<a name="ln835">                  case RMAP_NEXT:</a>
+<a name="ln836">                    continue;</a>
+<a name="ln837">                  case RMAP_GOTO:</a>
+<a name="ln838">                    {</a>
+<a name="ln839">                      /* Find the next clause to jump to */</a>
+<a name="ln840">                      struct route_map_index *next = index-&gt;next;</a>
+<a name="ln841">                      int nextpref = index-&gt;nextpref;</a>
+<a name="ln842"> </a>
+<a name="ln843">                      while (next &amp;&amp; next-&gt;pref &lt; nextpref)</a>
+<a name="ln844">                        {</a>
+<a name="ln845">                          index = next;</a>
+<a name="ln846">                          next = next-&gt;next;</a>
+<a name="ln847">                        }</a>
+<a name="ln848">                      if (next == NULL)</a>
+<a name="ln849">                        {</a>
+<a name="ln850">                          /* No clauses match! */</a>
+<a name="ln851">                          return ret;</a>
+<a name="ln852">                        }</a>
+<a name="ln853">                    }</a>
+<a name="ln854">                }</a>
+<a name="ln855">            }</a>
+<a name="ln856">          else if (index-&gt;type == RMAP_DENY)</a>
+<a name="ln857">            /* 'deny' */</a>
+<a name="ln858">            {</a>
+<a name="ln859">                return RMAP_DENYMATCH;</a>
+<a name="ln860">            }</a>
+<a name="ln861">        }</a>
+<a name="ln862">    }</a>
+<a name="ln863">  /* Finally route-map does not match at all. */</a>
+<a name="ln864">  return RMAP_DENYMATCH;</a>
+<a name="ln865">}</a>
+<a name="ln866"> </a>
+<a name="ln867">void</a>
+<a name="ln868">route_map_add_hook (void (*func) (const char *))</a>
+<a name="ln869">{</a>
+<a name="ln870">  route_map_master.add_hook = func;</a>
+<a name="ln871">}</a>
+<a name="ln872"> </a>
+<a name="ln873">void</a>
+<a name="ln874">route_map_delete_hook (void (*func) (const char *))</a>
+<a name="ln875">{</a>
+<a name="ln876">  route_map_master.delete_hook = func;</a>
+<a name="ln877">}</a>
+<a name="ln878"> </a>
+<a name="ln879">void</a>
+<a name="ln880">route_map_event_hook (void (*func) (route_map_event_t, const char *))</a>
+<a name="ln881">{</a>
+<a name="ln882">  route_map_master.event_hook = func;</a>
+<a name="ln883">}</a>
+<a name="ln884"> </a>
+<a name="ln885">void</a>
+<a name="ln886">route_map_init (void)</a>
+<a name="ln887">{</a>
+<a name="ln888">  /* Make vector for match and set. */</a>
+<a name="ln889">  route_match_vec = vector_init (1);</a>
+<a name="ln890">  route_set_vec = vector_init (1);</a>
+<a name="ln891">}</a>
+<a name="ln892"> </a>
+<a name="ln893">void</a>
+<a name="ln894">route_map_finish (void)</a>
+<a name="ln895">{</a>
+<a name="ln896">  vector_free (route_match_vec);</a>
+<a name="ln897">  route_match_vec = NULL;</a>
+<a name="ln898">  vector_free (route_set_vec);</a>
+<a name="ln899">  route_set_vec = NULL;</a>
+<a name="ln900">  /* cleanup route_map */                                                    </a>
+<a name="ln901">  while (route_map_master.head)                                              </a>
+<a name="ln902">    route_map_delete (route_map_master.head); </a>
+<a name="ln903">}</a>
+<a name="ln904"> </a>
+<a name="ln905">/* VTY related functions. */</a>
+<a name="ln906">DEFUN (route_map,</a>
+<a name="ln907">       route_map_cmd,</a>
+<a name="ln908">       &quot;route-map WORD (deny|permit) &lt;1-65535&gt;&quot;,</a>
+<a name="ln909">       &quot;Create route-map or enter route-map command mode\n&quot;</a>
+<a name="ln910">       &quot;Route map tag\n&quot;</a>
+<a name="ln911">       &quot;Route map denies set operations\n&quot;</a>
+<a name="ln912">       &quot;Route map permits set operations\n&quot;</a>
+<a name="ln913">       &quot;Sequence to insert to/delete from existing route-map entry\n&quot;)</a>
+<a name="ln914">{</a>
+<a name="ln915">  int permit;</a>
+<a name="ln916">  unsigned long pref;</a>
+<a name="ln917">  struct route_map *map;</a>
+<a name="ln918">  struct route_map_index *index;</a>
+<a name="ln919">  char *endptr = NULL;</a>
+<a name="ln920"> </a>
+<a name="ln921">  /* Permit check. */</a>
+<a name="ln922">  if (strncmp (argv[1], &quot;permit&quot;, strlen (argv[1])) == 0)</a>
+<a name="ln923">    permit = RMAP_PERMIT;</a>
+<a name="ln924">  else if (strncmp (argv[1], &quot;deny&quot;, strlen (argv[1])) == 0)</a>
+<a name="ln925">    permit = RMAP_DENY;</a>
+<a name="ln926">  else</a>
+<a name="ln927">    {</a>
+<a name="ln928">      vty_out (vty, &quot;the third field must be [permit|deny]%s&quot;, VTY_NEWLINE);</a>
+<a name="ln929">      return CMD_WARNING;</a>
+<a name="ln930">    }</a>
+<a name="ln931"> </a>
+<a name="ln932">  /* Preference check. */</a>
+<a name="ln933">  pref = strtoul (argv[2], &amp;endptr, 10);</a>
+<a name="ln934">  if (pref == ULONG_MAX || *endptr != '\0')</a>
+<a name="ln935">    {</a>
+<a name="ln936">      vty_out (vty, &quot;the fourth field must be positive integer%s&quot;,</a>
+<a name="ln937">	       VTY_NEWLINE);</a>
+<a name="ln938">      return CMD_WARNING;</a>
+<a name="ln939">    }</a>
+<a name="ln940">  if (pref == 0 || pref &gt; 65535)</a>
+<a name="ln941">    {</a>
+<a name="ln942">      vty_out (vty, &quot;the fourth field must be &lt;1-65535&gt;%s&quot;, VTY_NEWLINE);</a>
+<a name="ln943">      return CMD_WARNING;</a>
+<a name="ln944">    }</a>
+<a name="ln945"> </a>
+<a name="ln946">  /* Get route map. */</a>
+<a name="ln947">  map = route_map_get (argv[0]);</a>
+<a name="ln948">  index = route_map_index_get (map, permit, pref);</a>
+<a name="ln949"> </a>
+<a name="ln950">  vty-&gt;index = index;</a>
+<a name="ln951">  vty-&gt;node = RMAP_NODE;</a>
+<a name="ln952">  return CMD_SUCCESS;</a>
+<a name="ln953">}</a>
+<a name="ln954"> </a>
+<a name="ln955">DEFUN (no_route_map_all,</a>
+<a name="ln956">       no_route_map_all_cmd,</a>
+<a name="ln957">       &quot;no route-map WORD&quot;,</a>
+<a name="ln958">       NO_STR</a>
+<a name="ln959">       &quot;Create route-map or enter route-map command mode\n&quot;</a>
+<a name="ln960">       &quot;Route map tag\n&quot;)</a>
+<a name="ln961">{</a>
+<a name="ln962">  struct route_map *map;</a>
+<a name="ln963"> </a>
+<a name="ln964">  map = route_map_lookup_by_name (argv[0]);</a>
+<a name="ln965">  if (map == NULL)</a>
+<a name="ln966">    {</a>
+<a name="ln967">      vty_out (vty, &quot;%% Could not find route-map %s%s&quot;,</a>
+<a name="ln968">	       argv[0], VTY_NEWLINE);</a>
+<a name="ln969">      return CMD_WARNING;</a>
+<a name="ln970">    }</a>
+<a name="ln971"> </a>
+<a name="ln972">  route_map_delete (map);</a>
+<a name="ln973"> </a>
+<a name="ln974">  return CMD_SUCCESS;</a>
+<a name="ln975">}</a>
+<a name="ln976"> </a>
+<a name="ln977">DEFUN (no_route_map,</a>
+<a name="ln978">       no_route_map_cmd,</a>
+<a name="ln979">       &quot;no route-map WORD (deny|permit) &lt;1-65535&gt;&quot;,</a>
+<a name="ln980">       NO_STR</a>
+<a name="ln981">       &quot;Create route-map or enter route-map command mode\n&quot;</a>
+<a name="ln982">       &quot;Route map tag\n&quot;</a>
+<a name="ln983">       &quot;Route map denies set operations\n&quot;</a>
+<a name="ln984">       &quot;Route map permits set operations\n&quot;</a>
+<a name="ln985">       &quot;Sequence to insert to/delete from existing route-map entry\n&quot;)</a>
+<a name="ln986">{</a>
+<a name="ln987">  int permit;</a>
+<a name="ln988">  unsigned long pref;</a>
+<a name="ln989">  struct route_map *map;</a>
+<a name="ln990">  struct route_map_index *index;</a>
+<a name="ln991">  char *endptr = NULL;</a>
+<a name="ln992"> </a>
+<a name="ln993">  /* Permit check. */</a>
+<a name="ln994">  if (strncmp (argv[1], &quot;permit&quot;, strlen (argv[1])) == 0)</a>
+<a name="ln995">    permit = RMAP_PERMIT;</a>
+<a name="ln996">  else if (strncmp (argv[1], &quot;deny&quot;, strlen (argv[1])) == 0)</a>
+<a name="ln997">    permit = RMAP_DENY;</a>
+<a name="ln998">  else</a>
+<a name="ln999">    {</a>
+<a name="ln1000">      vty_out (vty, &quot;the third field must be [permit|deny]%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1001">      return CMD_WARNING;</a>
+<a name="ln1002">    }</a>
+<a name="ln1003"> </a>
+<a name="ln1004">  /* Preference. */</a>
+<a name="ln1005">  pref = strtoul (argv[2], &amp;endptr, 10);</a>
+<a name="ln1006">  if (pref == ULONG_MAX || *endptr != '\0')</a>
+<a name="ln1007">    {</a>
+<a name="ln1008">      vty_out (vty, &quot;the fourth field must be positive integer%s&quot;,</a>
+<a name="ln1009">	       VTY_NEWLINE);</a>
+<a name="ln1010">      return CMD_WARNING;</a>
+<a name="ln1011">    }</a>
+<a name="ln1012">  if (pref == 0 || pref &gt; 65535)</a>
+<a name="ln1013">    {</a>
+<a name="ln1014">      vty_out (vty, &quot;the fourth field must be &lt;1-65535&gt;%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1015">      return CMD_WARNING;</a>
+<a name="ln1016">    }</a>
+<a name="ln1017"> </a>
+<a name="ln1018">  /* Existence check. */</a>
+<a name="ln1019">  map = route_map_lookup_by_name (argv[0]);</a>
+<a name="ln1020">  if (map == NULL)</a>
+<a name="ln1021">    {</a>
+<a name="ln1022">      vty_out (vty, &quot;%% Could not find route-map %s%s&quot;,</a>
+<a name="ln1023">	       argv[0], VTY_NEWLINE);</a>
+<a name="ln1024">      return CMD_WARNING;</a>
+<a name="ln1025">    }</a>
+<a name="ln1026"> </a>
+<a name="ln1027">  /* Lookup route map index. */</a>
+<a name="ln1028">  index = route_map_index_lookup (map, permit, pref);</a>
+<a name="ln1029">  if (index == NULL)</a>
+<a name="ln1030">    {</a>
+<a name="ln1031">      vty_out (vty, &quot;%% Could not find route-map entry %s %s%s&quot;, </a>
+<a name="ln1032">	       argv[0], argv[2], VTY_NEWLINE);</a>
+<a name="ln1033">      return CMD_WARNING;</a>
+<a name="ln1034">    }</a>
+<a name="ln1035"> </a>
+<a name="ln1036">  /* Delete index from route map. */</a>
+<a name="ln1037">  route_map_index_delete (index, 1);</a>
+<a name="ln1038"> </a>
+<a name="ln1039">  /* If this route rule is the last one, delete route map itself. */</a>
+<a name="ln1040">  if (route_map_empty (map))</a>
+<a name="ln1041">    route_map_delete (map);</a>
+<a name="ln1042"> </a>
+<a name="ln1043">  return CMD_SUCCESS;</a>
+<a name="ln1044">}</a>
+<a name="ln1045"> </a>
+<a name="ln1046">DEFUN (rmap_onmatch_next,</a>
+<a name="ln1047">       rmap_onmatch_next_cmd,</a>
+<a name="ln1048">       &quot;on-match next&quot;,</a>
+<a name="ln1049">       &quot;Exit policy on matches\n&quot;</a>
+<a name="ln1050">       &quot;Next clause\n&quot;)</a>
+<a name="ln1051">{</a>
+<a name="ln1052">  struct route_map_index *index;</a>
+<a name="ln1053"> </a>
+<a name="ln1054">  index = vty-&gt;index;</a>
+<a name="ln1055"> </a>
+<a name="ln1056">  if (index)</a>
+<a name="ln1057">    index-&gt;exitpolicy = RMAP_NEXT;</a>
+<a name="ln1058"> </a>
+<a name="ln1059">  return CMD_SUCCESS;</a>
+<a name="ln1060">}</a>
+<a name="ln1061"> </a>
+<a name="ln1062">DEFUN (no_rmap_onmatch_next,</a>
+<a name="ln1063">       no_rmap_onmatch_next_cmd,</a>
+<a name="ln1064">       &quot;no on-match next&quot;,</a>
+<a name="ln1065">       NO_STR</a>
+<a name="ln1066">       &quot;Exit policy on matches\n&quot;</a>
+<a name="ln1067">       &quot;Next clause\n&quot;)</a>
+<a name="ln1068">{</a>
+<a name="ln1069">  struct route_map_index *index;</a>
+<a name="ln1070"> </a>
+<a name="ln1071">  index = vty-&gt;index;</a>
+<a name="ln1072">  </a>
+<a name="ln1073">  if (index)</a>
+<a name="ln1074">    index-&gt;exitpolicy = RMAP_EXIT;</a>
+<a name="ln1075"> </a>
+<a name="ln1076">  return CMD_SUCCESS;</a>
+<a name="ln1077">}</a>
+<a name="ln1078"> </a>
+<a name="ln1079">DEFUN (rmap_onmatch_goto,</a>
+<a name="ln1080">       rmap_onmatch_goto_cmd,</a>
+<a name="ln1081">       &quot;on-match goto &lt;1-65535&gt;&quot;,</a>
+<a name="ln1082">       &quot;Exit policy on matches\n&quot;</a>
+<a name="ln1083">       &quot;Goto Clause number\n&quot;</a>
+<a name="ln1084">       &quot;Number\n&quot;)</a>
+<a name="ln1085">{</a>
+<a name="ln1086">  struct route_map_index *index = vty-&gt;index;</a>
+<a name="ln1087">  int d = 0;</a>
+<a name="ln1088"> </a>
+<a name="ln1089">  if (index)</a>
+<a name="ln1090">    {</a>
+<a name="ln1091">      if (argc == 1 &amp;&amp; argv[0])</a>
+<a name="ln1092">        VTY_GET_INTEGER_RANGE(&quot;route-map index&quot;, d, argv[0], 1, 65536);</a>
+<a name="ln1093">      else</a>
+<a name="ln1094">        d = index-&gt;pref + 1;</a>
+<a name="ln1095">      </a>
+<a name="ln1096">      if (d &lt;= index-&gt;pref)</a>
+<a name="ln1097">	{</a>
+<a name="ln1098">	  /* Can't allow you to do that, Dave */</a>
+<a name="ln1099">	  vty_out (vty, &quot;can't jump backwards in route-maps%s&quot;, </a>
+<a name="ln1100">		   VTY_NEWLINE);</a>
+<a name="ln1101">	  return CMD_WARNING;</a>
+<a name="ln1102">	}</a>
+<a name="ln1103">      else</a>
+<a name="ln1104">	{</a>
+<a name="ln1105">	  index-&gt;exitpolicy = RMAP_GOTO;</a>
+<a name="ln1106">	  index-&gt;nextpref = d;</a>
+<a name="ln1107">	}</a>
+<a name="ln1108">    }</a>
+<a name="ln1109">  return CMD_SUCCESS;</a>
+<a name="ln1110">}</a>
+<a name="ln1111"> </a>
+<a name="ln1112">DEFUN (no_rmap_onmatch_goto,</a>
+<a name="ln1113">       no_rmap_onmatch_goto_cmd,</a>
+<a name="ln1114">       &quot;no on-match goto&quot;,</a>
+<a name="ln1115">       NO_STR</a>
+<a name="ln1116">       &quot;Exit policy on matches\n&quot;</a>
+<a name="ln1117">       &quot;Goto Clause number\n&quot;)</a>
+<a name="ln1118">{</a>
+<a name="ln1119">  struct route_map_index *index;</a>
+<a name="ln1120"> </a>
+<a name="ln1121">  index = vty-&gt;index;</a>
+<a name="ln1122"> </a>
+<a name="ln1123">  if (index)</a>
+<a name="ln1124">    index-&gt;exitpolicy = RMAP_EXIT;</a>
+<a name="ln1125">  </a>
+<a name="ln1126">  return CMD_SUCCESS;</a>
+<a name="ln1127">}</a>
+<a name="ln1128"> </a>
+<a name="ln1129">/* Cisco/GNU Zebra compatible ALIASes for on-match next */</a>
+<a name="ln1130">ALIAS (rmap_onmatch_goto,</a>
+<a name="ln1131">       rmap_continue_cmd,</a>
+<a name="ln1132">       &quot;continue&quot;,</a>
+<a name="ln1133">       &quot;Continue on a different entry within the route-map\n&quot;)</a>
+<a name="ln1134"> </a>
+<a name="ln1135">ALIAS (no_rmap_onmatch_goto,</a>
+<a name="ln1136">       no_rmap_continue_cmd,</a>
+<a name="ln1137">       &quot;no continue&quot;,</a>
+<a name="ln1138">       NO_STR</a>
+<a name="ln1139">       &quot;Continue on a different entry within the route-map\n&quot;)</a>
+<a name="ln1140"> </a>
+<a name="ln1141">/* GNU Zebra compatible */</a>
+<a name="ln1142">ALIAS (rmap_onmatch_goto,</a>
+<a name="ln1143">       rmap_continue_seq_cmd,</a>
+<a name="ln1144">       &quot;continue &lt;1-65535&gt;&quot;,</a>
+<a name="ln1145">       &quot;Continue on a different entry within the route-map\n&quot;</a>
+<a name="ln1146">       &quot;Route-map entry sequence number\n&quot;)</a>
+<a name="ln1147"> </a>
+<a name="ln1148">ALIAS (no_rmap_onmatch_goto,</a>
+<a name="ln1149">       no_rmap_continue_seq,</a>
+<a name="ln1150">       &quot;no continue &lt;1-65535&gt;&quot;,</a>
+<a name="ln1151">       NO_STR</a>
+<a name="ln1152">       &quot;Continue on a different entry within the route-map\n&quot;</a>
+<a name="ln1153">       &quot;Route-map entry sequence number\n&quot;)</a>
+<a name="ln1154"> </a>
+<a name="ln1155">DEFUN (rmap_show_name,</a>
+<a name="ln1156">       rmap_show_name_cmd,</a>
+<a name="ln1157">       &quot;show route-map [WORD]&quot;,</a>
+<a name="ln1158">       SHOW_STR</a>
+<a name="ln1159">       &quot;route-map information\n&quot;</a>
+<a name="ln1160">       &quot;route-map name\n&quot;)</a>
+<a name="ln1161">{</a>
+<a name="ln1162">    const char *name = NULL;</a>
+<a name="ln1163">    if (argc)</a>
+<a name="ln1164">      name = argv[0];</a>
+<a name="ln1165">    return vty_show_route_map (vty, name);</a>
+<a name="ln1166">}</a>
+<a name="ln1167"> </a>
+<a name="ln1168">ALIAS (rmap_onmatch_goto,</a>
+<a name="ln1169">      rmap_continue_index_cmd,</a>
+<a name="ln1170">      &quot;continue &lt;1-65536&gt;&quot;,</a>
+<a name="ln1171">      &quot;Exit policy on matches\n&quot;</a>
+<a name="ln1172">      &quot;Goto Clause number\n&quot;)</a>
+<a name="ln1173"> </a>
+<a name="ln1174">DEFUN (rmap_call,</a>
+<a name="ln1175">       rmap_call_cmd,</a>
+<a name="ln1176">       &quot;call WORD&quot;,</a>
+<a name="ln1177">       &quot;Jump to another Route-Map after match+set\n&quot;</a>
+<a name="ln1178">       &quot;Target route-map name\n&quot;)</a>
+<a name="ln1179">{</a>
+<a name="ln1180">  struct route_map_index *index;</a>
+<a name="ln1181"> </a>
+<a name="ln1182">  index = vty-&gt;index;</a>
+<a name="ln1183">  if (index)</a>
+<a name="ln1184">    {</a>
+<a name="ln1185">      if (index-&gt;nextrm)</a>
+<a name="ln1186">          XFREE (MTYPE_ROUTE_MAP_NAME, index-&gt;nextrm);</a>
+<a name="ln1187">      index-&gt;nextrm = XSTRDUP (MTYPE_ROUTE_MAP_NAME, argv[0]);</a>
+<a name="ln1188">    }</a>
+<a name="ln1189">  return CMD_SUCCESS;</a>
+<a name="ln1190">}</a>
+<a name="ln1191"> </a>
+<a name="ln1192">DEFUN (no_rmap_call,</a>
+<a name="ln1193">       no_rmap_call_cmd,</a>
+<a name="ln1194">       &quot;no call&quot;,</a>
+<a name="ln1195">       NO_STR</a>
+<a name="ln1196">       &quot;Jump to another Route-Map after match+set\n&quot;)</a>
+<a name="ln1197">{</a>
+<a name="ln1198">  struct route_map_index *index;</a>
+<a name="ln1199"> </a>
+<a name="ln1200">  index = vty-&gt;index;</a>
+<a name="ln1201"> </a>
+<a name="ln1202">  if (index-&gt;nextrm)</a>
+<a name="ln1203">    {</a>
+<a name="ln1204">      XFREE (MTYPE_ROUTE_MAP_NAME, index-&gt;nextrm);</a>
+<a name="ln1205">      index-&gt;nextrm = NULL;</a>
+<a name="ln1206">    }</a>
+<a name="ln1207"> </a>
+<a name="ln1208">  return CMD_SUCCESS;</a>
+<a name="ln1209">}</a>
+<a name="ln1210"> </a>
+<a name="ln1211">DEFUN (rmap_description,</a>
+<a name="ln1212">       rmap_description_cmd,</a>
+<a name="ln1213">       &quot;description .LINE&quot;,</a>
+<a name="ln1214">       &quot;Route-map comment\n&quot;</a>
+<a name="ln1215">       &quot;Comment describing this route-map rule\n&quot;)</a>
+<a name="ln1216">{</a>
+<a name="ln1217">  struct route_map_index *index;</a>
+<a name="ln1218"> </a>
+<a name="ln1219">  index = vty-&gt;index;</a>
+<a name="ln1220">  if (index)</a>
+<a name="ln1221">    {</a>
+<a name="ln1222">      if (index-&gt;description)</a>
+<a name="ln1223">	XFREE (MTYPE_TMP, index-&gt;description);</a>
+<a name="ln1224">      index-&gt;description = argv_concat (argv, argc, 0);</a>
+<a name="ln1225">    }</a>
+<a name="ln1226">  return CMD_SUCCESS;</a>
+<a name="ln1227">}</a>
+<a name="ln1228"> </a>
+<a name="ln1229">DEFUN (no_rmap_description,</a>
+<a name="ln1230">       no_rmap_description_cmd,</a>
+<a name="ln1231">       &quot;no description&quot;,</a>
+<a name="ln1232">       NO_STR</a>
+<a name="ln1233">       &quot;Route-map comment\n&quot;)</a>
+<a name="ln1234">{</a>
+<a name="ln1235">  struct route_map_index *index;</a>
+<a name="ln1236"> </a>
+<a name="ln1237">  index = vty-&gt;index;</a>
+<a name="ln1238">  if (index)</a>
+<a name="ln1239">    {</a>
+<a name="ln1240">      if (index-&gt;description)</a>
+<a name="ln1241">	XFREE (MTYPE_TMP, index-&gt;description);</a>
+<a name="ln1242">      index-&gt;description = NULL;</a>
+<a name="ln1243">    }</a>
+<a name="ln1244">  return CMD_SUCCESS;</a>
+<a name="ln1245">}</a>
+<a name="ln1246"> </a>
+<a name="ln1247">/* Configuration write function. */</a>
+<a name="ln1248">static int</a>
+<a name="ln1249">route_map_config_write (struct vty *vty)</a>
+<a name="ln1250">{</a>
+<a name="ln1251">  struct route_map *map;</a>
+<a name="ln1252">  struct route_map_index *index;</a>
+<a name="ln1253">  struct route_map_rule *rule;</a>
+<a name="ln1254">  int first = 1;</a>
+<a name="ln1255">  int write = 0;</a>
+<a name="ln1256"> </a>
+<a name="ln1257">  for (map = route_map_master.head; map; map = map-&gt;next)</a>
+<a name="ln1258">    for (index = map-&gt;head; index; index = index-&gt;next)</a>
+<a name="ln1259">      {</a>
+<a name="ln1260">	if (!first)</a>
+<a name="ln1261">	  vty_out (vty, &quot;!%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1262">	else</a>
+<a name="ln1263">	  first = 0;</a>
+<a name="ln1264"> </a>
+<a name="ln1265">	vty_out (vty, &quot;route-map %s %s %d%s&quot;, </a>
+<a name="ln1266">		 map-&gt;name,</a>
+<a name="ln1267">		 route_map_type_str (index-&gt;type),</a>
+<a name="ln1268">		 index-&gt;pref, VTY_NEWLINE);</a>
+<a name="ln1269"> </a>
+<a name="ln1270">	if (index-&gt;description)</a>
+<a name="ln1271">	  vty_out (vty, &quot; description %s%s&quot;, index-&gt;description, VTY_NEWLINE);</a>
+<a name="ln1272"> </a>
+<a name="ln1273">	for (rule = index-&gt;match_list.head; rule; rule = rule-&gt;next)</a>
+<a name="ln1274">	  vty_out (vty, &quot; match %s %s%s&quot;, rule-&gt;cmd-&gt;str, </a>
+<a name="ln1275">		   rule-&gt;rule_str ? rule-&gt;rule_str : &quot;&quot;,</a>
+<a name="ln1276">		   VTY_NEWLINE);</a>
+<a name="ln1277"> </a>
+<a name="ln1278">	for (rule = index-&gt;set_list.head; rule; rule = rule-&gt;next)</a>
+<a name="ln1279">	  vty_out (vty, &quot; set %s %s%s&quot;, rule-&gt;cmd-&gt;str,</a>
+<a name="ln1280">		   rule-&gt;rule_str ? rule-&gt;rule_str : &quot;&quot;,</a>
+<a name="ln1281">		   VTY_NEWLINE);</a>
+<a name="ln1282">   if (index-&gt;nextrm)</a>
+<a name="ln1283">     vty_out (vty, &quot; call %s%s&quot;, index-&gt;nextrm, VTY_NEWLINE);</a>
+<a name="ln1284">	if (index-&gt;exitpolicy == RMAP_GOTO)</a>
+<a name="ln1285">      vty_out (vty, &quot; on-match goto %d%s&quot;, index-&gt;nextpref, VTY_NEWLINE);</a>
+<a name="ln1286">	if (index-&gt;exitpolicy == RMAP_NEXT)</a>
+<a name="ln1287">	  vty_out (vty,&quot; on-match next%s&quot;, VTY_NEWLINE);</a>
+<a name="ln1288">	</a>
+<a name="ln1289">	write++;</a>
+<a name="ln1290">      }</a>
+<a name="ln1291">  return write;</a>
+<a name="ln1292">}</a>
+<a name="ln1293"> </a>
+<a name="ln1294">/* Route map node structure. */</a>
+<a name="ln1295">static struct cmd_node rmap_node =</a>
+<a name="ln1296">{</a>
+<a name="ln1297">  RMAP_NODE,</a>
+<a name="ln1298">  &quot;%s(config-route-map)# &quot;,</a>
+<a name="ln1299">  1</a>
+<a name="ln1300">};</a>
+<a name="ln1301"> </a>
+<a name="ln1302">/* Common route map rules */</a>
+<a name="ln1303"> </a>
+<a name="ln1304">void *</a>
+<a name="ln1305">route_map_rule_tag_compile (const char *arg)</a>
+<a name="ln1306">{</a>
+<a name="ln1307">  unsigned long int tmp;</a>
+<a name="ln1308">  char *endptr;</a>
+<a name="ln1309">  route_tag_t *tag;</a>
+<a name="ln1310"> </a>
+<a name="ln1311">  errno = 0;</a>
+<a name="ln1312">  tmp = strtoul(arg, &amp;endptr, 0);</a>
+<a name="ln1313">  if (arg[0] == '\0' || *endptr != '\0' || errno || tmp &gt; ROUTE_TAG_MAX)</a>
+<a name="ln1314">    return NULL;</a>
+<a name="ln1315"> </a>
+<a name="ln1316">  tag = XMALLOC(MTYPE_ROUTE_MAP_COMPILED, sizeof(*tag));</a>
+<a name="ln1317">  *tag = tmp;</a>
+<a name="ln1318"> </a>
+<a name="ln1319">  return tag;</a>
+<a name="ln1320">}</a>
+<a name="ln1321"> </a>
+<a name="ln1322">void</a>
+<a name="ln1323">route_map_rule_tag_free (void *rule)</a>
+<a name="ln1324">{</a>
+<a name="ln1325">  XFREE (MTYPE_ROUTE_MAP_COMPILED, rule);</a>
+<a name="ln1326">}</a>
+<a name="ln1327"> </a>
+<a name="ln1328">/* Initialization of route map vector. */</a>
+<a name="ln1329">void</a>
+<a name="ln1330">route_map_init_vty (void)</a>
+<a name="ln1331">{</a>
+<a name="ln1332">  /* Install route map top node. */</a>
+<a name="ln1333">  install_node (&amp;rmap_node, route_map_config_write);</a>
+<a name="ln1334"> </a>
+<a name="ln1335">  /* Install route map commands. */</a>
+<a name="ln1336">  install_default (RMAP_NODE);</a>
+<a name="ln1337">  install_element (CONFIG_NODE, &amp;route_map_cmd);</a>
+<a name="ln1338">  install_element (CONFIG_NODE, &amp;no_route_map_cmd);</a>
+<a name="ln1339">  install_element (CONFIG_NODE, &amp;no_route_map_all_cmd);</a>
+<a name="ln1340"> </a>
+<a name="ln1341">  /* Install the on-match stuff */</a>
+<a name="ln1342">  install_element (RMAP_NODE, &amp;route_map_cmd);</a>
+<a name="ln1343">  install_element (RMAP_NODE, &amp;rmap_onmatch_next_cmd);</a>
+<a name="ln1344">  install_element (RMAP_NODE, &amp;no_rmap_onmatch_next_cmd);</a>
+<a name="ln1345">  install_element (RMAP_NODE, &amp;rmap_onmatch_goto_cmd);</a>
+<a name="ln1346">  install_element (RMAP_NODE, &amp;no_rmap_onmatch_goto_cmd);</a>
+<a name="ln1347">  </a>
+<a name="ln1348">  /* Install the continue stuff (ALIAS of on-match). */</a>
+<a name="ln1349">  install_element (RMAP_NODE, &amp;rmap_continue_cmd);</a>
+<a name="ln1350">  install_element (RMAP_NODE, &amp;no_rmap_continue_cmd);</a>
+<a name="ln1351">  install_element (RMAP_NODE, &amp;rmap_continue_index_cmd);</a>
+<a name="ln1352">  </a>
+<a name="ln1353">  /* Install the call stuff. */</a>
+<a name="ln1354">  install_element (RMAP_NODE, &amp;rmap_call_cmd);</a>
+<a name="ln1355">  install_element (RMAP_NODE, &amp;no_rmap_call_cmd);</a>
+<a name="ln1356"> </a>
+<a name="ln1357">  /* Install description commands. */</a>
+<a name="ln1358">  install_element (RMAP_NODE, &amp;rmap_description_cmd);</a>
+<a name="ln1359">  install_element (RMAP_NODE, &amp;no_rmap_description_cmd);</a>
+<a name="ln1360">   </a>
+<a name="ln1361">  /* Install show command */</a>
+<a name="ln1362">  install_element (ENABLE_NODE, &amp;rmap_show_name_cmd);</a>
+<a name="ln1363">}</a>
+
+</code></pre>
+<div class="balloon" rel="7"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1042/" target="_blank">V1042</a> This file is marked with copyleft license, which requires you to open the derived source code.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

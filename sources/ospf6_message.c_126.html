@@ -1,0 +1,2596 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>ospf6_message.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.5.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/*</a>
+<a name="ln2"> * Copyright (C) 2003 Yasuhiro Ohara</a>
+<a name="ln3"> *</a>
+<a name="ln4"> * This file is part of GNU Zebra.</a>
+<a name="ln5"> *</a>
+<a name="ln6"> * GNU Zebra is free software; you can redistribute it and/or modify it</a>
+<a name="ln7"> * under the terms of the GNU General Public License as published by the</a>
+<a name="ln8"> * Free Software Foundation; either version 2, or (at your option) any</a>
+<a name="ln9"> * later version.</a>
+<a name="ln10"> *</a>
+<a name="ln11"> * GNU Zebra is distributed in the hope that it will be useful, but</a>
+<a name="ln12"> * WITHOUT ANY WARRANTY; without even the implied warranty of</a>
+<a name="ln13"> * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU</a>
+<a name="ln14"> * General Public License for more details.</a>
+<a name="ln15"> *</a>
+<a name="ln16"> * You should have received a copy of the GNU General Public License</a>
+<a name="ln17"> * along with GNU Zebra; see the file COPYING.  If not, write to the </a>
+<a name="ln18"> * Free Software Foundation, Inc., 59 Temple Place - Suite 330, </a>
+<a name="ln19"> * Boston, MA 02111-1307, USA.  </a>
+<a name="ln20"> */</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &lt;zebra.h&gt;</a>
+<a name="ln23"> </a>
+<a name="ln24">#include &quot;memory.h&quot;</a>
+<a name="ln25">#include &quot;log.h&quot;</a>
+<a name="ln26">#include &quot;vty.h&quot;</a>
+<a name="ln27">#include &quot;command.h&quot;</a>
+<a name="ln28">#include &quot;thread.h&quot;</a>
+<a name="ln29">#include &quot;linklist.h&quot;</a>
+<a name="ln30"> </a>
+<a name="ln31">#include &quot;ospf6_proto.h&quot;</a>
+<a name="ln32">#include &quot;ospf6_lsa.h&quot;</a>
+<a name="ln33">#include &quot;ospf6_lsdb.h&quot;</a>
+<a name="ln34">#include &quot;ospf6_network.h&quot;</a>
+<a name="ln35">#include &quot;ospf6_message.h&quot;</a>
+<a name="ln36"> </a>
+<a name="ln37">#include &quot;ospf6_top.h&quot;</a>
+<a name="ln38">#include &quot;ospf6_area.h&quot;</a>
+<a name="ln39">#include &quot;ospf6_neighbor.h&quot;</a>
+<a name="ln40">#include &quot;ospf6_interface.h&quot;</a>
+<a name="ln41"> </a>
+<a name="ln42">/* for structures and macros ospf6_lsa_examin() needs */</a>
+<a name="ln43">#include &quot;ospf6_abr.h&quot;</a>
+<a name="ln44">#include &quot;ospf6_asbr.h&quot;</a>
+<a name="ln45">#include &quot;ospf6_intra.h&quot;</a>
+<a name="ln46"> </a>
+<a name="ln47">#include &quot;ospf6_flood.h&quot;</a>
+<a name="ln48">#include &quot;ospf6d.h&quot;</a>
+<a name="ln49"> </a>
+<a name="ln50">#include &lt;netinet/ip6.h&gt;</a>
+<a name="ln51"> </a>
+<a name="ln52">unsigned char conf_debug_ospf6_message[6] = {0x03, 0, 0, 0, 0, 0};</a>
+<a name="ln53">static const struct message ospf6_message_type_str [] =</a>
+<a name="ln54">{</a>
+<a name="ln55">  { OSPF6_MESSAGE_TYPE_HELLO,    &quot;Hello&quot;    },</a>
+<a name="ln56">  { OSPF6_MESSAGE_TYPE_DBDESC,   &quot;DbDesc&quot;   },</a>
+<a name="ln57">  { OSPF6_MESSAGE_TYPE_LSREQ,    &quot;LSReq&quot;    },</a>
+<a name="ln58">  { OSPF6_MESSAGE_TYPE_LSUPDATE, &quot;LSUpdate&quot; },</a>
+<a name="ln59">  { OSPF6_MESSAGE_TYPE_LSACK,    &quot;LSAck&quot;    },</a>
+<a name="ln60">};</a>
+<a name="ln61">static const size_t ospf6_message_type_str_max = array_size(ospf6_message_type_str);</a>
+<a name="ln62"> </a>
+<a name="ln63">/* Minimum (besides the standard OSPF packet header) lengths for OSPF</a>
+<a name="ln64">   packets of particular types, offset is the &quot;type&quot; field. */</a>
+<a name="ln65">const u_int16_t ospf6_packet_minlen[OSPF6_MESSAGE_TYPE_ALL] =</a>
+<a name="ln66">{</a>
+<a name="ln67">  0,</a>
+<a name="ln68">  OSPF6_HELLO_MIN_SIZE,</a>
+<a name="ln69">  OSPF6_DB_DESC_MIN_SIZE,</a>
+<a name="ln70">  OSPF6_LS_REQ_MIN_SIZE,</a>
+<a name="ln71">  OSPF6_LS_UPD_MIN_SIZE,</a>
+<a name="ln72">  OSPF6_LS_ACK_MIN_SIZE</a>
+<a name="ln73">};</a>
+<a name="ln74"> </a>
+<a name="ln75">/* Minimum (besides the standard LSA header) lengths for LSAs of particular</a>
+<a name="ln76">   types, offset is the &quot;LSA function code&quot; portion of &quot;LSA type&quot; field. */</a>
+<a name="ln77">const u_int16_t ospf6_lsa_minlen[OSPF6_LSTYPE_SIZE] =</a>
+<a name="ln78">{</a>
+<a name="ln79">  0,</a>
+<a name="ln80">  /* 0x2001 */ OSPF6_ROUTER_LSA_MIN_SIZE,</a>
+<a name="ln81">  /* 0x2002 */ OSPF6_NETWORK_LSA_MIN_SIZE,</a>
+<a name="ln82">  /* 0x2003 */ OSPF6_INTER_PREFIX_LSA_MIN_SIZE,</a>
+<a name="ln83">  /* 0x2004 */ OSPF6_INTER_ROUTER_LSA_FIX_SIZE,</a>
+<a name="ln84">  /* 0x4005 */ OSPF6_AS_EXTERNAL_LSA_MIN_SIZE,</a>
+<a name="ln85">  /* 0x2006 */ 0,</a>
+<a name="ln86">  /* 0x2007 */ OSPF6_AS_EXTERNAL_LSA_MIN_SIZE,</a>
+<a name="ln87">  /* 0x0008 */ OSPF6_LINK_LSA_MIN_SIZE,</a>
+<a name="ln88">  /* 0x2009 */ OSPF6_INTRA_PREFIX_LSA_MIN_SIZE</a>
+<a name="ln89">};</a>
+<a name="ln90"> </a>
+<a name="ln91">/* print functions */</a>
+<a name="ln92"> </a>
+<a name="ln93">static void</a>
+<a name="ln94">ospf6_header_print (struct ospf6_header *oh)</a>
+<a name="ln95">{</a>
+<a name="ln96">  char router_id[16], area_id[16];</a>
+<a name="ln97">  inet_ntop (AF_INET, &amp;oh-&gt;router_id, router_id, sizeof (router_id));</a>
+<a name="ln98">  inet_ntop (AF_INET, &amp;oh-&gt;area_id, area_id, sizeof (area_id));</a>
+<a name="ln99"> </a>
+<a name="ln100">  zlog_debug (&quot;    OSPFv%d Type:%d Len:%hu Router-ID:%s&quot;,</a>
+<a name="ln101">             oh-&gt;version, oh-&gt;type, ntohs (oh-&gt;length), router_id);</a>
+<a name="ln102">  zlog_debug (&quot;    Area-ID:%s Cksum:%hx Instance-ID:%d&quot;,</a>
+<a name="ln103">             area_id, ntohs (oh-&gt;checksum), oh-&gt;instance_id);</a>
+<a name="ln104">}</a>
+<a name="ln105"> </a>
+<a name="ln106">void</a>
+<a name="ln107">ospf6_hello_print (struct ospf6_header *oh)</a>
+<a name="ln108">{</a>
+<a name="ln109">  struct ospf6_hello *hello;</a>
+<a name="ln110">  char options[16];</a>
+<a name="ln111">  char drouter[16], bdrouter[16], neighbor[16];</a>
+<a name="ln112">  char *p;</a>
+<a name="ln113"> </a>
+<a name="ln114">  ospf6_header_print (oh);</a>
+<a name="ln115">  assert (oh-&gt;type == OSPF6_MESSAGE_TYPE_HELLO);</a>
+<a name="ln116"> </a>
+<a name="ln117">  hello = (struct ospf6_hello *)</a>
+<a name="ln118">    ((caddr_t) oh + sizeof (struct ospf6_header));</a>
+<a name="ln119"> </a>
+<a name="ln120">  inet_ntop (AF_INET, &amp;hello-&gt;drouter, drouter, sizeof (drouter));</a>
+<a name="ln121">  inet_ntop (AF_INET, &amp;hello-&gt;bdrouter, bdrouter, sizeof (bdrouter));</a>
+<a name="ln122">  ospf6_options_printbuf (hello-&gt;options, options, sizeof (options));</a>
+<a name="ln123"> </a>
+<a name="ln124">  zlog_debug (&quot;    I/F-Id:%ld Priority:%d Option:%s&quot;,</a>
+<a name="ln125">             (u_long) ntohl (hello-&gt;interface_id), hello-&gt;priority, options);</a>
+<a name="ln126">  zlog_debug (&quot;    HelloInterval:%hu DeadInterval:%hu&quot;,</a>
+<a name="ln127">             ntohs (hello-&gt;hello_interval), ntohs (hello-&gt;dead_interval));</a>
+<a name="ln128">  zlog_debug (&quot;    DR:%s BDR:%s&quot;, drouter, bdrouter);</a>
+<a name="ln129"> </a>
+<a name="ln130">  for (p = (char *) ((caddr_t) hello + sizeof (struct ospf6_hello));</a>
+<a name="ln131">       p + sizeof (u_int32_t) &lt;= OSPF6_MESSAGE_END (oh);</a>
+<a name="ln132">       p += sizeof (u_int32_t))</a>
+<a name="ln133">    {</a>
+<a name="ln134">      inet_ntop (AF_INET, (void *) p, neighbor, sizeof (neighbor));</a>
+<a name="ln135">      zlog_debug (&quot;    Neighbor: %s&quot;, neighbor);</a>
+<a name="ln136">    }</a>
+<a name="ln137"> </a>
+<a name="ln138">  assert (p == OSPF6_MESSAGE_END (oh));</a>
+<a name="ln139">}</a>
+<a name="ln140"> </a>
+<a name="ln141">void</a>
+<a name="ln142">ospf6_dbdesc_print (struct ospf6_header *oh)</a>
+<a name="ln143">{</a>
+<a name="ln144">  struct ospf6_dbdesc *dbdesc;</a>
+<a name="ln145">  char options[16];</a>
+<a name="ln146">  char *p;</a>
+<a name="ln147"> </a>
+<a name="ln148">  ospf6_header_print (oh);</a>
+<a name="ln149">  assert (oh-&gt;type == OSPF6_MESSAGE_TYPE_DBDESC);</a>
+<a name="ln150"> </a>
+<a name="ln151">  dbdesc = (struct ospf6_dbdesc *)</a>
+<a name="ln152">    ((caddr_t) oh + sizeof (struct ospf6_header));</a>
+<a name="ln153"> </a>
+<a name="ln154">  ospf6_options_printbuf (dbdesc-&gt;options, options, sizeof (options));</a>
+<a name="ln155"> </a>
+<a name="ln156">  zlog_debug (&quot;    MBZ: %#x Option: %s IfMTU: %hu&quot;,</a>
+<a name="ln157">             dbdesc-&gt;reserved1, options, ntohs (dbdesc-&gt;ifmtu));</a>
+<a name="ln158">  zlog_debug (&quot;    MBZ: %#x Bits: %s%s%s SeqNum: %#lx&quot;,</a>
+<a name="ln159">             dbdesc-&gt;reserved2,</a>
+<a name="ln160">             (CHECK_FLAG (dbdesc-&gt;bits, OSPF6_DBDESC_IBIT) ? &quot;I&quot; : &quot;-&quot;),</a>
+<a name="ln161">             (CHECK_FLAG (dbdesc-&gt;bits, OSPF6_DBDESC_MBIT) ? &quot;M&quot; : &quot;-&quot;),</a>
+<a name="ln162">             (CHECK_FLAG (dbdesc-&gt;bits, OSPF6_DBDESC_MSBIT) ? &quot;m&quot; : &quot;s&quot;),</a>
+<a name="ln163">             (u_long) ntohl (dbdesc-&gt;seqnum));</a>
+<a name="ln164"> </a>
+<a name="ln165">  for (p = (char *) ((caddr_t) dbdesc + sizeof (struct ospf6_dbdesc));</a>
+<a name="ln166">       p + sizeof (struct ospf6_lsa_header) &lt;= OSPF6_MESSAGE_END (oh);</a>
+<a name="ln167">       p += sizeof (struct ospf6_lsa_header))</a>
+<a name="ln168">    ospf6_lsa_header_print_raw ((struct ospf6_lsa_header *) p);</a>
+<a name="ln169"> </a>
+<a name="ln170">  assert (p == OSPF6_MESSAGE_END (oh));</a>
+<a name="ln171">}</a>
+<a name="ln172"> </a>
+<a name="ln173">void</a>
+<a name="ln174">ospf6_lsreq_print (struct ospf6_header *oh)</a>
+<a name="ln175">{</a>
+<a name="ln176">  char id[16], adv_router[16];</a>
+<a name="ln177">  char *p;</a>
+<a name="ln178"> </a>
+<a name="ln179">  ospf6_header_print (oh);</a>
+<a name="ln180">  assert (oh-&gt;type == OSPF6_MESSAGE_TYPE_LSREQ);</a>
+<a name="ln181"> </a>
+<a name="ln182">  for (p = (char *) ((caddr_t) oh + sizeof (struct ospf6_header));</a>
+<a name="ln183">       p + sizeof (struct ospf6_lsreq_entry) &lt;= OSPF6_MESSAGE_END (oh);</a>
+<a name="ln184">       p += sizeof (struct ospf6_lsreq_entry))</a>
+<a name="ln185">    {</a>
+<a name="ln186">      struct ospf6_lsreq_entry *e = (struct ospf6_lsreq_entry *) p;</a>
+<a name="ln187">      inet_ntop (AF_INET, &amp;e-&gt;adv_router, adv_router, sizeof (adv_router));</a>
+<a name="ln188">      inet_ntop (AF_INET, &amp;e-&gt;id, id, sizeof (id));</a>
+<a name="ln189">      zlog_debug (&quot;    [%s Id:%s Adv:%s]&quot;,</a>
+<a name="ln190">                 ospf6_lstype_name (e-&gt;type), id, adv_router);</a>
+<a name="ln191">    }</a>
+<a name="ln192"> </a>
+<a name="ln193">  assert (p == OSPF6_MESSAGE_END (oh));</a>
+<a name="ln194">}</a>
+<a name="ln195"> </a>
+<a name="ln196">void</a>
+<a name="ln197">ospf6_lsupdate_print (struct ospf6_header *oh)</a>
+<a name="ln198">{</a>
+<a name="ln199">  struct ospf6_lsupdate *lsupdate;</a>
+<a name="ln200">  u_long num;</a>
+<a name="ln201">  char *p;</a>
+<a name="ln202"> </a>
+<a name="ln203">  ospf6_header_print (oh);</a>
+<a name="ln204">  assert (oh-&gt;type == OSPF6_MESSAGE_TYPE_LSUPDATE);</a>
+<a name="ln205"> </a>
+<a name="ln206">  lsupdate = (struct ospf6_lsupdate *)</a>
+<a name="ln207">    ((caddr_t) oh + sizeof (struct ospf6_header));</a>
+<a name="ln208"> </a>
+<a name="ln209">  num = ntohl (lsupdate-&gt;lsa_number);</a>
+<a name="ln210">  zlog_debug (&quot;    Number of LSA: %ld&quot;, num);</a>
+<a name="ln211"> </a>
+<a name="ln212">  for (p = (char *) ((caddr_t) lsupdate + sizeof (struct ospf6_lsupdate));</a>
+<a name="ln213">       p &lt; OSPF6_MESSAGE_END (oh) &amp;&amp;</a>
+<a name="ln214">       p + OSPF6_LSA_SIZE (p) &lt;= OSPF6_MESSAGE_END (oh);</a>
+<a name="ln215">       p += OSPF6_LSA_SIZE (p))</a>
+<a name="ln216">    {</a>
+<a name="ln217">      ospf6_lsa_header_print_raw ((struct ospf6_lsa_header *) p);</a>
+<a name="ln218">    }</a>
+<a name="ln219"> </a>
+<a name="ln220">  assert (p == OSPF6_MESSAGE_END (oh));</a>
+<a name="ln221">}</a>
+<a name="ln222"> </a>
+<a name="ln223">void</a>
+<a name="ln224">ospf6_lsack_print (struct ospf6_header *oh)</a>
+<a name="ln225">{</a>
+<a name="ln226">  char *p;</a>
+<a name="ln227"> </a>
+<a name="ln228">  ospf6_header_print (oh);</a>
+<a name="ln229">  assert (oh-&gt;type == OSPF6_MESSAGE_TYPE_LSACK);</a>
+<a name="ln230"> </a>
+<a name="ln231">  for (p = (char *) ((caddr_t) oh + sizeof (struct ospf6_header));</a>
+<a name="ln232">       p + sizeof (struct ospf6_lsa_header) &lt;= OSPF6_MESSAGE_END (oh);</a>
+<a name="ln233">       p += sizeof (struct ospf6_lsa_header))</a>
+<a name="ln234">    ospf6_lsa_header_print_raw ((struct ospf6_lsa_header *) p);</a>
+<a name="ln235"> </a>
+<a name="ln236">  assert (p == OSPF6_MESSAGE_END (oh));</a>
+<a name="ln237">}</a>
+<a name="ln238"> </a>
+<a name="ln239">static void</a>
+<a name="ln240">ospf6_hello_recv (struct in6_addr *src, struct in6_addr *dst,</a>
+<a name="ln241">                  struct ospf6_interface *oi, struct ospf6_header *oh)</a>
+<a name="ln242">{</a>
+<a name="ln243">  struct ospf6_hello *hello;</a>
+<a name="ln244">  struct ospf6_neighbor *on;</a>
+<a name="ln245">  char *p;</a>
+<a name="ln246">  int twoway = 0;</a>
+<a name="ln247">  int neighborchange = 0;</a>
+<a name="ln248">  int backupseen = 0;</a>
+<a name="ln249"> </a>
+<a name="ln250">  hello = (struct ospf6_hello *)</a>
+<a name="ln251">    ((caddr_t) oh + sizeof (struct ospf6_header));</a>
+<a name="ln252"> </a>
+<a name="ln253">  /* HelloInterval check */</a>
+<a name="ln254">  if (ntohs (hello-&gt;hello_interval) != oi-&gt;hello_interval)</a>
+<a name="ln255">    {</a>
+<a name="ln256">      if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln257">        zlog_debug (&quot;HelloInterval mismatch&quot;);</a>
+<a name="ln258">      return;</a>
+<a name="ln259">    }</a>
+<a name="ln260"> </a>
+<a name="ln261">  /* RouterDeadInterval check */</a>
+<a name="ln262">  if (ntohs (hello-&gt;dead_interval) != oi-&gt;dead_interval)</a>
+<a name="ln263">    {</a>
+<a name="ln264">      if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln265">        zlog_debug (&quot;RouterDeadInterval mismatch&quot;);</a>
+<a name="ln266">      return;</a>
+<a name="ln267">    }</a>
+<a name="ln268"> </a>
+<a name="ln269">  /* E-bit check */</a>
+<a name="ln270">  if (OSPF6_OPT_ISSET (hello-&gt;options, OSPF6_OPT_E) !=</a>
+<a name="ln271">      OSPF6_OPT_ISSET (oi-&gt;area-&gt;options, OSPF6_OPT_E))</a>
+<a name="ln272">    {</a>
+<a name="ln273">      if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln274">        zlog_debug (&quot;E-bit mismatch&quot;);</a>
+<a name="ln275">      return;</a>
+<a name="ln276">    }</a>
+<a name="ln277"> </a>
+<a name="ln278">  /* Find neighbor, create if not exist */</a>
+<a name="ln279">  on = ospf6_neighbor_lookup (oh-&gt;router_id, oi);</a>
+<a name="ln280">  if (on == NULL)</a>
+<a name="ln281">    {</a>
+<a name="ln282">      on = ospf6_neighbor_create (oh-&gt;router_id, oi);</a>
+<a name="ln283">      on-&gt;prev_drouter = on-&gt;drouter = hello-&gt;drouter;</a>
+<a name="ln284">      on-&gt;prev_bdrouter = on-&gt;bdrouter = hello-&gt;bdrouter;</a>
+<a name="ln285">      on-&gt;priority = hello-&gt;priority;</a>
+<a name="ln286">    }</a>
+<a name="ln287"> </a>
+<a name="ln288">  /* always override neighbor's source address and ifindex */</a>
+<a name="ln289">  on-&gt;ifindex = ntohl (hello-&gt;interface_id);</a>
+<a name="ln290">  memcpy (&amp;on-&gt;linklocal_addr, src, sizeof (struct in6_addr));</a>
+<a name="ln291"> </a>
+<a name="ln292">  /* TwoWay check */</a>
+<a name="ln293">  for (p = (char *) ((caddr_t) hello + sizeof (struct ospf6_hello));</a>
+<a name="ln294">       p + sizeof (u_int32_t) &lt;= OSPF6_MESSAGE_END (oh);</a>
+<a name="ln295">       p += sizeof (u_int32_t))</a>
+<a name="ln296">    {</a>
+<a name="ln297">      u_int32_t *router_id = (u_int32_t *) p;</a>
+<a name="ln298"> </a>
+<a name="ln299">      if (*router_id == oi-&gt;area-&gt;ospf6-&gt;router_id)</a>
+<a name="ln300">        twoway++;</a>
+<a name="ln301">    }</a>
+<a name="ln302"> </a>
+<a name="ln303">  assert (p == OSPF6_MESSAGE_END (oh));</a>
+<a name="ln304"> </a>
+<a name="ln305">  /* RouterPriority check */</a>
+<a name="ln306">  if (on-&gt;priority != hello-&gt;priority)</a>
+<a name="ln307">    {</a>
+<a name="ln308">      on-&gt;priority = hello-&gt;priority;</a>
+<a name="ln309">      neighborchange++;</a>
+<a name="ln310">    }</a>
+<a name="ln311"> </a>
+<a name="ln312">  /* DR check */</a>
+<a name="ln313">  if (on-&gt;drouter != hello-&gt;drouter)</a>
+<a name="ln314">    {</a>
+<a name="ln315">      on-&gt;prev_drouter = on-&gt;drouter;</a>
+<a name="ln316">      on-&gt;drouter = hello-&gt;drouter;</a>
+<a name="ln317">      if (on-&gt;prev_drouter == on-&gt;router_id || on-&gt;drouter == on-&gt;router_id)</a>
+<a name="ln318">        neighborchange++;</a>
+<a name="ln319">    }</a>
+<a name="ln320"> </a>
+<a name="ln321">  /* BDR check */</a>
+<a name="ln322">  if (on-&gt;bdrouter != hello-&gt;bdrouter)</a>
+<a name="ln323">    {</a>
+<a name="ln324">      on-&gt;prev_bdrouter = on-&gt;bdrouter;</a>
+<a name="ln325">      on-&gt;bdrouter = hello-&gt;bdrouter;</a>
+<a name="ln326">      if (on-&gt;prev_bdrouter == on-&gt;router_id || on-&gt;bdrouter == on-&gt;router_id)</a>
+<a name="ln327">        neighborchange++;</a>
+<a name="ln328">    }</a>
+<a name="ln329"> </a>
+<a name="ln330">  /* BackupSeen check */</a>
+<a name="ln331">  if (oi-&gt;state == OSPF6_INTERFACE_WAITING)</a>
+<a name="ln332">    {</a>
+<a name="ln333">      if (hello-&gt;bdrouter == on-&gt;router_id)</a>
+<a name="ln334">        backupseen++;</a>
+<a name="ln335">      else if (hello-&gt;drouter == on-&gt;router_id &amp;&amp; hello-&gt;bdrouter == htonl (0))</a>
+<a name="ln336">        backupseen++;</a>
+<a name="ln337">    }</a>
+<a name="ln338"> </a>
+<a name="ln339">  /* Execute neighbor events */</a>
+<a name="ln340">  thread_execute (master, hello_received, on, 0);</a>
+<a name="ln341">  if (twoway)</a>
+<a name="ln342">    thread_execute (master, twoway_received, on, 0);</a>
+<a name="ln343">  else</a>
+<a name="ln344">    thread_execute (master, oneway_received, on, 0);</a>
+<a name="ln345"> </a>
+<a name="ln346">  /* Schedule interface events */</a>
+<a name="ln347">  if (backupseen)</a>
+<a name="ln348">    thread_add_event (master, backup_seen, oi, 0);</a>
+<a name="ln349">  if (neighborchange)</a>
+<a name="ln350">    thread_add_event (master, neighbor_change, oi, 0);</a>
+<a name="ln351">}</a>
+<a name="ln352"> </a>
+<a name="ln353">static void</a>
+<a name="ln354">ospf6_dbdesc_recv_master (struct ospf6_header *oh,</a>
+<a name="ln355">                          struct ospf6_neighbor *on)</a>
+<a name="ln356">{</a>
+<a name="ln357">  struct ospf6_dbdesc *dbdesc;</a>
+<a name="ln358">  char *p;</a>
+<a name="ln359"> </a>
+<a name="ln360">  dbdesc = (struct ospf6_dbdesc *)</a>
+<a name="ln361">    ((caddr_t) oh + sizeof (struct ospf6_header));</a>
+<a name="ln362"> </a>
+<a name="ln363">  if (on-&gt;state &lt; OSPF6_NEIGHBOR_INIT)</a>
+<a name="ln364">    {</a>
+<a name="ln365">      if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln366">        zlog_debug (&quot;Neighbor state less than Init, ignore&quot;);</a>
+<a name="ln367">      return;</a>
+<a name="ln368">    }</a>
+<a name="ln369"> </a>
+<a name="ln370">  switch (on-&gt;state)</a>
+<a name="ln371">    {</a>
+<a name="ln372">    case OSPF6_NEIGHBOR_TWOWAY:</a>
+<a name="ln373">      if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln374">        zlog_debug (&quot;Neighbor state is 2-Way, ignore&quot;);</a>
+<a name="ln375">      return;</a>
+<a name="ln376"> </a>
+<a name="ln377">    case OSPF6_NEIGHBOR_INIT:</a>
+<a name="ln378">      thread_execute (master, twoway_received, on, 0);</a>
+<a name="ln379">      if (on-&gt;state != OSPF6_NEIGHBOR_EXSTART)</a>
+<a name="ln380">        {</a>
+<a name="ln381">          if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln382">            zlog_debug (&quot;Neighbor state is not ExStart, ignore&quot;);</a>
+<a name="ln383">          return;</a>
+<a name="ln384">        }</a>
+<a name="ln385">      /* else fall through to ExStart */</a>
+<a name="ln386"> </a>
+<a name="ln387">    case OSPF6_NEIGHBOR_EXSTART:</a>
+<a name="ln388">      /* if neighbor obeys us as our slave, schedule negotiation_done</a>
+<a name="ln389">         and process LSA Headers. Otherwise, ignore this message */</a>
+<a name="ln390">      if (! CHECK_FLAG (dbdesc-&gt;bits, OSPF6_DBDESC_MSBIT) &amp;&amp;</a>
+<a name="ln391">          ! CHECK_FLAG (dbdesc-&gt;bits, OSPF6_DBDESC_IBIT) &amp;&amp;</a>
+<a name="ln392">          ntohl (dbdesc-&gt;seqnum) == on-&gt;dbdesc_seqnum)</a>
+<a name="ln393">        {</a>
+<a name="ln394">          /* execute NegotiationDone */</a>
+<a name="ln395">          thread_execute (master, negotiation_done, on, 0);</a>
+<a name="ln396"> </a>
+<a name="ln397">          /* Record neighbor options */</a>
+<a name="ln398">          memcpy (on-&gt;options, dbdesc-&gt;options, sizeof (on-&gt;options));</a>
+<a name="ln399">        }</a>
+<a name="ln400">      else</a>
+<a name="ln401">        {</a>
+<a name="ln402">          if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln403">            zlog_debug (&quot;Negotiation failed&quot;);</a>
+<a name="ln404">          return;</a>
+<a name="ln405">        }</a>
+<a name="ln406">      /* fall through to exchange */</a>
+<a name="ln407"> </a>
+<a name="ln408">    case OSPF6_NEIGHBOR_EXCHANGE:</a>
+<a name="ln409">      if (! memcmp (dbdesc, &amp;on-&gt;dbdesc_last, sizeof (struct ospf6_dbdesc)))</a>
+<a name="ln410">        {</a>
+<a name="ln411">          /* Duplicated DatabaseDescription is dropped by master */</a>
+<a name="ln412">          if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln413">            zlog_debug (&quot;Duplicated dbdesc discarded by Master, ignore&quot;);</a>
+<a name="ln414">          return;</a>
+<a name="ln415">        }</a>
+<a name="ln416"> </a>
+<a name="ln417">      if (CHECK_FLAG (dbdesc-&gt;bits, OSPF6_DBDESC_MSBIT))</a>
+<a name="ln418">        {</a>
+<a name="ln419">          if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln420">            zlog_debug (&quot;Master/Slave bit mismatch&quot;);</a>
+<a name="ln421">          thread_add_event (master, seqnumber_mismatch, on, 0);</a>
+<a name="ln422">          return;</a>
+<a name="ln423">        }</a>
+<a name="ln424"> </a>
+<a name="ln425">      if (CHECK_FLAG (dbdesc-&gt;bits, OSPF6_DBDESC_IBIT))</a>
+<a name="ln426">        {</a>
+<a name="ln427">          if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln428">            zlog_debug (&quot;Initialize bit mismatch&quot;);</a>
+<a name="ln429">          thread_add_event (master, seqnumber_mismatch, on, 0);</a>
+<a name="ln430">          return;</a>
+<a name="ln431">        }</a>
+<a name="ln432"> </a>
+<a name="ln433">      if (memcmp (on-&gt;options, dbdesc-&gt;options, sizeof (on-&gt;options)))</a>
+<a name="ln434">        {</a>
+<a name="ln435">          if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln436">            zlog_debug (&quot;Option field mismatch&quot;);</a>
+<a name="ln437">          thread_add_event (master, seqnumber_mismatch, on, 0);</a>
+<a name="ln438">          return;</a>
+<a name="ln439">        }</a>
+<a name="ln440"> </a>
+<a name="ln441">      if (ntohl (dbdesc-&gt;seqnum) != on-&gt;dbdesc_seqnum)</a>
+<a name="ln442">        {</a>
+<a name="ln443">          if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln444">            zlog_debug (&quot;Sequence number mismatch (%#lx expected)&quot;,</a>
+<a name="ln445">                       (u_long) on-&gt;dbdesc_seqnum);</a>
+<a name="ln446">          thread_add_event (master, seqnumber_mismatch, on, 0);</a>
+<a name="ln447">          return;</a>
+<a name="ln448">        }</a>
+<a name="ln449">      break;</a>
+<a name="ln450"> </a>
+<a name="ln451">    case OSPF6_NEIGHBOR_LOADING:</a>
+<a name="ln452">    case OSPF6_NEIGHBOR_FULL:</a>
+<a name="ln453">      if (! memcmp (dbdesc, &amp;on-&gt;dbdesc_last, sizeof (struct ospf6_dbdesc)))</a>
+<a name="ln454">        {</a>
+<a name="ln455">          /* Duplicated DatabaseDescription is dropped by master */</a>
+<a name="ln456">          if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln457">            zlog_debug (&quot;Duplicated dbdesc discarded by Master, ignore&quot;);</a>
+<a name="ln458">          return;</a>
+<a name="ln459">        }</a>
+<a name="ln460"> </a>
+<a name="ln461">      if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln462">        zlog_debug (&quot;Not duplicate dbdesc in state %s&quot;,</a>
+<a name="ln463">		    ospf6_neighbor_state_str[on-&gt;state]);</a>
+<a name="ln464">      thread_add_event (master, seqnumber_mismatch, on, 0);</a>
+<a name="ln465">      return;</a>
+<a name="ln466"> </a>
+<a name="ln467">    default:</a>
+<a name="ln468">      assert (0);</a>
+<a name="ln469">      break;</a>
+<a name="ln470">    }</a>
+<a name="ln471"> </a>
+<a name="ln472">  /* Process LSA headers */</a>
+<a name="ln473">  for (p = (char *) ((caddr_t) dbdesc + sizeof (struct ospf6_dbdesc));</a>
+<a name="ln474">       p + sizeof (struct ospf6_lsa_header) &lt;= OSPF6_MESSAGE_END (oh);</a>
+<a name="ln475">       p += sizeof (struct ospf6_lsa_header))</a>
+<a name="ln476">    {</a>
+<a name="ln477">      struct ospf6_lsa *his, *mine;</a>
+<a name="ln478">      struct ospf6_lsdb *lsdb = NULL;</a>
+<a name="ln479"> </a>
+<a name="ln480">      his = ospf6_lsa_create_headeronly ((struct ospf6_lsa_header *) p);</a>
+<a name="ln481"> </a>
+<a name="ln482">      if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln483">        zlog_debug (&quot;%s&quot;, his-&gt;name);</a>
+<a name="ln484"> </a>
+<a name="ln485">      switch (OSPF6_LSA_SCOPE (his-&gt;header-&gt;type))</a>
+<a name="ln486">        {</a>
+<a name="ln487">        case OSPF6_SCOPE_LINKLOCAL:</a>
+<a name="ln488">          lsdb = on-&gt;ospf6_if-&gt;lsdb;</a>
+<a name="ln489">          break;</a>
+<a name="ln490">        case OSPF6_SCOPE_AREA:</a>
+<a name="ln491">          lsdb = on-&gt;ospf6_if-&gt;area-&gt;lsdb;</a>
+<a name="ln492">          break;</a>
+<a name="ln493">        case OSPF6_SCOPE_AS:</a>
+<a name="ln494">          lsdb = on-&gt;ospf6_if-&gt;area-&gt;ospf6-&gt;lsdb;</a>
+<a name="ln495">          break;</a>
+<a name="ln496">        case OSPF6_SCOPE_RESERVED:</a>
+<a name="ln497">          if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln498">            zlog_debug (&quot;Ignoring LSA of reserved scope&quot;);</a>
+<a name="ln499">          ospf6_lsa_delete (his);</a>
+<a name="ln500">          continue;</a>
+<a name="ln501">          break;</a>
+<a name="ln502">        }</a>
+<a name="ln503"> </a>
+<a name="ln504">      if (ntohs (his-&gt;header-&gt;type) == OSPF6_LSTYPE_AS_EXTERNAL &amp;&amp;</a>
+<a name="ln505">          IS_AREA_STUB (on-&gt;ospf6_if-&gt;area))</a>
+<a name="ln506">        {</a>
+<a name="ln507">          if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln508">            zlog_debug (&quot;SeqNumMismatch (E-bit mismatch), discard&quot;);</a>
+<a name="ln509">          ospf6_lsa_delete (his);</a>
+<a name="ln510">          thread_add_event (master, seqnumber_mismatch, on, 0);</a>
+<a name="ln511">          return;</a>
+<a name="ln512">        }</a>
+<a name="ln513"> </a>
+<a name="ln514">      mine = ospf6_lsdb_lookup (his-&gt;header-&gt;type, his-&gt;header-&gt;id,</a>
+<a name="ln515">                                his-&gt;header-&gt;adv_router, lsdb);</a>
+<a name="ln516">      if (mine == NULL)</a>
+<a name="ln517">        {</a>
+<a name="ln518">          if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln519">            zlog_debug (&quot;Add request (No database copy)&quot;);</a>
+<a name="ln520">          ospf6_lsdb_add (ospf6_lsa_copy(his), on-&gt;request_list);</a>
+<a name="ln521">        }</a>
+<a name="ln522">      else if (ospf6_lsa_compare (his, mine) &lt; 0)</a>
+<a name="ln523">        {</a>
+<a name="ln524">          if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln525">            zlog_debug (&quot;Add request (Received MoreRecent)&quot;);</a>
+<a name="ln526">          ospf6_lsdb_add (ospf6_lsa_copy(his), on-&gt;request_list);</a>
+<a name="ln527">        }</a>
+<a name="ln528">      else</a>
+<a name="ln529">        {</a>
+<a name="ln530">          if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln531">            zlog_debug (&quot;Discard (Existing MoreRecent)&quot;);</a>
+<a name="ln532">        }</a>
+<a name="ln533">      ospf6_lsa_delete (his);</a>
+<a name="ln534">    }</a>
+<a name="ln535"> </a>
+<a name="ln536">  assert (p == OSPF6_MESSAGE_END (oh));</a>
+<a name="ln537"> </a>
+<a name="ln538">  /* Increment sequence number */</a>
+<a name="ln539">  on-&gt;dbdesc_seqnum ++;</a>
+<a name="ln540"> </a>
+<a name="ln541">  /* schedule send lsreq */</a>
+<a name="ln542">  if (on-&gt;request_list-&gt;count &amp;&amp; (on-&gt;thread_send_lsreq == NULL))</a>
+<a name="ln543">    on-&gt;thread_send_lsreq =</a>
+<a name="ln544">      thread_add_event (master, ospf6_lsreq_send, on, 0);</a>
+<a name="ln545"> </a>
+<a name="ln546">  THREAD_OFF (on-&gt;thread_send_dbdesc);</a>
+<a name="ln547"> </a>
+<a name="ln548">  /* More bit check */</a>
+<a name="ln549">  if (! CHECK_FLAG (dbdesc-&gt;bits, OSPF6_DBDESC_MBIT) &amp;&amp;</a>
+<a name="ln550">      ! CHECK_FLAG (on-&gt;dbdesc_bits, OSPF6_DBDESC_MBIT))</a>
+<a name="ln551">    thread_add_event (master, exchange_done, on, 0);</a>
+<a name="ln552">  else</a>
+<a name="ln553">    on-&gt;thread_send_dbdesc =</a>
+<a name="ln554">      thread_add_event (master, ospf6_dbdesc_send_newone, on, 0);</a>
+<a name="ln555"> </a>
+<a name="ln556">  /* save last received dbdesc */</a>
+<a name="ln557">  memcpy (&amp;on-&gt;dbdesc_last, dbdesc, sizeof (struct ospf6_dbdesc));</a>
+<a name="ln558">}</a>
+<a name="ln559"> </a>
+<a name="ln560">static void</a>
+<a name="ln561">ospf6_dbdesc_recv_slave (struct ospf6_header *oh,</a>
+<a name="ln562">                         struct ospf6_neighbor *on)</a>
+<a name="ln563">{</a>
+<a name="ln564">  struct ospf6_dbdesc *dbdesc;</a>
+<a name="ln565">  char *p;</a>
+<a name="ln566"> </a>
+<a name="ln567">  dbdesc = (struct ospf6_dbdesc *)</a>
+<a name="ln568">    ((caddr_t) oh + sizeof (struct ospf6_header));</a>
+<a name="ln569"> </a>
+<a name="ln570">  if (on-&gt;state &lt; OSPF6_NEIGHBOR_INIT)</a>
+<a name="ln571">    {</a>
+<a name="ln572">      if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln573">        zlog_debug (&quot;Neighbor state less than Init, ignore&quot;);</a>
+<a name="ln574">      return;</a>
+<a name="ln575">    }</a>
+<a name="ln576"> </a>
+<a name="ln577">  switch (on-&gt;state)</a>
+<a name="ln578">    {</a>
+<a name="ln579">    case OSPF6_NEIGHBOR_TWOWAY:</a>
+<a name="ln580">      if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln581">        zlog_debug (&quot;Neighbor state is 2-Way, ignore&quot;);</a>
+<a name="ln582">      return;</a>
+<a name="ln583"> </a>
+<a name="ln584">    case OSPF6_NEIGHBOR_INIT:</a>
+<a name="ln585">      thread_execute (master, twoway_received, on, 0);</a>
+<a name="ln586">      if (on-&gt;state != OSPF6_NEIGHBOR_EXSTART)</a>
+<a name="ln587">        {</a>
+<a name="ln588">          if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln589">            zlog_debug (&quot;Neighbor state is not ExStart, ignore&quot;);</a>
+<a name="ln590">          return;</a>
+<a name="ln591">        }</a>
+<a name="ln592">      /* else fall through to ExStart */</a>
+<a name="ln593"> </a>
+<a name="ln594">    case OSPF6_NEIGHBOR_EXSTART:</a>
+<a name="ln595">      /* If the neighbor is Master, act as Slave. Schedule negotiation_done</a>
+<a name="ln596">         and process LSA Headers. Otherwise, ignore this message */</a>
+<a name="ln597">      if (CHECK_FLAG (dbdesc-&gt;bits, OSPF6_DBDESC_IBIT) &amp;&amp;</a>
+<a name="ln598">          CHECK_FLAG (dbdesc-&gt;bits, OSPF6_DBDESC_MBIT) &amp;&amp;</a>
+<a name="ln599">          CHECK_FLAG (dbdesc-&gt;bits, OSPF6_DBDESC_MSBIT) &amp;&amp;</a>
+<a name="ln600">          ntohs (oh-&gt;length) == sizeof (struct ospf6_header) +</a>
+<a name="ln601">                                sizeof (struct ospf6_dbdesc))</a>
+<a name="ln602">        {</a>
+<a name="ln603">          /* set the master/slave bit to slave */</a>
+<a name="ln604">          UNSET_FLAG (on-&gt;dbdesc_bits, OSPF6_DBDESC_MSBIT);</a>
+<a name="ln605"> </a>
+<a name="ln606">          /* set the DD sequence number to one specified by master */</a>
+<a name="ln607">          on-&gt;dbdesc_seqnum = ntohl (dbdesc-&gt;seqnum);</a>
+<a name="ln608"> </a>
+<a name="ln609">          /* schedule NegotiationDone */</a>
+<a name="ln610">          thread_execute (master, negotiation_done, on, 0);</a>
+<a name="ln611"> </a>
+<a name="ln612">          /* Record neighbor options */</a>
+<a name="ln613">          memcpy (on-&gt;options, dbdesc-&gt;options, sizeof (on-&gt;options));</a>
+<a name="ln614">        }</a>
+<a name="ln615">      else</a>
+<a name="ln616">        {</a>
+<a name="ln617">          if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln618">            zlog_debug (&quot;Negotiation failed&quot;);</a>
+<a name="ln619">          return;</a>
+<a name="ln620">        }</a>
+<a name="ln621">      break;</a>
+<a name="ln622"> </a>
+<a name="ln623">    case OSPF6_NEIGHBOR_EXCHANGE:</a>
+<a name="ln624">      if (! memcmp (dbdesc, &amp;on-&gt;dbdesc_last, sizeof (struct ospf6_dbdesc)))</a>
+<a name="ln625">        {</a>
+<a name="ln626">          /* Duplicated DatabaseDescription causes slave to retransmit */</a>
+<a name="ln627">          if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln628">            zlog_debug (&quot;Duplicated dbdesc causes retransmit&quot;);</a>
+<a name="ln629">          THREAD_OFF (on-&gt;thread_send_dbdesc);</a>
+<a name="ln630">          on-&gt;thread_send_dbdesc =</a>
+<a name="ln631">            thread_add_event (master, ospf6_dbdesc_send, on, 0);</a>
+<a name="ln632">          return;</a>
+<a name="ln633">        }</a>
+<a name="ln634"> </a>
+<a name="ln635">      if (! CHECK_FLAG (dbdesc-&gt;bits, OSPF6_DBDESC_MSBIT))</a>
+<a name="ln636">        {</a>
+<a name="ln637">          if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln638">            zlog_debug (&quot;Master/Slave bit mismatch&quot;);</a>
+<a name="ln639">          thread_add_event (master, seqnumber_mismatch, on, 0);</a>
+<a name="ln640">          return;</a>
+<a name="ln641">        }</a>
+<a name="ln642"> </a>
+<a name="ln643">      if (CHECK_FLAG (dbdesc-&gt;bits, OSPF6_DBDESC_IBIT))</a>
+<a name="ln644">        {</a>
+<a name="ln645">          if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln646">            zlog_debug (&quot;Initialize bit mismatch&quot;);</a>
+<a name="ln647">          thread_add_event (master, seqnumber_mismatch, on, 0);</a>
+<a name="ln648">          return;</a>
+<a name="ln649">        }</a>
+<a name="ln650"> </a>
+<a name="ln651">      if (memcmp (on-&gt;options, dbdesc-&gt;options, sizeof (on-&gt;options)))</a>
+<a name="ln652">        {</a>
+<a name="ln653">          if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln654">            zlog_debug (&quot;Option field mismatch&quot;);</a>
+<a name="ln655">          thread_add_event (master, seqnumber_mismatch, on, 0);</a>
+<a name="ln656">          return;</a>
+<a name="ln657">        }</a>
+<a name="ln658"> </a>
+<a name="ln659">      if (ntohl (dbdesc-&gt;seqnum) != on-&gt;dbdesc_seqnum + 1)</a>
+<a name="ln660">        {</a>
+<a name="ln661">          if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln662">            zlog_debug (&quot;Sequence number mismatch (%#lx expected)&quot;,</a>
+<a name="ln663">			(u_long) on-&gt;dbdesc_seqnum + 1);</a>
+<a name="ln664">          thread_add_event (master, seqnumber_mismatch, on, 0);</a>
+<a name="ln665">          return;</a>
+<a name="ln666">        }</a>
+<a name="ln667">      break;</a>
+<a name="ln668"> </a>
+<a name="ln669">    case OSPF6_NEIGHBOR_LOADING:</a>
+<a name="ln670">    case OSPF6_NEIGHBOR_FULL:</a>
+<a name="ln671">      if (! memcmp (dbdesc, &amp;on-&gt;dbdesc_last, sizeof (struct ospf6_dbdesc)))</a>
+<a name="ln672">        {</a>
+<a name="ln673">          /* Duplicated DatabaseDescription causes slave to retransmit */</a>
+<a name="ln674">          if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln675">            zlog_debug (&quot;Duplicated dbdesc causes retransmit&quot;);</a>
+<a name="ln676">          THREAD_OFF (on-&gt;thread_send_dbdesc);</a>
+<a name="ln677">          on-&gt;thread_send_dbdesc =</a>
+<a name="ln678">            thread_add_event (master, ospf6_dbdesc_send, on, 0);</a>
+<a name="ln679">          return;</a>
+<a name="ln680">        }</a>
+<a name="ln681"> </a>
+<a name="ln682">      if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln683">        zlog_debug (&quot;Not duplicate dbdesc in state %s&quot;,</a>
+<a name="ln684">		    ospf6_neighbor_state_str[on-&gt;state]);</a>
+<a name="ln685">      thread_add_event (master, seqnumber_mismatch, on, 0);</a>
+<a name="ln686">      return;</a>
+<a name="ln687"> </a>
+<a name="ln688">    default:</a>
+<a name="ln689">      assert (0);</a>
+<a name="ln690">      break;</a>
+<a name="ln691">    }</a>
+<a name="ln692"> </a>
+<a name="ln693">  /* Process LSA headers */</a>
+<a name="ln694">  for (p = (char *) ((caddr_t) dbdesc + sizeof (struct ospf6_dbdesc));</a>
+<a name="ln695">       p + sizeof (struct ospf6_lsa_header) &lt;= OSPF6_MESSAGE_END (oh);</a>
+<a name="ln696">       p += sizeof (struct ospf6_lsa_header))</a>
+<a name="ln697">    {</a>
+<a name="ln698">      struct ospf6_lsa *his, *mine;</a>
+<a name="ln699">      struct ospf6_lsdb *lsdb = NULL;</a>
+<a name="ln700"> </a>
+<a name="ln701">      his = ospf6_lsa_create_headeronly ((struct ospf6_lsa_header *) p);</a>
+<a name="ln702"> </a>
+<a name="ln703">      switch (OSPF6_LSA_SCOPE (his-&gt;header-&gt;type))</a>
+<a name="ln704">        {</a>
+<a name="ln705">        case OSPF6_SCOPE_LINKLOCAL:</a>
+<a name="ln706">          lsdb = on-&gt;ospf6_if-&gt;lsdb;</a>
+<a name="ln707">          break;</a>
+<a name="ln708">        case OSPF6_SCOPE_AREA:</a>
+<a name="ln709">          lsdb = on-&gt;ospf6_if-&gt;area-&gt;lsdb;</a>
+<a name="ln710">          break;</a>
+<a name="ln711">        case OSPF6_SCOPE_AS:</a>
+<a name="ln712">          lsdb = on-&gt;ospf6_if-&gt;area-&gt;ospf6-&gt;lsdb;</a>
+<a name="ln713">          break;</a>
+<a name="ln714">        case OSPF6_SCOPE_RESERVED:</a>
+<a name="ln715">          if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln716">            zlog_debug (&quot;Ignoring LSA of reserved scope&quot;);</a>
+<a name="ln717">          ospf6_lsa_delete (his);</a>
+<a name="ln718">          continue;</a>
+<a name="ln719">          break;</a>
+<a name="ln720">        }</a>
+<a name="ln721"> </a>
+<a name="ln722">      if (OSPF6_LSA_SCOPE (his-&gt;header-&gt;type) == OSPF6_SCOPE_AS &amp;&amp;</a>
+<a name="ln723">          IS_AREA_STUB (on-&gt;ospf6_if-&gt;area))</a>
+<a name="ln724">        {</a>
+<a name="ln725">          if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln726">            zlog_debug (&quot;E-bit mismatch with LSA Headers&quot;);</a>
+<a name="ln727">          ospf6_lsa_delete (his);</a>
+<a name="ln728">          thread_add_event (master, seqnumber_mismatch, on, 0);</a>
+<a name="ln729">          return;</a>
+<a name="ln730">        }</a>
+<a name="ln731"> </a>
+<a name="ln732">      mine = ospf6_lsdb_lookup (his-&gt;header-&gt;type, his-&gt;header-&gt;id,</a>
+<a name="ln733">                                his-&gt;header-&gt;adv_router, lsdb);</a>
+<a name="ln734">      if (mine == NULL || ospf6_lsa_compare (his, mine) &lt; 0)</a>
+<a name="ln735">        {</a>
+<a name="ln736">          if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln737">            zlog_debug (&quot;Add request-list: %s&quot;, his-&gt;name);</a>
+<a name="ln738">          ospf6_lsdb_add (ospf6_lsa_copy(his), on-&gt;request_list);</a>
+<a name="ln739">        }</a>
+<a name="ln740">      ospf6_lsa_delete (his);</a>
+<a name="ln741">    }</a>
+<a name="ln742"> </a>
+<a name="ln743">  assert (p == OSPF6_MESSAGE_END (oh));</a>
+<a name="ln744"> </a>
+<a name="ln745">  /* Set sequence number to Master's */</a>
+<a name="ln746">  on-&gt;dbdesc_seqnum = ntohl (dbdesc-&gt;seqnum);</a>
+<a name="ln747"> </a>
+<a name="ln748">  /* schedule send lsreq */</a>
+<a name="ln749">  if ((on-&gt;thread_send_lsreq == NULL) &amp;&amp;</a>
+<a name="ln750">      (on-&gt;request_list-&gt;count))</a>
+<a name="ln751">    on-&gt;thread_send_lsreq =</a>
+<a name="ln752">      thread_add_event (master, ospf6_lsreq_send, on, 0);</a>
+<a name="ln753"> </a>
+<a name="ln754">  THREAD_OFF (on-&gt;thread_send_dbdesc);</a>
+<a name="ln755">  on-&gt;thread_send_dbdesc =</a>
+<a name="ln756">    thread_add_event (master, ospf6_dbdesc_send_newone, on, 0);</a>
+<a name="ln757"> </a>
+<a name="ln758">  /* save last received dbdesc */</a>
+<a name="ln759">  memcpy (&amp;on-&gt;dbdesc_last, dbdesc, sizeof (struct ospf6_dbdesc));</a>
+<a name="ln760">}</a>
+<a name="ln761"> </a>
+<a name="ln762">static void</a>
+<a name="ln763">ospf6_dbdesc_recv (struct in6_addr *src, struct in6_addr *dst,</a>
+<a name="ln764">                   struct ospf6_interface *oi, struct ospf6_header *oh)</a>
+<a name="ln765">{</a>
+<a name="ln766">  struct ospf6_neighbor *on;</a>
+<a name="ln767">  struct ospf6_dbdesc *dbdesc;</a>
+<a name="ln768"> </a>
+<a name="ln769">  on = ospf6_neighbor_lookup (oh-&gt;router_id, oi);</a>
+<a name="ln770">  if (on == NULL)</a>
+<a name="ln771">    {</a>
+<a name="ln772">      if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln773">        zlog_debug (&quot;Neighbor not found, ignore&quot;);</a>
+<a name="ln774">      return;</a>
+<a name="ln775">    }</a>
+<a name="ln776"> </a>
+<a name="ln777">  dbdesc = (struct ospf6_dbdesc *)</a>
+<a name="ln778">    ((caddr_t) oh + sizeof (struct ospf6_header));</a>
+<a name="ln779"> </a>
+<a name="ln780">  /* Interface MTU check */</a>
+<a name="ln781">  if (!oi-&gt;mtu_ignore &amp;&amp; ntohs (dbdesc-&gt;ifmtu) != oi-&gt;ifmtu)</a>
+<a name="ln782">    {</a>
+<a name="ln783">      if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln784">        zlog_debug (&quot;I/F MTU mismatch&quot;);</a>
+<a name="ln785">      return;</a>
+<a name="ln786">    }</a>
+<a name="ln787"> </a>
+<a name="ln788">  if (dbdesc-&gt;reserved1 || dbdesc-&gt;reserved2)</a>
+<a name="ln789">    {</a>
+<a name="ln790">      if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln791">        zlog_debug (&quot;Non-0 reserved field in %s's DbDesc, correct&quot;,</a>
+<a name="ln792">		    on-&gt;name);</a>
+<a name="ln793">      dbdesc-&gt;reserved1 = 0;</a>
+<a name="ln794">      dbdesc-&gt;reserved2 = 0;</a>
+<a name="ln795">    }</a>
+<a name="ln796"> </a>
+<a name="ln797">  if (ntohl (oh-&gt;router_id) &lt; ntohl (ospf6-&gt;router_id))</a>
+<a name="ln798">    ospf6_dbdesc_recv_master (oh, on);</a>
+<a name="ln799">  else if (ntohl (ospf6-&gt;router_id) &lt; ntohl (oh-&gt;router_id))</a>
+<a name="ln800">    ospf6_dbdesc_recv_slave (oh, on);</a>
+<a name="ln801">  else</a>
+<a name="ln802">    {</a>
+<a name="ln803">      if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln804">        zlog_debug (&quot;Can't decide which is master, ignore&quot;);</a>
+<a name="ln805">    }</a>
+<a name="ln806">}</a>
+<a name="ln807"> </a>
+<a name="ln808">static void</a>
+<a name="ln809">ospf6_lsreq_recv (struct in6_addr *src, struct in6_addr *dst,</a>
+<a name="ln810">                  struct ospf6_interface *oi, struct ospf6_header *oh)</a>
+<a name="ln811">{</a>
+<a name="ln812">  struct ospf6_neighbor *on;</a>
+<a name="ln813">  char *p;</a>
+<a name="ln814">  struct ospf6_lsreq_entry *e;</a>
+<a name="ln815">  struct ospf6_lsdb *lsdb = NULL;</a>
+<a name="ln816">  struct ospf6_lsa *lsa;</a>
+<a name="ln817"> </a>
+<a name="ln818">  on = ospf6_neighbor_lookup (oh-&gt;router_id, oi);</a>
+<a name="ln819">  if (on == NULL)</a>
+<a name="ln820">    {</a>
+<a name="ln821">      if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln822">        zlog_debug (&quot;Neighbor not found, ignore&quot;);</a>
+<a name="ln823">      return;</a>
+<a name="ln824">    }</a>
+<a name="ln825"> </a>
+<a name="ln826">  if (on-&gt;state != OSPF6_NEIGHBOR_EXCHANGE &amp;&amp;</a>
+<a name="ln827">      on-&gt;state != OSPF6_NEIGHBOR_LOADING &amp;&amp;</a>
+<a name="ln828">      on-&gt;state != OSPF6_NEIGHBOR_FULL)</a>
+<a name="ln829">    {</a>
+<a name="ln830">      if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln831">        zlog_debug (&quot;Neighbor state less than Exchange, ignore&quot;);</a>
+<a name="ln832">      return;</a>
+<a name="ln833">    }</a>
+<a name="ln834"> </a>
+<a name="ln835">  /* Process each request */</a>
+<a name="ln836">  for (p = (char *) ((caddr_t) oh + sizeof (struct ospf6_header));</a>
+<a name="ln837">       p + sizeof (struct ospf6_lsreq_entry) &lt;= OSPF6_MESSAGE_END (oh);</a>
+<a name="ln838">       p += sizeof (struct ospf6_lsreq_entry))</a>
+<a name="ln839">    {</a>
+<a name="ln840">      e = (struct ospf6_lsreq_entry *) p;</a>
+<a name="ln841"> </a>
+<a name="ln842">      switch (OSPF6_LSA_SCOPE (e-&gt;type))</a>
+<a name="ln843">        {</a>
+<a name="ln844">        case OSPF6_SCOPE_LINKLOCAL:</a>
+<a name="ln845">          lsdb = on-&gt;ospf6_if-&gt;lsdb;</a>
+<a name="ln846">          break;</a>
+<a name="ln847">        case OSPF6_SCOPE_AREA:</a>
+<a name="ln848">          lsdb = on-&gt;ospf6_if-&gt;area-&gt;lsdb;</a>
+<a name="ln849">          break;</a>
+<a name="ln850">        case OSPF6_SCOPE_AS:</a>
+<a name="ln851">          lsdb = on-&gt;ospf6_if-&gt;area-&gt;ospf6-&gt;lsdb;</a>
+<a name="ln852">          break;</a>
+<a name="ln853">        default:</a>
+<a name="ln854">          if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln855">            zlog_debug (&quot;Ignoring LSA of reserved scope&quot;);</a>
+<a name="ln856">          continue;</a>
+<a name="ln857">          break;</a>
+<a name="ln858">        }</a>
+<a name="ln859"> </a>
+<a name="ln860">      /* Find database copy */</a>
+<a name="ln861">      lsa = ospf6_lsdb_lookup (e-&gt;type, e-&gt;id, e-&gt;adv_router, lsdb);</a>
+<a name="ln862">      if (lsa == NULL)</a>
+<a name="ln863">        {</a>
+<a name="ln864">          char id[16], adv_router[16];</a>
+<a name="ln865">          if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln866">            {</a>
+<a name="ln867">              inet_ntop (AF_INET, &amp;e-&gt;id, id, sizeof (id));</a>
+<a name="ln868">              inet_ntop (AF_INET, &amp;e-&gt;adv_router, adv_router,</a>
+<a name="ln869">                     sizeof (adv_router));</a>
+<a name="ln870">              zlog_debug (&quot;Can't find requested [%s Id:%s Adv:%s]&quot;,</a>
+<a name="ln871">			  ospf6_lstype_name (e-&gt;type), id, adv_router);</a>
+<a name="ln872">            }</a>
+<a name="ln873">          thread_add_event (master, bad_lsreq, on, 0);</a>
+<a name="ln874">          return;</a>
+<a name="ln875">        }</a>
+<a name="ln876"> </a>
+<a name="ln877">      ospf6_lsdb_add (ospf6_lsa_copy (lsa), on-&gt;lsupdate_list);</a>
+<a name="ln878">    }</a>
+<a name="ln879"> </a>
+<a name="ln880">  assert (p == OSPF6_MESSAGE_END (oh));</a>
+<a name="ln881"> </a>
+<a name="ln882">  /* schedule send lsupdate */</a>
+<a name="ln883">  THREAD_OFF (on-&gt;thread_send_lsupdate);</a>
+<a name="ln884">  on-&gt;thread_send_lsupdate =</a>
+<a name="ln885">    thread_add_event (master, ospf6_lsupdate_send_neighbor, on, 0);</a>
+<a name="ln886">}</a>
+<a name="ln887"> </a>
+<a name="ln888">/* Verify, that the specified memory area contains exactly N valid IPv6</a>
+<a name="ln889">   prefixes as specified by RFC5340, A.4.1. */</a>
+<a name="ln890">static unsigned</a>
+<a name="ln891">ospf6_prefixes_examin</a>
+<a name="ln892">(</a>
+<a name="ln893">  struct ospf6_prefix *current, /* start of buffer    */</a>
+<a name="ln894">  unsigned length,</a>
+<a name="ln895">  const u_int32_t req_num_pfxs  /* always compared with the actual number of prefixes */</a>
+<a name="ln896">)</a>
+<a name="ln897">{</a>
+<a name="ln898">  u_char requested_pfx_bytes;</a>
+<a name="ln899">  u_int32_t real_num_pfxs = 0;</a>
+<a name="ln900"> </a>
+<a name="ln901">  while (length)</a>
+<a name="ln902">  {</a>
+<a name="ln903">    if (length &lt; OSPF6_PREFIX_MIN_SIZE)</a>
+<a name="ln904">    {</a>
+<a name="ln905">      if (IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_UNKNOWN, RECV))</a>
+<a name="ln906">        zlog_debug (&quot;%s: undersized IPv6 prefix header&quot;, __func__);</a>
+<a name="ln907">      return MSG_NG;</a>
+<a name="ln908">    }</a>
+<a name="ln909">    /* safe to look deeper */</a>
+<a name="ln910">    if (current-&gt;prefix_length &gt; IPV6_MAX_BITLEN)</a>
+<a name="ln911">    {</a>
+<a name="ln912">      if (IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_UNKNOWN, RECV))</a>
+<a name="ln913">        zlog_debug (&quot;%s: invalid PrefixLength (%u bits)&quot;, __func__, current-&gt;prefix_length);</a>
+<a name="ln914">      return MSG_NG;</a>
+<a name="ln915">    }</a>
+<a name="ln916">    /* covers both fixed- and variable-sized fields */</a>
+<a name="ln917">    requested_pfx_bytes = OSPF6_PREFIX_MIN_SIZE + OSPF6_PREFIX_SPACE (current-&gt;prefix_length);</a>
+<a name="ln918">    if (requested_pfx_bytes &gt; length)</a>
+<a name="ln919">    {</a>
+<a name="ln920">      if (IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_UNKNOWN, RECV))</a>
+<a name="ln921">        zlog_debug (&quot;%s: undersized IPv6 prefix&quot;, __func__);</a>
+<a name="ln922">      return MSG_NG;</a>
+<a name="ln923">    }</a>
+<a name="ln924">    /* next prefix */</a>
+<a name="ln925">    length -= requested_pfx_bytes;</a>
+<a name="ln926">    current = (struct ospf6_prefix *) ((caddr_t) current + requested_pfx_bytes);</a>
+<a name="ln927">    real_num_pfxs++;</a>
+<a name="ln928">  }</a>
+<a name="ln929">  if (real_num_pfxs != req_num_pfxs)</a>
+<a name="ln930">  {</a>
+<a name="ln931">    if (IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_UNKNOWN, RECV))</a>
+<a name="ln932">      zlog_debug (&quot;%s: IPv6 prefix number mismatch (%u required, %u real)&quot;,</a>
+<a name="ln933">                  __func__, req_num_pfxs, real_num_pfxs);</a>
+<a name="ln934">    return MSG_NG;</a>
+<a name="ln935">  }</a>
+<a name="ln936">  return MSG_OK;</a>
+<a name="ln937">}</a>
+<a name="ln938"> </a>
+<a name="ln939">/* Verify an LSA to have a valid length and dispatch further (where</a>
+<a name="ln940">   appropriate) to check if the contents, including nested IPv6 prefixes,</a>
+<a name="ln941">   is properly sized/aligned within the LSA. Note that this function gets</a>
+<a name="ln942">   LSA type in network byte order, uses in host byte order and passes to</a>
+<a name="ln943">   ospf6_lstype_name() in network byte order again. */</a>
+<a name="ln944">static unsigned</a>
+<a name="ln945">ospf6_lsa_examin (struct ospf6_lsa_header *lsah, const u_int16_t lsalen, const u_char headeronly)</a>
+<a name="ln946">{</a>
+<a name="ln947">  struct ospf6_intra_prefix_lsa *intra_prefix_lsa;</a>
+<a name="ln948">  struct ospf6_as_external_lsa *as_external_lsa;</a>
+<a name="ln949">  struct ospf6_link_lsa *link_lsa;</a>
+<a name="ln950">  unsigned exp_length;</a>
+<a name="ln951">  u_int8_t ltindex;</a>
+<a name="ln952">  u_int16_t lsatype;</a>
+<a name="ln953"> </a>
+<a name="ln954">  /* In case an additional minimum length constraint is defined for current</a>
+<a name="ln955">     LSA type, make sure that this constraint is met. */</a>
+<a name="ln956">  lsatype = ntohs (lsah-&gt;type);</a>
+<a name="ln957">  ltindex = lsatype &amp; OSPF6_LSTYPE_FCODE_MASK;</a>
+<a name="ln958">  if</a>
+<a name="ln959">  (</a>
+<a name="ln960">    ltindex &lt; OSPF6_LSTYPE_SIZE &amp;&amp;</a>
+<a name="ln961">    ospf6_lsa_minlen[ltindex] &amp;&amp;</a>
+<a name="ln962">    lsalen &lt; ospf6_lsa_minlen[ltindex] + OSPF6_LSA_HEADER_SIZE</a>
+<a name="ln963">  )</a>
+<a name="ln964">  {</a>
+<a name="ln965">    if (IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_UNKNOWN, RECV))</a>
+<a name="ln966">      zlog_debug (&quot;%s: undersized (%u B) LSA&quot;, __func__, lsalen);</a>
+<a name="ln967">    return MSG_NG;</a>
+<a name="ln968">  }</a>
+<a name="ln969">  switch (lsatype)</a>
+<a name="ln970">  {</a>
+<a name="ln971">  case OSPF6_LSTYPE_ROUTER:</a>
+<a name="ln972">    /* RFC5340 A.4.3, LSA header + OSPF6_ROUTER_LSA_MIN_SIZE bytes followed</a>
+<a name="ln973">       by N&gt;=0 interface descriptions. */</a>
+<a name="ln974">    if ((lsalen - OSPF6_LSA_HEADER_SIZE - OSPF6_ROUTER_LSA_MIN_SIZE) % OSPF6_ROUTER_LSDESC_FIX_SIZE)</a>
+<a name="ln975">    {</a>
+<a name="ln976">      if (IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_UNKNOWN, RECV))</a>
+<a name="ln977">        zlog_debug (&quot;%s: interface description alignment error&quot;, __func__);</a>
+<a name="ln978">      return MSG_NG;</a>
+<a name="ln979">    }</a>
+<a name="ln980">    break;</a>
+<a name="ln981">  case OSPF6_LSTYPE_NETWORK:</a>
+<a name="ln982">    /* RFC5340 A.4.4, LSA header + OSPF6_NETWORK_LSA_MIN_SIZE bytes</a>
+<a name="ln983">       followed by N&gt;=0 attached router descriptions. */</a>
+<a name="ln984">    if ((lsalen - OSPF6_LSA_HEADER_SIZE - OSPF6_NETWORK_LSA_MIN_SIZE) % OSPF6_NETWORK_LSDESC_FIX_SIZE)</a>
+<a name="ln985">    {</a>
+<a name="ln986">      if (IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_UNKNOWN, RECV))</a>
+<a name="ln987">        zlog_debug (&quot;%s: router description alignment error&quot;, __func__);</a>
+<a name="ln988">      return MSG_NG;</a>
+<a name="ln989">    }</a>
+<a name="ln990">    break;</a>
+<a name="ln991">  case OSPF6_LSTYPE_INTER_PREFIX:</a>
+<a name="ln992">    /* RFC5340 A.4.5, LSA header + OSPF6_INTER_PREFIX_LSA_MIN_SIZE bytes</a>
+<a name="ln993">       followed by 3-4 fields of a single IPv6 prefix. */</a>
+<a name="ln994">    if (headeronly)</a>
+<a name="ln995">      break;</a>
+<a name="ln996">    return ospf6_prefixes_examin</a>
+<a name="ln997">    (</a>
+<a name="ln998">      (struct ospf6_prefix *) ((caddr_t) lsah + OSPF6_LSA_HEADER_SIZE + OSPF6_INTER_PREFIX_LSA_MIN_SIZE),</a>
+<a name="ln999">      lsalen - OSPF6_LSA_HEADER_SIZE - OSPF6_INTER_PREFIX_LSA_MIN_SIZE,</a>
+<a name="ln1000">      1</a>
+<a name="ln1001">    );</a>
+<a name="ln1002">  case OSPF6_LSTYPE_INTER_ROUTER:</a>
+<a name="ln1003">    /* RFC5340 A.4.6, fixed-size LSA. */</a>
+<a name="ln1004">    if (lsalen &gt; OSPF6_LSA_HEADER_SIZE + OSPF6_INTER_ROUTER_LSA_FIX_SIZE)</a>
+<a name="ln1005">    {</a>
+<a name="ln1006">      if (IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_UNKNOWN, RECV))</a>
+<a name="ln1007">        zlog_debug (&quot;%s: oversized (%u B) LSA&quot;, __func__, lsalen);</a>
+<a name="ln1008">      return MSG_NG;</a>
+<a name="ln1009">    }</a>
+<a name="ln1010">    break;</a>
+<a name="ln1011">  case OSPF6_LSTYPE_AS_EXTERNAL: /* RFC5340 A.4.7, same as A.4.8. */</a>
+<a name="ln1012">  case OSPF6_LSTYPE_TYPE_7:</a>
+<a name="ln1013">    /* RFC5340 A.4.8, LSA header + OSPF6_AS_EXTERNAL_LSA_MIN_SIZE bytes</a>
+<a name="ln1014">       followed by 3-4 fields of IPv6 prefix and 3 conditional LSA fields:</a>
+<a name="ln1015">       16 bytes of forwarding address, 4 bytes of external route tag,</a>
+<a name="ln1016">       4 bytes of referenced link state ID. */</a>
+<a name="ln1017">    if (headeronly)</a>
+<a name="ln1018">      break;</a>
+<a name="ln1019">    as_external_lsa = (struct ospf6_as_external_lsa *) ((caddr_t) lsah + OSPF6_LSA_HEADER_SIZE);</a>
+<a name="ln1020">    exp_length = OSPF6_LSA_HEADER_SIZE + OSPF6_AS_EXTERNAL_LSA_MIN_SIZE;</a>
+<a name="ln1021">    /* To find out if the last optional field (Referenced Link State ID) is</a>
+<a name="ln1022">       assumed in this LSA, we need to access fixed fields of the IPv6</a>
+<a name="ln1023">       prefix before ospf6_prefix_examin() confirms its sizing. */</a>
+<a name="ln1024">    if (exp_length + OSPF6_PREFIX_MIN_SIZE &gt; lsalen)</a>
+<a name="ln1025">    {</a>
+<a name="ln1026">      if (IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_UNKNOWN, RECV))</a>
+<a name="ln1027">        zlog_debug (&quot;%s: undersized (%u B) LSA header&quot;, __func__, lsalen);</a>
+<a name="ln1028">      return MSG_NG;</a>
+<a name="ln1029">    }</a>
+<a name="ln1030">    /* forwarding address */</a>
+<a name="ln1031">    if (CHECK_FLAG (as_external_lsa-&gt;bits_metric, OSPF6_ASBR_BIT_F))</a>
+<a name="ln1032">      exp_length += 16;</a>
+<a name="ln1033">    /* external route tag */</a>
+<a name="ln1034">    if (CHECK_FLAG (as_external_lsa-&gt;bits_metric, OSPF6_ASBR_BIT_T))</a>
+<a name="ln1035">      exp_length += 4;</a>
+<a name="ln1036">    /* referenced link state ID */</a>
+<a name="ln1037">    if (as_external_lsa-&gt;prefix.u._prefix_referenced_lstype)</a>
+<a name="ln1038">      exp_length += 4;</a>
+<a name="ln1039">    /* All the fixed-size fields (mandatory and optional) must fit. I.e.,</a>
+<a name="ln1040">       this check does not include any IPv6 prefix fields. */</a>
+<a name="ln1041">    if (exp_length &gt; lsalen)</a>
+<a name="ln1042">    {</a>
+<a name="ln1043">      if (IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_UNKNOWN, RECV))</a>
+<a name="ln1044">        zlog_debug (&quot;%s: undersized (%u B) LSA header&quot;, __func__, lsalen);</a>
+<a name="ln1045">      return MSG_NG;</a>
+<a name="ln1046">    }</a>
+<a name="ln1047">    /* The last call completely covers the remainder (IPv6 prefix). */</a>
+<a name="ln1048">    return ospf6_prefixes_examin</a>
+<a name="ln1049">    (</a>
+<a name="ln1050">      (struct ospf6_prefix *) ((caddr_t) as_external_lsa + OSPF6_AS_EXTERNAL_LSA_MIN_SIZE),</a>
+<a name="ln1051">      lsalen - exp_length,</a>
+<a name="ln1052">      1</a>
+<a name="ln1053">    );</a>
+<a name="ln1054">  case OSPF6_LSTYPE_LINK:</a>
+<a name="ln1055">    /* RFC5340 A.4.9, LSA header + OSPF6_LINK_LSA_MIN_SIZE bytes followed</a>
+<a name="ln1056">       by N&gt;=0 IPv6 prefix blocks (with N declared beforehand). */</a>
+<a name="ln1057">    if (headeronly)</a>
+<a name="ln1058">      break;</a>
+<a name="ln1059">    link_lsa = (struct ospf6_link_lsa *) ((caddr_t) lsah + OSPF6_LSA_HEADER_SIZE);</a>
+<a name="ln1060">    return ospf6_prefixes_examin</a>
+<a name="ln1061">    (</a>
+<a name="ln1062">      (struct ospf6_prefix *) ((caddr_t) link_lsa + OSPF6_LINK_LSA_MIN_SIZE),</a>
+<a name="ln1063">      lsalen - OSPF6_LSA_HEADER_SIZE - OSPF6_LINK_LSA_MIN_SIZE,</a>
+<a name="ln1064">      ntohl (link_lsa-&gt;prefix_num) /* 32 bits */</a>
+<a name="ln1065">    );</a>
+<a name="ln1066">  case OSPF6_LSTYPE_INTRA_PREFIX:</a>
+<a name="ln1067">  /* RFC5340 A.4.10, LSA header + OSPF6_INTRA_PREFIX_LSA_MIN_SIZE bytes</a>
+<a name="ln1068">     followed by N&gt;=0 IPv6 prefixes (with N declared beforehand). */</a>
+<a name="ln1069">    if (headeronly)</a>
+<a name="ln1070">      break;</a>
+<a name="ln1071">    intra_prefix_lsa = (struct ospf6_intra_prefix_lsa *) ((caddr_t) lsah + OSPF6_LSA_HEADER_SIZE);</a>
+<a name="ln1072">    return ospf6_prefixes_examin</a>
+<a name="ln1073">    (</a>
+<a name="ln1074">      (struct ospf6_prefix *) ((caddr_t) intra_prefix_lsa + OSPF6_INTRA_PREFIX_LSA_MIN_SIZE),</a>
+<a name="ln1075">      lsalen - OSPF6_LSA_HEADER_SIZE - OSPF6_INTRA_PREFIX_LSA_MIN_SIZE,</a>
+<a name="ln1076">      ntohs (intra_prefix_lsa-&gt;prefix_num) /* 16 bits */</a>
+<a name="ln1077">    );</a>
+<a name="ln1078">  }</a>
+<a name="ln1079">  /* No additional validation is possible for unknown LSA types, which are</a>
+<a name="ln1080">     themselves valid in OPSFv3, hence the default decision is to accept. */</a>
+<a name="ln1081">  return MSG_OK;</a>
+<a name="ln1082">}</a>
+<a name="ln1083"> </a>
+<a name="ln1084">/* Verify if the provided input buffer is a valid sequence of LSAs. This</a>
+<a name="ln1085">   includes verification of LSA blocks length/alignment and dispatching</a>
+<a name="ln1086">   of deeper-level checks. */</a>
+<a name="ln1087">static unsigned</a>
+<a name="ln1088">ospf6_lsaseq_examin</a>
+<a name="ln1089">(</a>
+<a name="ln1090">  struct ospf6_lsa_header *lsah, /* start of buffered data */</a>
+<a name="ln1091">  size_t length,</a>
+<a name="ln1092">  const u_char headeronly,</a>
+<a name="ln1093">  /* When declared_num_lsas is not 0, compare it to the real number of LSAs</a>
+<a name="ln1094">     and treat the difference as an error. */</a>
+<a name="ln1095">  const u_int32_t declared_num_lsas</a>
+<a name="ln1096">)</a>
+<a name="ln1097">{</a>
+<a name="ln1098">  u_int32_t counted_lsas = 0;</a>
+<a name="ln1099"> </a>
+<a name="ln1100">  while (length)</a>
+<a name="ln1101">  {</a>
+<a name="ln1102">    u_int16_t lsalen;</a>
+<a name="ln1103">    if (length &lt; OSPF6_LSA_HEADER_SIZE)</a>
+<a name="ln1104">    {</a>
+<a name="ln1105">      if (IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_UNKNOWN, RECV))</a>
+<a name="ln1106">        zlog_debug (&quot;%s: undersized (%zu B) trailing (#%u) LSA header&quot;,</a>
+<a name="ln1107">                    __func__, length, counted_lsas);</a>
+<a name="ln1108">      return MSG_NG;</a>
+<a name="ln1109">    }</a>
+<a name="ln1110">    /* save on ntohs() calls here and in the LSA validator */</a>
+<a name="ln1111">    lsalen = OSPF6_LSA_SIZE (lsah);</a>
+<a name="ln1112">    if (lsalen &lt; OSPF6_LSA_HEADER_SIZE)</a>
+<a name="ln1113">    {</a>
+<a name="ln1114">      if (IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_UNKNOWN, RECV))</a>
+<a name="ln1115">        zlog_debug (&quot;%s: malformed LSA header #%u, declared length is %u B&quot;,</a>
+<a name="ln1116">                    __func__, counted_lsas, lsalen);</a>
+<a name="ln1117">      return MSG_NG;</a>
+<a name="ln1118">    }</a>
+<a name="ln1119">    if (headeronly)</a>
+<a name="ln1120">    {</a>
+<a name="ln1121">      /* less checks here and in ospf6_lsa_examin() */</a>
+<a name="ln1122">      if (MSG_OK != ospf6_lsa_examin (lsah, lsalen, 1))</a>
+<a name="ln1123">      {</a>
+<a name="ln1124">        if (IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_UNKNOWN, RECV))</a>
+<a name="ln1125">          zlog_debug (&quot;%s: anomaly in header-only %s LSA #%u&quot;, __func__,</a>
+<a name="ln1126">                      ospf6_lstype_name (lsah-&gt;type), counted_lsas);</a>
+<a name="ln1127">        return MSG_NG;</a>
+<a name="ln1128">      }</a>
+<a name="ln1129">      lsah = (struct ospf6_lsa_header *) ((caddr_t) lsah + OSPF6_LSA_HEADER_SIZE);</a>
+<a name="ln1130">      length -= OSPF6_LSA_HEADER_SIZE;</a>
+<a name="ln1131">    }</a>
+<a name="ln1132">    else</a>
+<a name="ln1133">    {</a>
+<a name="ln1134">      /* make sure the input buffer is deep enough before further checks */</a>
+<a name="ln1135">      if (lsalen &gt; length)</a>
+<a name="ln1136">      {</a>
+<a name="ln1137">        if (IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_UNKNOWN, RECV))</a>
+<a name="ln1138">          zlog_debug (&quot;%s: anomaly in %s LSA #%u: declared length is %u B, buffered length is %zu B&quot;,</a>
+<a name="ln1139">                      __func__, ospf6_lstype_name (lsah-&gt;type), counted_lsas, lsalen, length);</a>
+<a name="ln1140">        return MSG_NG;</a>
+<a name="ln1141">      }</a>
+<a name="ln1142">      if (MSG_OK != ospf6_lsa_examin (lsah, lsalen, 0))</a>
+<a name="ln1143">      {</a>
+<a name="ln1144">        if (IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_UNKNOWN, RECV))</a>
+<a name="ln1145">          zlog_debug (&quot;%s: anomaly in %s LSA #%u&quot;, __func__,</a>
+<a name="ln1146">                      ospf6_lstype_name (lsah-&gt;type), counted_lsas);</a>
+<a name="ln1147">        return MSG_NG;</a>
+<a name="ln1148">      }</a>
+<a name="ln1149">      lsah = (struct ospf6_lsa_header *) ((caddr_t) lsah + lsalen);</a>
+<a name="ln1150">      length -= lsalen;</a>
+<a name="ln1151">    }</a>
+<a name="ln1152">    counted_lsas++;</a>
+<a name="ln1153">  }</a>
+<a name="ln1154"> </a>
+<a name="ln1155">  if (declared_num_lsas &amp;&amp; counted_lsas != declared_num_lsas)</a>
+<a name="ln1156">  {</a>
+<a name="ln1157">    if (IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_UNKNOWN, RECV))</a>
+<a name="ln1158">      zlog_debug (&quot;%s: #LSAs declared (%u) does not match actual (%u)&quot;,</a>
+<a name="ln1159">                  __func__, declared_num_lsas, counted_lsas);</a>
+<a name="ln1160">    return MSG_NG;</a>
+<a name="ln1161">  }</a>
+<a name="ln1162">  return MSG_OK;</a>
+<a name="ln1163">}</a>
+<a name="ln1164"> </a>
+<a name="ln1165">/* Verify a complete OSPF packet for proper sizing/alignment. */</a>
+<a name="ln1166">static unsigned</a>
+<a name="ln1167">ospf6_packet_examin (struct ospf6_header *oh, const unsigned bytesonwire)</a>
+<a name="ln1168">{</a>
+<a name="ln1169">  struct ospf6_lsupdate *lsupd;</a>
+<a name="ln1170">  unsigned test;</a>
+<a name="ln1171"> </a>
+<a name="ln1172">  /* length, 1st approximation */</a>
+<a name="ln1173">  if (bytesonwire &lt; OSPF6_HEADER_SIZE)</a>
+<a name="ln1174">  {</a>
+<a name="ln1175">    if (IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_UNKNOWN, RECV))</a>
+<a name="ln1176">      zlog_debug (&quot;%s: undersized (%u B) packet&quot;, __func__, bytesonwire);</a>
+<a name="ln1177">    return MSG_NG;</a>
+<a name="ln1178">  }</a>
+<a name="ln1179">  /* Now it is safe to access header fields. */</a>
+<a name="ln1180">  if (bytesonwire != ntohs (oh-&gt;length))</a>
+<a name="ln1181">  {</a>
+<a name="ln1182">    if (IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_UNKNOWN, RECV))</a>
+<a name="ln1183">      zlog_debug (&quot;%s: packet length error (%u real, %u declared)&quot;,</a>
+<a name="ln1184">                  __func__, bytesonwire, ntohs (oh-&gt;length));</a>
+<a name="ln1185">    return MSG_NG;</a>
+<a name="ln1186">  }</a>
+<a name="ln1187">  /* version check */</a>
+<a name="ln1188">  if (oh-&gt;version != OSPFV3_VERSION)</a>
+<a name="ln1189">  {</a>
+<a name="ln1190">    if (IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_UNKNOWN, RECV))</a>
+<a name="ln1191">      zlog_debug (&quot;%s: invalid (%u) protocol version&quot;, __func__, oh-&gt;version);</a>
+<a name="ln1192">    return MSG_NG;</a>
+<a name="ln1193">  }</a>
+<a name="ln1194">  /* length, 2nd approximation */</a>
+<a name="ln1195">  if</a>
+<a name="ln1196">  (</a>
+<a name="ln1197">    oh-&gt;type &lt; OSPF6_MESSAGE_TYPE_ALL &amp;&amp;</a>
+<a name="ln1198">    ospf6_packet_minlen[oh-&gt;type] &amp;&amp;</a>
+<a name="ln1199">    bytesonwire &lt; OSPF6_HEADER_SIZE + ospf6_packet_minlen[oh-&gt;type]</a>
+<a name="ln1200">  )</a>
+<a name="ln1201">  {</a>
+<a name="ln1202">    if (IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_UNKNOWN, RECV))</a>
+<a name="ln1203">      zlog_debug (&quot;%s: undersized (%u B) %s packet&quot;, __func__,</a>
+<a name="ln1204">                  bytesonwire, LOOKUP (ospf6_message_type_str, oh-&gt;type));</a>
+<a name="ln1205">    return MSG_NG;</a>
+<a name="ln1206">  }</a>
+<a name="ln1207">  /* type-specific deeper validation */</a>
+<a name="ln1208">  switch (oh-&gt;type)</a>
+<a name="ln1209">  {</a>
+<a name="ln1210">  case OSPF6_MESSAGE_TYPE_HELLO:</a>
+<a name="ln1211">    /* RFC5340 A.3.2, packet header + OSPF6_HELLO_MIN_SIZE bytes followed</a>
+<a name="ln1212">       by N&gt;=0 router-IDs. */</a>
+<a name="ln1213">    if (0 == (bytesonwire - OSPF6_HEADER_SIZE - OSPF6_HELLO_MIN_SIZE) % 4)</a>
+<a name="ln1214">      return MSG_OK;</a>
+<a name="ln1215">    if (IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_UNKNOWN, RECV))</a>
+<a name="ln1216">      zlog_debug (&quot;%s: alignment error in %s packet&quot;,</a>
+<a name="ln1217">                  __func__, LOOKUP (ospf6_message_type_str, oh-&gt;type));</a>
+<a name="ln1218">    return MSG_NG;</a>
+<a name="ln1219">  case OSPF6_MESSAGE_TYPE_DBDESC:</a>
+<a name="ln1220">    /* RFC5340 A.3.3, packet header + OSPF6_DB_DESC_MIN_SIZE bytes followed</a>
+<a name="ln1221">       by N&gt;=0 header-only LSAs. */</a>
+<a name="ln1222">    test = ospf6_lsaseq_examin</a>
+<a name="ln1223">    (</a>
+<a name="ln1224">      (struct ospf6_lsa_header *) ((caddr_t) oh + OSPF6_HEADER_SIZE + OSPF6_DB_DESC_MIN_SIZE),</a>
+<a name="ln1225">      bytesonwire - OSPF6_HEADER_SIZE - OSPF6_DB_DESC_MIN_SIZE,</a>
+<a name="ln1226">      1,</a>
+<a name="ln1227">      0</a>
+<a name="ln1228">    );</a>
+<a name="ln1229">    break;</a>
+<a name="ln1230">  case OSPF6_MESSAGE_TYPE_LSREQ:</a>
+<a name="ln1231">    /* RFC5340 A.3.4, packet header + N&gt;=0 LS description blocks. */</a>
+<a name="ln1232">    if (0 == (bytesonwire - OSPF6_HEADER_SIZE - OSPF6_LS_REQ_MIN_SIZE) % OSPF6_LSREQ_LSDESC_FIX_SIZE)</a>
+<a name="ln1233">      return MSG_OK;</a>
+<a name="ln1234">    if (IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_UNKNOWN, RECV))</a>
+<a name="ln1235">      zlog_debug (&quot;%s: alignment error in %s packet&quot;,</a>
+<a name="ln1236">                  __func__, LOOKUP (ospf6_message_type_str, oh-&gt;type));</a>
+<a name="ln1237">    return MSG_NG;</a>
+<a name="ln1238">  case OSPF6_MESSAGE_TYPE_LSUPDATE:</a>
+<a name="ln1239">    /* RFC5340 A.3.5, packet header + OSPF6_LS_UPD_MIN_SIZE bytes followed</a>
+<a name="ln1240">       by N&gt;=0 full LSAs (with N declared beforehand). */</a>
+<a name="ln1241">    lsupd = (struct ospf6_lsupdate *) ((caddr_t) oh + OSPF6_HEADER_SIZE);</a>
+<a name="ln1242">    test = ospf6_lsaseq_examin</a>
+<a name="ln1243">    (</a>
+<a name="ln1244">      (struct ospf6_lsa_header *) ((caddr_t) lsupd + OSPF6_LS_UPD_MIN_SIZE),</a>
+<a name="ln1245">      bytesonwire - OSPF6_HEADER_SIZE - OSPF6_LS_UPD_MIN_SIZE,</a>
+<a name="ln1246">      0,</a>
+<a name="ln1247">      ntohl (lsupd-&gt;lsa_number) /* 32 bits */</a>
+<a name="ln1248">    );</a>
+<a name="ln1249">    break;</a>
+<a name="ln1250">  case OSPF6_MESSAGE_TYPE_LSACK:</a>
+<a name="ln1251">    /* RFC5340 A.3.6, packet header + N&gt;=0 header-only LSAs. */</a>
+<a name="ln1252">    test = ospf6_lsaseq_examin</a>
+<a name="ln1253">    (</a>
+<a name="ln1254">      (struct ospf6_lsa_header *) ((caddr_t) oh + OSPF6_HEADER_SIZE + OSPF6_LS_ACK_MIN_SIZE),</a>
+<a name="ln1255">      bytesonwire - OSPF6_HEADER_SIZE - OSPF6_LS_ACK_MIN_SIZE,</a>
+<a name="ln1256">      1,</a>
+<a name="ln1257">      0</a>
+<a name="ln1258">    );</a>
+<a name="ln1259">    break;</a>
+<a name="ln1260">  default:</a>
+<a name="ln1261">    if (IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_UNKNOWN, RECV))</a>
+<a name="ln1262">      zlog_debug (&quot;%s: invalid (%u) message type&quot;, __func__, oh-&gt;type);</a>
+<a name="ln1263">    return MSG_NG;</a>
+<a name="ln1264">  }</a>
+<a name="ln1265">  if (test != MSG_OK &amp;&amp; IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_UNKNOWN, RECV))</a>
+<a name="ln1266">    zlog_debug (&quot;%s: anomaly in %s packet&quot;, __func__, LOOKUP (ospf6_message_type_str, oh-&gt;type));</a>
+<a name="ln1267">  return test;</a>
+<a name="ln1268">}</a>
+<a name="ln1269"> </a>
+<a name="ln1270">/* Verify particular fields of otherwise correct received OSPF packet to</a>
+<a name="ln1271">   meet the requirements of RFC. */</a>
+<a name="ln1272">static int</a>
+<a name="ln1273">ospf6_rxpacket_examin (struct ospf6_interface *oi, struct ospf6_header *oh, const unsigned bytesonwire)</a>
+<a name="ln1274">{</a>
+<a name="ln1275">  char buf[2][INET_ADDRSTRLEN];</a>
+<a name="ln1276"> </a>
+<a name="ln1277">  if (MSG_OK != ospf6_packet_examin (oh, bytesonwire))</a>
+<a name="ln1278">    return MSG_NG;</a>
+<a name="ln1279"> </a>
+<a name="ln1280">  /* Area-ID check */</a>
+<a name="ln1281">  if (oh-&gt;area_id != oi-&gt;area-&gt;area_id)</a>
+<a name="ln1282">  {</a>
+<a name="ln1283">    if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln1284">    {</a>
+<a name="ln1285">      if (oh-&gt;area_id == OSPF_AREA_BACKBONE)</a>
+<a name="ln1286">        zlog_debug (&quot;%s: Message may be via Virtual Link: not supported&quot;, __func__);</a>
+<a name="ln1287">      else</a>
+<a name="ln1288">        zlog_debug</a>
+<a name="ln1289">        (</a>
+<a name="ln1290">          &quot;%s: Area-ID mismatch (my %s, rcvd %s)&quot;, __func__,</a>
+<a name="ln1291">          inet_ntop (AF_INET, &amp;oi-&gt;area-&gt;area_id, buf[0], INET_ADDRSTRLEN),</a>
+<a name="ln1292">          inet_ntop (AF_INET, &amp;oh-&gt;area_id, buf[1], INET_ADDRSTRLEN)</a>
+<a name="ln1293">         );</a>
+<a name="ln1294">    }</a>
+<a name="ln1295">    return MSG_NG;</a>
+<a name="ln1296">  }</a>
+<a name="ln1297"> </a>
+<a name="ln1298">  /* Instance-ID check */</a>
+<a name="ln1299">  if (oh-&gt;instance_id != oi-&gt;instance_id)</a>
+<a name="ln1300">  {</a>
+<a name="ln1301">    if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln1302">      zlog_debug (&quot;%s: Instance-ID mismatch (my %u, rcvd %u)&quot;, __func__, oi-&gt;instance_id, oh-&gt;instance_id);</a>
+<a name="ln1303">    return MSG_NG;</a>
+<a name="ln1304">  }</a>
+<a name="ln1305"> </a>
+<a name="ln1306">  /* Router-ID check */</a>
+<a name="ln1307">  if (oh-&gt;router_id == oi-&gt;area-&gt;ospf6-&gt;router_id)</a>
+<a name="ln1308">  {</a>
+<a name="ln1309">    zlog_warn (&quot;%s: Duplicate Router-ID (%s)&quot;, __func__, inet_ntop (AF_INET, &amp;oh-&gt;router_id, buf[0], INET_ADDRSTRLEN));</a>
+<a name="ln1310">    return MSG_NG;</a>
+<a name="ln1311">  }</a>
+<a name="ln1312">  return MSG_OK;</a>
+<a name="ln1313">}</a>
+<a name="ln1314"> </a>
+<a name="ln1315">static void</a>
+<a name="ln1316">ospf6_lsupdate_recv (struct in6_addr *src, struct in6_addr *dst,</a>
+<a name="ln1317">                     struct ospf6_interface *oi, struct ospf6_header *oh)</a>
+<a name="ln1318">{</a>
+<a name="ln1319">  struct ospf6_neighbor *on;</a>
+<a name="ln1320">  struct ospf6_lsupdate *lsupdate;</a>
+<a name="ln1321">  char *p;</a>
+<a name="ln1322"> </a>
+<a name="ln1323">  on = ospf6_neighbor_lookup (oh-&gt;router_id, oi);</a>
+<a name="ln1324">  if (on == NULL)</a>
+<a name="ln1325">    {</a>
+<a name="ln1326">      if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln1327">        zlog_debug (&quot;Neighbor not found, ignore&quot;);</a>
+<a name="ln1328">      return;</a>
+<a name="ln1329">    }</a>
+<a name="ln1330"> </a>
+<a name="ln1331">  if (on-&gt;state != OSPF6_NEIGHBOR_EXCHANGE &amp;&amp;</a>
+<a name="ln1332">      on-&gt;state != OSPF6_NEIGHBOR_LOADING &amp;&amp;</a>
+<a name="ln1333">      on-&gt;state != OSPF6_NEIGHBOR_FULL)</a>
+<a name="ln1334">    {</a>
+<a name="ln1335">      if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln1336">        zlog_debug (&quot;Neighbor state less than Exchange, ignore&quot;);</a>
+<a name="ln1337">      return;</a>
+<a name="ln1338">    }</a>
+<a name="ln1339"> </a>
+<a name="ln1340">  lsupdate = (struct ospf6_lsupdate *)</a>
+<a name="ln1341">    ((caddr_t) oh + sizeof (struct ospf6_header));</a>
+<a name="ln1342"> </a>
+<a name="ln1343">  /* Process LSAs */</a>
+<a name="ln1344">  for (p = (char *) ((caddr_t) lsupdate + sizeof (struct ospf6_lsupdate));</a>
+<a name="ln1345">       p &lt; OSPF6_MESSAGE_END (oh) &amp;&amp;</a>
+<a name="ln1346">       p + OSPF6_LSA_SIZE (p) &lt;= OSPF6_MESSAGE_END (oh);</a>
+<a name="ln1347">       p += OSPF6_LSA_SIZE (p))</a>
+<a name="ln1348">    {</a>
+<a name="ln1349">      ospf6_receive_lsa (on, (struct ospf6_lsa_header *) p);</a>
+<a name="ln1350">    }</a>
+<a name="ln1351"> </a>
+<a name="ln1352">  assert (p == OSPF6_MESSAGE_END (oh));</a>
+<a name="ln1353"> </a>
+<a name="ln1354">}</a>
+<a name="ln1355"> </a>
+<a name="ln1356">static void</a>
+<a name="ln1357">ospf6_lsack_recv (struct in6_addr *src, struct in6_addr *dst,</a>
+<a name="ln1358">                  struct ospf6_interface *oi, struct ospf6_header *oh)</a>
+<a name="ln1359">{</a>
+<a name="ln1360">  struct ospf6_neighbor *on;</a>
+<a name="ln1361">  char *p;</a>
+<a name="ln1362">  struct ospf6_lsa *his, *mine;</a>
+<a name="ln1363">  struct ospf6_lsdb *lsdb = NULL;</a>
+<a name="ln1364"> </a>
+<a name="ln1365">  assert (oh-&gt;type == OSPF6_MESSAGE_TYPE_LSACK);</a>
+<a name="ln1366"> </a>
+<a name="ln1367">  on = ospf6_neighbor_lookup (oh-&gt;router_id, oi);</a>
+<a name="ln1368">  if (on == NULL)</a>
+<a name="ln1369">    {</a>
+<a name="ln1370">      if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln1371">        zlog_debug (&quot;Neighbor not found, ignore&quot;);</a>
+<a name="ln1372">      return;</a>
+<a name="ln1373">    }</a>
+<a name="ln1374"> </a>
+<a name="ln1375">  if (on-&gt;state != OSPF6_NEIGHBOR_EXCHANGE &amp;&amp;</a>
+<a name="ln1376">      on-&gt;state != OSPF6_NEIGHBOR_LOADING &amp;&amp;</a>
+<a name="ln1377">      on-&gt;state != OSPF6_NEIGHBOR_FULL)</a>
+<a name="ln1378">    {</a>
+<a name="ln1379">      if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln1380">        zlog_debug (&quot;Neighbor state less than Exchange, ignore&quot;);</a>
+<a name="ln1381">      return;</a>
+<a name="ln1382">    }</a>
+<a name="ln1383"> </a>
+<a name="ln1384">  for (p = (char *) ((caddr_t) oh + sizeof (struct ospf6_header));</a>
+<a name="ln1385">       p + sizeof (struct ospf6_lsa_header) &lt;= OSPF6_MESSAGE_END (oh);</a>
+<a name="ln1386">       p += sizeof (struct ospf6_lsa_header))</a>
+<a name="ln1387">    {</a>
+<a name="ln1388">      his = ospf6_lsa_create_headeronly ((struct ospf6_lsa_header *) p);</a>
+<a name="ln1389"> </a>
+<a name="ln1390">      switch (OSPF6_LSA_SCOPE (his-&gt;header-&gt;type))</a>
+<a name="ln1391">        {</a>
+<a name="ln1392">        case OSPF6_SCOPE_LINKLOCAL:</a>
+<a name="ln1393">          lsdb = on-&gt;ospf6_if-&gt;lsdb;</a>
+<a name="ln1394">          break;</a>
+<a name="ln1395">        case OSPF6_SCOPE_AREA:</a>
+<a name="ln1396">          lsdb = on-&gt;ospf6_if-&gt;area-&gt;lsdb;</a>
+<a name="ln1397">          break;</a>
+<a name="ln1398">        case OSPF6_SCOPE_AS:</a>
+<a name="ln1399">          lsdb = on-&gt;ospf6_if-&gt;area-&gt;ospf6-&gt;lsdb;</a>
+<a name="ln1400">          break;</a>
+<a name="ln1401">        case OSPF6_SCOPE_RESERVED:</a>
+<a name="ln1402">          if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln1403">            zlog_debug (&quot;Ignoring LSA of reserved scope&quot;);</a>
+<a name="ln1404">          ospf6_lsa_delete (his);</a>
+<a name="ln1405">          continue;</a>
+<a name="ln1406">          break;</a>
+<a name="ln1407">        }</a>
+<a name="ln1408"> </a>
+<a name="ln1409">      if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln1410">        zlog_debug (&quot;%s acknowledged by %s&quot;, his-&gt;name, on-&gt;name);</a>
+<a name="ln1411"> </a>
+<a name="ln1412">      /* Find database copy */</a>
+<a name="ln1413">      mine = ospf6_lsdb_lookup (his-&gt;header-&gt;type, his-&gt;header-&gt;id,</a>
+<a name="ln1414">                                his-&gt;header-&gt;adv_router, lsdb);</a>
+<a name="ln1415">      if (mine == NULL)</a>
+<a name="ln1416">        {</a>
+<a name="ln1417">          if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln1418">            zlog_debug (&quot;No database copy&quot;);</a>
+<a name="ln1419">          ospf6_lsa_delete (his);</a>
+<a name="ln1420">          continue;</a>
+<a name="ln1421">        }</a>
+<a name="ln1422"> </a>
+<a name="ln1423">      /* Check if the LSA is on his retrans-list */</a>
+<a name="ln1424">      mine = ospf6_lsdb_lookup (his-&gt;header-&gt;type, his-&gt;header-&gt;id,</a>
+<a name="ln1425">                                his-&gt;header-&gt;adv_router, on-&gt;retrans_list);</a>
+<a name="ln1426">      if (mine == NULL)</a>
+<a name="ln1427">        {</a>
+<a name="ln1428">          if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln1429">            zlog_debug (&quot;Not on %s's retrans-list&quot;, on-&gt;name);</a>
+<a name="ln1430">          ospf6_lsa_delete (his);</a>
+<a name="ln1431">          continue;</a>
+<a name="ln1432">        }</a>
+<a name="ln1433"> </a>
+<a name="ln1434">      if (ospf6_lsa_compare (his, mine) != 0)</a>
+<a name="ln1435">        {</a>
+<a name="ln1436">          /* Log this questionable acknowledgement,</a>
+<a name="ln1437">             and examine the next one. */</a>
+<a name="ln1438">          if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln1439">            zlog_debug (&quot;Questionable acknowledgement&quot;);</a>
+<a name="ln1440">          ospf6_lsa_delete (his);</a>
+<a name="ln1441">          continue;</a>
+<a name="ln1442">        }</a>
+<a name="ln1443"> </a>
+<a name="ln1444">      if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln1445">        zlog_debug (&quot;Acknowledged, remove from %s's retrans-list&quot;,</a>
+<a name="ln1446">		    on-&gt;name);</a>
+<a name="ln1447"> </a>
+<a name="ln1448">      ospf6_decrement_retrans_count (mine);</a>
+<a name="ln1449">      if (OSPF6_LSA_IS_MAXAGE (mine))</a>
+<a name="ln1450">        ospf6_maxage_remove (on-&gt;ospf6_if-&gt;area-&gt;ospf6);</a>
+<a name="ln1451">      ospf6_lsdb_remove (mine, on-&gt;retrans_list);</a>
+<a name="ln1452">      ospf6_lsa_delete (his);</a>
+<a name="ln1453">    }</a>
+<a name="ln1454"> </a>
+<a name="ln1455">  assert (p == OSPF6_MESSAGE_END (oh));</a>
+<a name="ln1456">}</a>
+<a name="ln1457"> </a>
+<a name="ln1458">static u_char *recvbuf = NULL;</a>
+<a name="ln1459">static u_char *sendbuf = NULL;</a>
+<a name="ln1460">static unsigned int iobuflen = 0;</a>
+<a name="ln1461"> </a>
+<a name="ln1462">int</a>
+<a name="ln1463">ospf6_iobuf_size (unsigned int size)</a>
+<a name="ln1464">{</a>
+<a name="ln1465">  u_char *recvnew, *sendnew;</a>
+<a name="ln1466"> </a>
+<a name="ln1467">  if (size &lt;= iobuflen)</a>
+<a name="ln1468">    return iobuflen;</a>
+<a name="ln1469"> </a>
+<a name="ln1470">  recvnew = XMALLOC (MTYPE_OSPF6_MESSAGE, size);</a>
+<a name="ln1471">  sendnew = XMALLOC (MTYPE_OSPF6_MESSAGE, size);</a>
+<a name="ln1472">  if (recvnew == NULL || sendnew == NULL)</a>
+<a name="ln1473">    {</a>
+<a name="ln1474">      if (recvnew)</a>
+<a name="ln1475">        XFREE (MTYPE_OSPF6_MESSAGE, recvnew);</a>
+<a name="ln1476">      if (sendnew)</a>
+<a name="ln1477">        XFREE (MTYPE_OSPF6_MESSAGE, sendnew);</a>
+<a name="ln1478">      zlog_debug (&quot;Could not allocate I/O buffer of size %d.&quot;, size);</a>
+<a name="ln1479">      return iobuflen;</a>
+<a name="ln1480">    }</a>
+<a name="ln1481"> </a>
+<a name="ln1482">  if (recvbuf)</a>
+<a name="ln1483">    XFREE (MTYPE_OSPF6_MESSAGE, recvbuf);</a>
+<a name="ln1484">  if (sendbuf)</a>
+<a name="ln1485">    XFREE (MTYPE_OSPF6_MESSAGE, sendbuf);</a>
+<a name="ln1486">  recvbuf = recvnew;</a>
+<a name="ln1487">  sendbuf = sendnew;</a>
+<a name="ln1488">  iobuflen = size;</a>
+<a name="ln1489"> </a>
+<a name="ln1490">  return iobuflen;</a>
+<a name="ln1491">}</a>
+<a name="ln1492"> </a>
+<a name="ln1493">void</a>
+<a name="ln1494">ospf6_message_terminate (void)</a>
+<a name="ln1495">{</a>
+<a name="ln1496">  if (recvbuf)</a>
+<a name="ln1497">    {</a>
+<a name="ln1498">      XFREE (MTYPE_OSPF6_MESSAGE, recvbuf);</a>
+<a name="ln1499">      recvbuf = NULL;</a>
+<a name="ln1500">    }</a>
+<a name="ln1501"> </a>
+<a name="ln1502">  if (sendbuf)</a>
+<a name="ln1503">    {</a>
+<a name="ln1504">      XFREE (MTYPE_OSPF6_MESSAGE, sendbuf);</a>
+<a name="ln1505">      sendbuf = NULL;</a>
+<a name="ln1506">    }</a>
+<a name="ln1507"> </a>
+<a name="ln1508">  iobuflen = 0;</a>
+<a name="ln1509">}</a>
+<a name="ln1510"> </a>
+<a name="ln1511">int</a>
+<a name="ln1512">ospf6_receive (struct thread *thread)</a>
+<a name="ln1513">{</a>
+<a name="ln1514">  int sockfd;</a>
+<a name="ln1515">  unsigned int len;</a>
+<a name="ln1516">  char srcname[64], dstname[64];</a>
+<a name="ln1517">  struct in6_addr src, dst;</a>
+<a name="ln1518">  ifindex_t ifindex;</a>
+<a name="ln1519">  struct iovec iovector[2];</a>
+<a name="ln1520">  struct ospf6_interface *oi;</a>
+<a name="ln1521">  struct ospf6_header *oh;</a>
+<a name="ln1522"> </a>
+<a name="ln1523">  /* add next read thread */</a>
+<a name="ln1524">  sockfd = THREAD_FD (thread);</a>
+<a name="ln1525">  thread_add_read (master, ospf6_receive, NULL, sockfd);</a>
+<a name="ln1526"> </a>
+<a name="ln1527">  /* initialize */</a>
+<a name="ln1528">  memset (&amp;src, 0, sizeof (src));</a>
+<a name="ln1529">  memset (&amp;dst, 0, sizeof (dst));</a>
+<a name="ln1530">  ifindex = 0;</a>
+<a name="ln1531">  memset (recvbuf, 0, iobuflen);</a>
+<a name="ln1532">  iovector[0].iov_base = recvbuf;</a>
+<a name="ln1533">  iovector[0].iov_len = iobuflen;</a>
+<a name="ln1534">  iovector[1].iov_base = NULL;</a>
+<a name="ln1535">  iovector[1].iov_len = 0;</a>
+<a name="ln1536"> </a>
+<a name="ln1537">  /* receive message */</a>
+<a name="ln1538">  len = ospf6_recvmsg (&amp;src, &amp;dst, &amp;ifindex, iovector);</a>
+<a name="ln1539">  if (len &gt; iobuflen)</a>
+<a name="ln1540">    {</a>
+<a name="ln1541">      zlog_err (&quot;Excess message read&quot;);</a>
+<a name="ln1542">      return 0;</a>
+<a name="ln1543">    }</a>
+<a name="ln1544"> </a>
+<a name="ln1545">  oi = ospf6_interface_lookup_by_ifindex (ifindex);</a>
+<a name="ln1546">  if (oi == NULL || oi-&gt;area == NULL || CHECK_FLAG(oi-&gt;flag, OSPF6_INTERFACE_DISABLE))</a>
+<a name="ln1547">    {</a>
+<a name="ln1548">      zlog_debug (&quot;Message received on disabled interface&quot;);</a>
+<a name="ln1549">      return 0;</a>
+<a name="ln1550">    }</a>
+<a name="ln1551">  if (CHECK_FLAG (oi-&gt;flag, OSPF6_INTERFACE_PASSIVE))</a>
+<a name="ln1552">    {</a>
+<a name="ln1553">      if (IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_UNKNOWN, RECV))</a>
+<a name="ln1554">        zlog_debug (&quot;%s: Ignore message on passive interface %s&quot;,</a>
+<a name="ln1555">                    __func__, oi-&gt;interface-&gt;name);</a>
+<a name="ln1556">      return 0;</a>
+<a name="ln1557">    }</a>
+<a name="ln1558"> </a>
+<a name="ln1559">  oh = (struct ospf6_header *) recvbuf;</a>
+<a name="ln1560">  if (ospf6_rxpacket_examin (oi, oh, len) != MSG_OK)</a>
+<a name="ln1561">    return 0;</a>
+<a name="ln1562"> </a>
+<a name="ln1563">  /* Being here means, that no sizing/alignment issues were detected in</a>
+<a name="ln1564">     the input packet. This renders the additional checks performed below</a>
+<a name="ln1565">     and also in the type-specific dispatching functions a dead code,</a>
+<a name="ln1566">     which can be dismissed in a cleanup-focused review round later. */</a>
+<a name="ln1567"> </a>
+<a name="ln1568">  /* Log */</a>
+<a name="ln1569">  if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, RECV))</a>
+<a name="ln1570">    {</a>
+<a name="ln1571">      inet_ntop (AF_INET6, &amp;src, srcname, sizeof (srcname));</a>
+<a name="ln1572">      inet_ntop (AF_INET6, &amp;dst, dstname, sizeof (dstname));</a>
+<a name="ln1573">      zlog_debug (&quot;%s received on %s&quot;,</a>
+<a name="ln1574">                 LOOKUP (ospf6_message_type_str, oh-&gt;type), oi-&gt;interface-&gt;name);</a>
+<a name="ln1575">      zlog_debug (&quot;    src: %s&quot;, srcname);</a>
+<a name="ln1576">      zlog_debug (&quot;    dst: %s&quot;, dstname);</a>
+<a name="ln1577"> </a>
+<a name="ln1578">      switch (oh-&gt;type)</a>
+<a name="ln1579">        {</a>
+<a name="ln1580">          case OSPF6_MESSAGE_TYPE_HELLO:</a>
+<a name="ln1581">            ospf6_hello_print (oh);</a>
+<a name="ln1582">            break;</a>
+<a name="ln1583">          case OSPF6_MESSAGE_TYPE_DBDESC:</a>
+<a name="ln1584">            ospf6_dbdesc_print (oh);</a>
+<a name="ln1585">            break;</a>
+<a name="ln1586">          case OSPF6_MESSAGE_TYPE_LSREQ:</a>
+<a name="ln1587">            ospf6_lsreq_print (oh);</a>
+<a name="ln1588">            break;</a>
+<a name="ln1589">          case OSPF6_MESSAGE_TYPE_LSUPDATE:</a>
+<a name="ln1590">            ospf6_lsupdate_print (oh);</a>
+<a name="ln1591">            break;</a>
+<a name="ln1592">          case OSPF6_MESSAGE_TYPE_LSACK:</a>
+<a name="ln1593">            ospf6_lsack_print (oh);</a>
+<a name="ln1594">            break;</a>
+<a name="ln1595">          default:</a>
+<a name="ln1596">            assert (0);</a>
+<a name="ln1597">        }</a>
+<a name="ln1598">    }</a>
+<a name="ln1599"> </a>
+<a name="ln1600">  switch (oh-&gt;type)</a>
+<a name="ln1601">    {</a>
+<a name="ln1602">      case OSPF6_MESSAGE_TYPE_HELLO:</a>
+<a name="ln1603">        ospf6_hello_recv (&amp;src, &amp;dst, oi, oh);</a>
+<a name="ln1604">        break;</a>
+<a name="ln1605"> </a>
+<a name="ln1606">      case OSPF6_MESSAGE_TYPE_DBDESC:</a>
+<a name="ln1607">        ospf6_dbdesc_recv (&amp;src, &amp;dst, oi, oh);</a>
+<a name="ln1608">        break;</a>
+<a name="ln1609"> </a>
+<a name="ln1610">      case OSPF6_MESSAGE_TYPE_LSREQ:</a>
+<a name="ln1611">        ospf6_lsreq_recv (&amp;src, &amp;dst, oi, oh);</a>
+<a name="ln1612">        break;</a>
+<a name="ln1613"> </a>
+<a name="ln1614">      case OSPF6_MESSAGE_TYPE_LSUPDATE:</a>
+<a name="ln1615">        ospf6_lsupdate_recv (&amp;src, &amp;dst, oi, oh);</a>
+<a name="ln1616">        break;</a>
+<a name="ln1617"> </a>
+<a name="ln1618">      case OSPF6_MESSAGE_TYPE_LSACK:</a>
+<a name="ln1619">        ospf6_lsack_recv (&amp;src, &amp;dst, oi, oh);</a>
+<a name="ln1620">        break;</a>
+<a name="ln1621"> </a>
+<a name="ln1622">      default:</a>
+<a name="ln1623">        assert (0);</a>
+<a name="ln1624">    }</a>
+<a name="ln1625"> </a>
+<a name="ln1626">  return 0;</a>
+<a name="ln1627">}</a>
+<a name="ln1628"> </a>
+<a name="ln1629">static void</a>
+<a name="ln1630">ospf6_send (struct in6_addr *src, struct in6_addr *dst,</a>
+<a name="ln1631">            struct ospf6_interface *oi, struct ospf6_header *oh)</a>
+<a name="ln1632">{</a>
+<a name="ln1633">  unsigned int len;</a>
+<a name="ln1634">  char srcname[64], dstname[64];</a>
+<a name="ln1635">  struct iovec iovector[2];</a>
+<a name="ln1636"> </a>
+<a name="ln1637">  /* initialize */</a>
+<a name="ln1638">  iovector[0].iov_base = (caddr_t) oh;</a>
+<a name="ln1639">  iovector[0].iov_len = ntohs (oh-&gt;length);</a>
+<a name="ln1640">  iovector[1].iov_base = NULL;</a>
+<a name="ln1641">  iovector[1].iov_len = 0;</a>
+<a name="ln1642"> </a>
+<a name="ln1643">  /* fill OSPF header */</a>
+<a name="ln1644">  oh-&gt;version = OSPFV3_VERSION;</a>
+<a name="ln1645">  /* message type must be set before */</a>
+<a name="ln1646">  /* message length must be set before */</a>
+<a name="ln1647">  oh-&gt;router_id = oi-&gt;area-&gt;ospf6-&gt;router_id;</a>
+<a name="ln1648">  oh-&gt;area_id = oi-&gt;area-&gt;area_id;</a>
+<a name="ln1649">  /* checksum is calculated by kernel */</a>
+<a name="ln1650">  oh-&gt;instance_id = oi-&gt;instance_id;</a>
+<a name="ln1651">  oh-&gt;reserved = 0;</a>
+<a name="ln1652"> </a>
+<a name="ln1653">  /* Log */</a>
+<a name="ln1654">  if (IS_OSPF6_DEBUG_MESSAGE (oh-&gt;type, SEND))</a>
+<a name="ln1655">    {</a>
+<a name="ln1656">      inet_ntop (AF_INET6, dst, dstname, sizeof (dstname));</a>
+<a name="ln1657">      if (src)</a>
+<a name="ln1658">        inet_ntop (AF_INET6, src, srcname, sizeof (srcname));</a>
+<a name="ln1659">      else</a>
+<a name="ln1660">        memset (srcname, 0, sizeof (srcname));</a>
+<a name="ln1661">      zlog_debug (&quot;%s send on %s&quot;,</a>
+<a name="ln1662">                 LOOKUP (ospf6_message_type_str, oh-&gt;type), oi-&gt;interface-&gt;name);</a>
+<a name="ln1663">      zlog_debug (&quot;    src: %s&quot;, srcname);</a>
+<a name="ln1664">      zlog_debug (&quot;    dst: %s&quot;, dstname);</a>
+<a name="ln1665"> </a>
+<a name="ln1666">      switch (oh-&gt;type)</a>
+<a name="ln1667">        {</a>
+<a name="ln1668">          case OSPF6_MESSAGE_TYPE_HELLO:</a>
+<a name="ln1669">            ospf6_hello_print (oh);</a>
+<a name="ln1670">            break;</a>
+<a name="ln1671">          case OSPF6_MESSAGE_TYPE_DBDESC:</a>
+<a name="ln1672">            ospf6_dbdesc_print (oh);</a>
+<a name="ln1673">            break;</a>
+<a name="ln1674">          case OSPF6_MESSAGE_TYPE_LSREQ:</a>
+<a name="ln1675">            ospf6_lsreq_print (oh);</a>
+<a name="ln1676">            break;</a>
+<a name="ln1677">          case OSPF6_MESSAGE_TYPE_LSUPDATE:</a>
+<a name="ln1678">            ospf6_lsupdate_print (oh);</a>
+<a name="ln1679">            break;</a>
+<a name="ln1680">          case OSPF6_MESSAGE_TYPE_LSACK:</a>
+<a name="ln1681">            ospf6_lsack_print (oh);</a>
+<a name="ln1682">            break;</a>
+<a name="ln1683">          default:</a>
+<a name="ln1684">            zlog_debug (&quot;Unknown message&quot;);</a>
+<a name="ln1685">            assert (0);</a>
+<a name="ln1686">            break;</a>
+<a name="ln1687">        }</a>
+<a name="ln1688">    }</a>
+<a name="ln1689"> </a>
+<a name="ln1690">  /* send message */</a>
+<a name="ln1691">  len = ospf6_sendmsg (src, dst, &amp;oi-&gt;interface-&gt;ifindex, iovector);</a>
+<a name="ln1692">  if (len != ntohs (oh-&gt;length))</a>
+<a name="ln1693">    zlog_err (&quot;Could not send entire message&quot;);</a>
+<a name="ln1694">}</a>
+<a name="ln1695"> </a>
+<a name="ln1696">static uint32_t</a>
+<a name="ln1697">ospf6_packet_max(struct ospf6_interface *oi)</a>
+<a name="ln1698">{</a>
+<a name="ln1699">  assert (oi-&gt;ifmtu &gt; sizeof (struct ip6_hdr));</a>
+<a name="ln1700">  return oi-&gt;ifmtu - (sizeof (struct ip6_hdr));</a>
+<a name="ln1701">}</a>
+<a name="ln1702"> </a>
+<a name="ln1703">int</a>
+<a name="ln1704">ospf6_hello_send (struct thread *thread)</a>
+<a name="ln1705">{</a>
+<a name="ln1706">  struct ospf6_interface *oi;</a>
+<a name="ln1707">  struct ospf6_header *oh;</a>
+<a name="ln1708">  struct ospf6_hello *hello;</a>
+<a name="ln1709">  u_char *p;</a>
+<a name="ln1710">  struct listnode *node, *nnode;</a>
+<a name="ln1711">  struct ospf6_neighbor *on;</a>
+<a name="ln1712"> </a>
+<a name="ln1713">  oi = (struct ospf6_interface *) THREAD_ARG (thread);</a>
+<a name="ln1714">  oi-&gt;thread_send_hello = (struct thread *) NULL;</a>
+<a name="ln1715"> </a>
+<a name="ln1716">  if (oi-&gt;state &lt;= OSPF6_INTERFACE_DOWN)</a>
+<a name="ln1717">    {</a>
+<a name="ln1718">      if (IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_HELLO, SEND))</a>
+<a name="ln1719">        zlog_debug (&quot;Unable to send Hello on down interface %s&quot;,</a>
+<a name="ln1720">                   oi-&gt;interface-&gt;name);</a>
+<a name="ln1721">      return 0;</a>
+<a name="ln1722">    }</a>
+<a name="ln1723"> </a>
+<a name="ln1724">  if (iobuflen == 0)</a>
+<a name="ln1725">    {</a>
+<a name="ln1726">      zlog_debug (&quot;Unable to send Hello on interface %s iobuflen is 0&quot;,</a>
+<a name="ln1727">                 oi-&gt;interface-&gt;name);</a>
+<a name="ln1728">      return 0;</a>
+<a name="ln1729">    }</a>
+<a name="ln1730"> </a>
+<a name="ln1731">  /* set next thread */</a>
+<a name="ln1732">  oi-&gt;thread_send_hello = thread_add_timer (master, ospf6_hello_send,</a>
+<a name="ln1733">                                            oi, oi-&gt;hello_interval);</a>
+<a name="ln1734"> </a>
+<a name="ln1735">  memset (sendbuf, 0, iobuflen);</a>
+<a name="ln1736">  oh = (struct ospf6_header *) sendbuf;</a>
+<a name="ln1737">  hello = (struct ospf6_hello *)((caddr_t) oh + sizeof (struct ospf6_header));</a>
+<a name="ln1738"> </a>
+<a name="ln1739">  hello-&gt;interface_id = htonl (oi-&gt;interface-&gt;ifindex);</a>
+<a name="ln1740">  hello-&gt;priority = oi-&gt;priority;</a>
+<a name="ln1741">  hello-&gt;options[0] = oi-&gt;area-&gt;options[0];</a>
+<a name="ln1742">  hello-&gt;options[1] = oi-&gt;area-&gt;options[1];</a>
+<a name="ln1743">  hello-&gt;options[2] = oi-&gt;area-&gt;options[2];</a>
+<a name="ln1744">  hello-&gt;hello_interval = htons (oi-&gt;hello_interval);</a>
+<a name="ln1745">  hello-&gt;dead_interval = htons (oi-&gt;dead_interval);</a>
+<a name="ln1746">  hello-&gt;drouter = oi-&gt;drouter;</a>
+<a name="ln1747">  hello-&gt;bdrouter = oi-&gt;bdrouter;</a>
+<a name="ln1748"> </a>
+<a name="ln1749">  p = (u_char *)((caddr_t) hello + sizeof (struct ospf6_hello));</a>
+<a name="ln1750"> </a>
+<a name="ln1751">  for (ALL_LIST_ELEMENTS (oi-&gt;neighbor_list, node, nnode, on))</a>
+<a name="ln1752">    {</a>
+<a name="ln1753">      if (on-&gt;state &lt; OSPF6_NEIGHBOR_INIT)</a>
+<a name="ln1754">        continue;</a>
+<a name="ln1755"> </a>
+<a name="ln1756">      if (p - sendbuf + sizeof (u_int32_t) &gt; ospf6_packet_max(oi))</a>
+<a name="ln1757">        {</a>
+<a name="ln1758">          if (IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_HELLO, SEND))</a>
+<a name="ln1759">            zlog_debug (&quot;sending Hello message: exceeds I/F MTU&quot;);</a>
+<a name="ln1760">          break;</a>
+<a name="ln1761">        }</a>
+<a name="ln1762"> </a>
+<a name="ln1763">      memcpy (p, &amp;on-&gt;router_id, sizeof (u_int32_t));</a>
+<a name="ln1764">      p += sizeof (u_int32_t);</a>
+<a name="ln1765">    }</a>
+<a name="ln1766"> </a>
+<a name="ln1767">  oh-&gt;type = OSPF6_MESSAGE_TYPE_HELLO;</a>
+<a name="ln1768">  oh-&gt;length = htons (p - sendbuf);</a>
+<a name="ln1769"> </a>
+<a name="ln1770">  ospf6_send (oi-&gt;linklocal_addr, &amp;allspfrouters6, oi, oh);</a>
+<a name="ln1771">  return 0;</a>
+<a name="ln1772">}</a>
+<a name="ln1773"> </a>
+<a name="ln1774">int</a>
+<a name="ln1775">ospf6_dbdesc_send (struct thread *thread)</a>
+<a name="ln1776">{</a>
+<a name="ln1777">  struct ospf6_neighbor *on;</a>
+<a name="ln1778">  struct ospf6_header *oh;</a>
+<a name="ln1779">  struct ospf6_dbdesc *dbdesc;</a>
+<a name="ln1780">  u_char *p;</a>
+<a name="ln1781">  struct ospf6_lsa *lsa;</a>
+<a name="ln1782">  struct in6_addr *dst;</a>
+<a name="ln1783"> </a>
+<a name="ln1784">  on = (struct ospf6_neighbor *) THREAD_ARG (thread);</a>
+<a name="ln1785">  on-&gt;thread_send_dbdesc = (struct thread *) NULL;</a>
+<a name="ln1786"> </a>
+<a name="ln1787">  if (on-&gt;state &lt; OSPF6_NEIGHBOR_EXSTART)</a>
+<a name="ln1788">    {</a>
+<a name="ln1789">      if (IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_DBDESC, SEND))</a>
+<a name="ln1790">        zlog_debug (&quot;Quit to send DbDesc to neighbor %s state %s&quot;,</a>
+<a name="ln1791">		    on-&gt;name, ospf6_neighbor_state_str[on-&gt;state]);</a>
+<a name="ln1792">      return 0;</a>
+<a name="ln1793">    }</a>
+<a name="ln1794"> </a>
+<a name="ln1795">  /* set next thread if master */</a>
+<a name="ln1796">  if (CHECK_FLAG (on-&gt;dbdesc_bits, OSPF6_DBDESC_MSBIT))</a>
+<a name="ln1797">    on-&gt;thread_send_dbdesc =</a>
+<a name="ln1798">      thread_add_timer (master, ospf6_dbdesc_send, on,</a>
+<a name="ln1799">                        on-&gt;ospf6_if-&gt;rxmt_interval);</a>
+<a name="ln1800"> </a>
+<a name="ln1801">  memset (sendbuf, 0, iobuflen);</a>
+<a name="ln1802">  oh = (struct ospf6_header *) sendbuf;</a>
+<a name="ln1803">  dbdesc = (struct ospf6_dbdesc *)((caddr_t) oh +</a>
+<a name="ln1804">                                   sizeof (struct ospf6_header));</a>
+<a name="ln1805"> </a>
+<a name="ln1806">  /* if this is initial one, initialize sequence number for DbDesc */</a>
+<a name="ln1807">  if (CHECK_FLAG (on-&gt;dbdesc_bits, OSPF6_DBDESC_IBIT) &amp;&amp;</a>
+<a name="ln1808">      (on-&gt;dbdesc_seqnum == 0))</a>
+<a name="ln1809">    {</a>
+<a name="ln1810">      struct timeval tv;</a>
+<a name="ln1811">      if (quagga_gettime (QUAGGA_CLK_MONOTONIC, &amp;tv) &lt; 0)</a>
+<a name="ln1812">        tv.tv_sec = 1;</a>
+<a name="ln1813">      on-&gt;dbdesc_seqnum = tv.tv_sec;</a>
+<a name="ln1814">    }</a>
+<a name="ln1815"> </a>
+<a name="ln1816">  dbdesc-&gt;options[0] = on-&gt;ospf6_if-&gt;area-&gt;options[0];</a>
+<a name="ln1817">  dbdesc-&gt;options[1] = on-&gt;ospf6_if-&gt;area-&gt;options[1];</a>
+<a name="ln1818">  dbdesc-&gt;options[2] = on-&gt;ospf6_if-&gt;area-&gt;options[2];</a>
+<a name="ln1819">  dbdesc-&gt;ifmtu = htons (on-&gt;ospf6_if-&gt;ifmtu);</a>
+<a name="ln1820">  dbdesc-&gt;bits = on-&gt;dbdesc_bits;</a>
+<a name="ln1821">  dbdesc-&gt;seqnum = htonl (on-&gt;dbdesc_seqnum);</a>
+<a name="ln1822"> </a>
+<a name="ln1823">  /* if this is not initial one, set LSA headers in dbdesc */</a>
+<a name="ln1824">  p = (u_char *)((caddr_t) dbdesc + sizeof (struct ospf6_dbdesc));</a>
+<a name="ln1825">  if (! CHECK_FLAG (on-&gt;dbdesc_bits, OSPF6_DBDESC_IBIT))</a>
+<a name="ln1826">    {</a>
+<a name="ln1827">      for (lsa = ospf6_lsdb_head (on-&gt;dbdesc_list); lsa;</a>
+<a name="ln1828">           lsa = ospf6_lsdb_next (lsa))</a>
+<a name="ln1829">        {</a>
+<a name="ln1830">          ospf6_lsa_age_update_to_send (lsa, on-&gt;ospf6_if-&gt;transdelay);</a>
+<a name="ln1831"> </a>
+<a name="ln1832">          /* MTU check */</a>
+<a name="ln1833">          if (p - sendbuf + sizeof (struct ospf6_lsa_header) &gt;</a>
+<a name="ln1834">              ospf6_packet_max(on-&gt;ospf6_if))</a>
+<a name="ln1835">            {</a>
+<a name="ln1836">              ospf6_lsdb_lsa_unlock (lsa);</a>
+<a name="ln1837">              break;</a>
+<a name="ln1838">            }</a>
+<a name="ln1839">          memcpy (p, lsa-&gt;header, sizeof (struct ospf6_lsa_header));</a>
+<a name="ln1840">          p += sizeof (struct ospf6_lsa_header);</a>
+<a name="ln1841">        }</a>
+<a name="ln1842">    }</a>
+<a name="ln1843"> </a>
+<a name="ln1844">  oh-&gt;type = OSPF6_MESSAGE_TYPE_DBDESC;</a>
+<a name="ln1845">  oh-&gt;length = htons (p - sendbuf);</a>
+<a name="ln1846"> </a>
+<a name="ln1847"> </a>
+<a name="ln1848">  if (on-&gt;ospf6_if-&gt;state == OSPF6_INTERFACE_POINTTOPOINT)</a>
+<a name="ln1849">    dst = &amp;allspfrouters6;</a>
+<a name="ln1850">  else</a>
+<a name="ln1851">    dst = &amp;on-&gt;linklocal_addr;</a>
+<a name="ln1852"> </a>
+<a name="ln1853">  ospf6_send (on-&gt;ospf6_if-&gt;linklocal_addr, dst, on-&gt;ospf6_if, oh);</a>
+<a name="ln1854"> </a>
+<a name="ln1855">  return 0;</a>
+<a name="ln1856">}</a>
+<a name="ln1857"> </a>
+<a name="ln1858">int</a>
+<a name="ln1859">ospf6_dbdesc_send_newone (struct thread *thread)</a>
+<a name="ln1860">{</a>
+<a name="ln1861">  struct ospf6_neighbor *on;</a>
+<a name="ln1862">  struct ospf6_lsa *lsa;</a>
+<a name="ln1863">  unsigned int size = 0;</a>
+<a name="ln1864"> </a>
+<a name="ln1865">  on = (struct ospf6_neighbor *) THREAD_ARG (thread);</a>
+<a name="ln1866">  ospf6_lsdb_remove_all (on-&gt;dbdesc_list);</a>
+<a name="ln1867"> </a>
+<a name="ln1868">  /* move LSAs from summary_list to dbdesc_list (within neighbor structure)</a>
+<a name="ln1869">     so that ospf6_send_dbdesc () can send those LSAs */</a>
+<a name="ln1870">  size = sizeof (struct ospf6_lsa_header) + sizeof (struct ospf6_dbdesc);</a>
+<a name="ln1871">  for (lsa = ospf6_lsdb_head (on-&gt;summary_list); lsa;</a>
+<a name="ln1872">       lsa = ospf6_lsdb_next (lsa))</a>
+<a name="ln1873">    {</a>
+<a name="ln1874">      if (size + sizeof (struct ospf6_lsa_header) &gt; ospf6_packet_max(on-&gt;ospf6_if))</a>
+<a name="ln1875">        {</a>
+<a name="ln1876">          ospf6_lsdb_lsa_unlock (lsa);</a>
+<a name="ln1877">          break;</a>
+<a name="ln1878">        }</a>
+<a name="ln1879"> </a>
+<a name="ln1880">      ospf6_lsdb_add (ospf6_lsa_copy (lsa), on-&gt;dbdesc_list);</a>
+<a name="ln1881">      ospf6_lsdb_remove (lsa, on-&gt;summary_list);</a>
+<a name="ln1882">      size += sizeof (struct ospf6_lsa_header);</a>
+<a name="ln1883">    }</a>
+<a name="ln1884"> </a>
+<a name="ln1885">  if (on-&gt;summary_list-&gt;count == 0)</a>
+<a name="ln1886">    UNSET_FLAG (on-&gt;dbdesc_bits, OSPF6_DBDESC_MBIT);</a>
+<a name="ln1887"> </a>
+<a name="ln1888">  /* If slave, More bit check must be done here */</a>
+<a name="ln1889">  if (! CHECK_FLAG (on-&gt;dbdesc_bits, OSPF6_DBDESC_MSBIT) &amp;&amp; /* Slave */</a>
+<a name="ln1890">      ! CHECK_FLAG (on-&gt;dbdesc_last.bits, OSPF6_DBDESC_MBIT) &amp;&amp;</a>
+<a name="ln1891">      ! CHECK_FLAG (on-&gt;dbdesc_bits, OSPF6_DBDESC_MBIT))</a>
+<a name="ln1892">    thread_add_event (master, exchange_done, on, 0);</a>
+<a name="ln1893"> </a>
+<a name="ln1894">  thread_execute (master, ospf6_dbdesc_send, on, 0);</a>
+<a name="ln1895">  return 0;</a>
+<a name="ln1896">}</a>
+<a name="ln1897"> </a>
+<a name="ln1898">int</a>
+<a name="ln1899">ospf6_lsreq_send (struct thread *thread)</a>
+<a name="ln1900">{</a>
+<a name="ln1901">  struct ospf6_neighbor *on;</a>
+<a name="ln1902">  struct ospf6_header *oh;</a>
+<a name="ln1903">  struct ospf6_lsreq_entry *e;</a>
+<a name="ln1904">  u_char *p;</a>
+<a name="ln1905">  struct ospf6_lsa *lsa, *last_req;</a>
+<a name="ln1906"> </a>
+<a name="ln1907">  on = (struct ospf6_neighbor *) THREAD_ARG (thread);</a>
+<a name="ln1908">  on-&gt;thread_send_lsreq = (struct thread *) NULL;</a>
+<a name="ln1909"> </a>
+<a name="ln1910">  /* LSReq will be sent only in ExStart or Loading */</a>
+<a name="ln1911">  if (on-&gt;state != OSPF6_NEIGHBOR_EXCHANGE &amp;&amp;</a>
+<a name="ln1912">      on-&gt;state != OSPF6_NEIGHBOR_LOADING)</a>
+<a name="ln1913">    {</a>
+<a name="ln1914">      if (IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_LSREQ, SEND))</a>
+<a name="ln1915">        zlog_debug (&quot;Quit to send LSReq to neighbor %s state %s&quot;,</a>
+<a name="ln1916">		    on-&gt;name, ospf6_neighbor_state_str[on-&gt;state]);</a>
+<a name="ln1917">      return 0;</a>
+<a name="ln1918">    }</a>
+<a name="ln1919"> </a>
+<a name="ln1920">  /* schedule loading_done if request list is empty */</a>
+<a name="ln1921">  if (on-&gt;request_list-&gt;count == 0)</a>
+<a name="ln1922">    {</a>
+<a name="ln1923">      thread_add_event (master, loading_done, on, 0);</a>
+<a name="ln1924">      return 0;</a>
+<a name="ln1925">    }</a>
+<a name="ln1926"> </a>
+<a name="ln1927">  memset (sendbuf, 0, iobuflen);</a>
+<a name="ln1928">  oh = (struct ospf6_header *) sendbuf;</a>
+<a name="ln1929">  last_req = NULL;</a>
+<a name="ln1930"> </a>
+<a name="ln1931">  /* set Request entries in lsreq */</a>
+<a name="ln1932">  p = (u_char *)((caddr_t) oh + sizeof (struct ospf6_header));</a>
+<a name="ln1933">  for (lsa = ospf6_lsdb_head (on-&gt;request_list); lsa;</a>
+<a name="ln1934">       lsa = ospf6_lsdb_next (lsa))</a>
+<a name="ln1935">    {</a>
+<a name="ln1936">      /* MTU check */</a>
+<a name="ln1937">      if (p - sendbuf + sizeof (struct ospf6_lsreq_entry) &gt; ospf6_packet_max(on-&gt;ospf6_if))</a>
+<a name="ln1938">        {</a>
+<a name="ln1939">          ospf6_lsdb_lsa_unlock (lsa);</a>
+<a name="ln1940">          break;</a>
+<a name="ln1941">        }</a>
+<a name="ln1942"> </a>
+<a name="ln1943">      e = (struct ospf6_lsreq_entry *) p;</a>
+<a name="ln1944">      e-&gt;type = lsa-&gt;header-&gt;type;</a>
+<a name="ln1945">      e-&gt;id = lsa-&gt;header-&gt;id;</a>
+<a name="ln1946">      e-&gt;adv_router = lsa-&gt;header-&gt;adv_router;</a>
+<a name="ln1947">      p += sizeof (struct ospf6_lsreq_entry);</a>
+<a name="ln1948">      last_req = lsa;</a>
+<a name="ln1949">    }</a>
+<a name="ln1950"> </a>
+<a name="ln1951">  if (last_req != NULL)</a>
+<a name="ln1952">    {</a>
+<a name="ln1953">      if (on-&gt;last_ls_req != NULL)</a>
+<a name="ln1954">	{</a>
+<a name="ln1955">	  ospf6_lsa_unlock (on-&gt;last_ls_req);</a>
+<a name="ln1956">	}</a>
+<a name="ln1957">      ospf6_lsa_lock (last_req);</a>
+<a name="ln1958">      on-&gt;last_ls_req = last_req;</a>
+<a name="ln1959">    }</a>
+<a name="ln1960"> </a>
+<a name="ln1961">  oh-&gt;type = OSPF6_MESSAGE_TYPE_LSREQ;</a>
+<a name="ln1962">  oh-&gt;length = htons (p - sendbuf);</a>
+<a name="ln1963"> </a>
+<a name="ln1964">  if (on-&gt;ospf6_if-&gt;state == OSPF6_INTERFACE_POINTTOPOINT)</a>
+<a name="ln1965">    ospf6_send (on-&gt;ospf6_if-&gt;linklocal_addr, &amp;allspfrouters6,</a>
+<a name="ln1966">              on-&gt;ospf6_if, oh);</a>
+<a name="ln1967">  else</a>
+<a name="ln1968">    ospf6_send (on-&gt;ospf6_if-&gt;linklocal_addr, &amp;on-&gt;linklocal_addr,</a>
+<a name="ln1969">		on-&gt;ospf6_if, oh);</a>
+<a name="ln1970"> </a>
+<a name="ln1971">  /* set next thread */</a>
+<a name="ln1972">  if (on-&gt;request_list-&gt;count != 0)</a>
+<a name="ln1973">    {</a>
+<a name="ln1974">      on-&gt;thread_send_lsreq =</a>
+<a name="ln1975">	thread_add_timer (master, ospf6_lsreq_send, on,</a>
+<a name="ln1976">			  on-&gt;ospf6_if-&gt;rxmt_interval);</a>
+<a name="ln1977">    }</a>
+<a name="ln1978"> </a>
+<a name="ln1979">  return 0;</a>
+<a name="ln1980">}</a>
+<a name="ln1981"> </a>
+<a name="ln1982">int</a>
+<a name="ln1983">ospf6_lsupdate_send_neighbor (struct thread *thread)</a>
+<a name="ln1984">{</a>
+<a name="ln1985">  struct ospf6_neighbor *on;</a>
+<a name="ln1986">  struct ospf6_header *oh;</a>
+<a name="ln1987">  struct ospf6_lsupdate *lsupdate;</a>
+<a name="ln1988">  u_char *p;</a>
+<a name="ln1989">  int lsa_cnt;</a>
+<a name="ln1990">  struct ospf6_lsa *lsa;</a>
+<a name="ln1991"> </a>
+<a name="ln1992">  on = (struct ospf6_neighbor *) THREAD_ARG (thread);</a>
+<a name="ln1993">  on-&gt;thread_send_lsupdate = (struct thread *) NULL;</a>
+<a name="ln1994"> </a>
+<a name="ln1995">  if (IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_LSUPDATE, SEND))</a>
+<a name="ln1996">    zlog_debug (&quot;LSUpdate to neighbor %s&quot;, on-&gt;name);</a>
+<a name="ln1997"> </a>
+<a name="ln1998">  if (on-&gt;state &lt; OSPF6_NEIGHBOR_EXCHANGE)</a>
+<a name="ln1999">    {</a>
+<a name="ln2000">      if (IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_LSUPDATE, SEND))</a>
+<a name="ln2001">        zlog_debug (&quot;Quit to send (neighbor state %s)&quot;,</a>
+<a name="ln2002">		    ospf6_neighbor_state_str[on-&gt;state]);</a>
+<a name="ln2003">      return 0;</a>
+<a name="ln2004">    }</a>
+<a name="ln2005"> </a>
+<a name="ln2006">  memset (sendbuf, 0, iobuflen);</a>
+<a name="ln2007">  oh = (struct ospf6_header *) sendbuf;</a>
+<a name="ln2008">  lsupdate = (struct ospf6_lsupdate *)</a>
+<a name="ln2009">    ((caddr_t) oh + sizeof (struct ospf6_header));</a>
+<a name="ln2010"> </a>
+<a name="ln2011">  p = (u_char *)((caddr_t) lsupdate + sizeof (struct ospf6_lsupdate));</a>
+<a name="ln2012">  lsa_cnt = 0;</a>
+<a name="ln2013"> </a>
+<a name="ln2014">  /* lsupdate_list lists those LSA which doesn't need to be</a>
+<a name="ln2015">     retransmitted. remove those from the list */</a>
+<a name="ln2016">  for (lsa = ospf6_lsdb_head (on-&gt;lsupdate_list); lsa;</a>
+<a name="ln2017">       lsa = ospf6_lsdb_next (lsa))</a>
+<a name="ln2018">    {</a>
+<a name="ln2019">      /* MTU check */</a>
+<a name="ln2020">      if ( (p - sendbuf + (unsigned int)OSPF6_LSA_SIZE (lsa-&gt;header))</a>
+<a name="ln2021">	   &gt; ospf6_packet_max(on-&gt;ospf6_if))</a>
+<a name="ln2022">	{</a>
+<a name="ln2023">	  ospf6_lsdb_lsa_unlock (lsa);</a>
+<a name="ln2024">	  break;</a>
+<a name="ln2025">	}</a>
+<a name="ln2026"> </a>
+<a name="ln2027">      ospf6_lsa_age_update_to_send (lsa, on-&gt;ospf6_if-&gt;transdelay);</a>
+<a name="ln2028">      memcpy (p, lsa-&gt;header, OSPF6_LSA_SIZE (lsa-&gt;header));</a>
+<a name="ln2029">      p += OSPF6_LSA_SIZE (lsa-&gt;header);</a>
+<a name="ln2030">      lsa_cnt++;</a>
+<a name="ln2031"> </a>
+<a name="ln2032">      assert (lsa-&gt;lock == 2);</a>
+<a name="ln2033">      ospf6_lsdb_remove (lsa, on-&gt;lsupdate_list);</a>
+<a name="ln2034">    }</a>
+<a name="ln2035"> </a>
+<a name="ln2036">  if (lsa_cnt)</a>
+<a name="ln2037">    {</a>
+<a name="ln2038">      oh-&gt;type = OSPF6_MESSAGE_TYPE_LSUPDATE;</a>
+<a name="ln2039">      oh-&gt;length = htons (p - sendbuf);</a>
+<a name="ln2040">      lsupdate-&gt;lsa_number = htonl (lsa_cnt);</a>
+<a name="ln2041"> </a>
+<a name="ln2042">      if ((on-&gt;ospf6_if-&gt;state == OSPF6_INTERFACE_POINTTOPOINT) ||</a>
+<a name="ln2043">	  (on-&gt;ospf6_if-&gt;state == OSPF6_INTERFACE_DR) ||</a>
+<a name="ln2044">	  (on-&gt;ospf6_if-&gt;state == OSPF6_INTERFACE_BDR))</a>
+<a name="ln2045">	ospf6_send (on-&gt;ospf6_if-&gt;linklocal_addr, &amp;allspfrouters6,</a>
+<a name="ln2046">		    on-&gt;ospf6_if, oh);</a>
+<a name="ln2047">      else</a>
+<a name="ln2048">	ospf6_send (on-&gt;ospf6_if-&gt;linklocal_addr, &amp;on-&gt;linklocal_addr,</a>
+<a name="ln2049">		    on-&gt;ospf6_if, oh);</a>
+<a name="ln2050">    }</a>
+<a name="ln2051"> </a>
+<a name="ln2052">  /* The addresses used for retransmissions are different from those sent the</a>
+<a name="ln2053">     first time and so we need to separate them here.</a>
+<a name="ln2054">  */</a>
+<a name="ln2055">  memset (sendbuf, 0, iobuflen);</a>
+<a name="ln2056">  oh = (struct ospf6_header *) sendbuf;</a>
+<a name="ln2057">  lsupdate = (struct ospf6_lsupdate *)</a>
+<a name="ln2058">    ((caddr_t) oh + sizeof (struct ospf6_header));</a>
+<a name="ln2059">  p = (u_char *)((caddr_t) lsupdate + sizeof (struct ospf6_lsupdate));</a>
+<a name="ln2060">  lsa_cnt = 0;</a>
+<a name="ln2061"> </a>
+<a name="ln2062">  for (lsa = ospf6_lsdb_head (on-&gt;retrans_list); lsa;</a>
+<a name="ln2063">       lsa = ospf6_lsdb_next (lsa))</a>
+<a name="ln2064">    {</a>
+<a name="ln2065">      /* MTU check */</a>
+<a name="ln2066">      if ( (p - sendbuf + (unsigned int)OSPF6_LSA_SIZE (lsa-&gt;header))</a>
+<a name="ln2067">	   &gt; ospf6_packet_max(on-&gt;ospf6_if))</a>
+<a name="ln2068">	{</a>
+<a name="ln2069">	  ospf6_lsdb_lsa_unlock (lsa);</a>
+<a name="ln2070">	  break;</a>
+<a name="ln2071">	}</a>
+<a name="ln2072"> </a>
+<a name="ln2073">      ospf6_lsa_age_update_to_send (lsa, on-&gt;ospf6_if-&gt;transdelay);</a>
+<a name="ln2074">      memcpy (p, lsa-&gt;header, OSPF6_LSA_SIZE (lsa-&gt;header));</a>
+<a name="ln2075">      p += OSPF6_LSA_SIZE (lsa-&gt;header);</a>
+<a name="ln2076">      lsa_cnt++;</a>
+<a name="ln2077">    }</a>
+<a name="ln2078"> </a>
+<a name="ln2079">  if (lsa_cnt)</a>
+<a name="ln2080">    {</a>
+<a name="ln2081">      oh-&gt;type = OSPF6_MESSAGE_TYPE_LSUPDATE;</a>
+<a name="ln2082">      oh-&gt;length = htons (p - sendbuf);</a>
+<a name="ln2083">      lsupdate-&gt;lsa_number = htonl (lsa_cnt);</a>
+<a name="ln2084"> </a>
+<a name="ln2085">      if (on-&gt;ospf6_if-&gt;state == OSPF6_INTERFACE_POINTTOPOINT)</a>
+<a name="ln2086">	ospf6_send (on-&gt;ospf6_if-&gt;linklocal_addr, &amp;allspfrouters6,</a>
+<a name="ln2087">		    on-&gt;ospf6_if, oh);</a>
+<a name="ln2088">      else</a>
+<a name="ln2089">	ospf6_send (on-&gt;ospf6_if-&gt;linklocal_addr, &amp;on-&gt;linklocal_addr,</a>
+<a name="ln2090">		    on-&gt;ospf6_if, oh);</a>
+<a name="ln2091">    }</a>
+<a name="ln2092"> </a>
+<a name="ln2093">  if (on-&gt;lsupdate_list-&gt;count != 0)</a>
+<a name="ln2094">    on-&gt;thread_send_lsupdate =</a>
+<a name="ln2095">      thread_add_event (master, ospf6_lsupdate_send_neighbor, on, 0);</a>
+<a name="ln2096">  else if (on-&gt;retrans_list-&gt;count != 0)</a>
+<a name="ln2097">    on-&gt;thread_send_lsupdate =</a>
+<a name="ln2098">      thread_add_timer (master, ospf6_lsupdate_send_neighbor, on,</a>
+<a name="ln2099">			on-&gt;ospf6_if-&gt;rxmt_interval);</a>
+<a name="ln2100">  return 0;</a>
+<a name="ln2101">}</a>
+<a name="ln2102"> </a>
+<a name="ln2103">int</a>
+<a name="ln2104">ospf6_lsupdate_send_interface (struct thread *thread)</a>
+<a name="ln2105">{</a>
+<a name="ln2106">  struct ospf6_interface *oi;</a>
+<a name="ln2107">  struct ospf6_header *oh;</a>
+<a name="ln2108">  struct ospf6_lsupdate *lsupdate;</a>
+<a name="ln2109">  u_char *p;</a>
+<a name="ln2110">  int lsa_cnt;</a>
+<a name="ln2111">  struct ospf6_lsa *lsa;</a>
+<a name="ln2112"> </a>
+<a name="ln2113">  oi = (struct ospf6_interface *) THREAD_ARG (thread);</a>
+<a name="ln2114">  oi-&gt;thread_send_lsupdate = (struct thread *) NULL;</a>
+<a name="ln2115"> </a>
+<a name="ln2116">  if (oi-&gt;state &lt;= OSPF6_INTERFACE_WAITING)</a>
+<a name="ln2117">    {</a>
+<a name="ln2118">      if (IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_LSUPDATE, SEND))</a>
+<a name="ln2119">        zlog_debug (&quot;Quit to send LSUpdate to interface %s state %s&quot;,</a>
+<a name="ln2120">		    oi-&gt;interface-&gt;name, ospf6_interface_state_str[oi-&gt;state]);</a>
+<a name="ln2121">      return 0;</a>
+<a name="ln2122">    }</a>
+<a name="ln2123"> </a>
+<a name="ln2124">  /* if we have nothing to send, return */</a>
+<a name="ln2125">  if (oi-&gt;lsupdate_list-&gt;count == 0)</a>
+<a name="ln2126">    return 0;</a>
+<a name="ln2127"> </a>
+<a name="ln2128">  memset (sendbuf, 0, iobuflen);</a>
+<a name="ln2129">  oh = (struct ospf6_header *) sendbuf;</a>
+<a name="ln2130">  lsupdate = (struct ospf6_lsupdate *)((caddr_t) oh +</a>
+<a name="ln2131">				       sizeof (struct ospf6_header));</a>
+<a name="ln2132"> </a>
+<a name="ln2133">  p = (u_char *)((caddr_t) lsupdate + sizeof (struct ospf6_lsupdate));</a>
+<a name="ln2134">  lsa_cnt = 0;</a>
+<a name="ln2135"> </a>
+<a name="ln2136">  for (lsa = ospf6_lsdb_head (oi-&gt;lsupdate_list); lsa;</a>
+<a name="ln2137">       lsa = ospf6_lsdb_next (lsa))</a>
+<a name="ln2138">    {</a>
+<a name="ln2139">      /* MTU check */</a>
+<a name="ln2140">      if ( (p - sendbuf + ((unsigned int)OSPF6_LSA_SIZE (lsa-&gt;header)))</a>
+<a name="ln2141">	   &gt; ospf6_packet_max(oi))</a>
+<a name="ln2142">	{</a>
+<a name="ln2143">	  ospf6_lsdb_lsa_unlock (lsa);</a>
+<a name="ln2144">	  break;</a>
+<a name="ln2145">	}</a>
+<a name="ln2146"> </a>
+<a name="ln2147">      ospf6_lsa_age_update_to_send (lsa, oi-&gt;transdelay);</a>
+<a name="ln2148">      memcpy (p, lsa-&gt;header, OSPF6_LSA_SIZE (lsa-&gt;header));</a>
+<a name="ln2149">      p += OSPF6_LSA_SIZE (lsa-&gt;header);</a>
+<a name="ln2150">      lsa_cnt++;</a>
+<a name="ln2151"> </a>
+<a name="ln2152">      assert (lsa-&gt;lock == 2);</a>
+<a name="ln2153">      ospf6_lsdb_remove (lsa, oi-&gt;lsupdate_list);</a>
+<a name="ln2154">    }</a>
+<a name="ln2155"> </a>
+<a name="ln2156">  if (lsa_cnt)</a>
+<a name="ln2157">    {</a>
+<a name="ln2158">      lsupdate-&gt;lsa_number = htonl (lsa_cnt);</a>
+<a name="ln2159"> </a>
+<a name="ln2160">      oh-&gt;type = OSPF6_MESSAGE_TYPE_LSUPDATE;</a>
+<a name="ln2161">      oh-&gt;length = htons (p - sendbuf);</a>
+<a name="ln2162"> </a>
+<a name="ln2163">      if ((oi-&gt;state == OSPF6_INTERFACE_POINTTOPOINT) ||</a>
+<a name="ln2164">	  (oi-&gt;state == OSPF6_INTERFACE_DR) ||</a>
+<a name="ln2165">	  (oi-&gt;state == OSPF6_INTERFACE_BDR))</a>
+<a name="ln2166">	ospf6_send (oi-&gt;linklocal_addr, &amp;allspfrouters6, oi, oh);</a>
+<a name="ln2167">      else</a>
+<a name="ln2168">	ospf6_send (oi-&gt;linklocal_addr, &amp;alldrouters6, oi, oh);</a>
+<a name="ln2169"> </a>
+<a name="ln2170">    }</a>
+<a name="ln2171"> </a>
+<a name="ln2172">  if (oi-&gt;lsupdate_list-&gt;count &gt; 0)</a>
+<a name="ln2173">    {</a>
+<a name="ln2174">      oi-&gt;thread_send_lsupdate =</a>
+<a name="ln2175">        thread_add_event (master, ospf6_lsupdate_send_interface, oi, 0);</a>
+<a name="ln2176">    }</a>
+<a name="ln2177"> </a>
+<a name="ln2178">  return 0;</a>
+<a name="ln2179">}</a>
+<a name="ln2180"> </a>
+<a name="ln2181">int</a>
+<a name="ln2182">ospf6_lsack_send_neighbor (struct thread *thread)</a>
+<a name="ln2183">{</a>
+<a name="ln2184">  struct ospf6_neighbor *on;</a>
+<a name="ln2185">  struct ospf6_header *oh;</a>
+<a name="ln2186">  u_char *p;</a>
+<a name="ln2187">  struct ospf6_lsa *lsa;</a>
+<a name="ln2188">  int lsa_cnt = 0;</a>
+<a name="ln2189"> </a>
+<a name="ln2190">  on = (struct ospf6_neighbor *) THREAD_ARG (thread);</a>
+<a name="ln2191">  on-&gt;thread_send_lsack = (struct thread *) NULL;</a>
+<a name="ln2192"> </a>
+<a name="ln2193">  if (on-&gt;state &lt; OSPF6_NEIGHBOR_EXCHANGE)</a>
+<a name="ln2194">    {</a>
+<a name="ln2195">      if (IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_LSACK, SEND))</a>
+<a name="ln2196">        zlog_debug (&quot;Quit to send LSAck to neighbor %s state %s&quot;,</a>
+<a name="ln2197">		    on-&gt;name, ospf6_neighbor_state_str[on-&gt;state]);</a>
+<a name="ln2198">      return 0;</a>
+<a name="ln2199">    }</a>
+<a name="ln2200"> </a>
+<a name="ln2201">  /* if we have nothing to send, return */</a>
+<a name="ln2202">  if (on-&gt;lsack_list-&gt;count == 0)</a>
+<a name="ln2203">    return 0;</a>
+<a name="ln2204"> </a>
+<a name="ln2205">  memset (sendbuf, 0, iobuflen);</a>
+<a name="ln2206">  oh = (struct ospf6_header *) sendbuf;</a>
+<a name="ln2207"> </a>
+<a name="ln2208">  p = (u_char *)((caddr_t) oh + sizeof (struct ospf6_header));</a>
+<a name="ln2209"> </a>
+<a name="ln2210">  for (lsa = ospf6_lsdb_head (on-&gt;lsack_list); lsa;</a>
+<a name="ln2211">       lsa = ospf6_lsdb_next (lsa))</a>
+<a name="ln2212">    {</a>
+<a name="ln2213">      /* MTU check */</a>
+<a name="ln2214">      if (p - sendbuf + sizeof (struct ospf6_lsa_header) &gt; ospf6_packet_max(on-&gt;ospf6_if))</a>
+<a name="ln2215">	{</a>
+<a name="ln2216">	  /* if we run out of packet size/space here,</a>
+<a name="ln2217">	     better to try again soon. */</a>
+<a name="ln2218">	  THREAD_OFF (on-&gt;thread_send_lsack);</a>
+<a name="ln2219">	  on-&gt;thread_send_lsack =</a>
+<a name="ln2220">	    thread_add_event (master, ospf6_lsack_send_neighbor, on, 0);</a>
+<a name="ln2221"> </a>
+<a name="ln2222">	  ospf6_lsdb_lsa_unlock (lsa);</a>
+<a name="ln2223">	  break;</a>
+<a name="ln2224">	}</a>
+<a name="ln2225"> </a>
+<a name="ln2226">      ospf6_lsa_age_update_to_send (lsa, on-&gt;ospf6_if-&gt;transdelay);</a>
+<a name="ln2227">      memcpy (p, lsa-&gt;header, sizeof (struct ospf6_lsa_header));</a>
+<a name="ln2228">      p += sizeof (struct ospf6_lsa_header);</a>
+<a name="ln2229"> </a>
+<a name="ln2230">      assert (lsa-&gt;lock == 2);</a>
+<a name="ln2231">      ospf6_lsdb_remove (lsa, on-&gt;lsack_list);</a>
+<a name="ln2232">      lsa_cnt++;</a>
+<a name="ln2233">    }</a>
+<a name="ln2234"> </a>
+<a name="ln2235">  if (lsa_cnt)</a>
+<a name="ln2236">    {</a>
+<a name="ln2237">      oh-&gt;type = OSPF6_MESSAGE_TYPE_LSACK;</a>
+<a name="ln2238">      oh-&gt;length = htons (p - sendbuf);</a>
+<a name="ln2239"> </a>
+<a name="ln2240">      ospf6_send (on-&gt;ospf6_if-&gt;linklocal_addr, &amp;on-&gt;linklocal_addr,</a>
+<a name="ln2241">		  on-&gt;ospf6_if, oh);</a>
+<a name="ln2242">    }</a>
+<a name="ln2243"> </a>
+<a name="ln2244">  if (on-&gt;thread_send_lsack == NULL &amp;&amp; on-&gt;lsack_list-&gt;count &gt; 0)</a>
+<a name="ln2245">    {</a>
+<a name="ln2246">      on-&gt;thread_send_lsack =</a>
+<a name="ln2247">        thread_add_event (master, ospf6_lsack_send_neighbor, on, 0);</a>
+<a name="ln2248">    }</a>
+<a name="ln2249"> </a>
+<a name="ln2250">  return 0;</a>
+<a name="ln2251">}</a>
+<a name="ln2252"> </a>
+<a name="ln2253">int</a>
+<a name="ln2254">ospf6_lsack_send_interface (struct thread *thread)</a>
+<a name="ln2255">{</a>
+<a name="ln2256">  struct ospf6_interface *oi;</a>
+<a name="ln2257">  struct ospf6_header *oh;</a>
+<a name="ln2258">  u_char *p;</a>
+<a name="ln2259">  struct ospf6_lsa *lsa;</a>
+<a name="ln2260">  int lsa_cnt = 0;</a>
+<a name="ln2261"> </a>
+<a name="ln2262">  oi = (struct ospf6_interface *) THREAD_ARG (thread);</a>
+<a name="ln2263">  oi-&gt;thread_send_lsack = (struct thread *) NULL;</a>
+<a name="ln2264"> </a>
+<a name="ln2265">  if (oi-&gt;state &lt;= OSPF6_INTERFACE_WAITING)</a>
+<a name="ln2266">    {</a>
+<a name="ln2267">      if (IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_LSACK, SEND))</a>
+<a name="ln2268">        zlog_debug (&quot;Quit to send LSAck to interface %s state %s&quot;,</a>
+<a name="ln2269">		    oi-&gt;interface-&gt;name, ospf6_interface_state_str[oi-&gt;state]);</a>
+<a name="ln2270">      return 0;</a>
+<a name="ln2271">    }</a>
+<a name="ln2272"> </a>
+<a name="ln2273">  /* if we have nothing to send, return */</a>
+<a name="ln2274">  if (oi-&gt;lsack_list-&gt;count == 0)</a>
+<a name="ln2275">    return 0;</a>
+<a name="ln2276"> </a>
+<a name="ln2277">  memset (sendbuf, 0, iobuflen);</a>
+<a name="ln2278">  oh = (struct ospf6_header *) sendbuf;</a>
+<a name="ln2279"> </a>
+<a name="ln2280">  p = (u_char *)((caddr_t) oh + sizeof (struct ospf6_header));</a>
+<a name="ln2281"> </a>
+<a name="ln2282">  for (lsa = ospf6_lsdb_head (oi-&gt;lsack_list); lsa;</a>
+<a name="ln2283">       lsa = ospf6_lsdb_next (lsa))</a>
+<a name="ln2284">    {</a>
+<a name="ln2285">      /* MTU check */</a>
+<a name="ln2286">      if (p - sendbuf + sizeof (struct ospf6_lsa_header) &gt; ospf6_packet_max(oi))</a>
+<a name="ln2287">	{</a>
+<a name="ln2288">	  /* if we run out of packet size/space here,</a>
+<a name="ln2289">	     better to try again soon. */</a>
+<a name="ln2290">	  THREAD_OFF (oi-&gt;thread_send_lsack);</a>
+<a name="ln2291">	  oi-&gt;thread_send_lsack =</a>
+<a name="ln2292">	    thread_add_event (master, ospf6_lsack_send_interface, oi, 0);</a>
+<a name="ln2293"> </a>
+<a name="ln2294">	  ospf6_lsdb_lsa_unlock (lsa);</a>
+<a name="ln2295">	  break;</a>
+<a name="ln2296">	}</a>
+<a name="ln2297"> </a>
+<a name="ln2298">      ospf6_lsa_age_update_to_send (lsa, oi-&gt;transdelay);</a>
+<a name="ln2299">      memcpy (p, lsa-&gt;header, sizeof (struct ospf6_lsa_header));</a>
+<a name="ln2300">      p += sizeof (struct ospf6_lsa_header);</a>
+<a name="ln2301"> </a>
+<a name="ln2302">      assert (lsa-&gt;lock == 2);</a>
+<a name="ln2303">      ospf6_lsdb_remove (lsa, oi-&gt;lsack_list);</a>
+<a name="ln2304">      lsa_cnt++;</a>
+<a name="ln2305">    }</a>
+<a name="ln2306"> </a>
+<a name="ln2307">  if (lsa_cnt)</a>
+<a name="ln2308">    {</a>
+<a name="ln2309">      oh-&gt;type = OSPF6_MESSAGE_TYPE_LSACK;</a>
+<a name="ln2310">      oh-&gt;length = htons (p - sendbuf);</a>
+<a name="ln2311"> </a>
+<a name="ln2312">      if ((oi-&gt;state == OSPF6_INTERFACE_POINTTOPOINT) ||</a>
+<a name="ln2313">	  (oi-&gt;state == OSPF6_INTERFACE_DR) ||</a>
+<a name="ln2314">	  (oi-&gt;state == OSPF6_INTERFACE_BDR))</a>
+<a name="ln2315">	ospf6_send (oi-&gt;linklocal_addr, &amp;allspfrouters6, oi, oh);</a>
+<a name="ln2316">      else</a>
+<a name="ln2317">	ospf6_send (oi-&gt;linklocal_addr, &amp;alldrouters6, oi, oh);</a>
+<a name="ln2318">    }</a>
+<a name="ln2319"> </a>
+<a name="ln2320">  if (oi-&gt;thread_send_lsack == NULL &amp;&amp; oi-&gt;lsack_list-&gt;count &gt; 0)</a>
+<a name="ln2321">    {</a>
+<a name="ln2322">      oi-&gt;thread_send_lsack =</a>
+<a name="ln2323">        thread_add_event (master, ospf6_lsack_send_interface, oi, 0);</a>
+<a name="ln2324">    }</a>
+<a name="ln2325"> </a>
+<a name="ln2326">  return 0;</a>
+<a name="ln2327">}</a>
+<a name="ln2328"> </a>
+<a name="ln2329"> </a>
+<a name="ln2330">/* Commands */</a>
+<a name="ln2331">DEFUN (debug_ospf6_message,</a>
+<a name="ln2332">       debug_ospf6_message_cmd,</a>
+<a name="ln2333">       &quot;debug ospf6 message (unknown|hello|dbdesc|lsreq|lsupdate|lsack|all)&quot;,</a>
+<a name="ln2334">       DEBUG_STR</a>
+<a name="ln2335">       OSPF6_STR</a>
+<a name="ln2336">       &quot;Debug OSPFv3 message\n&quot;</a>
+<a name="ln2337">       &quot;Debug Unknown message\n&quot;</a>
+<a name="ln2338">       &quot;Debug Hello message\n&quot;</a>
+<a name="ln2339">       &quot;Debug Database Description message\n&quot;</a>
+<a name="ln2340">       &quot;Debug Link State Request message\n&quot;</a>
+<a name="ln2341">       &quot;Debug Link State Update message\n&quot;</a>
+<a name="ln2342">       &quot;Debug Link State Acknowledgement message\n&quot;</a>
+<a name="ln2343">       &quot;Debug All message\n&quot;</a>
+<a name="ln2344">       )</a>
+<a name="ln2345">{</a>
+<a name="ln2346">  unsigned char level = 0;</a>
+<a name="ln2347">  int type = 0;</a>
+<a name="ln2348">  int i;</a>
+<a name="ln2349"> </a>
+<a name="ln2350">  assert (argc &gt; 0);</a>
+<a name="ln2351"> </a>
+<a name="ln2352">  /* check type */</a>
+<a name="ln2353">  if (! strncmp (argv[0], &quot;u&quot;, 1))</a>
+<a name="ln2354">    type = OSPF6_MESSAGE_TYPE_UNKNOWN;</a>
+<a name="ln2355">  else if (! strncmp (argv[0], &quot;h&quot;, 1))</a>
+<a name="ln2356">    type = OSPF6_MESSAGE_TYPE_HELLO;</a>
+<a name="ln2357">  else if (! strncmp (argv[0], &quot;d&quot;, 1))</a>
+<a name="ln2358">    type = OSPF6_MESSAGE_TYPE_DBDESC;</a>
+<a name="ln2359">  else if (! strncmp (argv[0], &quot;lsr&quot;, 3))</a>
+<a name="ln2360">    type = OSPF6_MESSAGE_TYPE_LSREQ;</a>
+<a name="ln2361">  else if (! strncmp (argv[0], &quot;lsu&quot;, 3))</a>
+<a name="ln2362">    type = OSPF6_MESSAGE_TYPE_LSUPDATE;</a>
+<a name="ln2363">  else if (! strncmp (argv[0], &quot;lsa&quot;, 3))</a>
+<a name="ln2364">    type = OSPF6_MESSAGE_TYPE_LSACK;</a>
+<a name="ln2365">  else if (! strncmp (argv[0], &quot;a&quot;, 1))</a>
+<a name="ln2366">    type = OSPF6_MESSAGE_TYPE_ALL;</a>
+<a name="ln2367"> </a>
+<a name="ln2368">  if (argc == 1)</a>
+<a name="ln2369">    level = OSPF6_DEBUG_MESSAGE_SEND | OSPF6_DEBUG_MESSAGE_RECV;</a>
+<a name="ln2370">  else if (! strncmp (argv[1], &quot;s&quot;, 1))</a>
+<a name="ln2371">    level = OSPF6_DEBUG_MESSAGE_SEND;</a>
+<a name="ln2372">  else if (! strncmp (argv[1], &quot;r&quot;, 1))</a>
+<a name="ln2373">    level = OSPF6_DEBUG_MESSAGE_RECV;</a>
+<a name="ln2374"> </a>
+<a name="ln2375">  if (type == OSPF6_MESSAGE_TYPE_ALL)</a>
+<a name="ln2376">    {</a>
+<a name="ln2377">      for (i = 0; i &lt; 6; i++)</a>
+<a name="ln2378">        OSPF6_DEBUG_MESSAGE_ON (i, level);</a>
+<a name="ln2379">    }</a>
+<a name="ln2380">  else</a>
+<a name="ln2381">    OSPF6_DEBUG_MESSAGE_ON (type, level);</a>
+<a name="ln2382"> </a>
+<a name="ln2383">  return CMD_SUCCESS;</a>
+<a name="ln2384">}</a>
+<a name="ln2385"> </a>
+<a name="ln2386">ALIAS (debug_ospf6_message,</a>
+<a name="ln2387">       debug_ospf6_message_sendrecv_cmd,</a>
+<a name="ln2388">       &quot;debug ospf6 message (unknown|hello|dbdesc|lsreq|lsupdate|lsack|all) (send|recv)&quot;,</a>
+<a name="ln2389">       DEBUG_STR</a>
+<a name="ln2390">       OSPF6_STR</a>
+<a name="ln2391">       &quot;Debug OSPFv3 message\n&quot;</a>
+<a name="ln2392">       &quot;Debug Unknown message\n&quot;</a>
+<a name="ln2393">       &quot;Debug Hello message\n&quot;</a>
+<a name="ln2394">       &quot;Debug Database Description message\n&quot;</a>
+<a name="ln2395">       &quot;Debug Link State Request message\n&quot;</a>
+<a name="ln2396">       &quot;Debug Link State Update message\n&quot;</a>
+<a name="ln2397">       &quot;Debug Link State Acknowledgement message\n&quot;</a>
+<a name="ln2398">       &quot;Debug All message\n&quot;</a>
+<a name="ln2399">       &quot;Debug only sending message\n&quot;</a>
+<a name="ln2400">       &quot;Debug only receiving message\n&quot;</a>
+<a name="ln2401">       )</a>
+<a name="ln2402"> </a>
+<a name="ln2403"> </a>
+<a name="ln2404">DEFUN (no_debug_ospf6_message,</a>
+<a name="ln2405">       no_debug_ospf6_message_cmd,</a>
+<a name="ln2406">       &quot;no debug ospf6 message (unknown|hello|dbdesc|lsreq|lsupdate|lsack|all)&quot;,</a>
+<a name="ln2407">       NO_STR</a>
+<a name="ln2408">       DEBUG_STR</a>
+<a name="ln2409">       OSPF6_STR</a>
+<a name="ln2410">       &quot;Debug OSPFv3 message\n&quot;</a>
+<a name="ln2411">       &quot;Debug Unknown message\n&quot;</a>
+<a name="ln2412">       &quot;Debug Hello message\n&quot;</a>
+<a name="ln2413">       &quot;Debug Database Description message\n&quot;</a>
+<a name="ln2414">       &quot;Debug Link State Request message\n&quot;</a>
+<a name="ln2415">       &quot;Debug Link State Update message\n&quot;</a>
+<a name="ln2416">       &quot;Debug Link State Acknowledgement message\n&quot;</a>
+<a name="ln2417">       &quot;Debug All message\n&quot;</a>
+<a name="ln2418">       )</a>
+<a name="ln2419">{</a>
+<a name="ln2420">  unsigned char level = 0;</a>
+<a name="ln2421">  int type = 0;</a>
+<a name="ln2422">  int i;</a>
+<a name="ln2423"> </a>
+<a name="ln2424">  assert (argc &gt; 0);</a>
+<a name="ln2425"> </a>
+<a name="ln2426">  /* check type */</a>
+<a name="ln2427">  if (! strncmp (argv[0], &quot;u&quot;, 1))</a>
+<a name="ln2428">    type = OSPF6_MESSAGE_TYPE_UNKNOWN;</a>
+<a name="ln2429">  else if (! strncmp (argv[0], &quot;h&quot;, 1))</a>
+<a name="ln2430">    type = OSPF6_MESSAGE_TYPE_HELLO;</a>
+<a name="ln2431">  else if (! strncmp (argv[0], &quot;d&quot;, 1))</a>
+<a name="ln2432">    type = OSPF6_MESSAGE_TYPE_DBDESC;</a>
+<a name="ln2433">  else if (! strncmp (argv[0], &quot;lsr&quot;, 3))</a>
+<a name="ln2434">    type = OSPF6_MESSAGE_TYPE_LSREQ;</a>
+<a name="ln2435">  else if (! strncmp (argv[0], &quot;lsu&quot;, 3))</a>
+<a name="ln2436">    type = OSPF6_MESSAGE_TYPE_LSUPDATE;</a>
+<a name="ln2437">  else if (! strncmp (argv[0], &quot;lsa&quot;, 3))</a>
+<a name="ln2438">    type = OSPF6_MESSAGE_TYPE_LSACK;</a>
+<a name="ln2439">  else if (! strncmp (argv[0], &quot;a&quot;, 1))</a>
+<a name="ln2440">    type = OSPF6_MESSAGE_TYPE_ALL;</a>
+<a name="ln2441"> </a>
+<a name="ln2442">  if (argc == 1)</a>
+<a name="ln2443">    level = OSPF6_DEBUG_MESSAGE_SEND | OSPF6_DEBUG_MESSAGE_RECV;</a>
+<a name="ln2444">  else if (! strncmp (argv[1], &quot;s&quot;, 1))</a>
+<a name="ln2445">    level = OSPF6_DEBUG_MESSAGE_SEND;</a>
+<a name="ln2446">  else if (! strncmp (argv[1], &quot;r&quot;, 1))</a>
+<a name="ln2447">    level = OSPF6_DEBUG_MESSAGE_RECV;</a>
+<a name="ln2448"> </a>
+<a name="ln2449">  if (type == OSPF6_MESSAGE_TYPE_ALL)</a>
+<a name="ln2450">    {</a>
+<a name="ln2451">      for (i = 0; i &lt; 6; i++)</a>
+<a name="ln2452">        OSPF6_DEBUG_MESSAGE_OFF (i, level);</a>
+<a name="ln2453">    }</a>
+<a name="ln2454">  else</a>
+<a name="ln2455">    OSPF6_DEBUG_MESSAGE_OFF (type, level);</a>
+<a name="ln2456"> </a>
+<a name="ln2457">  return CMD_SUCCESS;</a>
+<a name="ln2458">}</a>
+<a name="ln2459"> </a>
+<a name="ln2460">ALIAS (no_debug_ospf6_message,</a>
+<a name="ln2461">       no_debug_ospf6_message_sendrecv_cmd,</a>
+<a name="ln2462">       &quot;no debug ospf6 message &quot;</a>
+<a name="ln2463">       &quot;(unknown|hello|dbdesc|lsreq|lsupdate|lsack|all) (send|recv)&quot;,</a>
+<a name="ln2464">       NO_STR</a>
+<a name="ln2465">       DEBUG_STR</a>
+<a name="ln2466">       OSPF6_STR</a>
+<a name="ln2467">       &quot;Debug OSPFv3 message\n&quot;</a>
+<a name="ln2468">       &quot;Debug Unknown message\n&quot;</a>
+<a name="ln2469">       &quot;Debug Hello message\n&quot;</a>
+<a name="ln2470">       &quot;Debug Database Description message\n&quot;</a>
+<a name="ln2471">       &quot;Debug Link State Request message\n&quot;</a>
+<a name="ln2472">       &quot;Debug Link State Update message\n&quot;</a>
+<a name="ln2473">       &quot;Debug Link State Acknowledgement message\n&quot;</a>
+<a name="ln2474">       &quot;Debug All message\n&quot;</a>
+<a name="ln2475">       &quot;Debug only sending message\n&quot;</a>
+<a name="ln2476">       &quot;Debug only receiving message\n&quot;</a>
+<a name="ln2477">       )</a>
+<a name="ln2478"> </a>
+<a name="ln2479">int</a>
+<a name="ln2480">config_write_ospf6_debug_message (struct vty *vty)</a>
+<a name="ln2481">{</a>
+<a name="ln2482">  const char *type_str[] = {&quot;unknown&quot;, &quot;hello&quot;, &quot;dbdesc&quot;,</a>
+<a name="ln2483">                      &quot;lsreq&quot;, &quot;lsupdate&quot;, &quot;lsack&quot;};</a>
+<a name="ln2484">  unsigned char s = 0, r = 0;</a>
+<a name="ln2485">  int i;</a>
+<a name="ln2486"> </a>
+<a name="ln2487">  for (i = 0; i &lt; 6; i++)</a>
+<a name="ln2488">    {</a>
+<a name="ln2489">      if (IS_OSPF6_DEBUG_MESSAGE (i, SEND))</a>
+<a name="ln2490">        s |= 1 &lt;&lt; i;</a>
+<a name="ln2491">      if (IS_OSPF6_DEBUG_MESSAGE (i, RECV))</a>
+<a name="ln2492">        r |= 1 &lt;&lt; i;</a>
+<a name="ln2493">    }</a>
+<a name="ln2494"> </a>
+<a name="ln2495">  if (s == 0x3f &amp;&amp; r == 0x3f)</a>
+<a name="ln2496">    {</a>
+<a name="ln2497">      vty_out (vty, &quot;debug ospf6 message all%s&quot;, VNL);</a>
+<a name="ln2498">      return 0;</a>
+<a name="ln2499">    }</a>
+<a name="ln2500"> </a>
+<a name="ln2501">  if (s == 0x3f &amp;&amp; r == 0)</a>
+<a name="ln2502">    {</a>
+<a name="ln2503">      vty_out (vty, &quot;debug ospf6 message all send%s&quot;, VNL);</a>
+<a name="ln2504">      return 0;</a>
+<a name="ln2505">    }</a>
+<a name="ln2506">  else if (s == 0 &amp;&amp; r == 0x3f)</a>
+<a name="ln2507">    {</a>
+<a name="ln2508">      vty_out (vty, &quot;debug ospf6 message all recv%s&quot;, VNL);</a>
+<a name="ln2509">      return 0;</a>
+<a name="ln2510">    }</a>
+<a name="ln2511"> </a>
+<a name="ln2512">  /* Unknown message is logged by default */</a>
+<a name="ln2513">  if (! IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_UNKNOWN, SEND) &amp;&amp;</a>
+<a name="ln2514">      ! IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_UNKNOWN, RECV))</a>
+<a name="ln2515">    vty_out (vty, &quot;no debug ospf6 message unknown%s&quot;, VNL);</a>
+<a name="ln2516">  else if (! IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_UNKNOWN, SEND))</a>
+<a name="ln2517">    vty_out (vty, &quot;no debug ospf6 message unknown send%s&quot;, VNL);</a>
+<a name="ln2518">  else if (! IS_OSPF6_DEBUG_MESSAGE (OSPF6_MESSAGE_TYPE_UNKNOWN, RECV))</a>
+<a name="ln2519">    vty_out (vty, &quot;no debug ospf6 message unknown recv%s&quot;, VNL);</a>
+<a name="ln2520"> </a>
+<a name="ln2521">  for (i = 1; i &lt; 6; i++)</a>
+<a name="ln2522">    {</a>
+<a name="ln2523">      if (IS_OSPF6_DEBUG_MESSAGE (i, SEND) &amp;&amp;</a>
+<a name="ln2524">          IS_OSPF6_DEBUG_MESSAGE (i, RECV))</a>
+<a name="ln2525">        vty_out (vty, &quot;debug ospf6 message %s%s&quot;, type_str[i], VNL);</a>
+<a name="ln2526">      else if (IS_OSPF6_DEBUG_MESSAGE (i, SEND))</a>
+<a name="ln2527">        vty_out (vty, &quot;debug ospf6 message %s send%s&quot;, type_str[i],</a>
+<a name="ln2528">                 VNL);</a>
+<a name="ln2529">      else if (IS_OSPF6_DEBUG_MESSAGE (i, RECV))</a>
+<a name="ln2530">        vty_out (vty, &quot;debug ospf6 message %s recv%s&quot;, type_str[i],</a>
+<a name="ln2531">                 VNL);</a>
+<a name="ln2532">    }</a>
+<a name="ln2533"> </a>
+<a name="ln2534">  return 0;</a>
+<a name="ln2535">}</a>
+<a name="ln2536"> </a>
+<a name="ln2537">void</a>
+<a name="ln2538">install_element_ospf6_debug_message (void)</a>
+<a name="ln2539">{</a>
+<a name="ln2540">  install_element (ENABLE_NODE, &amp;debug_ospf6_message_cmd);</a>
+<a name="ln2541">  install_element (ENABLE_NODE, &amp;no_debug_ospf6_message_cmd);</a>
+<a name="ln2542">  install_element (ENABLE_NODE, &amp;debug_ospf6_message_sendrecv_cmd);</a>
+<a name="ln2543">  install_element (ENABLE_NODE, &amp;no_debug_ospf6_message_sendrecv_cmd);</a>
+<a name="ln2544">  install_element (CONFIG_NODE, &amp;debug_ospf6_message_cmd);</a>
+<a name="ln2545">  install_element (CONFIG_NODE, &amp;no_debug_ospf6_message_cmd);</a>
+<a name="ln2546">  install_element (CONFIG_NODE, &amp;debug_ospf6_message_sendrecv_cmd);</a>
+<a name="ln2547">  install_element (CONFIG_NODE, &amp;no_debug_ospf6_message_sendrecv_cmd);</a>
+<a name="ln2548">}</a>
+<a name="ln2549"> </a>
+<a name="ln2550"> </a>
+
+</code></pre>
+<div class="balloon" rel="7"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1042/" target="_blank">V1042</a> This file is marked with copyleft license, which requires you to open the derived source code.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

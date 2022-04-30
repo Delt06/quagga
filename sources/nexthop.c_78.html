@@ -1,0 +1,214 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>nexthop.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.5.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/* A generic nexthop structure</a>
+<a name="ln2"> * Copyright (C) 2013 Cumulus Networks, Inc.</a>
+<a name="ln3"> *</a>
+<a name="ln4"> * This file is part of Quagga.</a>
+<a name="ln5"> *</a>
+<a name="ln6"> * Quagga is free software; you can redistribute it and/or modify it</a>
+<a name="ln7"> * under the terms of the GNU General Public License as published by the</a>
+<a name="ln8"> * Free Software Foundation; either version 2, or (at your option) any</a>
+<a name="ln9"> * later version.</a>
+<a name="ln10"> *</a>
+<a name="ln11"> * Quagga is distributed in the hope that it will be useful, but</a>
+<a name="ln12"> * WITHOUT ANY WARRANTY; without even the implied warranty of</a>
+<a name="ln13"> * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU</a>
+<a name="ln14"> * General Public License for more details.</a>
+<a name="ln15"> *</a>
+<a name="ln16"> * You should have received a copy of the GNU General Public License</a>
+<a name="ln17"> * along with Quagga; see the file COPYING.  If not, write to the Free</a>
+<a name="ln18"> * Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA</a>
+<a name="ln19"> * 02111-1307, USA.</a>
+<a name="ln20"> */</a>
+<a name="ln21">#include &lt;zebra.h&gt;</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &quot;prefix.h&quot;</a>
+<a name="ln24">#include &quot;table.h&quot;</a>
+<a name="ln25">#include &quot;memory.h&quot;</a>
+<a name="ln26">#include &quot;str.h&quot;</a>
+<a name="ln27">#include &quot;command.h&quot;</a>
+<a name="ln28">#include &quot;if.h&quot;</a>
+<a name="ln29">#include &quot;log.h&quot;</a>
+<a name="ln30">#include &quot;sockunion.h&quot;</a>
+<a name="ln31">#include &quot;linklist.h&quot;</a>
+<a name="ln32">#include &quot;thread.h&quot;</a>
+<a name="ln33">#include &quot;prefix.h&quot;</a>
+<a name="ln34">#include &quot;nexthop.h&quot;</a>
+<a name="ln35"> </a>
+<a name="ln36">/* check if nexthops are same, non-recursive */</a>
+<a name="ln37">int</a>
+<a name="ln38">nexthop_same_no_recurse (struct nexthop *next1, struct nexthop *next2)</a>
+<a name="ln39">{</a>
+<a name="ln40">  if (next1-&gt;type != next2-&gt;type)</a>
+<a name="ln41">    return 0;</a>
+<a name="ln42"> </a>
+<a name="ln43">  switch (next1-&gt;type)</a>
+<a name="ln44">    {</a>
+<a name="ln45">    case NEXTHOP_TYPE_IPV4:</a>
+<a name="ln46">    case NEXTHOP_TYPE_IPV4_IFINDEX:</a>
+<a name="ln47">      if (! IPV4_ADDR_SAME (&amp;next1-&gt;gate.ipv4, &amp;next2-&gt;gate.ipv4))</a>
+<a name="ln48">	return 0;</a>
+<a name="ln49">      if (next1-&gt;ifindex &amp;&amp; (next1-&gt;ifindex != next2-&gt;ifindex))</a>
+<a name="ln50">	return 0;</a>
+<a name="ln51">      break;</a>
+<a name="ln52">    case NEXTHOP_TYPE_IFINDEX:</a>
+<a name="ln53">    case NEXTHOP_TYPE_IFNAME:</a>
+<a name="ln54">      if (next1-&gt;ifindex != next2-&gt;ifindex)</a>
+<a name="ln55">	return 0;</a>
+<a name="ln56">      break;</a>
+<a name="ln57">#ifdef HAVE_IPV6</a>
+<a name="ln58">    case NEXTHOP_TYPE_IPV6:</a>
+<a name="ln59">      if (! IPV6_ADDR_SAME (&amp;next1-&gt;gate.ipv6, &amp;next2-&gt;gate.ipv6))</a>
+<a name="ln60">	return 0;</a>
+<a name="ln61">      break;</a>
+<a name="ln62">    case NEXTHOP_TYPE_IPV6_IFINDEX:</a>
+<a name="ln63">    case NEXTHOP_TYPE_IPV6_IFNAME:</a>
+<a name="ln64">      if (! IPV6_ADDR_SAME (&amp;next1-&gt;gate.ipv6, &amp;next2-&gt;gate.ipv6))</a>
+<a name="ln65">	return 0;</a>
+<a name="ln66">      if (next1-&gt;ifindex != next2-&gt;ifindex)</a>
+<a name="ln67">	return 0;</a>
+<a name="ln68">      break;</a>
+<a name="ln69">#endif /* HAVE_IPV6 */</a>
+<a name="ln70">    default:</a>
+<a name="ln71">      /* do nothing */</a>
+<a name="ln72">      break;</a>
+<a name="ln73">    }</a>
+<a name="ln74">  return 1;</a>
+<a name="ln75">}</a>
+<a name="ln76"> </a>
+<a name="ln77">/*</a>
+<a name="ln78"> * nexthop_type_to_str</a>
+<a name="ln79"> */</a>
+<a name="ln80">const char *</a>
+<a name="ln81">nexthop_type_to_str (enum nexthop_types_t nh_type)</a>
+<a name="ln82">{</a>
+<a name="ln83">  static const char *desc[] = {</a>
+<a name="ln84">    &quot;none&quot;,</a>
+<a name="ln85">    &quot;Directly connected&quot;,</a>
+<a name="ln86">    &quot;Interface route&quot;,</a>
+<a name="ln87">    &quot;IPv4 nexthop&quot;,</a>
+<a name="ln88">    &quot;IPv4 nexthop with ifindex&quot;,</a>
+<a name="ln89">    &quot;IPv4 nexthop with ifname&quot;,</a>
+<a name="ln90">    &quot;IPv6 nexthop&quot;,</a>
+<a name="ln91">    &quot;IPv6 nexthop with ifindex&quot;,</a>
+<a name="ln92">    &quot;IPv6 nexthop with ifname&quot;,</a>
+<a name="ln93">    &quot;Null0 nexthop&quot;,</a>
+<a name="ln94">  };</a>
+<a name="ln95"> </a>
+<a name="ln96">  if (nh_type &gt;= ZEBRA_NUM_OF (desc))</a>
+<a name="ln97">    return &quot;&lt;Invalid nh type&gt;&quot;;</a>
+<a name="ln98"> </a>
+<a name="ln99">  return desc[nh_type];</a>
+<a name="ln100">}</a>
+<a name="ln101"> </a>
+<a name="ln102">struct nexthop *</a>
+<a name="ln103">nexthop_new (void)</a>
+<a name="ln104">{</a>
+<a name="ln105">  return XCALLOC (MTYPE_NEXTHOP, sizeof (struct nexthop));</a>
+<a name="ln106">}</a>
+<a name="ln107"> </a>
+<a name="ln108">/* Add nexthop to the end of a nexthop list.  */</a>
+<a name="ln109">void</a>
+<a name="ln110">nexthop_add (struct nexthop **target, struct nexthop *nexthop)</a>
+<a name="ln111">{</a>
+<a name="ln112">  struct nexthop *last;</a>
+<a name="ln113"> </a>
+<a name="ln114">  for (last = *target; last &amp;&amp; last-&gt;next; last = last-&gt;next)</a>
+<a name="ln115">    ;</a>
+<a name="ln116">  if (last)</a>
+<a name="ln117">    last-&gt;next = nexthop;</a>
+<a name="ln118">  else</a>
+<a name="ln119">    *target = nexthop;</a>
+<a name="ln120">  nexthop-&gt;prev = last;</a>
+<a name="ln121">}</a>
+<a name="ln122"> </a>
+<a name="ln123">void</a>
+<a name="ln124">copy_nexthops (struct nexthop **tnh, struct nexthop *nh)</a>
+<a name="ln125">{</a>
+<a name="ln126">  struct nexthop *nexthop;</a>
+<a name="ln127">  struct nexthop *nh1;</a>
+<a name="ln128"> </a>
+<a name="ln129">  for (nh1 = nh; nh1; nh1 = nh1-&gt;next)</a>
+<a name="ln130">    {</a>
+<a name="ln131">      nexthop = nexthop_new();</a>
+<a name="ln132">      nexthop-&gt;flags = nh-&gt;flags;</a>
+<a name="ln133">      nexthop-&gt;type = nh-&gt;type;</a>
+<a name="ln134">      nexthop-&gt;ifindex = nh-&gt;ifindex;</a>
+<a name="ln135">      if (nh-&gt;ifname)</a>
+<a name="ln136">	nexthop-&gt;ifname = XSTRDUP(0, nh-&gt;ifname);</a>
+<a name="ln137">      memcpy(&amp;(nexthop-&gt;gate), &amp;(nh-&gt;gate), sizeof(union g_addr));</a>
+<a name="ln138">      memcpy(&amp;(nexthop-&gt;src), &amp;(nh-&gt;src), sizeof(union g_addr));</a>
+<a name="ln139">      nexthop_add(tnh, nexthop);</a>
+<a name="ln140"> </a>
+<a name="ln141">      if (CHECK_FLAG(nh1-&gt;flags, NEXTHOP_FLAG_RECURSIVE))</a>
+<a name="ln142">	copy_nexthops(&amp;nexthop-&gt;resolved, nh1-&gt;resolved);</a>
+<a name="ln143">    }</a>
+<a name="ln144">}</a>
+<a name="ln145"> </a>
+<a name="ln146">/* Free nexthop. */</a>
+<a name="ln147">void</a>
+<a name="ln148">nexthop_free (struct nexthop *nexthop)</a>
+<a name="ln149">{</a>
+<a name="ln150">  if (nexthop-&gt;ifname)</a>
+<a name="ln151">    XFREE (0, nexthop-&gt;ifname);</a>
+<a name="ln152">  if (nexthop-&gt;resolved)</a>
+<a name="ln153">    nexthops_free(nexthop-&gt;resolved);</a>
+<a name="ln154">  XFREE (MTYPE_NEXTHOP, nexthop);</a>
+<a name="ln155">}</a>
+<a name="ln156"> </a>
+<a name="ln157">/* Frees a list of nexthops */</a>
+<a name="ln158">void</a>
+<a name="ln159">nexthops_free (struct nexthop *nexthop)</a>
+<a name="ln160">{</a>
+<a name="ln161">  struct nexthop *nh, *next;</a>
+<a name="ln162"> </a>
+<a name="ln163">  for (nh = nexthop; nh; nh = next)</a>
+<a name="ln164">    {</a>
+<a name="ln165">      next = nh-&gt;next;</a>
+<a name="ln166">      nexthop_free (nh);</a>
+<a name="ln167">    }</a>
+<a name="ln168">}</a>
+
+</code></pre>
+<div class="balloon" rel="7"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1042/" target="_blank">V1042</a> This file is marked with copyleft license, which requires you to open the derived source code.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

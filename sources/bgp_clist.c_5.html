@@ -1,0 +1,1281 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>bgp_clist.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.5.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/* BGP community-list and extcommunity-list.</a>
+<a name="ln2">   Copyright (C) 1999 Kunihiro Ishiguro</a>
+<a name="ln3"> </a>
+<a name="ln4">This file is part of GNU Zebra.</a>
+<a name="ln5"> </a>
+<a name="ln6">GNU Zebra is free software; you can redistribute it and/or modify it</a>
+<a name="ln7">under the terms of the GNU General Public License as published by the</a>
+<a name="ln8">Free Software Foundation; either version 2, or (at your option) any</a>
+<a name="ln9">later version.</a>
+<a name="ln10"> </a>
+<a name="ln11">GNU Zebra is distributed in the hope that it will be useful, but</a>
+<a name="ln12">WITHOUT ANY WARRANTY; without even the implied warranty of</a>
+<a name="ln13">MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU</a>
+<a name="ln14">General Public License for more details.</a>
+<a name="ln15"> </a>
+<a name="ln16">You should have received a copy of the GNU General Public License</a>
+<a name="ln17">along with GNU Zebra; see the file COPYING.  If not, write to the Free</a>
+<a name="ln18">Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA</a>
+<a name="ln19">02111-1307, USA.  */</a>
+<a name="ln20"> </a>
+<a name="ln21">#include &lt;zebra.h&gt;</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &quot;command.h&quot;</a>
+<a name="ln24">#include &quot;prefix.h&quot;</a>
+<a name="ln25">#include &quot;memory.h&quot;</a>
+<a name="ln26">#include &quot;filter.h&quot;</a>
+<a name="ln27"> </a>
+<a name="ln28">#include &quot;bgpd/bgpd.h&quot;</a>
+<a name="ln29">#include &quot;bgpd/bgp_community.h&quot;</a>
+<a name="ln30">#include &quot;bgpd/bgp_ecommunity.h&quot;</a>
+<a name="ln31">#include &quot;bgpd/bgp_lcommunity.h&quot;</a>
+<a name="ln32">#include &quot;bgpd/bgp_aspath.h&quot;</a>
+<a name="ln33">#include &quot;bgpd/bgp_regex.h&quot;</a>
+<a name="ln34">#include &quot;bgpd/bgp_clist.h&quot;</a>
+<a name="ln35"> </a>
+<a name="ln36">/* Lookup master structure for community-list or</a>
+<a name="ln37">   extcommunity-list.  */</a>
+<a name="ln38">struct community_list_master *</a>
+<a name="ln39">community_list_master_lookup (struct community_list_handler *ch, int master)</a>
+<a name="ln40">{</a>
+<a name="ln41">  if (ch)</a>
+<a name="ln42">    switch (master)</a>
+<a name="ln43">      {</a>
+<a name="ln44">      case COMMUNITY_LIST_MASTER:</a>
+<a name="ln45">	return &amp;ch-&gt;community_list;</a>
+<a name="ln46">      case EXTCOMMUNITY_LIST_MASTER:</a>
+<a name="ln47">	return &amp;ch-&gt;extcommunity_list;</a>
+<a name="ln48">      case LARGE_COMMUNITY_LIST_MASTER:</a>
+<a name="ln49">	return &amp;ch-&gt;lcommunity_list;</a>
+<a name="ln50">      }</a>
+<a name="ln51">  return NULL;</a>
+<a name="ln52">}</a>
+<a name="ln53"> </a>
+<a name="ln54">/* Allocate a new community list entry.  */</a>
+<a name="ln55">static struct community_entry *</a>
+<a name="ln56">community_entry_new (void)</a>
+<a name="ln57">{</a>
+<a name="ln58">  return XCALLOC (MTYPE_COMMUNITY_LIST_ENTRY, sizeof (struct community_entry));</a>
+<a name="ln59">}</a>
+<a name="ln60"> </a>
+<a name="ln61">/* Free community list entry.  */</a>
+<a name="ln62">static void</a>
+<a name="ln63">community_entry_free (struct community_entry *entry)</a>
+<a name="ln64">{</a>
+<a name="ln65">  switch (entry-&gt;style)</a>
+<a name="ln66">    {</a>
+<a name="ln67">    case COMMUNITY_LIST_STANDARD:</a>
+<a name="ln68">      if (entry-&gt;u.com)</a>
+<a name="ln69">        community_free (entry-&gt;u.com);</a>
+<a name="ln70">      break;</a>
+<a name="ln71">    case LARGE_COMMUNITY_LIST_STANDARD:</a>
+<a name="ln72">      if (entry-&gt;u.lcom)</a>
+<a name="ln73">        lcommunity_free (&amp;entry-&gt;u.lcom);</a>
+<a name="ln74">      break;</a>
+<a name="ln75">    case EXTCOMMUNITY_LIST_STANDARD:</a>
+<a name="ln76">      /* In case of standard extcommunity-list, configuration string</a>
+<a name="ln77">         is made by ecommunity_ecom2str().  */</a>
+<a name="ln78">      if (entry-&gt;config)</a>
+<a name="ln79">        XFREE (MTYPE_ECOMMUNITY_STR, entry-&gt;config);</a>
+<a name="ln80">      if (entry-&gt;u.ecom)</a>
+<a name="ln81">        ecommunity_free (&amp;entry-&gt;u.ecom);</a>
+<a name="ln82">      break;</a>
+<a name="ln83">    case COMMUNITY_LIST_EXPANDED:</a>
+<a name="ln84">    case EXTCOMMUNITY_LIST_EXPANDED:</a>
+<a name="ln85">    case LARGE_COMMUNITY_LIST_EXPANDED:</a>
+<a name="ln86">      if (entry-&gt;config)</a>
+<a name="ln87">        XFREE (MTYPE_COMMUNITY_LIST_CONFIG, entry-&gt;config);</a>
+<a name="ln88">      if (entry-&gt;reg)</a>
+<a name="ln89">        bgp_regex_free (entry-&gt;reg);</a>
+<a name="ln90">    default:</a>
+<a name="ln91">      break;</a>
+<a name="ln92">    }</a>
+<a name="ln93">  XFREE (MTYPE_COMMUNITY_LIST_ENTRY, entry);</a>
+<a name="ln94">}</a>
+<a name="ln95"> </a>
+<a name="ln96">/* Allocate a new community-list.  */</a>
+<a name="ln97">static struct community_list *</a>
+<a name="ln98">community_list_new (void)</a>
+<a name="ln99">{</a>
+<a name="ln100">  return XCALLOC (MTYPE_COMMUNITY_LIST, sizeof (struct community_list));</a>
+<a name="ln101">}</a>
+<a name="ln102"> </a>
+<a name="ln103">/* Free community-list.  */</a>
+<a name="ln104">static void</a>
+<a name="ln105">community_list_free (struct community_list *list)</a>
+<a name="ln106">{</a>
+<a name="ln107">  if (list-&gt;name)</a>
+<a name="ln108">    XFREE (MTYPE_COMMUNITY_LIST_NAME, list-&gt;name);</a>
+<a name="ln109">  XFREE (MTYPE_COMMUNITY_LIST, list);</a>
+<a name="ln110">}</a>
+<a name="ln111"> </a>
+<a name="ln112">static struct community_list *</a>
+<a name="ln113">community_list_insert (struct community_list_handler *ch,</a>
+<a name="ln114">		       const char *name, int master)</a>
+<a name="ln115">{</a>
+<a name="ln116">  size_t i;</a>
+<a name="ln117">  long number;</a>
+<a name="ln118">  struct community_list *new;</a>
+<a name="ln119">  struct community_list *point;</a>
+<a name="ln120">  struct community_list_list *list;</a>
+<a name="ln121">  struct community_list_master *cm;</a>
+<a name="ln122"> </a>
+<a name="ln123">  /* Lookup community-list master.  */</a>
+<a name="ln124">  cm = community_list_master_lookup (ch, master);</a>
+<a name="ln125">  if (!cm)</a>
+<a name="ln126">    return NULL;</a>
+<a name="ln127"> </a>
+<a name="ln128">  /* Allocate new community_list and copy given name. */</a>
+<a name="ln129">  new = community_list_new ();</a>
+<a name="ln130">  new-&gt;name = XSTRDUP (MTYPE_COMMUNITY_LIST_NAME, name);</a>
+<a name="ln131"> </a>
+<a name="ln132">  /* If name is made by all digit character.  We treat it as</a>
+<a name="ln133">     number. */</a>
+<a name="ln134">  for (number = 0, i = 0; i &lt; strlen (name); i++)</a>
+<a name="ln135">    {</a>
+<a name="ln136">      if (isdigit ((int) name[i]))</a>
+<a name="ln137">        number = (number * 10) + (name[i] - '0');</a>
+<a name="ln138">      else</a>
+<a name="ln139">        break;</a>
+<a name="ln140">    }</a>
+<a name="ln141"> </a>
+<a name="ln142">  /* In case of name is all digit character */</a>
+<a name="ln143">  if (i == strlen (name))</a>
+<a name="ln144">    {</a>
+<a name="ln145">      new-&gt;sort = COMMUNITY_LIST_NUMBER;</a>
+<a name="ln146"> </a>
+<a name="ln147">      /* Set access_list to number list. */</a>
+<a name="ln148">      list = &amp;cm-&gt;num;</a>
+<a name="ln149"> </a>
+<a name="ln150">      for (point = list-&gt;head; point; point = point-&gt;next)</a>
+<a name="ln151">        if (atol (point-&gt;name) &gt;= number)</a>
+<a name="ln152">          break;</a>
+<a name="ln153">    }</a>
+<a name="ln154">  else</a>
+<a name="ln155">    {</a>
+<a name="ln156">      new-&gt;sort = COMMUNITY_LIST_STRING;</a>
+<a name="ln157"> </a>
+<a name="ln158">      /* Set access_list to string list. */</a>
+<a name="ln159">      list = &amp;cm-&gt;str;</a>
+<a name="ln160"> </a>
+<a name="ln161">      /* Set point to insertion point. */</a>
+<a name="ln162">      for (point = list-&gt;head; point; point = point-&gt;next)</a>
+<a name="ln163">        if (strcmp (point-&gt;name, name) &gt;= 0)</a>
+<a name="ln164">          break;</a>
+<a name="ln165">    }</a>
+<a name="ln166"> </a>
+<a name="ln167">  /* Link to upper list.  */</a>
+<a name="ln168">  new-&gt;parent = list;</a>
+<a name="ln169"> </a>
+<a name="ln170">  /* In case of this is the first element of master. */</a>
+<a name="ln171">  if (list-&gt;head == NULL)</a>
+<a name="ln172">    {</a>
+<a name="ln173">      list-&gt;head = list-&gt;tail = new;</a>
+<a name="ln174">      return new;</a>
+<a name="ln175">    }</a>
+<a name="ln176"> </a>
+<a name="ln177">  /* In case of insertion is made at the tail of access_list. */</a>
+<a name="ln178">  if (point == NULL)</a>
+<a name="ln179">    {</a>
+<a name="ln180">      new-&gt;prev = list-&gt;tail;</a>
+<a name="ln181">      list-&gt;tail-&gt;next = new;</a>
+<a name="ln182">      list-&gt;tail = new;</a>
+<a name="ln183">      return new;</a>
+<a name="ln184">    }</a>
+<a name="ln185"> </a>
+<a name="ln186">  /* In case of insertion is made at the head of access_list. */</a>
+<a name="ln187">  if (point == list-&gt;head)</a>
+<a name="ln188">    {</a>
+<a name="ln189">      new-&gt;next = list-&gt;head;</a>
+<a name="ln190">      list-&gt;head-&gt;prev = new;</a>
+<a name="ln191">      list-&gt;head = new;</a>
+<a name="ln192">      return new;</a>
+<a name="ln193">    }</a>
+<a name="ln194"> </a>
+<a name="ln195">  /* Insertion is made at middle of the access_list. */</a>
+<a name="ln196">  new-&gt;next = point;</a>
+<a name="ln197">  new-&gt;prev = point-&gt;prev;</a>
+<a name="ln198"> </a>
+<a name="ln199">  if (point-&gt;prev)</a>
+<a name="ln200">    point-&gt;prev-&gt;next = new;</a>
+<a name="ln201">  point-&gt;prev = new;</a>
+<a name="ln202"> </a>
+<a name="ln203">  return new;</a>
+<a name="ln204">}</a>
+<a name="ln205"> </a>
+<a name="ln206">struct community_list *</a>
+<a name="ln207">community_list_lookup (struct community_list_handler *ch,</a>
+<a name="ln208">		       const char *name, int master)</a>
+<a name="ln209">{</a>
+<a name="ln210">  struct community_list *list;</a>
+<a name="ln211">  struct community_list_master *cm;</a>
+<a name="ln212"> </a>
+<a name="ln213">  if (!name)</a>
+<a name="ln214">    return NULL;</a>
+<a name="ln215"> </a>
+<a name="ln216">  cm = community_list_master_lookup (ch, master);</a>
+<a name="ln217">  if (!cm)</a>
+<a name="ln218">    return NULL;</a>
+<a name="ln219"> </a>
+<a name="ln220">  for (list = cm-&gt;num.head; list; list = list-&gt;next)</a>
+<a name="ln221">    if (strcmp (list-&gt;name, name) == 0)</a>
+<a name="ln222">      return list;</a>
+<a name="ln223">  for (list = cm-&gt;str.head; list; list = list-&gt;next)</a>
+<a name="ln224">    if (strcmp (list-&gt;name, name) == 0)</a>
+<a name="ln225">      return list;</a>
+<a name="ln226"> </a>
+<a name="ln227">  return NULL;</a>
+<a name="ln228">}</a>
+<a name="ln229"> </a>
+<a name="ln230">static struct community_list *</a>
+<a name="ln231">community_list_get (struct community_list_handler *ch,</a>
+<a name="ln232">		    const char *name, int master)</a>
+<a name="ln233">{</a>
+<a name="ln234">  struct community_list *list;</a>
+<a name="ln235"> </a>
+<a name="ln236">  list = community_list_lookup (ch, name, master);</a>
+<a name="ln237">  if (!list)</a>
+<a name="ln238">    list = community_list_insert (ch, name, master);</a>
+<a name="ln239">  return list;</a>
+<a name="ln240">}</a>
+<a name="ln241"> </a>
+<a name="ln242">static void</a>
+<a name="ln243">community_list_delete (struct community_list *list)</a>
+<a name="ln244">{</a>
+<a name="ln245">  struct community_list_list *clist;</a>
+<a name="ln246">  struct community_entry *entry, *next;</a>
+<a name="ln247"> </a>
+<a name="ln248">  for (entry = list-&gt;head; entry; entry = next)</a>
+<a name="ln249">    {</a>
+<a name="ln250">      next = entry-&gt;next;</a>
+<a name="ln251">      community_entry_free (entry);</a>
+<a name="ln252">    }</a>
+<a name="ln253"> </a>
+<a name="ln254">  clist = list-&gt;parent;</a>
+<a name="ln255"> </a>
+<a name="ln256">  if (list-&gt;next)</a>
+<a name="ln257">    list-&gt;next-&gt;prev = list-&gt;prev;</a>
+<a name="ln258">  else</a>
+<a name="ln259">    clist-&gt;tail = list-&gt;prev;</a>
+<a name="ln260"> </a>
+<a name="ln261">  if (list-&gt;prev)</a>
+<a name="ln262">    list-&gt;prev-&gt;next = list-&gt;next;</a>
+<a name="ln263">  else</a>
+<a name="ln264">    clist-&gt;head = list-&gt;next;</a>
+<a name="ln265"> </a>
+<a name="ln266">  community_list_free (list);</a>
+<a name="ln267">}</a>
+<a name="ln268"> </a>
+<a name="ln269">static int</a>
+<a name="ln270">community_list_empty_p (struct community_list *list)</a>
+<a name="ln271">{</a>
+<a name="ln272">  return (list-&gt;head == NULL &amp;&amp; list-&gt;tail == NULL) ? 1 : 0;</a>
+<a name="ln273">}</a>
+<a name="ln274"> </a>
+<a name="ln275">/* Add community-list entry to the list.  */</a>
+<a name="ln276">static void</a>
+<a name="ln277">community_list_entry_add (struct community_list *list,</a>
+<a name="ln278">                          struct community_entry *entry)</a>
+<a name="ln279">{</a>
+<a name="ln280">  entry-&gt;next = NULL;</a>
+<a name="ln281">  entry-&gt;prev = list-&gt;tail;</a>
+<a name="ln282"> </a>
+<a name="ln283">  if (list-&gt;tail)</a>
+<a name="ln284">    list-&gt;tail-&gt;next = entry;</a>
+<a name="ln285">  else</a>
+<a name="ln286">    list-&gt;head = entry;</a>
+<a name="ln287">  list-&gt;tail = entry;</a>
+<a name="ln288">}</a>
+<a name="ln289"> </a>
+<a name="ln290">/* Delete community-list entry from the list.  */</a>
+<a name="ln291">static void</a>
+<a name="ln292">community_list_entry_delete (struct community_list *list,</a>
+<a name="ln293">                             struct community_entry *entry, int style)</a>
+<a name="ln294">{</a>
+<a name="ln295">  if (entry-&gt;next)</a>
+<a name="ln296">    entry-&gt;next-&gt;prev = entry-&gt;prev;</a>
+<a name="ln297">  else</a>
+<a name="ln298">    list-&gt;tail = entry-&gt;prev;</a>
+<a name="ln299"> </a>
+<a name="ln300">  if (entry-&gt;prev)</a>
+<a name="ln301">    entry-&gt;prev-&gt;next = entry-&gt;next;</a>
+<a name="ln302">  else</a>
+<a name="ln303">    list-&gt;head = entry-&gt;next;</a>
+<a name="ln304"> </a>
+<a name="ln305">  community_entry_free (entry);</a>
+<a name="ln306"> </a>
+<a name="ln307">  if (community_list_empty_p (list))</a>
+<a name="ln308">    community_list_delete (list);</a>
+<a name="ln309">}</a>
+<a name="ln310"> </a>
+<a name="ln311">/* Lookup community-list entry from the list.  */</a>
+<a name="ln312">static struct community_entry *</a>
+<a name="ln313">community_list_entry_lookup (struct community_list *list, const void *arg,</a>
+<a name="ln314">                             int direct)</a>
+<a name="ln315">{</a>
+<a name="ln316">  struct community_entry *entry;</a>
+<a name="ln317"> </a>
+<a name="ln318">  for (entry = list-&gt;head; entry; entry = entry-&gt;next)</a>
+<a name="ln319">    {</a>
+<a name="ln320">      switch (entry-&gt;style)</a>
+<a name="ln321">        {</a>
+<a name="ln322">        case COMMUNITY_LIST_STANDARD:</a>
+<a name="ln323">          if (community_cmp (entry-&gt;u.com, arg))</a>
+<a name="ln324">            return entry;</a>
+<a name="ln325">          break;</a>
+<a name="ln326">	case LARGE_COMMUNITY_LIST_STANDARD:</a>
+<a name="ln327">          if (lcommunity_cmp (entry-&gt;u.lcom, arg))</a>
+<a name="ln328">            return entry;</a>
+<a name="ln329">          break;</a>
+<a name="ln330">        case EXTCOMMUNITY_LIST_STANDARD:</a>
+<a name="ln331">          if (ecommunity_cmp (entry-&gt;u.ecom, arg))</a>
+<a name="ln332">            return entry;</a>
+<a name="ln333">          break;</a>
+<a name="ln334">        case COMMUNITY_LIST_EXPANDED:</a>
+<a name="ln335">        case EXTCOMMUNITY_LIST_EXPANDED:</a>
+<a name="ln336">	case LARGE_COMMUNITY_LIST_EXPANDED:</a>
+<a name="ln337">          if (strcmp (entry-&gt;config, arg) == 0)</a>
+<a name="ln338">            return entry;</a>
+<a name="ln339">          break;</a>
+<a name="ln340">        default:</a>
+<a name="ln341">          break;</a>
+<a name="ln342">        }</a>
+<a name="ln343">    }</a>
+<a name="ln344">  return NULL;</a>
+<a name="ln345">}</a>
+<a name="ln346"> </a>
+<a name="ln347">static char *</a>
+<a name="ln348">community_str_get (struct community *com, int i)</a>
+<a name="ln349">{</a>
+<a name="ln350">  int len;</a>
+<a name="ln351">  u_int32_t comval;</a>
+<a name="ln352">  u_int16_t as;</a>
+<a name="ln353">  u_int16_t val;</a>
+<a name="ln354">  char *str;</a>
+<a name="ln355">  char *pnt;</a>
+<a name="ln356"> </a>
+<a name="ln357">  memcpy (&amp;comval, com_nthval (com, i), sizeof (u_int32_t));</a>
+<a name="ln358">  comval = ntohl (comval);</a>
+<a name="ln359"> </a>
+<a name="ln360">  switch (comval)</a>
+<a name="ln361">    {</a>
+<a name="ln362">      case COMMUNITY_INTERNET:</a>
+<a name="ln363">        len = strlen (&quot; internet&quot;);</a>
+<a name="ln364">        break;</a>
+<a name="ln365">      case COMMUNITY_NO_EXPORT:</a>
+<a name="ln366">        len = strlen (&quot; no-export&quot;);</a>
+<a name="ln367">        break;</a>
+<a name="ln368">      case COMMUNITY_NO_ADVERTISE:</a>
+<a name="ln369">        len = strlen (&quot; no-advertise&quot;);</a>
+<a name="ln370">        break;</a>
+<a name="ln371">      case COMMUNITY_LOCAL_AS:</a>
+<a name="ln372">        len = strlen (&quot; local-AS&quot;);</a>
+<a name="ln373">        break;</a>
+<a name="ln374">      default:</a>
+<a name="ln375">        len = strlen (&quot; 65536:65535&quot;);</a>
+<a name="ln376">        break;</a>
+<a name="ln377">    }</a>
+<a name="ln378"> </a>
+<a name="ln379">  /* Allocate memory.  */</a>
+<a name="ln380">  str = pnt = XMALLOC (MTYPE_COMMUNITY_STR, len);</a>
+<a name="ln381"> </a>
+<a name="ln382">  switch (comval)</a>
+<a name="ln383">    {</a>
+<a name="ln384">      case COMMUNITY_INTERNET:</a>
+<a name="ln385">        strcpy (pnt, &quot;internet&quot;);</a>
+<a name="ln386">        pnt += strlen (&quot;internet&quot;);</a>
+<a name="ln387">        break;</a>
+<a name="ln388">      case COMMUNITY_NO_EXPORT:</a>
+<a name="ln389">        strcpy (pnt, &quot;no-export&quot;);</a>
+<a name="ln390">        pnt += strlen (&quot;no-export&quot;);</a>
+<a name="ln391">        break;</a>
+<a name="ln392">      case COMMUNITY_NO_ADVERTISE:</a>
+<a name="ln393">        strcpy (pnt, &quot;no-advertise&quot;);</a>
+<a name="ln394">        pnt += strlen (&quot;no-advertise&quot;);</a>
+<a name="ln395">        break;</a>
+<a name="ln396">      case COMMUNITY_LOCAL_AS:</a>
+<a name="ln397">        strcpy (pnt, &quot;local-AS&quot;);</a>
+<a name="ln398">        pnt += strlen (&quot;local-AS&quot;);</a>
+<a name="ln399">        break;</a>
+<a name="ln400">      default:</a>
+<a name="ln401">        as = (comval &gt;&gt; 16) &amp; 0xFFFF;</a>
+<a name="ln402">        val = comval &amp; 0xFFFF;</a>
+<a name="ln403">        sprintf (pnt, &quot;%u:%d&quot;, as, val);</a>
+<a name="ln404">        pnt += strlen (pnt);</a>
+<a name="ln405">        break;</a>
+<a name="ln406">    }</a>
+<a name="ln407"> </a>
+<a name="ln408">  *pnt = '\0';</a>
+<a name="ln409"> </a>
+<a name="ln410">  return str;</a>
+<a name="ln411">}</a>
+<a name="ln412"> </a>
+<a name="ln413">/* Internal function to perform regular expression match for</a>
+<a name="ln414"> *  * a single community. */</a>
+<a name="ln415">static int</a>
+<a name="ln416">community_regexp_include (regex_t * reg, struct community *com, int i)</a>
+<a name="ln417">{</a>
+<a name="ln418">  char *str;</a>
+<a name="ln419">  int rv;</a>
+<a name="ln420"> </a>
+<a name="ln421">  /* When there is no communities attribute it is treated as empty</a>
+<a name="ln422"> *      string.  */</a>
+<a name="ln423">  if (com == NULL || com-&gt;size == 0)</a>
+<a name="ln424">    str = XSTRDUP(MTYPE_COMMUNITY_STR, &quot;&quot;);</a>
+<a name="ln425">  else</a>
+<a name="ln426">    str = community_str_get (com, i);</a>
+<a name="ln427"> </a>
+<a name="ln428">  /* Regular expression match.  */</a>
+<a name="ln429">  rv = regexec (reg, str, 0, NULL, 0);</a>
+<a name="ln430"> </a>
+<a name="ln431">  XFREE(MTYPE_COMMUNITY_STR, str);</a>
+<a name="ln432"> </a>
+<a name="ln433">  if (rv == 0)</a>
+<a name="ln434">    return 1;</a>
+<a name="ln435"> </a>
+<a name="ln436">  /* No match.  */</a>
+<a name="ln437">  return 0;</a>
+<a name="ln438">}</a>
+<a name="ln439"> </a>
+<a name="ln440">/* Internal function to perform regular expression match for community</a>
+<a name="ln441">   attribute.  */</a>
+<a name="ln442">static int</a>
+<a name="ln443">community_regexp_match (struct community *com, regex_t * reg)</a>
+<a name="ln444">{</a>
+<a name="ln445">  const char *str;</a>
+<a name="ln446"> </a>
+<a name="ln447">  /* When there is no communities attribute it is treated as empty</a>
+<a name="ln448">     string.  */</a>
+<a name="ln449">  if (com == NULL || com-&gt;size == 0)</a>
+<a name="ln450">    str = &quot;&quot;;</a>
+<a name="ln451">  else</a>
+<a name="ln452">    str = community_str (com);</a>
+<a name="ln453"> </a>
+<a name="ln454">  /* Regular expression match.  */</a>
+<a name="ln455">  if (regexec (reg, str, 0, NULL, 0) == 0)</a>
+<a name="ln456">    return 1;</a>
+<a name="ln457"> </a>
+<a name="ln458">  /* No match.  */</a>
+<a name="ln459">  return 0;</a>
+<a name="ln460">}</a>
+<a name="ln461"> </a>
+<a name="ln462">static char *</a>
+<a name="ln463">lcommunity_str_get (struct lcommunity *lcom, int i)</a>
+<a name="ln464">{</a>
+<a name="ln465">  struct lcommunity_val lcomval;</a>
+<a name="ln466">  u_int32_t globaladmin;</a>
+<a name="ln467">  u_int32_t localdata1;</a>
+<a name="ln468">  u_int32_t localdata2;</a>
+<a name="ln469">  char *str;</a>
+<a name="ln470">  u_char *ptr;</a>
+<a name="ln471">  char *pnt;</a>
+<a name="ln472"> </a>
+<a name="ln473">  ptr = lcom-&gt;val;</a>
+<a name="ln474">  ptr += (i * LCOMMUNITY_SIZE);</a>
+<a name="ln475"> </a>
+<a name="ln476">  memcpy (&amp;lcomval, ptr, LCOMMUNITY_SIZE);</a>
+<a name="ln477"> </a>
+<a name="ln478">  /* Allocate memory.  48 bytes taken off bgp_lcommunity.c */</a>
+<a name="ln479">  str = pnt = XMALLOC (MTYPE_LCOMMUNITY_STR, 48);</a>
+<a name="ln480"> </a>
+<a name="ln481">  ptr = (u_char *)lcomval.val;</a>
+<a name="ln482">  globaladmin = (*ptr++ &lt;&lt; 24);</a>
+<a name="ln483">  globaladmin |= (*ptr++ &lt;&lt; 16);</a>
+<a name="ln484">  globaladmin |= (*ptr++ &lt;&lt; 8);</a>
+<a name="ln485">  globaladmin |= (*ptr++);</a>
+<a name="ln486"> </a>
+<a name="ln487">  localdata1 = (*ptr++ &lt;&lt; 24);</a>
+<a name="ln488">  localdata1 |= (*ptr++ &lt;&lt; 16);</a>
+<a name="ln489">  localdata1 |= (*ptr++ &lt;&lt; 8);</a>
+<a name="ln490">  localdata1 |= (*ptr++);</a>
+<a name="ln491"> </a>
+<a name="ln492">  localdata2 = (*ptr++ &lt;&lt; 24);</a>
+<a name="ln493">  localdata2 |= (*ptr++ &lt;&lt; 16);</a>
+<a name="ln494">  localdata2 |= (*ptr++ &lt;&lt; 8);</a>
+<a name="ln495">  localdata2 |= (*ptr++);</a>
+<a name="ln496"> </a>
+<a name="ln497">  sprintf (pnt, &quot;%u:%u:%u&quot;, globaladmin, localdata1, localdata2);</a>
+<a name="ln498">  pnt += strlen (pnt);</a>
+<a name="ln499">  *pnt = '\0';</a>
+<a name="ln500"> </a>
+<a name="ln501">  return str;</a>
+<a name="ln502">}</a>
+<a name="ln503"> </a>
+<a name="ln504">/* Internal function to perform regular expression match for</a>
+<a name="ln505"> *  * a single community. */</a>
+<a name="ln506">static int</a>
+<a name="ln507">lcommunity_regexp_include (regex_t * reg, struct lcommunity *lcom, int i)</a>
+<a name="ln508">{</a>
+<a name="ln509">  const char *str;</a>
+<a name="ln510"> </a>
+<a name="ln511">  /* When there is no communities attribute it is treated as empty</a>
+<a name="ln512"> *      string.  */</a>
+<a name="ln513">  if (lcom == NULL || lcom-&gt;size == 0)</a>
+<a name="ln514">    str = &quot;&quot;;</a>
+<a name="ln515">  else</a>
+<a name="ln516">    str = lcommunity_str_get (lcom, i);</a>
+<a name="ln517"> </a>
+<a name="ln518">  /* Regular expression match.  */</a>
+<a name="ln519">  if (regexec (reg, str, 0, NULL, 0) == 0)</a>
+<a name="ln520">    return 1;</a>
+<a name="ln521"> </a>
+<a name="ln522">  /* No match.  */</a>
+<a name="ln523">  return 0;</a>
+<a name="ln524">}</a>
+<a name="ln525"> </a>
+<a name="ln526">static int</a>
+<a name="ln527">lcommunity_regexp_match (struct lcommunity *com, regex_t * reg)</a>
+<a name="ln528">{</a>
+<a name="ln529">  const char *str;</a>
+<a name="ln530"> </a>
+<a name="ln531">  /* When there is no communities attribute it is treated as empty</a>
+<a name="ln532">     string.  */</a>
+<a name="ln533">  if (com == NULL || com-&gt;size == 0)</a>
+<a name="ln534">    str = &quot;&quot;;</a>
+<a name="ln535">  else</a>
+<a name="ln536">    str = lcommunity_str (com);</a>
+<a name="ln537"> </a>
+<a name="ln538">  /* Regular expression match.  */</a>
+<a name="ln539">  if (regexec (reg, str, 0, NULL, 0) == 0)</a>
+<a name="ln540">    return 1;</a>
+<a name="ln541"> </a>
+<a name="ln542">  /* No match.  */</a>
+<a name="ln543">  return 0;</a>
+<a name="ln544">}</a>
+<a name="ln545"> </a>
+<a name="ln546"> </a>
+<a name="ln547">static int</a>
+<a name="ln548">ecommunity_regexp_match (struct ecommunity *ecom, regex_t * reg)</a>
+<a name="ln549">{</a>
+<a name="ln550">  const char *str;</a>
+<a name="ln551"> </a>
+<a name="ln552">  /* When there is no communities attribute it is treated as empty</a>
+<a name="ln553">     string.  */</a>
+<a name="ln554">  if (ecom == NULL || ecom-&gt;size == 0)</a>
+<a name="ln555">    str = &quot;&quot;;</a>
+<a name="ln556">  else</a>
+<a name="ln557">    str = ecommunity_str (ecom);</a>
+<a name="ln558"> </a>
+<a name="ln559">  /* Regular expression match.  */</a>
+<a name="ln560">  if (regexec (reg, str, 0, NULL, 0) == 0)</a>
+<a name="ln561">    return 1;</a>
+<a name="ln562"> </a>
+<a name="ln563">  /* No match.  */</a>
+<a name="ln564">  return 0;</a>
+<a name="ln565">}</a>
+<a name="ln566"> </a>
+<a name="ln567">/* When given community attribute matches to the community-list return</a>
+<a name="ln568">   1 else return 0.  */</a>
+<a name="ln569">int</a>
+<a name="ln570">community_list_match (struct community *com, struct community_list *list)</a>
+<a name="ln571">{</a>
+<a name="ln572">  struct community_entry *entry;</a>
+<a name="ln573"> </a>
+<a name="ln574">  for (entry = list-&gt;head; entry; entry = entry-&gt;next)</a>
+<a name="ln575">    {</a>
+<a name="ln576">      if (entry-&gt;any)</a>
+<a name="ln577">        return entry-&gt;direct == COMMUNITY_PERMIT ? 1 : 0;</a>
+<a name="ln578"> </a>
+<a name="ln579">      if (entry-&gt;style == COMMUNITY_LIST_STANDARD)</a>
+<a name="ln580">        {</a>
+<a name="ln581">          if (community_include (entry-&gt;u.com, COMMUNITY_INTERNET))</a>
+<a name="ln582">            return entry-&gt;direct == COMMUNITY_PERMIT ? 1 : 0;</a>
+<a name="ln583"> </a>
+<a name="ln584">          if (community_match (com, entry-&gt;u.com))</a>
+<a name="ln585">            return entry-&gt;direct == COMMUNITY_PERMIT ? 1 : 0;</a>
+<a name="ln586">        }</a>
+<a name="ln587">      else if (entry-&gt;style == COMMUNITY_LIST_EXPANDED)</a>
+<a name="ln588">        {</a>
+<a name="ln589">          if (community_regexp_match (com, entry-&gt;reg))</a>
+<a name="ln590">            return entry-&gt;direct == COMMUNITY_PERMIT ? 1 : 0;</a>
+<a name="ln591">        }</a>
+<a name="ln592">    }</a>
+<a name="ln593">  return 0;</a>
+<a name="ln594">}</a>
+<a name="ln595"> </a>
+<a name="ln596">int</a>
+<a name="ln597">lcommunity_list_match (struct lcommunity *lcom, struct community_list *list)</a>
+<a name="ln598">{</a>
+<a name="ln599">  struct community_entry *entry;</a>
+<a name="ln600"> </a>
+<a name="ln601">  for (entry = list-&gt;head; entry; entry = entry-&gt;next)</a>
+<a name="ln602">    {</a>
+<a name="ln603">      if (entry-&gt;any)</a>
+<a name="ln604">        return entry-&gt;direct == COMMUNITY_PERMIT ? 1 : 0;</a>
+<a name="ln605"> </a>
+<a name="ln606">      if (entry-&gt;style == LARGE_COMMUNITY_LIST_STANDARD)</a>
+<a name="ln607">        {</a>
+<a name="ln608">          if (lcommunity_match (lcom, entry-&gt;u.lcom))</a>
+<a name="ln609">            return entry-&gt;direct == COMMUNITY_PERMIT ? 1 : 0;</a>
+<a name="ln610">        }</a>
+<a name="ln611">      else if (entry-&gt;style == LARGE_COMMUNITY_LIST_EXPANDED)</a>
+<a name="ln612">        {</a>
+<a name="ln613">          if (lcommunity_regexp_match (lcom, entry-&gt;reg))</a>
+<a name="ln614">            return entry-&gt;direct == COMMUNITY_PERMIT ? 1 : 0;</a>
+<a name="ln615">        }</a>
+<a name="ln616">    }</a>
+<a name="ln617">  return 0;</a>
+<a name="ln618">}</a>
+<a name="ln619"> </a>
+<a name="ln620">int</a>
+<a name="ln621">ecommunity_list_match (struct ecommunity *ecom, struct community_list *list)</a>
+<a name="ln622">{</a>
+<a name="ln623">  struct community_entry *entry;</a>
+<a name="ln624"> </a>
+<a name="ln625">  for (entry = list-&gt;head; entry; entry = entry-&gt;next)</a>
+<a name="ln626">    {</a>
+<a name="ln627">      if (entry-&gt;any)</a>
+<a name="ln628">        return entry-&gt;direct == COMMUNITY_PERMIT ? 1 : 0;</a>
+<a name="ln629"> </a>
+<a name="ln630">      if (entry-&gt;style == EXTCOMMUNITY_LIST_STANDARD)</a>
+<a name="ln631">        {</a>
+<a name="ln632">          if (ecommunity_match (ecom, entry-&gt;u.ecom))</a>
+<a name="ln633">            return entry-&gt;direct == COMMUNITY_PERMIT ? 1 : 0;</a>
+<a name="ln634">        }</a>
+<a name="ln635">      else if (entry-&gt;style == EXTCOMMUNITY_LIST_EXPANDED)</a>
+<a name="ln636">        {</a>
+<a name="ln637">          if (ecommunity_regexp_match (ecom, entry-&gt;reg))</a>
+<a name="ln638">            return entry-&gt;direct == COMMUNITY_PERMIT ? 1 : 0;</a>
+<a name="ln639">        }</a>
+<a name="ln640">    }</a>
+<a name="ln641">  return 0;</a>
+<a name="ln642">}</a>
+<a name="ln643"> </a>
+<a name="ln644">/* Perform exact matching.  In case of expanded community-list, do</a>
+<a name="ln645">   same thing as community_list_match().  */</a>
+<a name="ln646">int</a>
+<a name="ln647">community_list_exact_match (struct community *com,</a>
+<a name="ln648">                            struct community_list *list)</a>
+<a name="ln649">{</a>
+<a name="ln650">  struct community_entry *entry;</a>
+<a name="ln651"> </a>
+<a name="ln652">  for (entry = list-&gt;head; entry; entry = entry-&gt;next)</a>
+<a name="ln653">    {</a>
+<a name="ln654">      if (entry-&gt;any)</a>
+<a name="ln655">        return entry-&gt;direct == COMMUNITY_PERMIT ? 1 : 0;</a>
+<a name="ln656"> </a>
+<a name="ln657">      if (entry-&gt;style == COMMUNITY_LIST_STANDARD)</a>
+<a name="ln658">        {</a>
+<a name="ln659">          if (community_include (entry-&gt;u.com, COMMUNITY_INTERNET))</a>
+<a name="ln660">            return entry-&gt;direct == COMMUNITY_PERMIT ? 1 : 0;</a>
+<a name="ln661"> </a>
+<a name="ln662">          if (community_cmp (com, entry-&gt;u.com))</a>
+<a name="ln663">            return entry-&gt;direct == COMMUNITY_PERMIT ? 1 : 0;</a>
+<a name="ln664">        }</a>
+<a name="ln665">      else if (entry-&gt;style == COMMUNITY_LIST_EXPANDED)</a>
+<a name="ln666">        {</a>
+<a name="ln667">          if (community_regexp_match (com, entry-&gt;reg))</a>
+<a name="ln668">            return entry-&gt;direct == COMMUNITY_PERMIT ? 1 : 0;</a>
+<a name="ln669">        }</a>
+<a name="ln670">    }</a>
+<a name="ln671">  return 0;</a>
+<a name="ln672">}</a>
+<a name="ln673"> </a>
+<a name="ln674">/* Delete all permitted communities in the list from com.  */</a>
+<a name="ln675">struct community *</a>
+<a name="ln676">community_list_match_delete (struct community *com,</a>
+<a name="ln677">                             struct community_list *list)</a>
+<a name="ln678">{</a>
+<a name="ln679">  struct community_entry *entry;</a>
+<a name="ln680">  u_int32_t val;</a>
+<a name="ln681">  u_int32_t com_index_to_delete[com-&gt;size];</a>
+<a name="ln682">  int delete_index = 0;</a>
+<a name="ln683">  int i;</a>
+<a name="ln684"> </a>
+<a name="ln685">  /* Loop over each community value and evaluate each against the</a>
+<a name="ln686">   * community-list.  If we need to delete a community value add its index to</a>
+<a name="ln687">   * com_index_to_delete.</a>
+<a name="ln688">   */</a>
+<a name="ln689">  for (i = 0; i &lt; com-&gt;size; i++)</a>
+<a name="ln690">    {</a>
+<a name="ln691">      val = community_val_get (com, i);</a>
+<a name="ln692"> </a>
+<a name="ln693">      for (entry = list-&gt;head; entry; entry = entry-&gt;next)</a>
+<a name="ln694">        {</a>
+<a name="ln695">          if (entry-&gt;any)</a>
+<a name="ln696">            {</a>
+<a name="ln697">              if (entry-&gt;direct == COMMUNITY_PERMIT)</a>
+<a name="ln698">                {</a>
+<a name="ln699">                  com_index_to_delete[delete_index] = i;</a>
+<a name="ln700">                  delete_index++;</a>
+<a name="ln701">                }</a>
+<a name="ln702">              break;</a>
+<a name="ln703">            }</a>
+<a name="ln704"> </a>
+<a name="ln705">          else if ((entry-&gt;style == COMMUNITY_LIST_STANDARD)</a>
+<a name="ln706">                   &amp;&amp; (community_include (entry-&gt;u.com, COMMUNITY_INTERNET)</a>
+<a name="ln707">                       || community_include (entry-&gt;u.com, val) ))</a>
+<a name="ln708">            {</a>
+<a name="ln709">              if (entry-&gt;direct == COMMUNITY_PERMIT)</a>
+<a name="ln710">                {</a>
+<a name="ln711">                  com_index_to_delete[delete_index] = i;</a>
+<a name="ln712">                  delete_index++;</a>
+<a name="ln713">                }</a>
+<a name="ln714">              break;</a>
+<a name="ln715">            }</a>
+<a name="ln716"> </a>
+<a name="ln717">          else if ((entry-&gt;style == COMMUNITY_LIST_EXPANDED)</a>
+<a name="ln718">                   &amp;&amp; community_regexp_include (entry-&gt;reg, com, i))</a>
+<a name="ln719">            {</a>
+<a name="ln720">              if (entry-&gt;direct == COMMUNITY_PERMIT)</a>
+<a name="ln721">                {</a>
+<a name="ln722">                  com_index_to_delete[delete_index] = i;</a>
+<a name="ln723">                  delete_index++;</a>
+<a name="ln724">                }</a>
+<a name="ln725">              break;</a>
+<a name="ln726">            }</a>
+<a name="ln727">         }</a>
+<a name="ln728">     }</a>
+<a name="ln729"> </a>
+<a name="ln730">  /* Delete all of the communities we flagged for deletion */</a>
+<a name="ln731">  for (i = delete_index-1; i &gt;= 0; i--)</a>
+<a name="ln732">    {</a>
+<a name="ln733">      val = community_val_get (com, com_index_to_delete[i]);</a>
+<a name="ln734">      community_del_val (com, &amp;val);</a>
+<a name="ln735">    }</a>
+<a name="ln736"> </a>
+<a name="ln737">  return com;</a>
+<a name="ln738">}</a>
+<a name="ln739"> </a>
+<a name="ln740">/* To avoid duplicated entry in the community-list, this function</a>
+<a name="ln741">   compares specified entry to existing entry.  */</a>
+<a name="ln742">static int</a>
+<a name="ln743">community_list_dup_check (struct community_list *list,</a>
+<a name="ln744">                          struct community_entry *new)</a>
+<a name="ln745">{</a>
+<a name="ln746">  struct community_entry *entry;</a>
+<a name="ln747"> </a>
+<a name="ln748">  for (entry = list-&gt;head; entry; entry = entry-&gt;next)</a>
+<a name="ln749">    {</a>
+<a name="ln750">      if (entry-&gt;style != new-&gt;style)</a>
+<a name="ln751">        continue;</a>
+<a name="ln752"> </a>
+<a name="ln753">      if (entry-&gt;direct != new-&gt;direct)</a>
+<a name="ln754">        continue;</a>
+<a name="ln755"> </a>
+<a name="ln756">      if (entry-&gt;any != new-&gt;any)</a>
+<a name="ln757">        continue;</a>
+<a name="ln758"> </a>
+<a name="ln759">      if (entry-&gt;any)</a>
+<a name="ln760">        return 1;</a>
+<a name="ln761"> </a>
+<a name="ln762">      switch (entry-&gt;style)</a>
+<a name="ln763">        {</a>
+<a name="ln764">        case COMMUNITY_LIST_STANDARD:</a>
+<a name="ln765">          if (community_cmp (entry-&gt;u.com, new-&gt;u.com))</a>
+<a name="ln766">            return 1;</a>
+<a name="ln767">          break;</a>
+<a name="ln768">        case EXTCOMMUNITY_LIST_STANDARD:</a>
+<a name="ln769">          if (ecommunity_cmp (entry-&gt;u.ecom, new-&gt;u.ecom))</a>
+<a name="ln770">            return 1;</a>
+<a name="ln771">          break;</a>
+<a name="ln772">        case LARGE_COMMUNITY_LIST_STANDARD:</a>
+<a name="ln773">          if (lcommunity_cmp (entry-&gt;u.lcom, new-&gt;u.lcom))</a>
+<a name="ln774">            return 1;</a>
+<a name="ln775">          break;</a>
+<a name="ln776">        case COMMUNITY_LIST_EXPANDED:</a>
+<a name="ln777">        case EXTCOMMUNITY_LIST_EXPANDED:</a>
+<a name="ln778">        case LARGE_COMMUNITY_LIST_EXPANDED:</a>
+<a name="ln779">          if (entry-&gt;config &amp;&amp; new-&gt;config</a>
+<a name="ln780">              &amp;&amp; strcmp (entry-&gt;config, new-&gt;config) == 0)</a>
+<a name="ln781">            return 1;</a>
+<a name="ln782">          if (!entry-&gt;config &amp;&amp; !new-&gt;config)</a>
+<a name="ln783">            return 1;</a>
+<a name="ln784">          break;</a>
+<a name="ln785">        default:</a>
+<a name="ln786">          break;</a>
+<a name="ln787">        }</a>
+<a name="ln788">    }</a>
+<a name="ln789">  return 0;</a>
+<a name="ln790">}</a>
+<a name="ln791"> </a>
+<a name="ln792">/* Set community-list.  */</a>
+<a name="ln793">int</a>
+<a name="ln794">community_list_set (struct community_list_handler *ch,</a>
+<a name="ln795">                    const char *name, const char *str, int direct, int style)</a>
+<a name="ln796">{</a>
+<a name="ln797">  struct community_entry *entry = NULL;</a>
+<a name="ln798">  struct community_list *list;</a>
+<a name="ln799">  struct community *com = NULL;</a>
+<a name="ln800">  regex_t *regex = NULL;</a>
+<a name="ln801"> </a>
+<a name="ln802">  /* Get community list. */</a>
+<a name="ln803">  list = community_list_get (ch, name, COMMUNITY_LIST_MASTER);</a>
+<a name="ln804"> </a>
+<a name="ln805">  /* When community-list already has entry, new entry should have same</a>
+<a name="ln806">     style.  If you want to have mixed style community-list, you can</a>
+<a name="ln807">     comment out this check.  */</a>
+<a name="ln808">  if (!community_list_empty_p (list))</a>
+<a name="ln809">    {</a>
+<a name="ln810">      struct community_entry *first;</a>
+<a name="ln811"> </a>
+<a name="ln812">      first = list-&gt;head;</a>
+<a name="ln813"> </a>
+<a name="ln814">      if (style != first-&gt;style)</a>
+<a name="ln815">	{</a>
+<a name="ln816">	  return (first-&gt;style == COMMUNITY_LIST_STANDARD</a>
+<a name="ln817">		  ? COMMUNITY_LIST_ERR_STANDARD_CONFLICT</a>
+<a name="ln818">		  : COMMUNITY_LIST_ERR_EXPANDED_CONFLICT);</a>
+<a name="ln819">	}</a>
+<a name="ln820">    }</a>
+<a name="ln821"> </a>
+<a name="ln822">  if (str)</a>
+<a name="ln823">    {</a>
+<a name="ln824">      if (style == COMMUNITY_LIST_STANDARD)</a>
+<a name="ln825">	com = community_str2com (str);</a>
+<a name="ln826">      else</a>
+<a name="ln827">	regex = bgp_regcomp (str);</a>
+<a name="ln828"> </a>
+<a name="ln829">      if (! com &amp;&amp; ! regex)</a>
+<a name="ln830">	return COMMUNITY_LIST_ERR_MALFORMED_VAL;</a>
+<a name="ln831">    }</a>
+<a name="ln832"> </a>
+<a name="ln833">  entry = community_entry_new ();</a>
+<a name="ln834">  entry-&gt;direct = direct;</a>
+<a name="ln835">  entry-&gt;style = style;</a>
+<a name="ln836">  entry-&gt;any = (str ? 0 : 1);</a>
+<a name="ln837">  entry-&gt;u.com = com;</a>
+<a name="ln838">  entry-&gt;reg = regex;</a>
+<a name="ln839">  entry-&gt;config = (regex ? XSTRDUP (MTYPE_COMMUNITY_LIST_CONFIG, str) : NULL);</a>
+<a name="ln840"> </a>
+<a name="ln841">  /* Do not put duplicated community entry.  */</a>
+<a name="ln842">  if (community_list_dup_check (list, entry))</a>
+<a name="ln843">    community_entry_free (entry);</a>
+<a name="ln844">  else</a>
+<a name="ln845">    community_list_entry_add (list, entry);</a>
+<a name="ln846"> </a>
+<a name="ln847">  return 0;</a>
+<a name="ln848">}</a>
+<a name="ln849"> </a>
+<a name="ln850">/* Unset community-list.  When str is NULL, delete all of</a>
+<a name="ln851">   community-list entry belongs to the specified name.  */</a>
+<a name="ln852">int</a>
+<a name="ln853">community_list_unset (struct community_list_handler *ch,</a>
+<a name="ln854">                      const char *name, const char *str, </a>
+<a name="ln855">                      int direct, int style)</a>
+<a name="ln856">{</a>
+<a name="ln857">  struct community_entry *entry = NULL;</a>
+<a name="ln858">  struct community_list *list;</a>
+<a name="ln859">  struct community *com = NULL;</a>
+<a name="ln860">  regex_t *regex = NULL;</a>
+<a name="ln861"> </a>
+<a name="ln862">  /* Lookup community list.  */</a>
+<a name="ln863">  list = community_list_lookup (ch, name, COMMUNITY_LIST_MASTER);</a>
+<a name="ln864">  if (list == NULL)</a>
+<a name="ln865">    return COMMUNITY_LIST_ERR_CANT_FIND_LIST;</a>
+<a name="ln866"> </a>
+<a name="ln867">  /* Delete all of entry belongs to this community-list.  */</a>
+<a name="ln868">  if (!str)</a>
+<a name="ln869">    {</a>
+<a name="ln870">      community_list_delete (list);</a>
+<a name="ln871">      return 0;</a>
+<a name="ln872">    }</a>
+<a name="ln873"> </a>
+<a name="ln874">  if (style == COMMUNITY_LIST_STANDARD)</a>
+<a name="ln875">    com = community_str2com (str);</a>
+<a name="ln876">  else</a>
+<a name="ln877">    regex = bgp_regcomp (str);</a>
+<a name="ln878"> </a>
+<a name="ln879">  if (! com &amp;&amp; ! regex)</a>
+<a name="ln880">    return COMMUNITY_LIST_ERR_MALFORMED_VAL;</a>
+<a name="ln881"> </a>
+<a name="ln882">  if (com)</a>
+<a name="ln883">    entry = community_list_entry_lookup (list, com, direct);</a>
+<a name="ln884">  else</a>
+<a name="ln885">    entry = community_list_entry_lookup (list, str, direct);</a>
+<a name="ln886"> </a>
+<a name="ln887">  if (com)</a>
+<a name="ln888">    community_free (com);</a>
+<a name="ln889">  if (regex)</a>
+<a name="ln890">    bgp_regex_free (regex);</a>
+<a name="ln891"> </a>
+<a name="ln892">  if (!entry)</a>
+<a name="ln893">    return COMMUNITY_LIST_ERR_CANT_FIND_LIST;</a>
+<a name="ln894"> </a>
+<a name="ln895">  community_list_entry_delete (list, entry, style);</a>
+<a name="ln896"> </a>
+<a name="ln897">  return 0;</a>
+<a name="ln898">}</a>
+<a name="ln899"> </a>
+<a name="ln900">/* Delete all permitted large communities in the list from com.  */</a>
+<a name="ln901">struct lcommunity *</a>
+<a name="ln902">lcommunity_list_match_delete (struct lcommunity *lcom,</a>
+<a name="ln903">			      struct community_list *list)</a>
+<a name="ln904">{</a>
+<a name="ln905">  struct community_entry *entry;</a>
+<a name="ln906">  u_int32_t com_index_to_delete[lcom-&gt;size];</a>
+<a name="ln907">  u_char *ptr;</a>
+<a name="ln908">  int delete_index = 0;</a>
+<a name="ln909">  int i;</a>
+<a name="ln910"> </a>
+<a name="ln911">  /* Loop over each lcommunity value and evaluate each against the</a>
+<a name="ln912">   * community-list.  If we need to delete a community value add its index to</a>
+<a name="ln913">   * com_index_to_delete.</a>
+<a name="ln914">   */</a>
+<a name="ln915"> </a>
+<a name="ln916">  for (i = 0; i &lt; lcom-&gt;size; i++)</a>
+<a name="ln917">    {</a>
+<a name="ln918">      ptr = lcom-&gt;val + (i * LCOMMUNITY_SIZE);</a>
+<a name="ln919">      for (entry = list-&gt;head; entry; entry = entry-&gt;next)</a>
+<a name="ln920">        {</a>
+<a name="ln921">          if (entry-&gt;any)</a>
+<a name="ln922">            {</a>
+<a name="ln923">              if (entry-&gt;direct == COMMUNITY_PERMIT)</a>
+<a name="ln924">                {</a>
+<a name="ln925">                  com_index_to_delete[delete_index] = i;</a>
+<a name="ln926">                  delete_index++;</a>
+<a name="ln927">                }</a>
+<a name="ln928">              break;</a>
+<a name="ln929">            }</a>
+<a name="ln930"> </a>
+<a name="ln931">          else if ((entry-&gt;style == LARGE_COMMUNITY_LIST_STANDARD)</a>
+<a name="ln932">                   &amp;&amp; lcommunity_include (entry-&gt;u.lcom, ptr) )</a>
+<a name="ln933">            {</a>
+<a name="ln934">              if (entry-&gt;direct == COMMUNITY_PERMIT)</a>
+<a name="ln935">                {</a>
+<a name="ln936">                  com_index_to_delete[delete_index] = i;</a>
+<a name="ln937">                  delete_index++;</a>
+<a name="ln938">                }</a>
+<a name="ln939">              break;</a>
+<a name="ln940">            }</a>
+<a name="ln941"> </a>
+<a name="ln942">          else if ((entry-&gt;style == LARGE_COMMUNITY_LIST_STANDARD)</a>
+<a name="ln943">                   &amp;&amp; entry-&gt;reg</a>
+<a name="ln944">		   &amp;&amp; lcommunity_regexp_include (entry-&gt;reg, lcom, i))</a>
+<a name="ln945">            {</a>
+<a name="ln946">              if (entry-&gt;direct == COMMUNITY_PERMIT)</a>
+<a name="ln947">                {</a>
+<a name="ln948">                  com_index_to_delete[delete_index] = i;</a>
+<a name="ln949">                  delete_index++;</a>
+<a name="ln950">                }</a>
+<a name="ln951">              break;</a>
+<a name="ln952">            }</a>
+<a name="ln953">         }</a>
+<a name="ln954">     }</a>
+<a name="ln955"> </a>
+<a name="ln956">  /* Delete all of the communities we flagged for deletion */</a>
+<a name="ln957"> </a>
+<a name="ln958">  for (i = delete_index-1; i &gt;= 0; i--)</a>
+<a name="ln959">    {</a>
+<a name="ln960">      ptr = lcom-&gt;val + (com_index_to_delete[i] * LCOMMUNITY_SIZE);</a>
+<a name="ln961">      lcommunity_del_val (lcom, ptr);</a>
+<a name="ln962">    }</a>
+<a name="ln963"> </a>
+<a name="ln964">  return lcom;</a>
+<a name="ln965">}</a>
+<a name="ln966"> </a>
+<a name="ln967">/* Set lcommunity-list.  */</a>
+<a name="ln968">int</a>
+<a name="ln969">lcommunity_list_set (struct community_list_handler *ch,</a>
+<a name="ln970">		     const char *name, const char *str, int direct, int style)</a>
+<a name="ln971">{</a>
+<a name="ln972">  struct community_entry *entry = NULL;</a>
+<a name="ln973">  struct community_list *list;</a>
+<a name="ln974">  struct lcommunity *lcom = NULL;</a>
+<a name="ln975">  regex_t *regex = NULL;</a>
+<a name="ln976"> </a>
+<a name="ln977">  /* Get community list. */</a>
+<a name="ln978">  list = community_list_get (ch, name, LARGE_COMMUNITY_LIST_MASTER);</a>
+<a name="ln979"> </a>
+<a name="ln980">  /* When community-list already has entry, new entry should have same</a>
+<a name="ln981">     style.  If you want to have mixed style community-list, you can</a>
+<a name="ln982">     comment out this check.  */</a>
+<a name="ln983">  if (!community_list_empty_p (list))</a>
+<a name="ln984">    {</a>
+<a name="ln985">      struct community_entry *first;</a>
+<a name="ln986"> </a>
+<a name="ln987">      first = list-&gt;head;</a>
+<a name="ln988"> </a>
+<a name="ln989">      if (style != first-&gt;style)</a>
+<a name="ln990">	{</a>
+<a name="ln991">	  return (first-&gt;style == COMMUNITY_LIST_STANDARD</a>
+<a name="ln992">		  ? COMMUNITY_LIST_ERR_STANDARD_CONFLICT</a>
+<a name="ln993">		  : COMMUNITY_LIST_ERR_EXPANDED_CONFLICT);</a>
+<a name="ln994">	}</a>
+<a name="ln995">    }</a>
+<a name="ln996"> </a>
+<a name="ln997">  if (str)</a>
+<a name="ln998">    {</a>
+<a name="ln999">      if (style == LARGE_COMMUNITY_LIST_STANDARD)</a>
+<a name="ln1000">	lcom = lcommunity_str2com (str);</a>
+<a name="ln1001">      else</a>
+<a name="ln1002">	regex = bgp_regcomp (str);</a>
+<a name="ln1003"> </a>
+<a name="ln1004">      if (! lcom &amp;&amp; ! regex)</a>
+<a name="ln1005">	return COMMUNITY_LIST_ERR_MALFORMED_VAL;</a>
+<a name="ln1006">    }</a>
+<a name="ln1007"> </a>
+<a name="ln1008">  entry = community_entry_new ();</a>
+<a name="ln1009">  entry-&gt;direct = direct;</a>
+<a name="ln1010">  entry-&gt;style = style;</a>
+<a name="ln1011">  entry-&gt;any = (str ? 0 : 1);</a>
+<a name="ln1012">  entry-&gt;u.lcom = lcom;</a>
+<a name="ln1013">  entry-&gt;reg = regex;</a>
+<a name="ln1014">  if (lcom)</a>
+<a name="ln1015">    entry-&gt;config = lcommunity_lcom2str (lcom, LCOMMUNITY_FORMAT_COMMUNITY_LIST);</a>
+<a name="ln1016">  else if (regex)</a>
+<a name="ln1017">    entry-&gt;config = XSTRDUP (MTYPE_COMMUNITY_LIST_CONFIG, str);</a>
+<a name="ln1018">  else</a>
+<a name="ln1019">    entry-&gt;config = NULL;</a>
+<a name="ln1020"> </a>
+<a name="ln1021">  /* Do not put duplicated community entry.  */</a>
+<a name="ln1022">  if (community_list_dup_check (list, entry))</a>
+<a name="ln1023">    community_entry_free (entry);</a>
+<a name="ln1024">  else</a>
+<a name="ln1025">    community_list_entry_add (list, entry);</a>
+<a name="ln1026"> </a>
+<a name="ln1027">  return 0;</a>
+<a name="ln1028">}</a>
+<a name="ln1029"> </a>
+<a name="ln1030">/* Unset community-list.  When str is NULL, delete all of</a>
+<a name="ln1031">   community-list entry belongs to the specified name.  */</a>
+<a name="ln1032">int</a>
+<a name="ln1033">lcommunity_list_unset (struct community_list_handler *ch,</a>
+<a name="ln1034">		       const char *name, const char *str,</a>
+<a name="ln1035">		       int direct, int style)</a>
+<a name="ln1036">{</a>
+<a name="ln1037">  struct community_entry *entry = NULL;</a>
+<a name="ln1038">  struct community_list *list;</a>
+<a name="ln1039">  struct lcommunity *lcom = NULL;</a>
+<a name="ln1040">  regex_t *regex = NULL;</a>
+<a name="ln1041"> </a>
+<a name="ln1042">  /* Lookup community list.  */</a>
+<a name="ln1043">  list = community_list_lookup (ch, name, LARGE_COMMUNITY_LIST_MASTER);</a>
+<a name="ln1044">  if (list == NULL)</a>
+<a name="ln1045">    return COMMUNITY_LIST_ERR_CANT_FIND_LIST;</a>
+<a name="ln1046"> </a>
+<a name="ln1047">  /* Delete all of entry belongs to this community-list.  */</a>
+<a name="ln1048">  if (!str)</a>
+<a name="ln1049">    {</a>
+<a name="ln1050">      community_list_delete (list);</a>
+<a name="ln1051">      return 0;</a>
+<a name="ln1052">    }</a>
+<a name="ln1053"> </a>
+<a name="ln1054">  if (style == LARGE_COMMUNITY_LIST_STANDARD)</a>
+<a name="ln1055">    lcom = lcommunity_str2com (str);</a>
+<a name="ln1056">  else</a>
+<a name="ln1057">    regex = bgp_regcomp (str);</a>
+<a name="ln1058"> </a>
+<a name="ln1059">  if (! lcom &amp;&amp; ! regex)</a>
+<a name="ln1060">    return COMMUNITY_LIST_ERR_MALFORMED_VAL;</a>
+<a name="ln1061"> </a>
+<a name="ln1062">  if (lcom)</a>
+<a name="ln1063">    entry = community_list_entry_lookup (list, lcom, direct);</a>
+<a name="ln1064">  else</a>
+<a name="ln1065">    entry = community_list_entry_lookup (list, str, direct);</a>
+<a name="ln1066"> </a>
+<a name="ln1067">  if (lcom)</a>
+<a name="ln1068">    lcommunity_free (&amp;lcom);</a>
+<a name="ln1069">  if (regex)</a>
+<a name="ln1070">    bgp_regex_free (regex);</a>
+<a name="ln1071"> </a>
+<a name="ln1072">  if (!entry)</a>
+<a name="ln1073">    return COMMUNITY_LIST_ERR_CANT_FIND_LIST;</a>
+<a name="ln1074"> </a>
+<a name="ln1075">  community_list_entry_delete (list, entry, style);</a>
+<a name="ln1076"> </a>
+<a name="ln1077">  return 0;</a>
+<a name="ln1078">}</a>
+<a name="ln1079"> </a>
+<a name="ln1080">/* Set extcommunity-list.  */</a>
+<a name="ln1081">int</a>
+<a name="ln1082">extcommunity_list_set (struct community_list_handler *ch,</a>
+<a name="ln1083">                       const char *name, const char *str, </a>
+<a name="ln1084">                       int direct, int style)</a>
+<a name="ln1085">{</a>
+<a name="ln1086">  struct community_entry *entry = NULL;</a>
+<a name="ln1087">  struct community_list *list;</a>
+<a name="ln1088">  struct ecommunity *ecom = NULL;</a>
+<a name="ln1089">  regex_t *regex = NULL;</a>
+<a name="ln1090"> </a>
+<a name="ln1091">  entry = NULL;</a>
+<a name="ln1092"> </a>
+<a name="ln1093">  /* Get community list. */</a>
+<a name="ln1094">  list = community_list_get (ch, name, EXTCOMMUNITY_LIST_MASTER);</a>
+<a name="ln1095"> </a>
+<a name="ln1096">  /* When community-list already has entry, new entry should have same</a>
+<a name="ln1097">     style.  If you want to have mixed style community-list, you can</a>
+<a name="ln1098">     comment out this check.  */</a>
+<a name="ln1099">  if (!community_list_empty_p (list))</a>
+<a name="ln1100">    {</a>
+<a name="ln1101">      struct community_entry *first;</a>
+<a name="ln1102"> </a>
+<a name="ln1103">      first = list-&gt;head;</a>
+<a name="ln1104"> </a>
+<a name="ln1105">      if (style != first-&gt;style)</a>
+<a name="ln1106">	{</a>
+<a name="ln1107">	  return (first-&gt;style == EXTCOMMUNITY_LIST_STANDARD</a>
+<a name="ln1108">		  ? COMMUNITY_LIST_ERR_STANDARD_CONFLICT</a>
+<a name="ln1109">		  : COMMUNITY_LIST_ERR_EXPANDED_CONFLICT);</a>
+<a name="ln1110">	}</a>
+<a name="ln1111">    }</a>
+<a name="ln1112"> </a>
+<a name="ln1113">  if (str)</a>
+<a name="ln1114">    {</a>
+<a name="ln1115">      if (style == EXTCOMMUNITY_LIST_STANDARD)</a>
+<a name="ln1116">	ecom = ecommunity_str2com (str, 0, 1);</a>
+<a name="ln1117">      else</a>
+<a name="ln1118">	regex = bgp_regcomp (str);</a>
+<a name="ln1119"> </a>
+<a name="ln1120">      if (! ecom &amp;&amp; ! regex)</a>
+<a name="ln1121">	return COMMUNITY_LIST_ERR_MALFORMED_VAL;</a>
+<a name="ln1122">    }</a>
+<a name="ln1123"> </a>
+<a name="ln1124">  if (ecom)</a>
+<a name="ln1125">    ecom-&gt;str = ecommunity_ecom2str (ecom, ECOMMUNITY_FORMAT_DISPLAY);</a>
+<a name="ln1126"> </a>
+<a name="ln1127">  entry = community_entry_new ();</a>
+<a name="ln1128">  entry-&gt;direct = direct;</a>
+<a name="ln1129">  entry-&gt;style = style;</a>
+<a name="ln1130">  entry-&gt;any = (str ? 0 : 1);</a>
+<a name="ln1131">  if (ecom)</a>
+<a name="ln1132">    entry-&gt;config = ecommunity_ecom2str (ecom, ECOMMUNITY_FORMAT_COMMUNITY_LIST);</a>
+<a name="ln1133">  else if (regex)</a>
+<a name="ln1134">    entry-&gt;config = XSTRDUP (MTYPE_COMMUNITY_LIST_CONFIG, str);</a>
+<a name="ln1135">  else</a>
+<a name="ln1136">    entry-&gt;config = NULL;</a>
+<a name="ln1137">  entry-&gt;u.ecom = ecom;</a>
+<a name="ln1138">  entry-&gt;reg = regex;</a>
+<a name="ln1139"> </a>
+<a name="ln1140">  /* Do not put duplicated community entry.  */</a>
+<a name="ln1141">  if (community_list_dup_check (list, entry))</a>
+<a name="ln1142">    community_entry_free (entry);</a>
+<a name="ln1143">  else</a>
+<a name="ln1144">    community_list_entry_add (list, entry);</a>
+<a name="ln1145"> </a>
+<a name="ln1146">  return 0;</a>
+<a name="ln1147">}</a>
+<a name="ln1148"> </a>
+<a name="ln1149">/* Unset extcommunity-list.  When str is NULL, delete all of</a>
+<a name="ln1150">   extcommunity-list entry belongs to the specified name.  */</a>
+<a name="ln1151">int</a>
+<a name="ln1152">extcommunity_list_unset (struct community_list_handler *ch,</a>
+<a name="ln1153">                         const char *name, const char *str, </a>
+<a name="ln1154">                         int direct, int style)</a>
+<a name="ln1155">{</a>
+<a name="ln1156">  struct community_entry *entry = NULL;</a>
+<a name="ln1157">  struct community_list *list;</a>
+<a name="ln1158">  struct ecommunity *ecom = NULL;</a>
+<a name="ln1159">  regex_t *regex = NULL;</a>
+<a name="ln1160"> </a>
+<a name="ln1161">  /* Lookup extcommunity list.  */</a>
+<a name="ln1162">  list = community_list_lookup (ch, name, EXTCOMMUNITY_LIST_MASTER);</a>
+<a name="ln1163">  if (list == NULL)</a>
+<a name="ln1164">    return COMMUNITY_LIST_ERR_CANT_FIND_LIST;</a>
+<a name="ln1165"> </a>
+<a name="ln1166">  /* Delete all of entry belongs to this extcommunity-list.  */</a>
+<a name="ln1167">  if (!str)</a>
+<a name="ln1168">    {</a>
+<a name="ln1169">      community_list_delete (list);</a>
+<a name="ln1170">      return 0;</a>
+<a name="ln1171">    }</a>
+<a name="ln1172"> </a>
+<a name="ln1173">  if (style == EXTCOMMUNITY_LIST_STANDARD)</a>
+<a name="ln1174">    ecom = ecommunity_str2com (str, 0, 1);</a>
+<a name="ln1175">  else</a>
+<a name="ln1176">    regex = bgp_regcomp (str);</a>
+<a name="ln1177"> </a>
+<a name="ln1178">  if (! ecom &amp;&amp; ! regex)</a>
+<a name="ln1179">    return COMMUNITY_LIST_ERR_MALFORMED_VAL;</a>
+<a name="ln1180"> </a>
+<a name="ln1181">  if (ecom)</a>
+<a name="ln1182">    entry = community_list_entry_lookup (list, ecom, direct);</a>
+<a name="ln1183">  else</a>
+<a name="ln1184">    entry = community_list_entry_lookup (list, str, direct);</a>
+<a name="ln1185"> </a>
+<a name="ln1186">  if (ecom)</a>
+<a name="ln1187">    ecommunity_free (&amp;ecom);</a>
+<a name="ln1188">  if (regex)</a>
+<a name="ln1189">    bgp_regex_free (regex);</a>
+<a name="ln1190"> </a>
+<a name="ln1191">  if (!entry)</a>
+<a name="ln1192">    return COMMUNITY_LIST_ERR_CANT_FIND_LIST;</a>
+<a name="ln1193"> </a>
+<a name="ln1194">  community_list_entry_delete (list, entry, style);</a>
+<a name="ln1195"> </a>
+<a name="ln1196">  return 0;</a>
+<a name="ln1197">}</a>
+<a name="ln1198"> </a>
+<a name="ln1199">/* Initializa community-list.  Return community-list handler.  */</a>
+<a name="ln1200">struct community_list_handler *</a>
+<a name="ln1201">community_list_init (void)</a>
+<a name="ln1202">{</a>
+<a name="ln1203">  struct community_list_handler *ch;</a>
+<a name="ln1204">  ch = XCALLOC (MTYPE_COMMUNITY_LIST_HANDLER,</a>
+<a name="ln1205">                sizeof (struct community_list_handler));</a>
+<a name="ln1206">  return ch;</a>
+<a name="ln1207">}</a>
+<a name="ln1208"> </a>
+<a name="ln1209">/* Terminate community-list.  */</a>
+<a name="ln1210">void</a>
+<a name="ln1211">community_list_terminate (struct community_list_handler *ch)</a>
+<a name="ln1212">{</a>
+<a name="ln1213">  struct community_list_master *cm;</a>
+<a name="ln1214">  struct community_list *list;</a>
+<a name="ln1215"> </a>
+<a name="ln1216">  cm = &amp;ch-&gt;community_list;</a>
+<a name="ln1217">  while ((list = cm-&gt;num.head) != NULL)</a>
+<a name="ln1218">    community_list_delete (list);</a>
+<a name="ln1219">  while ((list = cm-&gt;str.head) != NULL)</a>
+<a name="ln1220">    community_list_delete (list);</a>
+<a name="ln1221"> </a>
+<a name="ln1222">  cm = &amp;ch-&gt;lcommunity_list;</a>
+<a name="ln1223">  while ((list = cm-&gt;num.head) != NULL)</a>
+<a name="ln1224">    community_list_delete (list);</a>
+<a name="ln1225">  while ((list = cm-&gt;str.head) != NULL)</a>
+<a name="ln1226">    community_list_delete (list);</a>
+<a name="ln1227"> </a>
+<a name="ln1228">  cm = &amp;ch-&gt;extcommunity_list;</a>
+<a name="ln1229">  while ((list = cm-&gt;num.head) != NULL)</a>
+<a name="ln1230">    community_list_delete (list);</a>
+<a name="ln1231">  while ((list = cm-&gt;str.head) != NULL)</a>
+<a name="ln1232">    community_list_delete (list);</a>
+<a name="ln1233"> </a>
+<a name="ln1234">  XFREE (MTYPE_COMMUNITY_LIST_HANDLER, ch);</a>
+<a name="ln1235">}</a>
+
+</code></pre>
+<div class="balloon" rel="7"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1042/" target="_blank">V1042</a> This file is marked with copyleft license, which requires you to open the derived source code.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

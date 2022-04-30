@@ -1,0 +1,179 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>snmp.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.5.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/* SNMP support</a>
+<a name="ln2"> * Copyright (C) 1999 Kunihiro Ishiguro &lt;kunihiro@zebra.org&gt;</a>
+<a name="ln3"> *</a>
+<a name="ln4"> * This file is part of GNU Zebra.</a>
+<a name="ln5"> *</a>
+<a name="ln6"> * GNU Zebra is free software; you can redistribute it and/or modify it</a>
+<a name="ln7"> * under the terms of the GNU General Public License as published by the</a>
+<a name="ln8"> * Free Software Foundation; either version 2, or (at your option) any</a>
+<a name="ln9"> * later version.</a>
+<a name="ln10"> *</a>
+<a name="ln11"> * GNU Zebra is distributed in the hope that it will be useful, but</a>
+<a name="ln12"> * WITHOUT ANY WARRANTY; without even the implied warranty of</a>
+<a name="ln13"> * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU</a>
+<a name="ln14"> * General Public License for more details.</a>
+<a name="ln15"> *</a>
+<a name="ln16"> * You should have received a copy of the GNU General Public License</a>
+<a name="ln17"> * along with GNU Zebra; see the file COPYING.  If not, write to the Free</a>
+<a name="ln18"> * Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA</a>
+<a name="ln19"> * 02111-1307, USA.  </a>
+<a name="ln20"> */</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &lt;zebra.h&gt;</a>
+<a name="ln23"> </a>
+<a name="ln24">#ifdef HAVE_SNMP</a>
+<a name="ln25">#include &lt;net-snmp/net-snmp-config.h&gt;</a>
+<a name="ln26">#include &lt;net-snmp/net-snmp-includes.h&gt;</a>
+<a name="ln27"> </a>
+<a name="ln28">#include &quot;smux.h&quot;</a>
+<a name="ln29"> </a>
+<a name="ln30">#define min(A,B) ((A) &lt; (B) ? (A) : (B))</a>
+<a name="ln31"> </a>
+<a name="ln32">int</a>
+<a name="ln33">oid_compare (const oid *o1, int o1_len, const oid *o2, int o2_len)</a>
+<a name="ln34">{</a>
+<a name="ln35">  int i;</a>
+<a name="ln36"> </a>
+<a name="ln37">  for (i = 0; i &lt; min (o1_len, o2_len); i++)</a>
+<a name="ln38">    {</a>
+<a name="ln39">      if (o1[i] &lt; o2[i])</a>
+<a name="ln40">	return -1;</a>
+<a name="ln41">      else if (o1[i] &gt; o2[i])</a>
+<a name="ln42">	return 1;</a>
+<a name="ln43">    }</a>
+<a name="ln44">  if (o1_len &lt; o2_len)</a>
+<a name="ln45">    return -1;</a>
+<a name="ln46">  if (o1_len &gt; o2_len)</a>
+<a name="ln47">    return 1;</a>
+<a name="ln48"> </a>
+<a name="ln49">  return 0;</a>
+<a name="ln50">}</a>
+<a name="ln51"> </a>
+<a name="ln52">void *</a>
+<a name="ln53">oid_copy (void *dest, const void *src, size_t size)</a>
+<a name="ln54">{</a>
+<a name="ln55">  return memcpy (dest, src, size * sizeof (oid));</a>
+<a name="ln56">}</a>
+<a name="ln57"> </a>
+<a name="ln58">void</a>
+<a name="ln59">oid2in_addr (oid oid[], int len, struct in_addr *addr)</a>
+<a name="ln60">{</a>
+<a name="ln61">  int i;</a>
+<a name="ln62">  u_char *pnt;</a>
+<a name="ln63">  </a>
+<a name="ln64">  if (len == 0)</a>
+<a name="ln65">    return;</a>
+<a name="ln66"> </a>
+<a name="ln67">  pnt = (u_char *) addr;</a>
+<a name="ln68"> </a>
+<a name="ln69">  for (i = 0; i &lt; len; i++)</a>
+<a name="ln70">    *pnt++ = oid[i];</a>
+<a name="ln71">}</a>
+<a name="ln72"> </a>
+<a name="ln73">void</a>
+<a name="ln74">oid_copy_addr (oid oid[], struct in_addr *addr, int len)</a>
+<a name="ln75">{</a>
+<a name="ln76">  int i;</a>
+<a name="ln77">  u_char *pnt;</a>
+<a name="ln78">  </a>
+<a name="ln79">  if (len == 0)</a>
+<a name="ln80">    return;</a>
+<a name="ln81"> </a>
+<a name="ln82">  pnt = (u_char *) addr;</a>
+<a name="ln83"> </a>
+<a name="ln84">  for (i = 0; i &lt; len; i++)</a>
+<a name="ln85">    oid[i] = *pnt++;</a>
+<a name="ln86">}</a>
+<a name="ln87"> </a>
+<a name="ln88">int</a>
+<a name="ln89">smux_header_generic (struct variable *v, oid *name, size_t *length, int exact,</a>
+<a name="ln90">		     size_t *var_len, WriteMethod **write_method)</a>
+<a name="ln91">{</a>
+<a name="ln92">  oid fulloid[MAX_OID_LEN];</a>
+<a name="ln93">  int ret;</a>
+<a name="ln94"> </a>
+<a name="ln95">  oid_copy (fulloid, v-&gt;name, v-&gt;namelen);</a>
+<a name="ln96">  fulloid[v-&gt;namelen] = 0;</a>
+<a name="ln97">  /* Check against full instance. */</a>
+<a name="ln98">  ret = oid_compare (name, *length, fulloid, v-&gt;namelen + 1);</a>
+<a name="ln99"> </a>
+<a name="ln100">  /* Check single instance. */</a>
+<a name="ln101">  if ((exact &amp;&amp; (ret != 0)) || (!exact &amp;&amp; (ret &gt;= 0)))</a>
+<a name="ln102">	return MATCH_FAILED;</a>
+<a name="ln103"> </a>
+<a name="ln104">  /* In case of getnext, fill in full instance. */</a>
+<a name="ln105">  memcpy (name, fulloid, (v-&gt;namelen + 1) * sizeof (oid));</a>
+<a name="ln106">  *length = v-&gt;namelen + 1;</a>
+<a name="ln107"> </a>
+<a name="ln108">  *write_method = 0;</a>
+<a name="ln109">  *var_len = sizeof(long);    /* default to 'long' results */</a>
+<a name="ln110"> </a>
+<a name="ln111">  return MATCH_SUCCEEDED;</a>
+<a name="ln112">}</a>
+<a name="ln113"> </a>
+<a name="ln114">int</a>
+<a name="ln115">smux_header_table (struct variable *v, oid *name, size_t *length, int exact,</a>
+<a name="ln116">		   size_t *var_len, WriteMethod **write_method)</a>
+<a name="ln117">{</a>
+<a name="ln118">  /* If the requested OID name is less than OID prefix we</a>
+<a name="ln119">     handle, adjust it to our prefix. */</a>
+<a name="ln120">  if ((oid_compare (name, *length, v-&gt;name, v-&gt;namelen)) &lt; 0)</a>
+<a name="ln121">    {</a>
+<a name="ln122">      if (exact)</a>
+<a name="ln123">	return MATCH_FAILED;</a>
+<a name="ln124">      oid_copy(name, v-&gt;name, v-&gt;namelen);</a>
+<a name="ln125">      *length = v-&gt;namelen;</a>
+<a name="ln126">    }</a>
+<a name="ln127"> </a>
+<a name="ln128">  *write_method = 0;</a>
+<a name="ln129">  *var_len = sizeof(long);</a>
+<a name="ln130"> </a>
+<a name="ln131">  return MATCH_SUCCEEDED;</a>
+<a name="ln132">}</a>
+<a name="ln133">#endif /* HAVE_SNMP */</a>
+
+</code></pre>
+<div class="balloon" rel="7"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1042/" target="_blank">V1042</a> This file is marked with copyleft license, which requires you to open the derived source code.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

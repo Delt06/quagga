@@ -1,0 +1,716 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>sockopt.c</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.5.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/* setsockopt functions</a>
+<a name="ln2"> * Copyright (C) 1999 Kunihiro Ishiguro</a>
+<a name="ln3"> *</a>
+<a name="ln4"> * This file is part of GNU Zebra.</a>
+<a name="ln5"> *</a>
+<a name="ln6"> * GNU Zebra is free software; you can redistribute it and/or modify it</a>
+<a name="ln7"> * under the terms of the GNU General Public License as published by the</a>
+<a name="ln8"> * Free Software Foundation; either version 2, or (at your option) any</a>
+<a name="ln9"> * later version.</a>
+<a name="ln10"> *</a>
+<a name="ln11"> * GNU Zebra is distributed in the hope that it will be useful, but</a>
+<a name="ln12"> * WITHOUT ANY WARRANTY; without even the implied warranty of</a>
+<a name="ln13"> * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU</a>
+<a name="ln14"> * General Public License for more details.</a>
+<a name="ln15"> *</a>
+<a name="ln16"> * You should have received a copy of the GNU General Public License</a>
+<a name="ln17"> * along with GNU Zebra; see the file COPYING.  If not, write to the Free</a>
+<a name="ln18"> * Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA</a>
+<a name="ln19"> * 02111-1307, USA.  </a>
+<a name="ln20"> */</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &lt;zebra.h&gt;</a>
+<a name="ln23"> </a>
+<a name="ln24">#ifdef SUNOS_5</a>
+<a name="ln25">#include &lt;ifaddrs.h&gt;</a>
+<a name="ln26">#endif</a>
+<a name="ln27"> </a>
+<a name="ln28">#include &quot;log.h&quot;</a>
+<a name="ln29">#include &quot;sockopt.h&quot;</a>
+<a name="ln30">#include &quot;sockunion.h&quot;</a>
+<a name="ln31"> </a>
+<a name="ln32">int</a>
+<a name="ln33">setsockopt_so_recvbuf (int sock, int size)</a>
+<a name="ln34">{</a>
+<a name="ln35">  int ret;</a>
+<a name="ln36">  </a>
+<a name="ln37">  if ( (ret = setsockopt (sock, SOL_SOCKET, SO_RCVBUF, (char *)</a>
+<a name="ln38">                          &amp;size, sizeof (int))) &lt; 0)</a>
+<a name="ln39">    zlog_err (&quot;fd %d: can't setsockopt SO_RCVBUF to %d: %s&quot;,</a>
+<a name="ln40">	      sock,size,safe_strerror(errno));</a>
+<a name="ln41"> </a>
+<a name="ln42">  return ret;</a>
+<a name="ln43">}</a>
+<a name="ln44"> </a>
+<a name="ln45">int</a>
+<a name="ln46">setsockopt_so_sendbuf (const int sock, int size)</a>
+<a name="ln47">{</a>
+<a name="ln48">  int ret = setsockopt (sock, SOL_SOCKET, SO_SNDBUF,</a>
+<a name="ln49">    (char *)&amp;size, sizeof (int));</a>
+<a name="ln50">  </a>
+<a name="ln51">  if (ret &lt; 0)</a>
+<a name="ln52">    zlog_err (&quot;fd %d: can't setsockopt SO_SNDBUF to %d: %s&quot;,</a>
+<a name="ln53">      sock, size, safe_strerror (errno));</a>
+<a name="ln54"> </a>
+<a name="ln55">  return ret;</a>
+<a name="ln56">}</a>
+<a name="ln57"> </a>
+<a name="ln58">int</a>
+<a name="ln59">getsockopt_so_sendbuf (const int sock)</a>
+<a name="ln60">{</a>
+<a name="ln61">  u_int32_t optval;</a>
+<a name="ln62">  socklen_t optlen = sizeof (optval);</a>
+<a name="ln63">  int ret = getsockopt (sock, SOL_SOCKET, SO_SNDBUF,</a>
+<a name="ln64">    (char *)&amp;optval, &amp;optlen);</a>
+<a name="ln65">  if (ret &lt; 0)</a>
+<a name="ln66">  {</a>
+<a name="ln67">    zlog_err (&quot;fd %d: can't getsockopt SO_SNDBUF: %d (%s)&quot;,</a>
+<a name="ln68">      sock, errno, safe_strerror (errno));</a>
+<a name="ln69">    return ret;</a>
+<a name="ln70">  }</a>
+<a name="ln71">  return optval;</a>
+<a name="ln72">}</a>
+<a name="ln73"> </a>
+<a name="ln74">static void *</a>
+<a name="ln75">getsockopt_cmsg_data (struct msghdr *msgh, int level, int type)</a>
+<a name="ln76">{</a>
+<a name="ln77">  struct cmsghdr *cmsg;</a>
+<a name="ln78">  void *ptr = NULL;</a>
+<a name="ln79">  </a>
+<a name="ln80">  for (cmsg = ZCMSG_FIRSTHDR(msgh); </a>
+<a name="ln81">       cmsg != NULL;</a>
+<a name="ln82">       cmsg = CMSG_NXTHDR(msgh, cmsg))</a>
+<a name="ln83">    if (cmsg-&gt;cmsg_level == level &amp;&amp; cmsg-&gt;cmsg_type)</a>
+<a name="ln84">      return (ptr = CMSG_DATA(cmsg));</a>
+<a name="ln85"> </a>
+<a name="ln86">  return NULL;</a>
+<a name="ln87">}</a>
+<a name="ln88"> </a>
+<a name="ln89">#ifdef HAVE_IPV6</a>
+<a name="ln90">/* Set IPv6 packet info to the socket. */</a>
+<a name="ln91">int</a>
+<a name="ln92">setsockopt_ipv6_pktinfo (int sock, int val)</a>
+<a name="ln93">{</a>
+<a name="ln94">  int ret;</a>
+<a name="ln95">    </a>
+<a name="ln96">#ifdef IPV6_RECVPKTINFO		/*2292bis-01*/</a>
+<a name="ln97">  ret = setsockopt(sock, IPPROTO_IPV6, IPV6_RECVPKTINFO, &amp;val, sizeof(val));</a>
+<a name="ln98">  if (ret &lt; 0)</a>
+<a name="ln99">    zlog_warn (&quot;can't setsockopt IPV6_RECVPKTINFO : %s&quot;, safe_strerror (errno));</a>
+<a name="ln100">#else	/*RFC2292*/</a>
+<a name="ln101">  ret = setsockopt(sock, IPPROTO_IPV6, IPV6_PKTINFO, &amp;val, sizeof(val));</a>
+<a name="ln102">  if (ret &lt; 0)</a>
+<a name="ln103">    zlog_warn (&quot;can't setsockopt IPV6_PKTINFO : %s&quot;, safe_strerror (errno));</a>
+<a name="ln104">#endif /* INIA_IPV6 */</a>
+<a name="ln105">  return ret;</a>
+<a name="ln106">}</a>
+<a name="ln107"> </a>
+<a name="ln108">/* Set multicast hops val to the socket. */</a>
+<a name="ln109">int</a>
+<a name="ln110">setsockopt_ipv6_checksum (int sock, int val)</a>
+<a name="ln111">{</a>
+<a name="ln112">  int ret;</a>
+<a name="ln113"> </a>
+<a name="ln114">#ifdef GNU_LINUX</a>
+<a name="ln115">  ret = setsockopt(sock, IPPROTO_RAW, IPV6_CHECKSUM, &amp;val, sizeof(val));</a>
+<a name="ln116">#else</a>
+<a name="ln117">  ret = setsockopt(sock, IPPROTO_IPV6, IPV6_CHECKSUM, &amp;val, sizeof(val));</a>
+<a name="ln118">#endif /* GNU_LINUX */</a>
+<a name="ln119">  if (ret &lt; 0)</a>
+<a name="ln120">    zlog_warn (&quot;can't setsockopt IPV6_CHECKSUM&quot;);</a>
+<a name="ln121">  return ret;</a>
+<a name="ln122">}</a>
+<a name="ln123"> </a>
+<a name="ln124">/* Set multicast hops val to the socket. */</a>
+<a name="ln125">int</a>
+<a name="ln126">setsockopt_ipv6_multicast_hops (int sock, int val)</a>
+<a name="ln127">{</a>
+<a name="ln128">  int ret;</a>
+<a name="ln129"> </a>
+<a name="ln130">  ret = setsockopt(sock, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, &amp;val, sizeof(val));</a>
+<a name="ln131">  if (ret &lt; 0)</a>
+<a name="ln132">    zlog_warn (&quot;can't setsockopt IPV6_MULTICAST_HOPS&quot;);</a>
+<a name="ln133">  return ret;</a>
+<a name="ln134">}</a>
+<a name="ln135"> </a>
+<a name="ln136">/* Set multicast hops val to the socket. */</a>
+<a name="ln137">int</a>
+<a name="ln138">setsockopt_ipv6_unicast_hops (int sock, int val)</a>
+<a name="ln139">{</a>
+<a name="ln140">  int ret;</a>
+<a name="ln141"> </a>
+<a name="ln142">  ret = setsockopt(sock, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &amp;val, sizeof(val));</a>
+<a name="ln143">  if (ret &lt; 0)</a>
+<a name="ln144">    zlog_warn (&quot;can't setsockopt IPV6_UNICAST_HOPS&quot;);</a>
+<a name="ln145">  return ret;</a>
+<a name="ln146">}</a>
+<a name="ln147"> </a>
+<a name="ln148">int</a>
+<a name="ln149">setsockopt_ipv6_hoplimit (int sock, int val)</a>
+<a name="ln150">{</a>
+<a name="ln151">  int ret;</a>
+<a name="ln152"> </a>
+<a name="ln153">#ifdef IPV6_RECVHOPLIMIT	/*2292bis-01*/</a>
+<a name="ln154">  ret = setsockopt (sock, IPPROTO_IPV6, IPV6_RECVHOPLIMIT, &amp;val, sizeof(val));</a>
+<a name="ln155">  if (ret &lt; 0)</a>
+<a name="ln156">    zlog_warn (&quot;can't setsockopt IPV6_RECVHOPLIMIT&quot;);</a>
+<a name="ln157">#else	/*RFC2292*/</a>
+<a name="ln158">  ret = setsockopt (sock, IPPROTO_IPV6, IPV6_HOPLIMIT, &amp;val, sizeof(val));</a>
+<a name="ln159">  if (ret &lt; 0)</a>
+<a name="ln160">    zlog_warn (&quot;can't setsockopt IPV6_HOPLIMIT&quot;);</a>
+<a name="ln161">#endif</a>
+<a name="ln162">  return ret;</a>
+<a name="ln163">}</a>
+<a name="ln164"> </a>
+<a name="ln165">/* Set multicast loop zero to the socket. */</a>
+<a name="ln166">int</a>
+<a name="ln167">setsockopt_ipv6_multicast_loop (int sock, int val)</a>
+<a name="ln168">{</a>
+<a name="ln169">  int ret;</a>
+<a name="ln170">    </a>
+<a name="ln171">  ret = setsockopt (sock, IPPROTO_IPV6, IPV6_MULTICAST_LOOP, &amp;val,</a>
+<a name="ln172">		    sizeof (val));</a>
+<a name="ln173">  if (ret &lt; 0)</a>
+<a name="ln174">    zlog_warn (&quot;can't setsockopt IPV6_MULTICAST_LOOP&quot;);</a>
+<a name="ln175">  return ret;</a>
+<a name="ln176">}</a>
+<a name="ln177"> </a>
+<a name="ln178">static int</a>
+<a name="ln179">getsockopt_ipv6_ifindex (struct msghdr *msgh)</a>
+<a name="ln180">{</a>
+<a name="ln181">  struct in6_pktinfo *pktinfo;</a>
+<a name="ln182">  </a>
+<a name="ln183">  pktinfo = getsockopt_cmsg_data (msgh, IPPROTO_IPV6, IPV6_PKTINFO);</a>
+<a name="ln184">  </a>
+<a name="ln185">  return pktinfo-&gt;ipi6_ifindex;</a>
+<a name="ln186">}</a>
+<a name="ln187"> </a>
+<a name="ln188">int</a>
+<a name="ln189">setsockopt_ipv6_tclass(int sock, int tclass)</a>
+<a name="ln190">{</a>
+<a name="ln191">  int ret = 0;</a>
+<a name="ln192"> </a>
+<a name="ln193">#ifdef IPV6_TCLASS /* RFC3542 */</a>
+<a name="ln194">  ret = setsockopt (sock, IPPROTO_IPV6, IPV6_TCLASS, &amp;tclass, sizeof (tclass));</a>
+<a name="ln195">  if (ret &lt; 0)</a>
+<a name="ln196">    zlog_warn (&quot;Can't set IPV6_TCLASS option for fd %d to %#x: %s&quot;,</a>
+<a name="ln197">	       sock, tclass, safe_strerror(errno));</a>
+<a name="ln198">#endif</a>
+<a name="ln199">  return ret;</a>
+<a name="ln200">}</a>
+<a name="ln201">#endif /* HAVE_IPV6 */</a>
+<a name="ln202"> </a>
+<a name="ln203">/*</a>
+<a name="ln204"> * Process multicast socket options for IPv4 in an OS-dependent manner.</a>
+<a name="ln205"> * Supported options are IP_{ADD,DROP}_MEMBERSHIP.</a>
+<a name="ln206"> *</a>
+<a name="ln207"> * Many operating systems have a limit on the number of groups that</a>
+<a name="ln208"> * can be joined per socket (where each group and local address</a>
+<a name="ln209"> * counts).  This impacts OSPF, which joins groups on each interface</a>
+<a name="ln210"> * using a single socket.  The limit is typically 20, derived from the</a>
+<a name="ln211"> * original BSD multicast implementation.  Some systems have</a>
+<a name="ln212"> * mechanisms for increasing this limit.</a>
+<a name="ln213"> *</a>
+<a name="ln214"> * In many 4.4BSD-derived systems, multicast group operations are not</a>
+<a name="ln215"> * allowed on interfaces that are not UP.  Thus, a previous attempt to</a>
+<a name="ln216"> * leave the group may have failed, leaving it still joined, and we</a>
+<a name="ln217"> * drop/join quietly to recover.  This may not be necessary, but aims to</a>
+<a name="ln218"> * defend against unknown behavior in that we will still return an error</a>
+<a name="ln219"> * if the second join fails.  It is not clear how other systems</a>
+<a name="ln220"> * (e.g. Linux, Solaris) behave when leaving groups on down interfaces,</a>
+<a name="ln221"> * but this behavior should not be harmful if they behave the same way,</a>
+<a name="ln222"> * allow leaves, or implicitly leave all groups joined to down interfaces.</a>
+<a name="ln223"> */</a>
+<a name="ln224">int</a>
+<a name="ln225">setsockopt_ipv4_multicast(int sock,</a>
+<a name="ln226">			int optname, </a>
+<a name="ln227">			unsigned int mcast_addr,</a>
+<a name="ln228">			ifindex_t ifindex)</a>
+<a name="ln229">{</a>
+<a name="ln230">#ifdef HAVE_RFC3678</a>
+<a name="ln231">  struct group_req gr;</a>
+<a name="ln232">  struct sockaddr_in *si;</a>
+<a name="ln233">  int ret;</a>
+<a name="ln234">  memset (&amp;gr, 0, sizeof(gr));</a>
+<a name="ln235">  si = (struct sockaddr_in *)&amp;gr.gr_group;</a>
+<a name="ln236">  gr.gr_interface = ifindex;</a>
+<a name="ln237">  si-&gt;sin_family = AF_INET;</a>
+<a name="ln238">#ifdef HAVE_STRUCT_SOCKADDR_IN_SIN_LEN</a>
+<a name="ln239">  si-&gt;sin_len = sizeof(struct sockaddr_in);</a>
+<a name="ln240">#endif /* HAVE_STRUCT_SOCKADDR_IN_SIN_LEN */</a>
+<a name="ln241">  si-&gt;sin_addr.s_addr = mcast_addr;</a>
+<a name="ln242">  ret = setsockopt(sock, IPPROTO_IP, (optname == IP_ADD_MEMBERSHIP) ? </a>
+<a name="ln243">    MCAST_JOIN_GROUP : MCAST_LEAVE_GROUP, (void *)&amp;gr, sizeof(gr));</a>
+<a name="ln244">  if ((ret &lt; 0) &amp;&amp; (optname == IP_ADD_MEMBERSHIP) &amp;&amp; (errno == EADDRINUSE))</a>
+<a name="ln245">    {</a>
+<a name="ln246">      setsockopt(sock, IPPROTO_IP, MCAST_LEAVE_GROUP, (void *)&amp;gr, sizeof(gr));</a>
+<a name="ln247">      ret = setsockopt(sock, IPPROTO_IP, MCAST_JOIN_GROUP, (void *)&amp;gr, sizeof(gr));</a>
+<a name="ln248">    }</a>
+<a name="ln249">  return ret;</a>
+<a name="ln250"> </a>
+<a name="ln251">#elif defined(HAVE_STRUCT_IP_MREQN_IMR_IFINDEX) &amp;&amp; !defined(__FreeBSD__)</a>
+<a name="ln252">  struct ip_mreqn mreqn;</a>
+<a name="ln253">  int ret;</a>
+<a name="ln254">  </a>
+<a name="ln255">  assert(optname == IP_ADD_MEMBERSHIP || optname == IP_DROP_MEMBERSHIP);</a>
+<a name="ln256">  memset (&amp;mreqn, 0, sizeof(mreqn));</a>
+<a name="ln257"> </a>
+<a name="ln258">  mreqn.imr_multiaddr.s_addr = mcast_addr;</a>
+<a name="ln259">  mreqn.imr_ifindex = ifindex;</a>
+<a name="ln260">  </a>
+<a name="ln261">  ret = setsockopt(sock, IPPROTO_IP, optname,</a>
+<a name="ln262">                   (void *)&amp;mreqn, sizeof(mreqn));</a>
+<a name="ln263">  if ((ret &lt; 0) &amp;&amp; (optname == IP_ADD_MEMBERSHIP) &amp;&amp; (errno == EADDRINUSE))</a>
+<a name="ln264">    {</a>
+<a name="ln265">      /* see above: handle possible problem when interface comes back up */</a>
+<a name="ln266">      char buf[1][INET_ADDRSTRLEN];</a>
+<a name="ln267">      zlog_info(&quot;setsockopt_ipv4_multicast attempting to drop and &quot;</a>
+<a name="ln268">                &quot;re-add (fd %d, mcast %s, ifindex %u)&quot;,</a>
+<a name="ln269">                sock,</a>
+<a name="ln270">                inet_ntop(AF_INET, &amp;mreqn.imr_multiaddr,</a>
+<a name="ln271">                          buf[0], sizeof(buf[0])), ifindex);</a>
+<a name="ln272">      setsockopt(sock, IPPROTO_IP, IP_DROP_MEMBERSHIP,</a>
+<a name="ln273">                 (void *)&amp;mreqn, sizeof(mreqn));</a>
+<a name="ln274">      ret = setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP,</a>
+<a name="ln275">                       (void *)&amp;mreqn, sizeof(mreqn));</a>
+<a name="ln276">    }</a>
+<a name="ln277">  return ret;</a>
+<a name="ln278"> </a>
+<a name="ln279">  /* Example defines for another OS, boilerplate off other code in this</a>
+<a name="ln280">     function, AND handle optname as per other sections for consistency !! */</a>
+<a name="ln281">  /* #elif  defined(BOGON_NIX) &amp;&amp; EXAMPLE_VERSION_CODE &gt; -100000 */</a>
+<a name="ln282">  /* Add your favourite OS here! */</a>
+<a name="ln283"> </a>
+<a name="ln284">#elif defined(HAVE_BSD_STRUCT_IP_MREQ_HACK) /* #if OS_TYPE */ </a>
+<a name="ln285">  /* standard BSD API */</a>
+<a name="ln286"> </a>
+<a name="ln287">  struct in_addr m;</a>
+<a name="ln288">  struct ip_mreq mreq;</a>
+<a name="ln289">  int ret;</a>
+<a name="ln290"> </a>
+<a name="ln291">  assert(optname == IP_ADD_MEMBERSHIP || optname == IP_DROP_MEMBERSHIP);</a>
+<a name="ln292"> </a>
+<a name="ln293">  m.s_addr = htonl(ifindex);</a>
+<a name="ln294"> </a>
+<a name="ln295">  memset (&amp;mreq, 0, sizeof(mreq));</a>
+<a name="ln296">  mreq.imr_multiaddr.s_addr = mcast_addr;</a>
+<a name="ln297">  mreq.imr_interface = m;</a>
+<a name="ln298">  </a>
+<a name="ln299">  ret = setsockopt (sock, IPPROTO_IP, optname, (void *)&amp;mreq, sizeof(mreq));</a>
+<a name="ln300">  if ((ret &lt; 0) &amp;&amp; (optname == IP_ADD_MEMBERSHIP) &amp;&amp; (errno == EADDRINUSE))</a>
+<a name="ln301">    {</a>
+<a name="ln302">      /* see above: handle possible problem when interface comes back up */</a>
+<a name="ln303">      char buf[1][INET_ADDRSTRLEN];</a>
+<a name="ln304">      zlog_info(&quot;setsockopt_ipv4_multicast attempting to drop and &quot;</a>
+<a name="ln305">                &quot;re-add (fd %d, mcast %s, ifindex %u)&quot;,</a>
+<a name="ln306">                sock,</a>
+<a name="ln307">                inet_ntop(AF_INET, &amp;mreq.imr_multiaddr,</a>
+<a name="ln308">                          buf[0], sizeof(buf[0])), ifindex);</a>
+<a name="ln309">      setsockopt (sock, IPPROTO_IP, IP_DROP_MEMBERSHIP,</a>
+<a name="ln310">                  (void *)&amp;mreq, sizeof(mreq));</a>
+<a name="ln311">      ret = setsockopt (sock, IPPROTO_IP, IP_ADD_MEMBERSHIP,</a>
+<a name="ln312">                        (void *)&amp;mreq, sizeof(mreq));</a>
+<a name="ln313">    }</a>
+<a name="ln314">  return ret;</a>
+<a name="ln315"> </a>
+<a name="ln316">#else</a>
+<a name="ln317">  #error &quot;Unsupported multicast API&quot;</a>
+<a name="ln318">#endif /* #if OS_TYPE */</a>
+<a name="ln319"> </a>
+<a name="ln320">}</a>
+<a name="ln321"> </a>
+<a name="ln322">/*</a>
+<a name="ln323"> * Set IP_MULTICAST_IF socket option in an OS-dependent manner.</a>
+<a name="ln324"> */</a>
+<a name="ln325">int</a>
+<a name="ln326">setsockopt_ipv4_multicast_if(int sock, ifindex_t ifindex)</a>
+<a name="ln327">{</a>
+<a name="ln328"> </a>
+<a name="ln329">#ifdef HAVE_STRUCT_IP_MREQN_IMR_IFINDEX</a>
+<a name="ln330">  struct ip_mreqn mreqn;</a>
+<a name="ln331">  memset (&amp;mreqn, 0, sizeof(mreqn));</a>
+<a name="ln332"> </a>
+<a name="ln333">  mreqn.imr_ifindex = ifindex;</a>
+<a name="ln334">  return setsockopt(sock, IPPROTO_IP, IP_MULTICAST_IF, (void *)&amp;mreqn, sizeof(mreqn));</a>
+<a name="ln335"> </a>
+<a name="ln336">  /* Example defines for another OS, boilerplate off other code in this</a>
+<a name="ln337">     function */</a>
+<a name="ln338">  /* #elif  defined(BOGON_NIX) &amp;&amp; EXAMPLE_VERSION_CODE &gt; -100000 */</a>
+<a name="ln339">  /* Add your favourite OS here! */</a>
+<a name="ln340">#elif defined(HAVE_BSD_STRUCT_IP_MREQ_HACK)</a>
+<a name="ln341">  struct in_addr m;</a>
+<a name="ln342"> </a>
+<a name="ln343">  m.s_addr = htonl(ifindex);</a>
+<a name="ln344"> </a>
+<a name="ln345">  return setsockopt (sock, IPPROTO_IP, IP_MULTICAST_IF, (void *)&amp;m, sizeof(m));</a>
+<a name="ln346">#elif defined(SUNOS_5)</a>
+<a name="ln347">  char ifname[IF_NAMESIZE];</a>
+<a name="ln348">  struct ifaddrs *ifa, *ifap;</a>
+<a name="ln349">  struct in_addr ifaddr;</a>
+<a name="ln350"> </a>
+<a name="ln351">  if (if_indextoname(ifindex, ifname) == NULL)</a>
+<a name="ln352">    return -1;</a>
+<a name="ln353"> </a>
+<a name="ln354">  if (getifaddrs(&amp;ifa) != 0)</a>
+<a name="ln355">    return -1;</a>
+<a name="ln356"> </a>
+<a name="ln357">  for (ifap = ifa; ifap != NULL; ifap = ifap-&gt;ifa_next)</a>
+<a name="ln358">    {</a>
+<a name="ln359">      struct sockaddr_in *sa;</a>
+<a name="ln360"> </a>
+<a name="ln361">      if (strcmp(ifap-&gt;ifa_name, ifname) != 0)</a>
+<a name="ln362">        continue;</a>
+<a name="ln363">      if (ifap-&gt;ifa_addr-&gt;sa_family != AF_INET)</a>
+<a name="ln364">        continue;</a>
+<a name="ln365">      sa = (struct sockaddr_in*)ifap-&gt;ifa_addr;</a>
+<a name="ln366">      memcpy(&amp;ifaddr, &amp;sa-&gt;sin_addr, sizeof(ifaddr));</a>
+<a name="ln367">      break;</a>
+<a name="ln368">    }</a>
+<a name="ln369"> </a>
+<a name="ln370">  freeifaddrs(ifa);</a>
+<a name="ln371">  if (!ifap) /* This means we did not find an IP */</a>
+<a name="ln372">    return -1;</a>
+<a name="ln373"> </a>
+<a name="ln374">  return setsockopt(sock, IPPROTO_IP, IP_MULTICAST_IF, (void *)&amp;ifaddr, sizeof(ifaddr));</a>
+<a name="ln375">#else</a>
+<a name="ln376">  #error &quot;Unsupported multicast API&quot;</a>
+<a name="ln377">#endif</a>
+<a name="ln378">}</a>
+<a name="ln379">  </a>
+<a name="ln380">static int</a>
+<a name="ln381">setsockopt_ipv4_ifindex (int sock, ifindex_t val)</a>
+<a name="ln382">{</a>
+<a name="ln383">  int ret;</a>
+<a name="ln384"> </a>
+<a name="ln385">#if defined (IP_PKTINFO)</a>
+<a name="ln386">  if ((ret = setsockopt (sock, IPPROTO_IP, IP_PKTINFO, &amp;val, sizeof (val))) &lt; 0)</a>
+<a name="ln387">    zlog_warn (&quot;Can't set IP_PKTINFO option for fd %d to %d: %s&quot;,</a>
+<a name="ln388">	       sock,val,safe_strerror(errno));</a>
+<a name="ln389">#elif defined (IP_RECVIF)</a>
+<a name="ln390">  if ((ret = setsockopt (sock, IPPROTO_IP, IP_RECVIF, &amp;val, sizeof (val))) &lt; 0)</a>
+<a name="ln391">    zlog_warn (&quot;Can't set IP_RECVIF option for fd %d to %d: %s&quot;,</a>
+<a name="ln392">	       sock,val,safe_strerror(errno));</a>
+<a name="ln393">#else</a>
+<a name="ln394">#warning &quot;Neither IP_PKTINFO nor IP_RECVIF is available.&quot;</a>
+<a name="ln395">#warning &quot;Will not be able to receive link info.&quot;</a>
+<a name="ln396">#warning &quot;Things might be seriously broken..&quot;</a>
+<a name="ln397">  /* XXX Does this ever happen?  Should there be a zlog_warn message here? */</a>
+<a name="ln398">  ret = -1;</a>
+<a name="ln399">#endif</a>
+<a name="ln400">  return ret;</a>
+<a name="ln401">}</a>
+<a name="ln402"> </a>
+<a name="ln403">int</a>
+<a name="ln404">setsockopt_ipv4_tos(int sock, int tos)</a>
+<a name="ln405">{</a>
+<a name="ln406">  int ret;</a>
+<a name="ln407"> </a>
+<a name="ln408">  ret = setsockopt (sock, IPPROTO_IP, IP_TOS, &amp;tos, sizeof (tos));</a>
+<a name="ln409">  if (ret &lt; 0)</a>
+<a name="ln410">    zlog_warn (&quot;Can't set IP_TOS option for fd %d to %#x: %s&quot;,</a>
+<a name="ln411">	       sock, tos, safe_strerror(errno));</a>
+<a name="ln412">  return ret;</a>
+<a name="ln413">}</a>
+<a name="ln414"> </a>
+<a name="ln415"> </a>
+<a name="ln416">int</a>
+<a name="ln417">setsockopt_ifindex (int af, int sock, ifindex_t val)</a>
+<a name="ln418">{</a>
+<a name="ln419">  int ret = -1;</a>
+<a name="ln420">  </a>
+<a name="ln421">  switch (af)</a>
+<a name="ln422">    {</a>
+<a name="ln423">      case AF_INET:</a>
+<a name="ln424">        ret = setsockopt_ipv4_ifindex (sock, val);</a>
+<a name="ln425">        break;</a>
+<a name="ln426">#ifdef HAVE_IPV6</a>
+<a name="ln427">      case AF_INET6:</a>
+<a name="ln428">        ret = setsockopt_ipv6_pktinfo (sock, val);</a>
+<a name="ln429">        break;</a>
+<a name="ln430">#endif</a>
+<a name="ln431">      default:</a>
+<a name="ln432">        zlog_warn (&quot;setsockopt_ifindex: unknown address family %d&quot;, af);</a>
+<a name="ln433">    }</a>
+<a name="ln434">  return ret;</a>
+<a name="ln435">}</a>
+<a name="ln436">  </a>
+<a name="ln437">/*</a>
+<a name="ln438"> * Requires: msgh is not NULL and points to a valid struct msghdr, which</a>
+<a name="ln439"> * may or may not have control data about the incoming interface.</a>
+<a name="ln440"> *</a>
+<a name="ln441"> * Returns the interface index (small integer &gt;= 1) if it can be</a>
+<a name="ln442"> * determined, or else 0.</a>
+<a name="ln443"> */</a>
+<a name="ln444">static ifindex_t</a>
+<a name="ln445">getsockopt_ipv4_ifindex (struct msghdr *msgh)</a>
+<a name="ln446">{</a>
+<a name="ln447">  /* XXX: initialize to zero?  (Always overwritten, so just cosmetic.) */</a>
+<a name="ln448">  ifindex_t ifindex = -1;</a>
+<a name="ln449"> </a>
+<a name="ln450">#if defined(IP_PKTINFO)</a>
+<a name="ln451">/* Linux pktinfo based ifindex retrieval */</a>
+<a name="ln452">  struct in_pktinfo *pktinfo;</a>
+<a name="ln453">  </a>
+<a name="ln454">  pktinfo = </a>
+<a name="ln455">    (struct in_pktinfo *)getsockopt_cmsg_data (msgh, IPPROTO_IP, IP_PKTINFO);</a>
+<a name="ln456">  /* XXX Can pktinfo be NULL?  Clean up post 0.98. */</a>
+<a name="ln457">  ifindex = pktinfo-&gt;ipi_ifindex;</a>
+<a name="ln458">  </a>
+<a name="ln459">#elif defined(IP_RECVIF)</a>
+<a name="ln460"> </a>
+<a name="ln461">  /* retrieval based on IP_RECVIF */</a>
+<a name="ln462"> </a>
+<a name="ln463">#ifndef SUNOS_5</a>
+<a name="ln464">  /* BSD systems use a sockaddr_dl as the control message payload. */</a>
+<a name="ln465">  struct sockaddr_dl *sdl;</a>
+<a name="ln466">#else</a>
+<a name="ln467">  /* SUNOS_5 uses an integer with the index. */</a>
+<a name="ln468">  ifindex_t *ifindex_p;</a>
+<a name="ln469">#endif /* SUNOS_5 */</a>
+<a name="ln470"> </a>
+<a name="ln471">#ifndef SUNOS_5</a>
+<a name="ln472">  /* BSD */</a>
+<a name="ln473">  sdl = </a>
+<a name="ln474">    (struct sockaddr_dl *)getsockopt_cmsg_data (msgh, IPPROTO_IP, IP_RECVIF);</a>
+<a name="ln475">  if (sdl != NULL)</a>
+<a name="ln476">    ifindex = sdl-&gt;sdl_index;</a>
+<a name="ln477">  else</a>
+<a name="ln478">    ifindex = 0;</a>
+<a name="ln479">#else</a>
+<a name="ln480">  /*</a>
+<a name="ln481">   * Solaris.  On Solaris 8, IP_RECVIF is defined, but the call to</a>
+<a name="ln482">   * enable it fails with errno=99, and the struct msghdr has</a>
+<a name="ln483">   * controllen 0.</a>
+<a name="ln484">   */</a>
+<a name="ln485">  ifindex_p = (uint_t *)getsockopt_cmsg_data (msgh, IPPROTO_IP, IP_RECVIF); </a>
+<a name="ln486">  if (ifindex_p != NULL)</a>
+<a name="ln487">    ifindex = *ifindex_p;</a>
+<a name="ln488">  else</a>
+<a name="ln489">    ifindex = 0;</a>
+<a name="ln490">#endif /* SUNOS_5 */</a>
+<a name="ln491"> </a>
+<a name="ln492">#else</a>
+<a name="ln493">  /*</a>
+<a name="ln494">   * Neither IP_PKTINFO nor IP_RECVIF defined - warn at compile time.</a>
+<a name="ln495">   * XXX Decide if this is a core service, or if daemons have to cope.</a>
+<a name="ln496">   * Since Solaris 8 and OpenBSD seem not to provide it, it seems that</a>
+<a name="ln497">   * daemons have to cope.</a>
+<a name="ln498">   */</a>
+<a name="ln499">#warning &quot;getsockopt_ipv4_ifindex: Neither IP_PKTINFO nor IP_RECVIF defined.&quot;</a>
+<a name="ln500">#warning &quot;Some daemons may fail to operate correctly!&quot;</a>
+<a name="ln501">  ifindex = 0;</a>
+<a name="ln502"> </a>
+<a name="ln503">#endif /* IP_PKTINFO */ </a>
+<a name="ln504"> </a>
+<a name="ln505">  return ifindex;</a>
+<a name="ln506">}</a>
+<a name="ln507"> </a>
+<a name="ln508">/* return ifindex, 0 if none found */</a>
+<a name="ln509">ifindex_t</a>
+<a name="ln510">getsockopt_ifindex (int af, struct msghdr *msgh)</a>
+<a name="ln511">{</a>
+<a name="ln512">  switch (af)</a>
+<a name="ln513">    {</a>
+<a name="ln514">      case AF_INET:</a>
+<a name="ln515">        return (getsockopt_ipv4_ifindex (msgh));</a>
+<a name="ln516">        break;</a>
+<a name="ln517">#ifdef HAVE_IPV6</a>
+<a name="ln518">      case AF_INET6:</a>
+<a name="ln519">        return (getsockopt_ipv6_ifindex (msgh));</a>
+<a name="ln520">        break;</a>
+<a name="ln521">#endif</a>
+<a name="ln522">      default:</a>
+<a name="ln523">        zlog_warn (&quot;getsockopt_ifindex: unknown address family %d&quot;, af);</a>
+<a name="ln524">        return 0;</a>
+<a name="ln525">    }</a>
+<a name="ln526">}</a>
+<a name="ln527"> </a>
+<a name="ln528">/* swab iph between order system uses for IP_HDRINCL and host order */</a>
+<a name="ln529">void</a>
+<a name="ln530">sockopt_iphdrincl_swab_htosys (struct ip *iph)</a>
+<a name="ln531">{</a>
+<a name="ln532">  /* BSD and derived take iph in network order, except for </a>
+<a name="ln533">   * ip_len and ip_off</a>
+<a name="ln534">   */</a>
+<a name="ln535">#ifndef HAVE_IP_HDRINCL_BSD_ORDER</a>
+<a name="ln536">  iph-&gt;ip_len = htons(iph-&gt;ip_len);</a>
+<a name="ln537">  iph-&gt;ip_off = htons(iph-&gt;ip_off);</a>
+<a name="ln538">#endif /* HAVE_IP_HDRINCL_BSD_ORDER */</a>
+<a name="ln539"> </a>
+<a name="ln540">  iph-&gt;ip_id = htons(iph-&gt;ip_id);</a>
+<a name="ln541">}</a>
+<a name="ln542"> </a>
+<a name="ln543">void</a>
+<a name="ln544">sockopt_iphdrincl_swab_systoh (struct ip *iph)</a>
+<a name="ln545">{</a>
+<a name="ln546">#ifndef HAVE_IP_HDRINCL_BSD_ORDER</a>
+<a name="ln547">  iph-&gt;ip_len = ntohs(iph-&gt;ip_len);</a>
+<a name="ln548">  iph-&gt;ip_off = ntohs(iph-&gt;ip_off);</a>
+<a name="ln549">#endif /* HAVE_IP_HDRINCL_BSD_ORDER */</a>
+<a name="ln550"> </a>
+<a name="ln551">  iph-&gt;ip_id = ntohs(iph-&gt;ip_id);</a>
+<a name="ln552">}</a>
+<a name="ln553"> </a>
+<a name="ln554">int</a>
+<a name="ln555">sockopt_tcp_rtt (int sock)</a>
+<a name="ln556">{</a>
+<a name="ln557">#ifdef TCP_INFO</a>
+<a name="ln558">  struct tcp_info ti;</a>
+<a name="ln559">  socklen_t len = sizeof(ti);</a>
+<a name="ln560"> </a>
+<a name="ln561">  if (getsockopt (sock, IPPROTO_TCP, TCP_INFO, &amp;ti, &amp;len) != 0)</a>
+<a name="ln562">    return 0;</a>
+<a name="ln563"> </a>
+<a name="ln564">  return ti.tcpi_rtt / 1000;</a>
+<a name="ln565">#else</a>
+<a name="ln566">  return 0;</a>
+<a name="ln567">#endif</a>
+<a name="ln568">}</a>
+<a name="ln569"> </a>
+<a name="ln570">int</a>
+<a name="ln571">sockopt_tcp_signature (int sock, union sockunion *su, const char *password)</a>
+<a name="ln572">{</a>
+<a name="ln573">#if defined(HAVE_TCP_MD5_LINUX24) &amp;&amp; defined(GNU_LINUX)</a>
+<a name="ln574">  /* Support for the old Linux 2.4 TCP-MD5 patch, taken from Hasso Tepper's</a>
+<a name="ln575">   * version of the Quagga patch (based on work by Rick Payne, and Bruce</a>
+<a name="ln576">   * Simpson)</a>
+<a name="ln577">   */</a>
+<a name="ln578">#define TCP_MD5_AUTH 13</a>
+<a name="ln579">#define TCP_MD5_AUTH_ADD 1</a>
+<a name="ln580">#define TCP_MD5_AUTH_DEL 2</a>
+<a name="ln581">  struct tcp_rfc2385_cmd {</a>
+<a name="ln582">    u_int8_t     command;    /* Command - Add/Delete */</a>
+<a name="ln583">    u_int32_t    address;    /* IPV4 address associated */</a>
+<a name="ln584">    u_int8_t     keylen;     /* MD5 Key len (do NOT assume 0 terminated ascii) */</a>
+<a name="ln585">    void         *key;       /* MD5 Key */</a>
+<a name="ln586">  } cmd;</a>
+<a name="ln587">  struct in_addr *addr = &amp;su-&gt;sin.sin_addr;</a>
+<a name="ln588">  </a>
+<a name="ln589">  cmd.command = (password != NULL ? TCP_MD5_AUTH_ADD : TCP_MD5_AUTH_DEL);</a>
+<a name="ln590">  cmd.address = addr-&gt;s_addr;</a>
+<a name="ln591">  cmd.keylen = (password != NULL ? strlen (password) : 0);</a>
+<a name="ln592">  cmd.key = password;</a>
+<a name="ln593">  </a>
+<a name="ln594">  return setsockopt (sock, IPPROTO_TCP, TCP_MD5_AUTH, &amp;cmd, sizeof cmd);</a>
+<a name="ln595">  </a>
+<a name="ln596">#elif HAVE_DECL_TCP_MD5SIG</a>
+<a name="ln597">  int ret;</a>
+<a name="ln598">#ifndef GNU_LINUX</a>
+<a name="ln599">  /*</a>
+<a name="ln600">   * XXX Need to do PF_KEY operation here to add/remove an SA entry,</a>
+<a name="ln601">   * and add/remove an SP entry for this peer's packet flows also.</a>
+<a name="ln602">   */</a>
+<a name="ln603">  int md5sig = password &amp;&amp; *password ? 1 : 0;</a>
+<a name="ln604">#else</a>
+<a name="ln605">  int keylen = password ? strlen (password) : 0;</a>
+<a name="ln606">  struct tcp_md5sig md5sig;</a>
+<a name="ln607">  union sockunion *su2, *susock;</a>
+<a name="ln608">  </a>
+<a name="ln609">  /* Figure out whether the socket and the sockunion are the same family..</a>
+<a name="ln610">   * adding AF_INET to AF_INET6 needs to be v4 mapped, you'd think..</a>
+<a name="ln611">   */</a>
+<a name="ln612">  if (!(susock = sockunion_getsockname (sock)))</a>
+<a name="ln613">    return -1;</a>
+<a name="ln614">  </a>
+<a name="ln615">  if (susock-&gt;sa.sa_family == su-&gt;sa.sa_family)</a>
+<a name="ln616">    su2 = su;</a>
+<a name="ln617">  else</a>
+<a name="ln618">    {</a>
+<a name="ln619">      /* oops.. */</a>
+<a name="ln620">      su2 = susock;</a>
+<a name="ln621">      </a>
+<a name="ln622">      if (su2-&gt;sa.sa_family == AF_INET)</a>
+<a name="ln623">        {</a>
+<a name="ln624">          sockunion_free (susock);</a>
+<a name="ln625">          return 0;</a>
+<a name="ln626">        }</a>
+<a name="ln627">      </a>
+<a name="ln628">#ifdef HAVE_IPV6</a>
+<a name="ln629">      /* If this does not work, then all users of this sockopt will need to</a>
+<a name="ln630">       * differentiate between IPv4 and IPv6, and keep seperate sockets for</a>
+<a name="ln631">       * each. </a>
+<a name="ln632">       *</a>
+<a name="ln633">       * Sadly, it doesn't seem to work at present. It's unknown whether</a>
+<a name="ln634">       * this is a bug or not.</a>
+<a name="ln635">       */</a>
+<a name="ln636">      if (su2-&gt;sa.sa_family == AF_INET6</a>
+<a name="ln637">          &amp;&amp; su-&gt;sa.sa_family == AF_INET)</a>
+<a name="ln638">        {</a>
+<a name="ln639">           su2-&gt;sin6.sin6_family = AF_INET6;</a>
+<a name="ln640">           /* V4Map the address */</a>
+<a name="ln641">           memset (&amp;su2-&gt;sin6.sin6_addr, 0, sizeof (struct in6_addr));</a>
+<a name="ln642">           su2-&gt;sin6.sin6_addr.s6_addr32[2] = htonl(0xffff);</a>
+<a name="ln643">           memcpy (&amp;su2-&gt;sin6.sin6_addr.s6_addr32[3], &amp;su-&gt;sin.sin_addr, 4);</a>
+<a name="ln644">        }</a>
+<a name="ln645">#endif</a>
+<a name="ln646">    }</a>
+<a name="ln647">  </a>
+<a name="ln648">  memset (&amp;md5sig, 0, sizeof (md5sig));</a>
+<a name="ln649">  memcpy (&amp;md5sig.tcpm_addr, su2, sizeof (*su2));</a>
+<a name="ln650">  md5sig.tcpm_keylen = keylen;</a>
+<a name="ln651">  if (keylen)</a>
+<a name="ln652">    memcpy (md5sig.tcpm_key, password, keylen);</a>
+<a name="ln653">  sockunion_free (susock);</a>
+<a name="ln654">#endif /* GNU_LINUX */</a>
+<a name="ln655">  if ((ret = setsockopt (sock, IPPROTO_TCP, TCP_MD5SIG, &amp;md5sig, sizeof md5sig)) &lt; 0)</a>
+<a name="ln656">    {</a>
+<a name="ln657">      /* ENOENT is harmless.  It is returned when we clear a password for which</a>
+<a name="ln658">	 one was not previously set. */</a>
+<a name="ln659">      if (ENOENT == errno)</a>
+<a name="ln660">	ret = 0;</a>
+<a name="ln661">      else</a>
+<a name="ln662">	zlog_err (&quot;sockopt_tcp_signature: setsockopt(%d): %s&quot;,</a>
+<a name="ln663">		  sock, safe_strerror(errno));</a>
+<a name="ln664">    }</a>
+<a name="ln665">  return ret;</a>
+<a name="ln666">#else /* HAVE_TCP_MD5SIG */</a>
+<a name="ln667">  return -2;</a>
+<a name="ln668">#endif /* !HAVE_TCP_MD5SIG */</a>
+<a name="ln669">}</a>
+
+</code></pre>
+<div class="balloon" rel="7"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v1042/" target="_blank">V1042</a> This file is marked with copyleft license, which requires you to open the derived source code.</p></div>
+<div class="balloon" rel="649"><p><span style="font-size:18px">&uarr;</span> <a href="https://pvs-studio.com/en/docs/warnings/v512/" target="_blank">V512</a> A call of the 'memcpy' function will lead to underflow of the buffer '& md5sig.tcpm_addr'.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>
